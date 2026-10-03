@@ -1,0 +1,14 @@
+#[bengara::test]
+async fn トップページが表示される() {
+    get("/").await.assert_ok().assert_see("{{name}}");
+}
+
+#[bengara::test]
+async fn 生存確認が応答する() {
+    get("/up").await.assert_ok().assert_see("ok");
+}
+
+#[bengara::test]
+async fn 無いページは404になる() {
+    get("/no-such-page").await.assert_status(404);
+}

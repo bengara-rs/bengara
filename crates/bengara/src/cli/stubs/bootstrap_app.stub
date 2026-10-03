@@ -1,0 +1,9 @@
+//! アプリの組み立て。Laravel の bootstrap/app.php に当たります。
+
+use bengara::prelude::*;
+
+pub fn app() -> Application {
+    Application::configure()
+        .with_routing(|r| r.web(crate::routes::web::routes).health("/up"))
+        .create()
+}

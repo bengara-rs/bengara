@@ -1,0 +1,8 @@
+//! 画面のルート。Laravel の routes/web.php に当たります。
+
+use bengara::prelude::*;
+use crate::app::http::controllers::HomeController;
+
+pub fn routes() {
+    Route::get("/", HomeController::index).name("home");
+}

@@ -1,0 +1,59 @@
+use bengara::prelude::*;
+
+pub struct HomeController;
+
+impl HomeController {
+    pub async fn index() -> Result<Response> {
+        let app = config::<AppConfig>();
+        html(welcome(&app.name, &app.env))
+    }
+}
+
+fn welcome(name: &str, env: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{name}</title>
+<style>
+  :root {{ color-scheme: light dark; --fg: #1b1917; --bg: #faf8f5; --accent: #9c3d2e; }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{ --fg: #f2efe9; --bg: #17150f; --accent: #e07a5f; }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: var(--bg); color: var(--fg);
+    font-family: system-ui, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  }}
+  main {{ padding: 2rem; max-width: 40rem; }}
+  h1 {{ font-size: clamp(2rem, 6vw, 3rem); margin: 0 0 .25rem; letter-spacing: .02em; }}
+  .accent {{ color: var(--accent); }}
+  p {{ line-height: 1.8; }}
+  ul {{ line-height: 2; padding-left: 1.2rem; }}
+  code {{
+    background: color-mix(in srgb, var(--fg) 10%, transparent);
+    padding: .15rem .4rem; border-radius: .3rem; font-size: .9em;
+  }}
+  footer {{ margin-top: 2rem; font-size: .85rem; opacity: .65; }}
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="accent">{name}</span> が動いています</h1>
+  <p>環境は <code>{env}</code> です。この画面は <code>app/Http/Controllers/HomeController.rs</code> が返しています。</p>
+  <ul>
+    <li>ルートを足す: <code>routes/web.rs</code></li>
+    <li>コントローラを足す: <code>app/Http/Controllers/</code> に .rs を置くだけ（登録は不要）</li>
+    <li>ルートの一覧: <code>cargo artisan route:list</code></li>
+    <li>テスト: <code>cargo test</code></li>
+  </ul>
+  <footer>bengara — Laravel の構成で書ける Rust 製 Web フレームワーク（Laravel 公式とは無関係です）</footer>
+</main>
+</body>
+</html>
+"#
+    )
+}

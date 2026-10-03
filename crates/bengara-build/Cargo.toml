@@ -1,0 +1,14 @@
+[package]
+name = "bengara-build"
+description = "bengara の build.rs 用。Laravel と同じ名前のファイルを自動検出してモジュール宣言を生成する（依存クレートなし）"
+keywords = ["build-dependencies", "bengara", "codegen"]
+categories = ["development-tools::build-utils"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

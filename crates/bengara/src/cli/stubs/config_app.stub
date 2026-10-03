@@ -1,0 +1,15 @@
+//! 基本設定。Laravel の config/app.php に当たります。
+//!
+//! 値は .env から来ます。設定そのものは Rust のコードとしてバイナリに入るので、
+//! 本番に設定ファイルを置く必要はありません。
+
+use bengara::prelude::*;
+
+pub fn config() -> AppConfig {
+    AppConfig {
+        name: env("APP_NAME", "{{name}}"),
+        env: env("APP_ENV", "production"),
+        debug: env("APP_DEBUG", false),
+        url: env("APP_URL", "http://localhost:8000"),
+    }
+}

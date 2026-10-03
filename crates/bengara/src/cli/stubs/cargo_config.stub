@@ -1,0 +1,3 @@
+# cargo artisan ... で開発用コマンドを呼べるようにする
+[alias]
+artisan = ["run", "-q", "--bin", "artisan", "--"]

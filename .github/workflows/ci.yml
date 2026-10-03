@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # フレームワーク単体の検査。
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # 機能フラグを外しても通ることを確かめる。
+      - run: cargo clippy -p bengara --no-default-features --all-targets -- -D warnings
+
+  # 対応する一番古い Rust 版（Cargo.toml の rust-version）で通ることを確かめる。
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # 利用者の手順をそのまま再現する。
+  # cargo new → init → build → test が通ること。
+  user-flow:
+    name: user-flow (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bengara
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo new してフレームワークを手元のソースに差し替える
+        shell: bash
+        run: |
+          cargo new myapp
+          cd myapp
+          # cargo new の Cargo.toml は [dependencies] で終わるので、そこへ追記する。
+          # 公開前なので、crates.io ではなく手元のソースを使う。
+          printf 'bengara = "0.1"\n\n' >> Cargo.toml
+          printf '[patch.crates-io]\n' >> Cargo.toml
+          printf 'bengara = { path = "../bengara/crates/bengara" }\n' >> Cargo.toml
+          printf 'bengara-build = { path = "../bengara/crates/bengara-build" }\n' >> Cargo.toml
+          printf 'bengara-macros = { path = "../bengara/crates/bengara-macros" }\n' >> Cargo.toml
+          printf 'fn main() { bengara::run() }\n' > src/main.rs
+      - name: init してビルドとテスト
+        shell: bash
+        working-directory: myapp
+        run: |
+          cargo run -- init
+          cargo build
+          cargo test
+          cargo run -- route:list
+
+  # アプリ側（bengara-sandbox）が壊れていないことを確かめる。
+  # フレームワークだけを変えたときの巻き込み事故を防ぐため。
+  sandbox:
+    name: sandbox
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bengara-rs/bengara-sandbox
+          path: sandbox
+          # 非公開のリポジトリなら、読み取り権限のあるトークンを渡す。
+          # token: ${{ secrets.SANDBOX_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          # 変更中の bengara を、サブモジュールの位置に置く。
+          path: sandbox/bengara
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+        working-directory: sandbox
