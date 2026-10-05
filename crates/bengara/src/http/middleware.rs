@@ -57,21 +57,26 @@ pub struct Next {
     stack: Arc<[Arc<dyn Middleware>]>,
     index: usize,
     handler: Arc<dyn ErasedHandler>,
-    debug: bool,
+    options: crate::http::response::RenderOptions,
 }
 
 impl Next {
     pub(crate) fn new(
         stack: Arc<[Arc<dyn Middleware>]>,
         handler: Arc<dyn ErasedHandler>,
-        debug: bool,
+        options: crate::http::response::RenderOptions,
     ) -> Self {
         Self {
             stack,
             index: 0,
             handler,
-            debug,
+            options,
         }
+    }
+
+    /// エラーをどう見せるかの指定（ミドルウェアが自分でレスポンスを組むとき用）。
+    pub(crate) fn render_options(&self) -> crate::http::response::RenderOptions {
+        self.options.clone()
     }
 
     /// 次のミドルウェア、または最後のハンドラを呼ぶ。
@@ -80,20 +85,20 @@ impl Next {
     /// そうしないと、レスポンスに手を入れるミドルウェアが、エラーのときだけ素通りされてしまいます。
     /// 戻り値が `Result` なのは、ミドルウェア自身が `?` と `abort()` を使えるようにするためです。
     pub fn run(self, req: Request) -> BoxFuture {
-        let debug = self.debug;
+        let options = self.options.clone();
         let inner = match self.stack.get(self.index).cloned() {
             Some(middleware) => {
                 let next = Self {
                     stack: self.stack,
                     index: self.index + 1,
                     handler: self.handler,
-                    debug,
+                    options: options.clone(),
                 };
                 middleware.handle(req, next)
             }
             None => self.handler.call(req),
         };
-        Box::pin(async move { Ok(crate::http::response::render(inner.await, debug)) })
+        Box::pin(async move { Ok(crate::http::response::render(inner.await, options)) })
     }
 }
 
@@ -226,10 +231,14 @@ mod tests {
     }
 
     async fn run(stack: Arc<[Arc<dyn Middleware>]>, log: &Log) -> Response {
-        Next::new(stack, handler_for(log), false)
-            .run(Request::new("GET", "/"))
-            .await
-            .unwrap()
+        Next::new(
+            stack,
+            handler_for(log),
+            crate::http::response::RenderOptions::new(false, false),
+        )
+        .run(Request::new("GET", "/"))
+        .await
+        .unwrap()
     }
 
     #[tokio::test]

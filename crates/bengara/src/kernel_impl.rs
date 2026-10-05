@@ -46,6 +46,8 @@ fn dispatch(args: &[String], factory: fn() -> Application) -> Result<()> {
             print_routes(&build(factory));
             Ok(())
         }
+        "key:generate" => generate_key(),
+        "session:gc" => sweep_sessions(),
         "init" => crate::cli::init_here(),
         "--version" | "-V" | "version" => {
             println!("bengara {}", env!("CARGO_PKG_VERSION"));
@@ -119,6 +121,75 @@ fn next_value<'a>(iter: &mut impl Iterator<Item = &'a String>, name: &str) -> Re
         .ok_or_else(|| crate::Error::msg(format!("{name} の値がありません")))
 }
 
+/// `APP_KEY` を作って `.env` に書き込む。
+///
+/// すでにある場合は、`--force` が無いかぎり上書きしません。
+/// 鍵を変えると、いま動いているセッションと署名付き URL が全部無効になるためです。
+fn generate_key() -> Result<()> {
+    let force = std::env::args().any(|a| a == "--force");
+    let path = paths::base_path().join(".env");
+
+    if !path.is_file() {
+        return Err(crate::Error::msg(format!(
+            "{} がありません。先に .env を作ってください",
+            path.display()
+        )));
+    }
+
+    let body = std::fs::read_to_string(&path)?;
+    let line_of = |line: &str| line.trim_start().starts_with("APP_KEY=");
+    let already_set = body
+        .lines()
+        .any(|line| line_of(line) && line.trim().len() > "APP_KEY=".len());
+
+    if already_set && !force {
+        println!(
+            "APP_KEY はすでに設定されています。作り直すと、いまのセッションと\n\
+             署名付き URL がすべて無効になります。それでもよければ --force を付けてください。"
+        );
+        return Ok(());
+    }
+
+    let key = crate::support::crypto::random_token();
+    let updated = if body.lines().any(line_of) {
+        let mut out: Vec<String> = body
+            .lines()
+            .map(|line| {
+                if line_of(line) {
+                    format!("APP_KEY={key}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        out.push(String::new());
+        out.join("\n")
+    } else {
+        let mut out = body;
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("APP_KEY=");
+        out.push_str(&key);
+        out.push('\n');
+        out
+    };
+
+    std::fs::write(&path, updated)?;
+    println!("APP_KEY を {} に書き込みました。", path.display());
+    Ok(())
+}
+
+fn sweep_sessions() -> Result<()> {
+    let dir = paths::storage_path("framework/sessions");
+    let removed = crate::session::sweep_expired(&dir)?;
+    println!(
+        "期限切れのセッションを {removed} 件消しました（{}）",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// 登録されているルートを表で出す。
 fn print_routes(app: &Application) {
     let routes = app.routes();
@@ -183,6 +254,8 @@ fn print_help() {
       --host <ホスト>  待ち受けるホスト（既定: APP_HOST か 127.0.0.1）
       --port <ポート>  待ち受けるポート（既定: APP_PORT か 8000）
   route:list           登録されているルートを一覧にする
+  key:generate         APP_KEY を作って .env に書き込む（--force で上書き）
+  session:gc           期限切れのセッションを消す
   init                 Laravel と同じ構成のファイルを作る（最初の1回だけ）
   --version            版番号を出す
   --help               このヘルプを出す

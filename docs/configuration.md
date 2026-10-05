@@ -93,14 +93,20 @@ APP_PORT=8000
 | `APP_NAME` | `init` 時のパッケージ名 | アプリ名。`AppConfig.name` |
 | `APP_ENV` | `production` | 環境名。`AppConfig.env` |
 | `APP_DEBUG` | `false` | エラーページの詳細表示、ログの既定の細かさ |
-| `APP_URL` | `http://localhost:8000` | アプリの URL。`AppConfig.url` |
+| `APP_URL` | `http://localhost:8000` | アプリの URL。`AppConfig.url` と `url()` の土台 |
+| `APP_KEY` | （なし） | セッションと署名付き URL の署名に使う鍵。`cargo artisan key:generate` で作る |
+| `SESSION_DRIVER` | `file` | セッションの置き場所（`file` / `memory`） |
+| `SESSION_LIFETIME` | `120` | セッションが消えるまでの分 |
 | `APP_HOST` | `127.0.0.1` | サーバーが待ち受けるホスト |
 | `APP_PORT` | `8000` | サーバーが待ち受けるポート |
 | `APP_BASE_PATH` | （なし） | プロジェクトのルート。`serve` が起動時に渡します |
 | `RUST_LOG` | （なし） | ログの細かさ。無ければ `APP_DEBUG` から決まります |
 
 `APP_NAME` `APP_ENV` `APP_DEBUG` `APP_URL` は `config/app.rs` が読んでいるだけです。読み方を変えるのは自由です。
-`APP_HOST` `APP_PORT` `APP_BASE_PATH` `RUST_LOG` はフレームワークが直接読みます。
+`APP_HOST` `APP_PORT` `APP_BASE_PATH` `RUST_LOG` `SESSION_*` はフレームワークが直接読みます。
+
+**`APP_KEY` が空のままだと、セッションと署名付き URL を使うリクエストが 500 になります。**
+`cargo artisan key:generate` で作ってください（[session.md](session.md)）。
 
 ## 機能フラグ
 

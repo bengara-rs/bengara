@@ -19,6 +19,10 @@ pub enum Error {
     Io(std::io::Error),
     /// JSON の変換エラー。500 になります。
     Json(serde_json::Error),
+    /// 入力の検査に落ちた。422 になります。
+    ///
+    /// `Box` に入れているのは、`Error` 全体が大きくなるのを防ぐためです。
+    Validation(Box<crate::validation::ValidationErrors>),
 }
 
 impl Error {
@@ -39,6 +43,7 @@ impl Error {
     pub fn status(&self) -> u16 {
         match self {
             Error::Http { status, .. } => *status,
+            Error::Validation(_) => 422,
             _ => 500,
         }
     }
@@ -47,6 +52,7 @@ impl Error {
     pub fn public_message(&self) -> String {
         match self {
             Error::Http { message, .. } if !message.is_empty() => message.clone(),
+            Error::Validation(e) => e.to_string(),
             _ => reason_phrase(self.status()).to_string(),
         }
     }
@@ -62,6 +68,7 @@ impl fmt::Display for Error {
             Error::Message(m) => write!(f, "{m}"),
             Error::Io(e) => write!(f, "入出力エラー: {e}"),
             Error::Json(e) => write!(f, "JSON エラー: {e}"),
+            Error::Validation(e) => write!(f, "入力の検査に落ちました: {e}"),
         }
     }
 }

@@ -112,6 +112,35 @@ GET     /              home
 GET     /admin         admin.index  admin
 ```
 
+## 回数の制限（throttle）
+
+```rust
+// bootstrap/app.rs
+.alias("throttle", Throttle::per_minute(60))
+
+// routes/web.rs
+Route::post("/login", AuthController::login).middleware("throttle");
+```
+
+| 作り方 | 中身 |
+|---|---|
+| `Throttle::per_minute(60)` | 1分に60回 |
+| `Throttle::new(10, Duration::from_secs(30))` | 30秒に10回 |
+| `Throttle::from_spec("60,1")?` | Laravel の `throttle:60,1` と同じ書き方 |
+
+超えると **429** を返し、`Retry-After`（秒）が付きます。
+通ったときは `X-RateLimit-Limit` と `X-RateLimit-Remaining` が付きます。
+
+数えるのは「相手とパスの組」です。相手は `X-Forwarded-For` の先頭 → `X-Real-IP` の順で見ます。
+
+### 大事な制限
+
+**回数はプロセスのメモリに数えます。**
+プロセスを2つ動かすと、それぞれが別々に数えるので、**実際の上限は指定の約2倍になります。**
+
+厳密に守りたいときは、前段のプロキシ（nginx の `limit_req` など）で掛けてください。
+共通の置き場所に載せ替えるのは、キャッシュを作ってからです（[backlog.md](backlog.md)）。
+
 ## 状態を持たせたいとき
 
 設定を持つミドルウェアは、`Middleware` トレイトを自分で実装します。

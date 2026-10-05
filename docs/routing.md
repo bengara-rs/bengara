@@ -89,6 +89,45 @@ redirect().route("home")
 redirect().route_with("posts.show", &[("post", "12")])
 ```
 
+## URL を作る
+
+| 関数 | 返すもの |
+|---|---|
+| `route("home")` | パスだけ（`/`） |
+| `route_with("posts.show", &[("post", "12")])` | パスだけ（`/posts/12`） |
+| `url("/posts")` | `APP_URL` をつないだ絶対 URL |
+| `route_url("home")` | 名前付きルートの絶対 URL |
+| `route_url_with("posts.show", &[("post", "12")])` | 同上（パス引数つき） |
+
+```rust
+url("/posts")           // http://localhost:8000/posts
+url("https://x.test")   // そのまま返る
+```
+
+## 署名付き URL
+
+「退会する」のリンクのように、**ログインしていない人に渡すリンク**で使います。
+クエリを1文字でも書き換えると、確認が通らなくなります。
+
+```rust
+// 作る
+let link = signed_url("/unsubscribe", &[("user", "12")])?;
+let temp = temporary_signed_url("/unsubscribe", &[("user", "12")], 3600)?;  // 1時間だけ
+
+// 確かめる
+pub async fn unsubscribe(req: Request) -> Result<Response> {
+    if !has_valid_signature(&req)? {
+        return abort(403);
+    }
+    // ...
+}
+```
+
+- `APP_KEY` が要ります（[session.md](session.md)）。
+- クエリの並び順が変わっても通ります。
+- `signature` と `expires` は仕組みが使う名前なので、自分では指定できません。
+- **署名が合わなくても自動では止まりません。** 何を返すかは自分で決めてください。
+
 ## 書ける場所
 
 `Route::*` は `routes/*.rs` の中（= `Routing::web` から呼ばれている間）でだけ有効です。

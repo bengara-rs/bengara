@@ -66,7 +66,10 @@ async fn dispatch(
         Ok(bytes) => bytes.to_vec(),
         Err(_) => {
             let error = Error::http(413, "本文が大きすぎます");
-            return into_axum(crate::http::response::error_response(&error, false));
+            return into_axum(crate::http::response::error_response(
+                &error,
+                crate::http::response::RenderOptions::new(false, false),
+            ));
         }
     };
 

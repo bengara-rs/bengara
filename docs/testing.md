@@ -54,6 +54,10 @@ async fn 無いページは404になる() {
 | `post(uri, body)` |
 | `post_json(uri, body)` — `body` は `&serde_json::Value` |
 | `send(method, uri, body, headers)` — `body: Vec<u8>`、`headers: &[(&str, &str)]` |
+| `post_with_csrf(uri, body, token_uri)` |
+| `csrf_token(token_uri)` |
+| `fresh()` — Cookie を捨てた別のクライアント |
+| `cookie(name)` — 覚えている Cookie |
 
 ```rust
 #[bengara::test]
@@ -62,6 +66,39 @@ async fn JSONを受け取れる() {
     res.assert_status(201);
 }
 ```
+
+## セッションと CSRF を使うテスト
+
+`client` は **Cookie を覚えます。** 続けて送るとセッションがつながります。
+
+```rust
+#[bengara::test]
+async fn セッションがつながる() {
+    let token = client.csrf_token("/csrf-token").await;
+    client
+        .send("POST", "/remember", b"value=x".to_vec(),
+              &[("content-type", "application/x-www-form-urlencoded"),
+                ("x-csrf-token", &token)])
+        .await
+        .assert_ok();
+
+    // 次のリクエストでも読める
+    client.get("/recall").await.assert_ok().assert_see("x");
+}
+```
+
+| メソッド | 中身 |
+|---|---|
+| `client.fresh()` | Cookie を捨てた、**別の人**としてのクライアント |
+| `client.cookie(name)` | いま持っている Cookie の値 |
+| `client.csrf_token(uri)` | トークンを返すルートを叩いて `token` を取り出す |
+| `client.post_with_csrf(uri, body, token_uri)` | トークンを取ってから POST する |
+
+`send` に `cookie` ヘッダーを自分で指定したときは、そちらが優先されます。
+
+### テストでディスクに書かないようにする
+
+`.env` に `SESSION_DRIVER=memory` を書いておくと、セッションがファイルに残りません。
 
 ### TestResponse
 

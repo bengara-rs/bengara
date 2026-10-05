@@ -81,6 +81,11 @@ impl Response {
         self
     }
 
+    /// Cookie を1本足す。何本でも足せます。
+    pub fn with_cookie(self, cookie: &super::cookie::Cookie) -> Self {
+        self.with_added_header("set-cookie", cookie.to_header_value())
+    }
+
     /// 本文を差し替える。
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
@@ -197,13 +202,72 @@ pub fn abort_with<T>(status: u16, message: impl Into<String>) -> Result<T> {
     })
 }
 
+/// エラーをどう見せるかの指定。起動時とリクエストごとに決まり、以後は変わりません。
+///
+/// `Arc` を1つ持つだけなので、クローンは安いです。
+#[derive(Clone)]
+pub(crate) struct RenderOptions {
+    /// 詳しい内容を出すか（`APP_DEBUG`）。
+    pub(crate) debug: bool,
+    /// クライアントが JSON を欲しがっているか。
+    pub(crate) wants_json: bool,
+    /// 利用者が差し替えたエラーの見せ方。
+    pub(crate) exceptions: Option<std::sync::Arc<crate::application::Exceptions>>,
+}
+
+impl RenderOptions {
+    pub(crate) fn new(debug: bool, wants_json: bool) -> Self {
+        Self {
+            debug,
+            wants_json,
+            exceptions: None,
+        }
+    }
+
+    pub(crate) fn with_exceptions(
+        mut self,
+        exceptions: Option<std::sync::Arc<crate::application::Exceptions>>,
+    ) -> Self {
+        self.exceptions = exceptions;
+        self
+    }
+}
+
 /// エラーをレスポンスに変える。
 ///
-/// `debug` が真なら、画面に詳しい内容を出します。
-pub(crate) fn error_response(error: &Error, debug: bool) -> Response {
+/// `wants_json` なら JSON、そうでなければ HTML の画面を返します。
+pub(crate) fn error_response(error: &Error, options: RenderOptions) -> Response {
+    // まず、利用者が差し替えた見せ方を試す。
+    if let Some(exceptions) = &options.exceptions {
+        if let Some(response) = exceptions.apply(error) {
+            return response;
+        }
+    }
+
     let status = error.status();
-    let title = format!("{status} {}", reason_phrase(status));
-    let detail = if debug {
+
+    // 入力の検査だけは、どの項目が駄目かを機械が読める形で返す。
+    if let Error::Validation(errors) = error {
+        if options.wants_json {
+            return Response::json(&errors.to_json())
+                .unwrap_or_else(|_| Response::text("入力に誤りがあります。"))
+                .with_status(status);
+        }
+        let detail = errors
+            .all()
+            .iter()
+            .map(|(field, reasons)| format!("{field}: {}", reasons.join(" / ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Response::html(error_page(
+            &format!("{status} {}", reason_phrase(status)),
+            &detail,
+            options.debug,
+        ))
+        .with_status(status);
+    }
+
+    let detail = if options.debug {
         let mut detail = error.to_string();
         let mut source = std::error::Error::source(error);
         while let Some(e) = source {
@@ -214,9 +278,17 @@ pub(crate) fn error_response(error: &Error, debug: bool) -> Response {
     } else {
         error.public_message()
     };
-    Response::html(error_page(&title, &detail, debug)).with_status(status)
-}
 
+    if options.wants_json {
+        let body = serde_json::json!({ "message": detail });
+        return Response::json(&body)
+            .unwrap_or_else(|_| Response::text(detail.clone()))
+            .with_status(status);
+    }
+
+    let title = format!("{status} {}", reason_phrase(status));
+    Response::html(error_page(&title, &detail, options.debug)).with_status(status)
+}
 fn error_page(title: &str, detail: &str, debug: bool) -> String {
     let detail = escape_html(detail);
     let hint = if debug {
@@ -267,7 +339,7 @@ pub fn escape_html(input: &str) -> String {
 /// ハンドラやミドルウェアの戻り値を、必ずレスポンスにする。
 ///
 /// エラーはログに残してから、ステータス付きのレスポンスに変えます。
-pub(crate) fn render(result: crate::error::Result<Response>, debug: bool) -> Response {
+pub(crate) fn render(result: crate::error::Result<Response>, options: RenderOptions) -> Response {
     match result {
         Ok(response) => response,
         Err(error) => {
@@ -276,7 +348,7 @@ pub(crate) fn render(result: crate::error::Result<Response>, debug: bool) -> Res
             } else {
                 tracing::debug!("{error}");
             }
-            error_response(&error, debug)
+            error_response(&error, options)
         }
     }
 }

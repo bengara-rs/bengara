@@ -151,6 +151,43 @@ return abort_with(404, "記事が見つかりません");
 `allow` には、そのパスで通るメソッドがアルファベット順に入ります（`allow: GET, POST`）。
 くわしくは [routing.md](routing.md) を見てください。
 
+## HTML で返るか JSON で返るか
+
+エラーの形は、リクエストを見て決めます（Laravel の `expectsJson()` と同じ考え方）。
+
+| 見るもの | JSON になる条件 |
+|---|---|
+| `Accept` | `application/json` か `+json` を含む |
+| `Accept` | `text/html` が無く `*/*` がある（`curl` の既定） |
+| `X-Requested-With` | `XMLHttpRequest` |
+| `Content-Type` | 自分が JSON を送ってきた |
+
+```json
+{ "message": "そのページはありません" }
+```
+
+入力の検査（422）だけは、項目ごとの理由も入ります（[validation.md](validation.md)）。
+
+## エラーの形を差し替える
+
+```rust
+// bootstrap/app.rs
+Application::configure()
+    .with_exceptions(|e| {
+        e.render(|error| {
+            (error.status() == 404).then(|| {
+                Response::json(&bengara::serde_json::json!({ "message": "ありません" }))
+                    .unwrap_or_else(|_| Response::text("not found"))
+                    .with_status(404)
+            })
+        })
+    })
+```
+
+- 登録した関数を**上から順に試し**、最初に `Some` を返したものを使います。
+- どれも返さなければ、bengara の既定の形になります。
+- `render` は何回でも呼べます。
+
 ## エラーページ
 
 - `APP_DEBUG=true` のときだけ、エラーページに詳しい内容（原因の連鎖）が出ます。

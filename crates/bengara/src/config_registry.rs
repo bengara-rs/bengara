@@ -98,6 +98,11 @@ pub struct AppConfig {
     pub debug: bool,
     /// アプリの URL。
     pub url: String,
+    /// 署名に使う鍵（`APP_KEY`）。
+    ///
+    /// セッションと署名付き URL で使います。**空のままだと、それらを使うときにエラーになります。**
+    /// `cargo artisan key:generate` で作ってください。
+    pub key: String,
 }
 
 impl Default for AppConfig {
@@ -108,6 +113,7 @@ impl Default for AppConfig {
             env: env("APP_ENV", "production"),
             debug: env("APP_DEBUG", false),
             url: env("APP_URL", "http://localhost"),
+            key: env("APP_KEY", ""),
         }
     }
 }
@@ -121,6 +127,16 @@ impl AppConfig {
     /// 手元の開発環境か。
     pub fn is_local(&self) -> bool {
         self.env == "local"
+    }
+
+    /// 署名に使う鍵を取り出す。設定されていなければ、直し方を書いたエラーを返す。
+    pub(crate) fn signing_key(&self) -> crate::error::Result<&[u8]> {
+        if self.key.is_empty() {
+            return Err(crate::Error::msg(
+                "APP_KEY が設定されていません。`cargo artisan key:generate` で作って .env に入れてください",
+            ));
+        }
+        Ok(self.key.as_bytes())
     }
 }
 

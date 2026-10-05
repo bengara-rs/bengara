@@ -11,5 +11,7 @@ pub fn config() -> AppConfig {
         env: env("APP_ENV", "production"),
         debug: env("APP_DEBUG", false),
         url: env("APP_URL", "http://localhost:8000"),
+        // セッションと署名付き URL の署名に使います。`cargo artisan key:generate` で作ります。
+        key: env("APP_KEY", ""),
     }
 }

@@ -58,7 +58,7 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 |---|---|
 | 引数の型からコンテナが解決して注入する | **自動解決は無い。** 受け付ける形は `async fn f() -> Result<Response>` と `async fn f(req: Request) -> Result<Response>` の 2 つだけ |
 | `Request` から何でも取れる | `Request` のメソッドは決まった一覧のみ（[requests-and-responses.md](requests-and-responses.md)） |
-| `view('welcome')` | テンプレートは無い。`html(...)` に文字列を渡す |
+| `view("welcome")` | **テンプレートは作りません。** `html(...)` に文字列を渡すか、JSON を返して画面は別で作る |
 
 ## レスポンス
 
@@ -68,6 +68,49 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | `redirect('/login')` | `redirect().to("/login")` — `Result<Response>` |
 | `abort(403)` | `abort(403)` — `Result<T>` を返すので `return abort(403);` と書く |
 | 例外を投げる | `Err` を返す。`Error::Http` ならそのステータス、それ以外は 500 |
+
+## 入力とバリデーション
+
+| Laravel | bengara |
+|---|---|
+| `$request->input('title')` | `req.input("title")` — `Option<String>` が返る |
+| `$request->validate([...])` | `req.validate(&[("title", "required|max:255")])?` |
+| 規則は配列でも文字列でも書ける | **文字列だけ**（`"required\|max:255"`） |
+| 落ちると例外 → リダイレクトか JSON | 落ちると `Error::Validation` → 422。`Accept` で JSON か HTML |
+| `old('title')` | `req.session().old("title")` |
+| `regex:` / `unique:` / `exists:` | まだ無い |
+| フォームリクエスト（`StorePostRequest`） | まだ無い |
+
+## セッションと CSRF
+
+| Laravel | bengara |
+|---|---|
+| `session(['k' => 'v'])` | `req.session().put("k", "v")` |
+| `session()->flash('k', 'v')` | `req.session().flash("k", "v")` |
+| `SESSION_DRIVER=file`（既定） | 同じ。`memory` も選べる（テスト用） |
+| Cookie は暗号化される | **署名だけ。** 中身はサーバー側に置くので、ブラウザには出ない |
+| `@csrf` が隠しフィールドを出す | テンプレートが無いので、`req.csrf_token()` を自分で埋める |
+| `X-CSRF-TOKEN` ヘッダー | 同じ |
+| 失敗すると 419 | 同じ |
+| `VerifyCsrfToken::$except` | `VerifyCsrfToken::new().except("/api/*")` |
+
+## URL と署名
+
+| Laravel | bengara |
+|---|---|
+| `url('/posts')` | `url("/posts")`（同じ） |
+| `URL::signedRoute(...)` | `signed_url("/unsubscribe", &[("user", "12")])?` — **ルート名ではなくパス**を渡す |
+| `URL::temporarySignedRoute(...)` | `temporary_signed_url(path, params, secs)?` |
+| `$request->hasValidSignature()` | `has_valid_signature(&req)?` |
+| ミドルウェア `signed` が自動で止める | **自動では止まらない。** 自分で確かめて返し方を決める |
+
+## エラーと制限
+
+| Laravel | bengara |
+|---|---|
+| `bootstrap/app.php` の `withExceptions` | `with_exceptions(\|e\| e.render(...))` |
+| `throttle:60,1` | `Throttle::from_spec("60,1")?` を `alias` に登録 |
+| 制限はキャッシュで共有される | **プロセスごとに数える**（2 プロセスなら上限は約 2 倍） |
 
 ## 読み込みのしかた
 
@@ -104,7 +147,7 @@ Rust では原理的に作れないものがあるためです。
 
 | PHP 固有のもの | bengara |
 |---|---|
-| Blade のテンプレート文法 | 作りません。Rust のテンプレートエンジンを使います（まだ未実装） |
+| Blade のテンプレート文法 | 作りません。Rust のエンジンを選ぶのは Laravel に似せる話とは別なので、当面は入れません |
 | 実行時に型や名前を調べる仕組み（リフレクション） | ありません。Rust に無いためです |
 | サービスコンテナによる依存の自動解決 | ありません。ハンドラの引数は決まった2つの形だけです |
 | マジックメソッド（`__get` / `__call`）による遅延ロード | ありません。読み込みはいつも明示的に書きます |

@@ -10,23 +10,49 @@
 //! }
 //! ```
 
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use crate::application::Application;
 use crate::http::{Request, Response};
 use crate::{kernel_impl, Hooks};
 
 /// テスト用のクライアント。
+///
+/// **Cookie を覚えます。** ブラウザと同じように、1つのクライアントで続けて送ると
+/// セッションがつながります。別の人として送りたいときは `fresh()` で作り直してください。
 #[derive(Clone)]
 pub struct TestClient {
     app: Application,
+    cookies: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl TestClient {
     /// 組み立て済みのアプリからクライアントを作る。
     pub fn new(app: Application) -> Self {
         app.install_names();
-        Self { app }
+        Self {
+            app,
+            cookies: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Cookie を捨てた、別の人としてのクライアントを作る。
+    pub fn fresh(&self) -> Self {
+        Self {
+            app: self.app.clone(),
+            cookies: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// いま持っている Cookie の値。
+    pub fn cookie(&self, name: &str) -> Option<String> {
+        self.cookies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// GET を送る。クエリは `"/search?q=1"` のように書けます。
@@ -56,7 +82,38 @@ impl TestClient {
         .await
     }
 
+    /// CSRF のトークンを取ってから POST する。
+    ///
+    /// `/csrf-token` のような、トークンを返すルートを先に叩きます。
+    /// トークンは `X-CSRF-TOKEN` ヘッダーで送ります。
+    ///
+    /// ```ignore
+    /// client.post_with_csrf("/posts", "title=x", "/csrf-token").await;
+    /// ```
+    pub async fn post_with_csrf(&self, uri: &str, body: &str, token_uri: &str) -> TestResponse {
+        let token = self.csrf_token(token_uri).await;
+        self.send(
+            "POST",
+            uri,
+            body.as_bytes().to_vec(),
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("x-csrf-token", &token),
+            ],
+        )
+        .await
+    }
+
+    /// トークンを返すルートを叩いて、`token` の値を取り出す。
+    pub async fn csrf_token(&self, token_uri: &str) -> String {
+        let res = self.get(token_uri).await;
+        res.json()["token"].as_str().unwrap_or_default().to_string()
+    }
+
     /// メソッド・ヘッダーまで自分で決めて送る。
+    ///
+    /// 覚えている Cookie は自動で付きます。`cookie` ヘッダーを自分で指定したときは、
+    /// そちらを優先します。
     pub async fn send(
         &self,
         method: &str,
@@ -68,21 +125,66 @@ impl TestClient {
             Some((path, query)) => (path, query),
             None => (uri, ""),
         };
-        let headers = headers
+        let mut headers: Vec<(String, String)> = headers
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
             .collect();
+
+        if !headers.iter().any(|(k, _)| k == "cookie") {
+            if let Some(header) = self.cookie_header() {
+                headers.push(("cookie".to_string(), header));
+            }
+        }
+
         let req = Request::new(method, path)
             .with_query(query)
             .with_headers(headers)
             .with_body(body);
+        let response = self.app.handle(req).await;
+        self.remember_cookies(&response);
         TestResponse {
-            inner: self.app.handle(req).await,
+            inner: response,
             uri: uri.to_string(),
         }
     }
-}
 
+    fn cookie_header(&self) -> Option<String> {
+        let cookies = self.cookies.lock().unwrap_or_else(|e| e.into_inner());
+        if cookies.is_empty() {
+            return None;
+        }
+        Some(
+            cookies
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+
+    /// `Set-Cookie` を覚える。`Max-Age=0` のものは捨てます。
+    fn remember_cookies(&self, response: &Response) {
+        let mut cookies = self.cookies.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, value) in response.headers() {
+            if name != "set-cookie" {
+                continue;
+            }
+            let mut parts = value.split(';');
+            let Some(pair) = parts.next() else { continue };
+            let Some((key, val)) = pair.split_once('=') else {
+                continue;
+            };
+            let removed = value
+                .split(';')
+                .any(|p| p.trim().eq_ignore_ascii_case("Max-Age=0"));
+            if removed {
+                cookies.remove(key.trim());
+            } else {
+                cookies.insert(key.trim().to_string(), val.trim().to_string());
+            }
+        }
+    }
+}
 /// 返ってきた内容を確かめるための型。
 pub struct TestResponse {
     inner: Response,

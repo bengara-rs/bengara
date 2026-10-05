@@ -25,6 +25,45 @@ struct Inner {
     routes: Routes,
     public_dir: PathBuf,
     debug: bool,
+    exceptions: Option<Arc<Exceptions>>,
+}
+
+/// エラーからレスポンスを作る関数。
+type ExceptionHandler = Box<dyn Fn(&Error) -> Option<Response> + Send + Sync>;
+
+/// エラーの見せ方の差し替え。
+///
+/// `with_exceptions` で登録した関数を順に試し、最初に `Some` を返したものを使います。
+/// どれも返さなければ、bengara の既定の画面になります。
+#[derive(Default)]
+pub struct Exceptions {
+    handlers: Vec<ExceptionHandler>,
+}
+
+impl Exceptions {
+    /// エラーからレスポンスを作る関数を足す。
+    ///
+    /// ```ignore
+    /// .with_exceptions(|e| e.render(|error| {
+    ///     (error.status() == 404).then(|| Response::text("見つかりません").with_status(404))
+    /// }))
+    /// ```
+    pub fn render(
+        mut self,
+        handler: impl Fn(&Error) -> Option<Response> + Send + Sync + 'static,
+    ) -> Self {
+        self.handlers.push(Box::new(handler));
+        self
+    }
+
+    /// 登録した関数を順に試す。
+    pub(crate) fn apply(&self, error: &Error) -> Option<Response> {
+        self.handlers.iter().find_map(|h| h(error))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
 }
 
 impl Application {
@@ -52,22 +91,25 @@ impl Application {
     /// 1本のリクエストを処理する。ソケットを使わないので、テストからも呼べます。
     pub(crate) async fn handle(&self, mut req: Request) -> Response {
         let is_head = req.method() == "HEAD";
+        let options = crate::http::response::RenderOptions::new(self.inner.debug, wants_json(&req))
+            .with_exceptions(self.inner.exceptions.clone());
         let response = match self.inner.routes.find(req.method(), req.path()) {
             Matched::Found { def, params } => {
                 req.set_params(params);
                 req.set_route_name(def.name.clone());
-                let debug = self.inner.debug;
                 let future = match &def.stack {
-                    Some(stack) => Next::new(stack.clone(), def.handler.clone(), debug).run(req),
+                    Some(stack) => {
+                        Next::new(stack.clone(), def.handler.clone(), options.clone()).run(req)
+                    }
                     None => def.handler.call(req),
                 };
                 // ハンドラのパニックを1リクエストに閉じ込める。
                 match tokio::spawn(future).await {
-                    Ok(result) => crate::http::response::render(result, debug),
+                    Ok(result) => crate::http::response::render(result, options.clone()),
                     Err(join_error) => {
                         let error = Error::msg(panic_message(&join_error));
                         tracing::error!("ハンドラがパニックしました: {error}");
-                        error_response(&error, self.inner.debug)
+                        error_response(&error, options)
                     }
                 }
             }
@@ -77,9 +119,9 @@ impl Application {
                     status: 405,
                     message: String::new(),
                 };
-                error_response(&error, self.inner.debug).with_header("allow", allowed.join(", "))
+                error_response(&error, options.clone()).with_header("allow", allowed.join(", "))
             }
-            Matched::NotFound => self.serve_static_or_404(&req).await,
+            Matched::NotFound => self.serve_static_or_404(&req, options.clone()).await,
         };
         if is_head {
             response.with_body(Vec::new())
@@ -88,7 +130,11 @@ impl Application {
         }
     }
 
-    async fn serve_static_or_404(&self, req: &Request) -> Response {
+    async fn serve_static_or_404(
+        &self,
+        req: &Request,
+        options: crate::http::response::RenderOptions,
+    ) -> Response {
         if matches!(req.method(), "GET" | "HEAD") {
             let dir = self.inner.public_dir.clone();
             let path = req.path().to_string();
@@ -105,9 +151,41 @@ impl Application {
                 status: 404,
                 message: String::new(),
             },
-            self.inner.debug,
+            options,
         )
     }
+}
+
+/// クライアントが JSON を欲しがっているか。
+///
+/// `Accept` に `application/json` があるか、`X-Requested-With: XMLHttpRequest` が付いているか、
+/// 自分が JSON を送ってきたか、のどれかで判断します。Laravel の `expectsJson()` と同じ考え方です。
+fn wants_json(req: &Request) -> bool {
+    if let Some(accept) = req.header("accept") {
+        let accept = accept.to_ascii_lowercase();
+        if accept.contains("application/json") || accept.contains("+json") {
+            return true;
+        }
+        // ブラウザは text/html を先に書く。それが無く */* だけなら API 呼び出しとみなす。
+        if !accept.contains("text/html") && accept.contains("*/*") {
+            return true;
+        }
+    }
+    if req
+        .header("x-requested-with")
+        .is_some_and(|v| v.eq_ignore_ascii_case("XMLHttpRequest"))
+    {
+        return true;
+    }
+    req.header("content-type").is_some_and(|ct| {
+        let kind = ct
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        kind == "application/json" || kind.ends_with("+json")
+    })
 }
 
 fn panic_message(join_error: &tokio::task::JoinError) -> String {
@@ -122,6 +200,7 @@ fn panic_message(join_error: &tokio::task::JoinError) -> String {
 pub struct ApplicationBuilder {
     routing: Routing,
     middleware: Middlewares,
+    exceptions: Exceptions,
 }
 
 impl ApplicationBuilder {
@@ -130,6 +209,12 @@ impl ApplicationBuilder {
     /// ```ignore
     /// .with_middleware(|m| m.append(AddPoweredBy::handle).alias("admin", EnsureAdmin::handle))
     /// ```
+    pub fn with_exceptions(mut self, configure: impl FnOnce(Exceptions) -> Exceptions) -> Self {
+        self.exceptions = configure(std::mem::take(&mut self.exceptions));
+        self
+    }
+
+    /// ミドルウェアを登録する。
     pub fn with_middleware(mut self, configure: impl FnOnce(Middlewares) -> Middlewares) -> Self {
         self.middleware = configure(std::mem::take(&mut self.middleware));
         self
@@ -178,6 +263,7 @@ impl ApplicationBuilder {
                 routes: Routes::build(defs),
                 public_dir: paths::app_path("public"),
                 debug: app_config().debug,
+                exceptions: (!self.exceptions.is_empty()).then(|| Arc::new(self.exceptions)),
             }),
         }
     }

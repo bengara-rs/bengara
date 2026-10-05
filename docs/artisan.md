@@ -33,7 +33,9 @@
 | コマンド | 動き |
 |---|---|
 | 引数なし / `serve` | HTTP サーバーを起動。`--host` / `--port`（`--port=8080` の形も可） |
-| `route:list` | 登録されているルートの表（METHOD / URI / NAME） |
+| `route:list` | 登録されているルートの表（METHOD / URI / NAME / MIDDLEWARE） |
+| `key:generate` | `APP_KEY` を作って `.env` に書き込む。`--force` で上書き |
+| `session:gc` | 期限切れのセッションのファイルを消す |
 | `init` | Laravel と同じ構成のファイルを作る |
 | `--version` / `--help` | 版・ヘルプ |
 

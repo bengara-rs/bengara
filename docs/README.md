@@ -14,8 +14,10 @@ bengara を使う人のための資料です。フレームワークの紹介は
 
 | ページ | 内容 |
 |---|---|
-| [routing.md](routing.md) | ルート定義、パス引数、名前付きルート、グループ、404 と 405 |
-| [middleware.md](middleware.md) | リクエストの前後に挟む処理 |
+| [routing.md](routing.md) | ルート定義、パス引数、名前付きルート、グループ、署名付き URL、404 と 405 |
+| [middleware.md](middleware.md) | リクエストの前後に挟む処理、回数の制限 |
+| [validation.md](validation.md) | 入力の検査 |
+| [session.md](session.md) | セッション、Cookie、CSRF |
 | [requests-and-responses.md](requests-and-responses.md) | Request / Response / リダイレクト / エラー / 静的ファイル |
 | [configuration.md](configuration.md) | `config/*.rs` と `.env` |
 | [testing.md](testing.md) | `#[bengara::test]` でのテスト |

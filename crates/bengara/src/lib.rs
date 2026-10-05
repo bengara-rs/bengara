@@ -30,17 +30,21 @@ mod http;
 mod kernel_impl;
 mod paths;
 mod server;
+pub mod session;
+mod support;
+pub mod validation;
 
 pub mod testing;
 
-pub use application::{Application, ApplicationBuilder, Routing};
+pub use application::{Application, ApplicationBuilder, Exceptions, Routing};
 pub use config_registry::{config, try_config, AppConfig, Registry};
 pub use env_vars::{env, FromEnv};
 pub use error::{Error, Result};
 pub use http::{
-    abort, abort_with, escape_html, html, json, redirect, route, route_with, text, BoxFuture,
+    abort, abort_with, escape_html, has_valid_signature, html, json, redirect, route, route_url,
+    route_url_with, route_with, signed_url, temporary_signed_url, text, url, BoxFuture, Cookie,
     Handler, Middleware, Middlewares, Next, Redirect, Registered, Request, Response, Route,
-    RouteGroup,
+    RouteGroup, SameSite, Throttle,
 };
 pub use paths::{app_path, base_path, public_path, storage_path};
 
@@ -123,9 +127,14 @@ macro_rules! app {
 /// ```
 pub mod prelude {
     pub use crate::{
-        abort, abort_with, app_path, base_path, config, env, escape_html, html, json, public_path,
-        redirect, route, route_with, storage_path, text, try_config, AppConfig, Application,
-        BoxFuture, Error, Middleware, Middlewares, Next, Redirect, Registered, Request, Response,
-        Result, Route, RouteGroup, Routing,
+        abort, abort_with, app_path, base_path, config, env, escape_html, has_valid_signature,
+        html, json, public_path, redirect, route, route_url, route_url_with, route_with,
+        signed_url, storage_path, temporary_signed_url, text, try_config, url, AppConfig,
+        Application, BoxFuture, Cookie, Error, Exceptions, Middleware, Middlewares, Next, Redirect,
+        Registered, Request, Response, Result, Route, RouteGroup, Routing, SameSite, Throttle,
     };
+
+    // セッションまわりは `session::` のまま使うと長いので、よく使う型だけ入れておきます。
+    pub use crate::session::{Session, SessionConfig, StartSession, VerifyCsrfToken};
+    pub use crate::validation::{Validated, ValidationErrors};
 }
