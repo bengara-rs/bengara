@@ -107,7 +107,9 @@ APP_PORT=8000
 | `HASH_ITERATIONS`  | `120000`                   | パスワードの変換の繰り返し回数（[authentication.md](authentication.md)）     |
 | `APP_HOST`         | `127.0.0.1`                | サーバーが待ち受けるホスト                                                   |
 | `APP_PORT`         | `8000`                     | サーバーが待ち受けるポート                                                   |
-| `APP_BASE_PATH`    | （なし）                   | プロジェクトのルート。`serve` が起動時に渡します                             |
+| `APP_BASE_PATH`    | （なし）                   | 基準ディレクトリ。**絶対パスのみ**（[deployment.md](deployment.md)）         |
+| `APP_STORAGE_PATH` | （なし）                   | `storage/` の場所。**絶対パスのみ**                                          |
+| `APP_SHUTDOWN_TIMEOUT` | `30`                   | 停止の上限（秒）。**`0` は無制限**                                           |
 | `RUST_LOG`         | （なし）                   | ログの細かさ。無ければ `APP_DEBUG` から決まります                            |
 | `CACHE_DRIVER`     | `file`                     | キャッシュの置き場所（`file` / `memory`）（[cache.md](cache.md)）            |
 | `STORAGE_DISK`     | `local`                    | 既定のファイル置き場（[storage.md](storage.md)）                             |
@@ -118,8 +120,11 @@ APP_PORT=8000
 | `APP_FALLBACK_LOCALE` | `ja`                    | 鍵が無いときに見る言語                                                       |
 
 `APP_NAME` `APP_ENV` `APP_DEBUG` `APP_URL` は `config/app.rs` が読んでいるだけです。読み方を変えるのは自由です。
-`APP_HOST` `APP_PORT` `APP_BASE_PATH` `RUST_LOG` `SESSION_*` `DB_TEST_DATABASE` は
-フレームワークが直接読みます。
+`APP_HOST` `APP_PORT` `APP_BASE_PATH` `APP_STORAGE_PATH` `APP_SHUTDOWN_TIMEOUT`
+`RUST_LOG` `SESSION_*` `DB_TEST_DATABASE` はフレームワークが直接読みます。
+**`APP_BASE_PATH` は `.env` に書いても効きません。** `.env` の場所そのものを決める値なので、
+読む前に必要になります。本物の環境変数で渡してください。
+`APP_STORAGE_PATH` と `APP_SHUTDOWN_TIMEOUT` は `.env` でも効きます。
 `DB_CONNECTION` と `DB_DATABASE` は `config/database.rs` が読んでいるだけです（[database.md](database.md)）。
 `CACHE_DRIVER` `STORAGE_DISK` `MAIL_*` `APP_LOCALE` `APP_FALLBACK_LOCALE` は、
 対応する `config/*.rs` が無ければフレームワークが直接読みます。
@@ -194,7 +199,7 @@ let mail = config::< crate::config::mail::MailConfig>();
 
 | 関数                | 返すもの                                                                             |
 |---------------------|--------------------------------------------------------------------------------------|
-| `base_path()`       | プロジェクトのルート（`APP_BASE_PATH` → `CARGO_MANIFEST_DIR` → カレント の順で決定） |
+| `base_path()`       | 基準ディレクトリ（決め方は [deployment.md](deployment.md)。**決まらなければ起動しません**） |
 | `app_path(rel)`     | ルートからの相対パスを絶対パスにする                                                 |
 | `public_path(rel)`  | `public/` 以下のパス                                                                 |
 | `storage_path(rel)` | `storage/` 以下のパス                                                                |

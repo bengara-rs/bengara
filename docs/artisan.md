@@ -36,8 +36,12 @@
 | `route:list`           | 登録されているルートの表（METHOD / URI / NAME / MIDDLEWARE）       |
 | `key:generate`         | `APP_KEY` を作って `.env` に書き込む。`--force` で上書き           |
 | `session:gc`           | 期限切れのセッションのファイルを消す                               |
+| `storage:init`         | `storage/` の下の書き込み先を作る（デプロイ時に1回）               |
+| `about`                | いまの設定と置き場所を出す。**`APP_KEY` の値は出しません**          |
 | `init`                 | Laravel と同じ構成のファイルを作る                                 |
 | `--version` / `--help` | 版・ヘルプ                                                         |
+
+`storage:init` と `about` は [deployment.md](deployment.md) で詳しく説明しています。
 
 データベースのコマンド（`features = ["sqlite"]` のとき）。詳しくは
 [migrations.md](migrations.md) にあります。
@@ -52,8 +56,12 @@
 | `migrate:fresh`    | 表を全部消してから流し直す（`--force` が要る場合あり）          |
 | `db:seed`          | シーダーを流す（`--class=DatabaseSeeder`）                      |
 | `db:wipe`          | 表を全部消す                                                    |
+| `migrate:unlock`   | 途中で落ちて残った実行中の札を外す                              |
 
 どれにも `--database=接続の名前` を付けられます。
+
+**表を変えるコマンドは同時に流せません。** 2つ目は「実行中です」で止まります
+（[deployment.md](deployment.md)）。`migrate:status` は読むだけなので、いつでも流せます。
 
 周辺機能のコマンド。
 

@@ -86,6 +86,21 @@ jobs:
           cargo run -- schedule:list
           cargo run -- schedule:run
           cargo run -- lang:list
+          # 本番の置き方のコマンドも、雛形のまま動くこと。
+          cargo run -- storage:init
+          cargo run -- about
+      - name: リリースビルドで public/ が埋め込まれる
+        shell: bash
+        working-directory: myapp
+        run: |
+          cargo build --release
+          # 生成されたコードに include_bytes! が入っていること。
+          # init は public/robots.txt を作るので、必ず1件以上ある。
+          if ! grep -rq "include_bytes!" target/release/build/myapp-*/out/bengara_app.rs; then
+            echo "public/ が埋め込まれていません"
+            exit 1
+          fi
+          echo "public/ が埋め込まれました"
 
   # アプリ側（bengara-sandbox）が壊れていないことを確かめる。
   # フレームワークだけを変えたときの巻き込み事故を防ぐため。

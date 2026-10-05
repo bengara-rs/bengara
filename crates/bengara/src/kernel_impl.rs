@@ -9,8 +9,37 @@ use crate::env_vars::{self, env};
 use crate::error::Result;
 use crate::{paths, server, Hooks};
 
+/// 置き場所が無くても使えるコマンド。
+///
+/// `init` はこれから置き場所を作るところなので、`--version` と `--help` は
+/// どこで実行しても答えられるべきなので、基準ディレクトリの確認を飛ばします。
+const WITHOUT_BASE: &[&str] = &[
+    "init",
+    "--version",
+    "-V",
+    "version",
+    "--help",
+    "-h",
+    "help",
+    "list",
+];
+
 /// 本体の入口。`bengara::app!()` から呼ばれます。
 pub fn main(hooks: Hooks, factory: fn() -> Application) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = args.first().map(String::as_str).unwrap_or("serve");
+
+    // 置き場所が決まらないまま動き出さない（決定記録 #064）。
+    // **`.env` を読む前**に確かめる。読む場所そのものが決まっていないため。
+    // つまり `APP_BASE_PATH` は `.env` に書いても効きません。
+    let needs_base = !WITHOUT_BASE.contains(&command);
+    if needs_base {
+        if let Err(error) = paths::guard() {
+            eprintln!("エラー: {error}");
+            std::process::exit(1);
+        }
+    }
+
     let base = paths::base_path().to_path_buf();
     let dotenv = env_vars::load_dotenv(&base);
     init_tracing();
@@ -18,13 +47,22 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
         tracing::debug!("{} を読み込みました", path.display());
     }
 
+    // `APP_STORAGE_PATH` は `.env` に書いても効くので、読み込んだ**後**に確かめる。
+    if needs_base {
+        if let Err(error) = paths::guard_storage() {
+            eprintln!("エラー: {error}");
+            std::process::exit(1);
+        }
+    }
+
     let mut registry = Registry::new();
     (hooks.configs)(&mut registry);
     config_registry::install(registry);
     // 言語の表を固定する。以後は読むだけ。
     crate::lang::install((hooks.lang)());
+    // 埋め込んだ public/ を固定する。以後は読むだけ。
+    crate::http::statics::install_embedded((hooks.public)());
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(error) = dispatch(&args, hooks, factory) {
         eprintln!("エラー: {error}");
         std::process::exit(1);
@@ -42,6 +80,8 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
         "serve" => {
             let options = ServeOptions::parse(rest)?;
             let app = build(factory);
+            // 使う絶対パスを出す。設定の間違いはここを見れば分かる。
+            crate::ops::log_paths();
             server::serve(app, &options.host, options.port)
         }
         "route:list" => {
@@ -50,6 +90,11 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
         }
         "key:generate" => generate_key(),
         "session:gc" => sweep_sessions(),
+        "storage:init" => crate::ops::storage_init(),
+        "about" => {
+            print_about(&hooks);
+            Ok(())
+        }
         // DB のコマンド（migrate / db:seed など）。
         name if crate::database::commands::is_command(name) => {
             crate::database::commands::run(name, rest, (hooks.migrations)(), (hooks.seeders)())
@@ -257,6 +302,78 @@ fn print_routes(app: &Application) {
     println!("\n{} 本", routes.len());
 }
 
+/// `about`：いまの設定と置き場所を1画面で出す。
+///
+/// 本番で「どこを見ているのか」を確かめるためのコマンドです。
+/// **秘密は出しません**（`APP_KEY` は設定の有無だけ）。
+fn print_about(hooks: &Hooks) {
+    use crate::support::text;
+
+    let app = crate::config_registry::app_config();
+    let storage = paths::storage_root();
+
+    let rows: Vec<(&str, String)> = vec![
+        ("bengara", env!("CARGO_PKG_VERSION").to_string()),
+        ("アプリ名", app.name.clone()),
+        ("環境", app.env.clone()),
+        ("デバッグ表示", yes_no(app.debug)),
+        ("URL", app.url.clone()),
+        // 鍵そのものは出さない。設定されているかだけを出す。
+        ("APP_KEY", yes_no(!app.key.trim().is_empty())),
+        (
+            "基準ディレクトリ",
+            format!(
+                "{}（{}）",
+                paths::base_path().display(),
+                paths::base_source().label()
+            ),
+        ),
+        (
+            "storage",
+            format!(
+                "{}{}",
+                storage.display(),
+                if storage.is_dir() {
+                    ""
+                } else {
+                    "  ← ありません（storage:init）"
+                }
+            ),
+        ),
+        ("public", paths::app_path("public").display().to_string()),
+        (
+            "言語",
+            format!(
+                "{} / {:?}",
+                crate::Lang::current(),
+                crate::Lang::available()
+            ),
+        ),
+        ("セッション", env("SESSION_DRIVER", "file".to_string())),
+        ("キャッシュ", env("CACHE_DRIVER", "file".to_string())),
+        ("メール", env("MAIL_DRIVER", "log".to_string())),
+        ("停止の上限", crate::server::shutdown_timeout_label()),
+        ("マイグレーション", (hooks.migrations)().len().to_string()),
+        ("シーダー", (hooks.seeders)().len().to_string()),
+        ("ジョブ", (hooks.jobs)().len().to_string()),
+        ("自作コマンド", (hooks.commands)().len().to_string()),
+    ];
+
+    let width = rows
+        .iter()
+        .map(|(label, _)| text::width(label))
+        .max()
+        .unwrap_or(4);
+    for (label, value) in &rows {
+        println!("{}  {value}", text::pad(label, width));
+    }
+}
+
+/// 真偽を日本語にする。
+fn yes_no(value: bool) -> String {
+    if value { "あり" } else { "なし" }.to_string()
+}
+
 fn print_help(hooks: Hooks) {
     let describe = |list: &[(&str, &str)]| {
         list.iter()
@@ -276,6 +393,8 @@ fn print_help(hooks: Hooks) {
   route:list           登録されているルートを一覧にする
   key:generate         APP_KEY を作って .env に書き込む（--force で上書き）
   session:gc           期限切れのセッションを消す
+  storage:init         storage/ の下の書き込み先を作る（デプロイ時に1回）
+  about                いまの設定と置き場所を出す
   init                 Laravel と同じ構成のファイルを作る（最初の1回だけ）
   --version            版番号を出す
   --help               このヘルプを出す
@@ -369,6 +488,8 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
     }
     // 言語の表を固定する。
     crate::lang::install((hooks.lang)());
+    // 埋め込んだ public/ を固定する。以後は読むだけ。
+    crate::http::statics::install_embedded((hooks.public)());
     // マイグレーションの一覧を、あとで `refresh_database()` から使えるようにしておく。
     let _ = TEST_HOOKS.set(hooks);
 }

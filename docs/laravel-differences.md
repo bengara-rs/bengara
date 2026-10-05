@@ -214,6 +214,22 @@ Laravel から移してきたコードは、ここで取り違えやすいので
 | `trans_choice`（複数形）                  | ありません。鍵を分けます                                      |
 | `make:command` ＋ `$signature`            | `app/Console/Commands/*.rs` に `DESCRIPTION` と `handle`      |
 
+## 本番で動かす
+
+| Laravel                               | bengara                                                      |
+|---------------------------------------|--------------------------------------------------------------|
+| `public/` を Web サーバーの公開先にする | 実行ファイルだけ置く。`public/` は **バイナリの中**            |
+| `php artisan storage:link`             | **ありません。** `/storage/...` を直接配信します               |
+| `Storage::url($path)`                  | ありません。`/storage/` ＋ パスを組み立てます                  |
+| `php artisan about`                    | 同じ名前。**`APP_KEY` の値は出しません**                       |
+| `php artisan down`（メンテナンスモード） | ありません。前段のプロキシで止めてください                     |
+| `php artisan optimize`（設定のキャッシュ） | **要りません。** 設定は起動時に固定されます                  |
+| php-fpm のプロセス管理                 | 自分で2プロセス起動し、前段で振り分けます                      |
+| `composer install --no-dev`            | 要りません。実行ファイル1つです                                |
+| `storage/` を手で `mkdir`               | `cargo artisan storage:init`（**起動時には作りません**）        |
+| `migrate` の同時実行                   | **後から来たほうが止まります**（`migration_locks` 表の札）      |
+| `php artisan queue:restart`            | ありません。worker に停止の合図を送ってください                |
+
 ## PHP 固有の機能は作りません
 
 PHP の言語や実行の形に強く結びついた機能は、bengara では作りません。

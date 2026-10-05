@@ -24,6 +24,8 @@ pub struct Application {
 struct Inner {
     routes: Routes,
     public_dir: PathBuf,
+    /// `/storage/...` で配信する置き場所（`storage/app/public/`）。
+    storage_public_dir: PathBuf,
     debug: bool,
     exceptions: Option<Arc<Exceptions>>,
 }
@@ -136,14 +138,36 @@ impl Application {
         options: crate::http::response::RenderOptions,
     ) -> Response {
         if matches!(req.method(), "GET" | "HEAD") {
-            let dir = self.inner.public_dir.clone();
             let path = req.path().to_string();
-            let found =
-                tokio::task::spawn_blocking(move || crate::http::statics::serve(&dir, &path))
-                    .await
-                    .unwrap_or(None);
-            if let Some(response) = found {
-                return response;
+
+            // 1. `/storage/...` は storage/app/public/ から。
+            if path.starts_with(crate::http::statics::STORAGE_PREFIX) {
+                let dir = self.inner.storage_public_dir.clone();
+                let found = tokio::task::spawn_blocking(move || {
+                    crate::http::statics::serve_storage(&dir, &path)
+                })
+                .await
+                .unwrap_or(None);
+                if let Some(response) = found {
+                    return response;
+                }
+            } else {
+                // 2. バイナリに埋め込んだ public/（リリースビルドのとき）。
+                //    メモリから読むだけなので、裏のスレッドに回す必要はない。
+                if let Some(response) =
+                    crate::http::statics::serve_embedded(crate::http::statics::embedded(), &path)
+                {
+                    return response;
+                }
+                // 3. ディスクの public/。
+                let dir = self.inner.public_dir.clone();
+                let found =
+                    tokio::task::spawn_blocking(move || crate::http::statics::serve(&dir, &path))
+                        .await
+                        .unwrap_or(None);
+                if let Some(response) = found {
+                    return response;
+                }
             }
         }
         error_response(
@@ -284,6 +308,7 @@ impl ApplicationBuilder {
             inner: Arc::new(Inner {
                 routes: Routes::build(defs),
                 public_dir: paths::app_path("public"),
+                storage_public_dir: crate::storage::Storage::public_root(),
                 debug: app_config().debug,
                 exceptions: (!self.exceptions.is_empty()).then(|| Arc::new(self.exceptions)),
             }),

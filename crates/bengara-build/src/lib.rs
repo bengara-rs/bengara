@@ -68,6 +68,12 @@ const TARGETS: &[Target] = &[
 /// 生成するファイル名（`OUT_DIR` の下）。
 const OUT_FILE: &str = "bengara_app.rs";
 
+/// この大きさを超えるファイルを埋め込むときは警告を出す（8 MiB）。
+const MAX_EMBED_FILE: u64 = 8 * 1024 * 1024;
+
+/// `public/` の合計がこれを超えるときは警告を出す（32 MiB）。
+const MAX_EMBED_TOTAL: u64 = 32 * 1024 * 1024;
+
 /// `build.rs` から呼ぶ入口。
 ///
 /// ```ignore
@@ -126,6 +132,10 @@ struct Generator {
     has_console: bool,
     /// `resources/lang/*.toml` から読んだ文字（言語ごと）。
     lang: Vec<(String, Vec<(String, String)>)>,
+    /// `public/` の中のファイル（配信するときの鍵と、実ファイルのパス）。
+    ///
+    /// リリースビルドのときだけ中身が入ります。
+    public: Vec<(String, PathBuf)>,
     /// 生成コードに埋め込むエラー（`compile_error!` にする）。
     errors: Vec<String>,
 }
@@ -146,6 +156,95 @@ impl Generator {
             self.emit_dir(&dir, target.name, target, 0);
         }
         self.read_lang(root);
+        self.read_public(root);
+    }
+
+    /// `public/` の中身を、バイナリに埋め込む一覧にする。
+    ///
+    /// **リリースビルドのときだけ**集めます。デバッグビルドではディスクから読むので、
+    /// ファイルを直したらすぐ反映されます。
+    fn read_public(&mut self, root: &Path) {
+        let dir = root.join("public");
+        println!("cargo:rerun-if-changed={}", dir.display());
+
+        // PROFILE は cargo がビルドスクリプトに渡す（"debug" か "release"）。
+        if env::var("PROFILE").as_deref() != Ok("release") {
+            return;
+        }
+        if !dir.is_dir() {
+            return;
+        }
+        self.collect_public(&dir, "");
+
+        // 大きくなりすぎたら気づけるようにする。止めはしない。
+        let mut total: u64 = 0;
+        for (key, path) in &self.public {
+            let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            total += size;
+            if size > MAX_EMBED_FILE {
+                warn(&format!(
+                    "public/{key} は {} MiB あります。バイナリに埋め込みます",
+                    size / 1024 / 1024
+                ));
+            }
+        }
+        if total > MAX_EMBED_TOTAL {
+            warn(&format!(
+                "public/ の合計が {} MiB あります。バイナリがその分大きくなります",
+                total / 1024 / 1024
+            ));
+        }
+    }
+
+    /// `public/` を下までたどる。`prefix` は配信するときの鍵の頭（`/` 区切り）。
+    fn collect_public(&mut self, dir: &Path, prefix: &str) {
+        let Some(entries) = self.read_dir_sorted(dir) else {
+            return;
+        };
+        for path in entries {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                self.errors
+                    .push(format!("{} の名前が UTF-8 ではありません", path.display()));
+                continue;
+            };
+            // 隠しファイルは配信しない。
+            if name.starts_with('.') {
+                continue;
+            }
+            // 鍵の区切りは常に `/`。Windows で作っても Linux と同じ鍵になる。
+            let key = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.is_dir() {
+                self.collect_public(&path, &key);
+            } else {
+                println!("cargo:rerun-if-changed={}", path.display());
+                self.public.push((key, path));
+            }
+        }
+    }
+
+    /// 埋め込んだ `public/` を Rust の定数として書き出す。
+    ///
+    /// ```ignore
+    /// static __BENGARA_PUBLIC: &[(&str, &[u8])] = &[("robots.txt", include_bytes!("..."))];
+    /// ```
+    fn public_code(&self) -> String {
+        let mut list = String::new();
+        for (key, path) in &self.public {
+            let _ = write!(
+                list,
+                "({:?}, include_bytes!({:?})),",
+                key,
+                path.to_string_lossy()
+            );
+        }
+        format!(
+            "#[doc(hidden)]\n\
+             static __BENGARA_PUBLIC: &[(&str, &[u8])] = &[{list}];\n"
+        )
     }
 
     /// `resources/lang/*.toml` を読んで、文字の表を作る。
@@ -518,12 +617,13 @@ impl Generator {
         } else {
             "|_| {}"
         };
-        // 言語の表。ビルド時に読んだ中身をそのまま埋め込む。
+        // 言語の表と、埋め込んだ public/。どちらもビルド時に読んだ中身をそのまま入れる。
         let lang = self.lang_code();
+        let public = self.public_code();
 
         let _ = write!(
             code,
-            "{lang}\
+            "{lang}{public}\
              #[doc(hidden)]\n\
              pub fn __bengara_hooks() -> ::bengara::Hooks {{\n\
              \x20   ::bengara::Hooks {{\n\
@@ -535,6 +635,7 @@ impl Generator {
              \x20       jobs: {jobs},\n\
              \x20       commands: {commands},\n\
              \x20       lang: || __BENGARA_LANG,\n\
+             \x20       public: || __BENGARA_PUBLIC,\n\
              \x20       schedule: {schedule},\n\
              \x20   }}\n\
              }}\n"

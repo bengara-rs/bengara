@@ -84,6 +84,8 @@ cargo build --release
 ```
 
 リリースビルドでは実行ファイルが 2 つできます（本体と `artisan`）。本番に置くのは本体だけで足ります。
+**`public/` もバイナリに入るので、置くのは実行ファイルと `.env` の2つだけです**
+（[deployment.md](deployment.md)）。
 
 ## つまずきやすい点
 
@@ -114,7 +116,12 @@ artisan = ["run", "-q", "--bin", "artisan", "--"]
 `.cargo/config.toml` のエイリアスはカレントディレクトリから上に向かって探されるので、サブディレクトリからでも見つかることがありますが、
 `init` やパスの解決はルートを前提にしています。
 
-ルートの決め方は `APP_BASE_PATH` → `CARGO_MANIFEST_DIR` → カレントディレクトリの順です。
+`cargo` 経由で実行するかぎり、ルートは `CARGO_MANIFEST_DIR` から決まるので、
+サブディレクトリからでも正しい場所を見ます。
+`cargo` を通さずに `./target/debug/myapp` と打つときは、ルートで実行してください。
+
+ルートの決め方（全5段階）と、決まらないときの動きは [deployment.md](deployment.md) にあります。
+**決まらなければ起動しません。**
 
 ### ポートが使われている
 
@@ -141,3 +148,4 @@ bengara のプロジェクトに `src/` はありません。入口は直下の 
 - [directory-structure.md](directory-structure.md) — どこに何を置くか
 - [routing.md](routing.md) — ルートを足す
 - [artisan.md](artisan.md) — `serve` の動き
+- [deployment.md](deployment.md) — 本番に置く（**実行ファイルと `.env` だけ**）

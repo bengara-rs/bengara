@@ -30,6 +30,10 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
         "シーダーを流す（--class=DatabaseSeeder で1本だけ）",
     ),
     ("db:wipe", "表を全部消す"),
+    (
+        "migrate:unlock",
+        "途中で落ちて残った実行中の札を外す（誰が取ったかを表示する）",
+    ),
 ];
 
 /// この名前が DB のコマンドか。
@@ -52,6 +56,20 @@ pub(crate) fn run(
     runtime.block_on(execute(command, &options, migrations, seeders))
 }
 
+/// 表を変えるコマンド。実行の前に札を取ります。
+///
+/// `migrate:status` は読むだけなので入れません。
+/// `migrate:unlock` は札を外すためのものなので、当然入れません。
+const NEEDS_LOCK: &[&str] = &[
+    "migrate",
+    "migrate:rollback",
+    "migrate:reset",
+    "migrate:refresh",
+    "migrate:fresh",
+    "db:seed",
+    "db:wipe",
+];
+
 async fn execute(
     command: &str,
     options: &Options,
@@ -60,6 +78,28 @@ async fn execute(
 ) -> Result<()> {
     let migrator = Migrator::connect(options.database.as_deref()).await?;
 
+    // 複数のプロセスから同時に流さない（決定記録 #067）。
+    let locked = NEEDS_LOCK.contains(&command);
+    if locked {
+        migrator.lock().await?;
+    }
+    let result = run_one(command, options, migrations, seeders, &migrator).await;
+    if locked {
+        // 失敗しても札は返す。返せなかったときは、外し方を伝える。
+        if let Err(e) = migrator.unlock().await {
+            eprintln!("警告: 札を外せませんでした（{e}）。`migrate:unlock` で外せます");
+        }
+    }
+    result
+}
+
+async fn run_one(
+    command: &str,
+    options: &Options,
+    migrations: &[Migration],
+    seeders: &[Seeder],
+    migrator: &Migrator,
+) -> Result<()> {
     match command {
         "migrate" => {
             report("実行した", migrator.run(migrations).await?);
@@ -115,6 +155,13 @@ async fn execute(
             guard_destructive(options)?;
             report("消した", migrator.drop_all_tables().await?);
         }
+        "migrate:unlock" => match migrator.lock_holder().await? {
+            Some((owner, at)) => {
+                migrator.unlock().await?;
+                println!("札を外しました（{owner} が {at} に取ったもの）。");
+            }
+            None => println!("札は誰も持っていません。"),
+        },
         other => {
             return Err(Error::msg(format!(
                 "`{other}` は DB のコマンドではありません"
@@ -250,10 +297,29 @@ mod tests {
     }
 
     #[test]
+    fn 表を変えるコマンドは札を取る() {
+        for command in NEEDS_LOCK {
+            assert!(is_command(command), "{command} が一覧に無い");
+        }
+        // 読むだけのものは札を取らない。
+        assert!(!NEEDS_LOCK.contains(&"migrate:status"));
+        // 札を外すコマンド自身は札を取らない。
+        assert!(!NEEDS_LOCK.contains(&"migrate:unlock"));
+    }
+
+    #[test]
+    fn 札を外すコマンドがヘルプに出る() {
+        assert!(is_command("migrate:unlock"));
+        assert!(COMMANDS
+            .iter()
+            .any(|(name, description)| *name == "migrate:unlock" && !description.is_empty()));
+    }
+
+    #[test]
     fn コマンドの名前を見分ける() {
         assert!(is_command("migrate"));
         assert!(is_command("db:seed"));
         assert!(!is_command("serve"));
-        assert_eq!(COMMANDS.len(), 8);
+        assert_eq!(COMMANDS.len(), 9);
     }
 }

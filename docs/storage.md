@@ -108,12 +108,44 @@ pub async fn write_note(req: Request) -> Result<Response> {
 
 ## 公開するもの
 
-`public` ディスクに置いたものは、**まだ自動では配信されません。**
-いまは読み出す画面を自分で書いてください。
+`public` ディスクに置いたものは、**`/storage/...` で配信されます。**
+
+```
+storage/app/public/avatars/1.png   →   GET /storage/avatars/1.png
+```
 
 ```rust
-pub async fn logo() -> Result<Response> {
-    match Storage::disk("public").read_bytes("logo.png").await? {
+Storage::disk("public").write("avatars/1.png", bytes).await?;
+// これで http://localhost:8000/storage/avatars/1.png が返る
+```
+
+| 決めごと         | 内容                                                       |
+|------------------|------------------------------------------------------------|
+| メソッド         | `GET` と `HEAD` だけ。ほかは 404                            |
+| 無いファイル     | 404                                                        |
+| ディレクトリ     | 中の `index.html` を探す                                   |
+| 置き場所の外     | **404**（エラーの中身は見せません）                         |
+| 頭のパス         | `/storage/` で固定。変えられません                          |
+
+**`storage:link` はありません。** Windows でシンボリックリンクを作るには管理者権限が
+要るので、フレームワークが直接配信する形にしました。
+
+### 認可を挟みたいとき
+
+**ルートのほうが先に当たります。** 同じパスに自分のルートを書けば、そちらが勝ちます。
+
+```rust
+// routes/web.rs
+Route::get("/storage/private/{name}", FileController::show).middleware("auth");
+```
+
+```rust
+pub async fn show(req: Request) -> Result<Response> {
+    let name: String = req.param_as("name")?;
+    let user = req.auth().user_or_fail::<User>().await?;
+    let path = format!("private/{}/{name}", user.id);
+
+    match Storage::disk("public").read_bytes(&path).await? {
         Some(bytes) => Ok(Response::bytes("image/png", bytes)),
         None => abort(404),
     }
@@ -134,10 +166,26 @@ app_path("Models")        // <プロジェクト>/app/Models
 | 項目                       | 代わりにすること                   |
 |----------------------------|------------------------------------|
 | S3 などの外部の置き場所    | ありません                         |
-| `storage:link`             | 配信する画面を自分で書く           |
+| `storage:link`             | `/storage/...` で直接配信します     |
+| `Storage::url(path)`       | `/storage/` ＋ パスを自分で組み立てる |
 | アップロードの受け取り（multipart） | ありません。本文をそのまま受け取る |
+| `ETag` / 範囲リクエスト     | 前段のプロキシに任せる              |
+
+## 置き場所を動かす
+
+```
+APP_STORAGE_PATH=/var/lib/myapp/storage
+```
+
+**絶対パスのみです。** 相対パスを指定すると起動しません。
+プロセスを2つ以上動かすときは、全プロセスで同じ場所を指してください
+（[deployment.md](deployment.md)）。
+
+`storage/` の中のディレクトリは、`cargo artisan storage:init` が作ります。
+**起動時には作りません。**
 
 ## 関連
 
+- [deployment.md](deployment.md) — `storage:init`、置き場所の決め方
 - [requests-and-responses.md](requests-and-responses.md) — 応答の作り方、静的ファイル
 - [configuration.md](configuration.md) — `config/*.rs` と `.env`

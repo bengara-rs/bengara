@@ -27,12 +27,19 @@ const DIRECTORIES: &[&str] = &[
     "resources/lang",
     "resources/views",
     "routes",
-    "storage/app",
-    "storage/framework",
-    "storage/logs",
     "tests/Feature",
     "tests/Unit",
 ];
+
+/// `storage/` の下に作るディレクトリ。
+///
+/// `storage:init` と同じ一覧を使います。2か所に書くと必ずずれるためです。
+fn storage_directories() -> Vec<String> {
+    crate::ops::STORAGE_DIRECTORIES
+        .iter()
+        .map(|d| format!("storage/{d}"))
+        .collect()
+}
 
 /// `.gitkeep` を置くディレクトリ（今はまだ中身が無いもの）。
 const KEEP: &[&str] = &[
@@ -45,7 +52,7 @@ const KEEP: &[&str] = &[
     "database/factories",
     "database/migrations",
     "resources/views",
-    "storage/logs",
+    "storage/logs", // storage/ の中は storage_directories() が作る
     "tests/Unit",
 ];
 
@@ -69,6 +76,10 @@ pub(crate) fn run(root: &Path) -> Result<()> {
 
     for dir in DIRECTORIES {
         create_dir(root, dir, &mut report)?;
+    }
+    // storage/ の下は `storage:init` と同じ一覧で作る。
+    for dir in storage_directories() {
+        create_dir(root, &dir, &mut report)?;
     }
     for dir in KEEP {
         // 中身があるディレクトリには置かない。git は空のディレクトリだけを無視するため。

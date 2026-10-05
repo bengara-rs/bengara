@@ -36,6 +36,7 @@ mod http;
 mod kernel_impl;
 pub mod lang;
 pub mod mail;
+pub(crate) mod ops;
 mod paths;
 pub mod queue;
 pub mod schedule;
@@ -109,6 +110,11 @@ pub struct Hooks {
     pub commands: fn() -> &'static [Command],
     /// `resources/lang/*.toml` から読んだ文字の表。
     pub lang: fn() -> LangTable,
+    /// リリースビルドでバイナリに埋め込んだ `public/` の中身。
+    ///
+    /// 鍵は `public/` からの相対パスで、区切りは常に `/` です。
+    /// デバッグビルドでは空になり、ディスクの `public/` を読みます。
+    pub public: fn() -> &'static [(&'static str, &'static [u8])],
     /// `routes/console.rs` の `schedule()` を呼んで登録する。
     pub schedule: fn(&mut Schedule),
 }
@@ -122,6 +128,7 @@ impl Default for Hooks {
             jobs: || &[],
             commands: || &[],
             lang: || &[],
+            public: || &[],
             schedule: |_| {},
         }
     }

@@ -120,6 +120,16 @@ impl Storage {
         })
     }
 
+    /// `public` の置き場所そのもの（`/storage/...` の配信に使う）。
+    ///
+    /// 設定に `public` が無ければ `storage/app/public` を使います。
+    /// 起動時に1回だけ呼び、以後は読むだけにします。
+    pub(crate) fn public_root() -> PathBuf {
+        Self::named("public")
+            .map(|disk| disk.root)
+            .unwrap_or_else(|_| crate::paths::storage_path("app/public"))
+    }
+
     /// 文字列を書く。途中のディレクトリは作ります。
     pub async fn put(path: &str, contents: impl Into<String>) -> Result<()> {
         Self::default_disk()?

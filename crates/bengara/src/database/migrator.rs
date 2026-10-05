@@ -18,6 +18,23 @@ use crate::error::{Error, Result};
 /// 記録を残す表の名前。
 const TABLE: &str = "migrations";
 
+/// 札（実行中の目印）を置く表の名前。
+pub(crate) const LOCK_TABLE: &str = "migration_locks";
+
+/// 札の主キー。1行しか入れないので固定します。
+const LOCK_ID: i64 = 1;
+
+/// 札に書く「誰が取ったか」。
+///
+/// プロセス番号と、分かればホスト名を入れます。残った札の持ち主を探せるようにするためです。
+fn lock_owner() -> String {
+    let pid = std::process::id();
+    match std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
+        Ok(host) if !host.trim().is_empty() => format!("{host}:{pid}"),
+        _ => format!("pid {pid}"),
+    }
+}
+
 /// マイグレーション1本。`bengara-build` が生成します。
 ///
 /// ```ignore
@@ -107,6 +124,81 @@ impl Migrator {
             self.source.execute(&sql, &[]).await?;
         }
         Ok(())
+    }
+
+    /// 札を置く表が無ければ作る。
+    async fn ensure_lock_table(&self) -> Result<()> {
+        let mut schema = Schema::new(self.driver());
+        schema.create_if_not_exists(LOCK_TABLE, |t| {
+            // 1行しか入らないように、主キーを固定の値にする。
+            t.integer("id").primary();
+            t.string("owner");
+            t.string("acquired_at");
+        });
+        for sql in schema.into_statements() {
+            self.source.execute(&sql, &[]).await?;
+        }
+        Ok(())
+    }
+
+    /// 表を変えるコマンドの札を取る。
+    ///
+    /// すでに誰かが取っていれば、 **取らずにエラー**にします。
+    /// 複数のプロセスから同時に `migrate` すると、同じものが二重に走るためです。
+    pub(crate) async fn lock(&self) -> Result<()> {
+        self.ensure_lock_table().await?;
+
+        let owner = lock_owner();
+        let now = super::now();
+        let inserted = super::QueryBuilder::new(self.source.clone(), LOCK_TABLE)
+            .insert(&[
+                ("id", Value::Int(LOCK_ID)),
+                ("owner", Value::Text(owner)),
+                ("acquired_at", Value::Text(now)),
+            ])
+            .await;
+
+        if inserted.is_ok() {
+            return Ok(());
+        }
+
+        // 入らなかった。誰が持っているかを見せて止める。
+        let held = self.lock_holder().await.unwrap_or(None);
+        let detail = match held {
+            Some((owner, at)) => format!("（{owner} が {at} に開始）"),
+            None => String::new(),
+        };
+        Err(Error::msg(format!(
+            "別のプロセスがマイグレーションを実行中です{detail}。\n\
+             終わってからもう一度実行してください。\n\
+             途中で落ちて札が残っているときは、`migrate:unlock` で消せます。"
+        )))
+    }
+
+    /// 札を返す。取れていなくても失敗にしません。
+    pub(crate) async fn unlock(&self) -> Result<u64> {
+        self.ensure_lock_table().await?;
+        let affected = super::QueryBuilder::new(self.source.clone(), LOCK_TABLE)
+            .where_("id", LOCK_ID)
+            .delete()
+            .await?;
+        Ok(affected)
+    }
+
+    /// 札を持っている相手（名前と取った時刻）。
+    pub(crate) async fn lock_holder(&self) -> Result<Option<(String, String)>> {
+        self.ensure_lock_table().await?;
+        let row = super::QueryBuilder::new(self.source.clone(), LOCK_TABLE)
+            .where_("id", LOCK_ID)
+            .first()
+            .await?;
+        match row {
+            Some(row) => Ok(Some((
+                row.get::<String>("owner")?,
+                row.get::<String>("acquired_at")?,
+            ))),
+            None => Ok(None),
+        }
     }
 
     /// 実行済みの一覧（名前とバッチ番号）。古い順。
@@ -263,7 +355,9 @@ impl Migrator {
 
     /// 表を全部消す。
     pub(crate) async fn drop_all_tables(&self) -> Result<Vec<String>> {
-        let tables = self.backend.table_names().await?;
+        let mut tables = self.backend.table_names().await?;
+        // 札の表は残す。いま自分が札を持っているので、消すと排他が切れる。
+        tables.retain(|t| t != LOCK_TABLE);
         if tables.is_empty() {
             return Ok(Vec::new());
         }
@@ -349,6 +443,35 @@ mod tests {
         up,
         down,
     }];
+
+    #[test]
+    fn 札の持ち主が分かる形になる() {
+        let owner = lock_owner();
+        assert!(!owner.is_empty());
+        // プロセス番号が入っていること（残った札の持ち主を探せるように）。
+        assert!(
+            owner.contains(&std::process::id().to_string()),
+            "{owner} にプロセス番号が入っていない"
+        );
+    }
+
+    #[test]
+    fn 札の表はマイグレーションの表と別() {
+        assert_ne!(LOCK_TABLE, TABLE);
+        assert_eq!(LOCK_TABLE, "migration_locks");
+    }
+
+    #[test]
+    fn 札の表は1行しか入らない形() {
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.create_if_not_exists(LOCK_TABLE, |t| {
+            t.integer("id").primary();
+            t.string("owner");
+            t.string("acquired_at");
+        });
+        let sql = schema.to_sql().join("\n");
+        assert!(sql.contains("primary key"), "{sql}");
+    }
 
     #[test]
     fn 一覧は名前とsqlを持つ() {

@@ -40,6 +40,12 @@ bengara を使う人のための資料です。フレームワークの紹介は
 | [localization.md](localization.md)           | 多言語                                     |
 | [console-commands.md](console-commands.md)   | 自分のコマンド                             |
 
+## 本番で動かす
+
+| ページ                           | 内容                                                       |
+|----------------------------------|------------------------------------------------------------|
+| [deployment.md](deployment.md)   | 置き方、`storage:init`、止め方、プロセス2つ、更新の手順     |
+
 ## 知っておく
 
 | ページ                                           | 内容             |
