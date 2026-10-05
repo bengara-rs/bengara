@@ -78,8 +78,8 @@ Route::get("/posts/{post}", PostController::show).name("posts.show");
 URL を引くには次を使います。どちらも `Result<String>` を返します。
 
 ```rust
-let url = route("home")?;                                     // "/"
-let url = route_with("posts.show", &[("post", "12")])?;       // "/posts/12"
+let url = route("home") ?;                                     // "/"
+let url = route_with("posts.show", & [("post", "12")]) ?;       // "/posts/12"
 ```
 
 ### パス引数は符号化される
@@ -87,11 +87,11 @@ let url = route_with("posts.show", &[("post", "12")])?;       // "/posts/12"
 `route_with()` は値をパーセント符号化します。照合する側が符号化されたパスで見るので、
 作る側もそろえます。
 
-| 書いたもの                                      | できる URL                   |
-|-------------------------------------------------|------------------------------|
-| `route_with("posts.show", &[("post", "a b")])`  | `/posts/a%20b`               |
-| `route_with("posts.show", &[("post", "a/b")])`  | `/posts/a%2Fb`               |
-| `route_with("files.show", &[("path", "a/b")])`  | `/files/a/b`（`{*path}` のみ） |
+| 書いたもの                                     | できる URL                     |
+|------------------------------------------------|--------------------------------|
+| `route_with("posts.show", &[("post", "a b")])` | `/posts/a%20b`                 |
+| `route_with("posts.show", &[("post", "a/b")])` | `/posts/a%2Fb`                 |
+| `route_with("files.show", &[("path", "a/b")])` | `/files/a/b`（`{*path}` のみ） |
 
 - **`/` も `%2F` になります。** そのままにすると別のルートに当たってしまいます。
 - 末尾全取り（`{*path}`）のときだけ `/` を残します。そこは複数の区間を表すためです。
@@ -101,7 +101,7 @@ let url = route_with("posts.show", &[("post", "12")])?;       // "/posts/12"
 
 ```rust
 redirect().route("home")
-redirect().route_with("posts.show", &[("post", "12")])
+redirect().route_with("posts.show", & [("post", "12")])
 ```
 
 ## URL を作る
@@ -126,8 +126,8 @@ url("https://x.test")   // そのまま返る
 
 ```rust
 // 作る
-let link = signed_url("/unsubscribe", &[("user", "12")])?;
-let temp = temporary_signed_url("/unsubscribe", &[("user", "12")], 3600)?;  // 1時間だけ
+let link = signed_url("/unsubscribe", & [("user", "12")]) ?;
+let temp = temporary_signed_url("/unsubscribe", & [("user", "12")], 3600) ?;  // 1時間だけ
 
 // 確かめる
 pub async fn unsubscribe(req: Request) -> Result<Response> {
@@ -147,11 +147,11 @@ pub async fn unsubscribe(req: Request) -> Result<Response> {
 
 `signed_url()` と `temporary_signed_url()` は、次の文字を含むパスを **`Err` で断ります**。
 
-| 文字       | なぜ                                     |
-|------------|------------------------------------------|
-| `?`        | クエリの始まりと区別できない             |
-| `#`        | ブラウザが送らない部分の始まり           |
-| 非 ASCII   | 符号化の仕方で署名が変わる               |
+| 文字     | なぜ                           |
+|----------|--------------------------------|
+| `?`      | クエリの始まりと区別できない   |
+| `#`      | ブラウザが送らない部分の始まり |
+| 非 ASCII | 符号化の仕方で署名が変わる     |
 
 符号化してから渡してください。確かめる側は符号化されたパスを見ます。
 
@@ -218,8 +218,8 @@ GET   /up
 
 ```rust
 Route::get("/admin", AdminController::index)
-    .middleware("admin")
-    .name("admin.index");
+.middleware("admin")
+.name("admin.index");
 ```
 
 名前は `bootstrap/app.rs` で登録します。くわしくは [middleware.md](middleware.md)。
@@ -230,12 +230,12 @@ Route::get("/admin", AdminController::index)
 
 ```rust
 Route::prefix("admin")
-    .middleware("admin")
-    .name("admin.")
-    .group(|| {
-        Route::get("/", AdminController::index).name("index");   // /admin        admin.index
-        Route::get("/users", AdminController::users).name("users"); // /admin/users  admin.users
-    });
+.middleware("admin")
+.name("admin.")
+.group(| | {
+Route::get("/", AdminController::index).name("index");   // /admin        admin.index
+Route::get("/users", AdminController::users).name("users"); // /admin/users  admin.users
+});
 ```
 
 | 付けるもの   | 書き方                       | 畳み方                                 |
@@ -247,8 +247,8 @@ Route::prefix("admin")
 3 つは好きな順でつなげられます。どれか 1 つだけでも使えます。
 
 ```rust
-Route::middleware("auth").group(|| {
-    Route::post("/posts", PostController::store);
+Route::middleware("auth").group(| | {
+Route::post("/posts", PostController::store);
 });
 ```
 
@@ -257,11 +257,11 @@ Route::middleware("auth").group(|| {
 外側の設定は内側へ引き継がれます。
 
 ```rust
-Route::prefix("admin").middleware("auth").name("admin.").group(|| {
-    Route::prefix("posts").name("posts.").group(|| {
-        Route::get("/{post}", PostController::show).name("show");
-        // → GET /admin/posts/{post}   名前 admin.posts.show   ミドルウェア auth
-    });
+Route::prefix("admin").middleware("auth").name("admin.").group(| | {
+Route::prefix("posts").name("posts.").group( | | {
+Route::get("/{post}", PostController::show).name("show");
+// → GET /admin/posts/{post}   名前 admin.posts.show   ミドルウェア auth
+});
 });
 ```
 

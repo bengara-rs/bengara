@@ -91,9 +91,9 @@ pub async fn index() -> Result<Response> {
 ```rust
 let row = DB::table("posts").find(1).await?.unwrap();
 
-let title: String = row.get("title")?;        // 無い列・型違いはエラー
-let views: i64 = row.get("views")?;
-let body: Option<String> = row.get("body")?;  // null を許すとき
+let title: String = row.get("title") ?;        // 無い列・型違いはエラー
+let views: i64 = row.get("views") ?;
+let body: Option<String> = row.get("body") ?;  // null を許すとき
 let maybe = row.try_get::<i64>("views");      // 読めなければ None
 ```
 
@@ -159,8 +159,7 @@ DB::table("posts")
 ページの境目で同じ行が2回出ることがあります（`latest()` に `order_by_desc("id")` を足すなど）。
 
 **列名と演算子は確かめます。**
-`order_by` / `order_by_desc` / `group_by` / `having_op` に渡せる列名は、
-**英数字と `_` `.` だけ**です。演算子は許可一覧で照合します。
+`order_by` / `order_by_desc` / `group_by` / `having_op` に渡せる列名は、 **英数字と `_` `.` だけ**です。演算子は許可一覧で照合します。
 
 - 外れていると **終端のメソッドを呼んだとき**にエラーになります（組み立てのときではありません）。
 - 外から来た文字列をそのまま渡しても、SQL に混ざりません。
@@ -207,11 +206,11 @@ let sum = DB::table("posts").sum::<i64>("views").await?;              // Option<
 
 `count()` の数え方は、付いている指定で変わります。
 
-| 付いている指定 | `count()` が返すもの   |
-|----------------|------------------------|
-| 何も無い       | 行の数                 |
-| `group_by`     | **グループの数**       |
-| `distinct`     | 重なりを除いた行の数   |
+| 付いている指定 | `count()` が返すもの |
+|----------------|----------------------|
+| 何も無い       | 行の数               |
+| `group_by`     | **グループの数**     |
+| `distinct`     | 重なりを除いた行の数 |
 
 `paginate` の `total` も同じ数え方です。
 
@@ -231,26 +230,26 @@ DB::table("posts")
 ```rust
 // 1 行
 DB::table("posts")
-    .insert(&[("title", "はじめての記事".into()), ("views", 0.into())])
-    .await?;
+.insert( & [("title", "はじめての記事".into()), ("views", 0.into())])
+.await?;
 
 // 入れて ID を受け取る
 let id = DB::table("posts")
-    .insert_get_id(&[("title", "はじめての記事".into())])
-    .await?;
+.insert_get_id( & [("title", "はじめての記事".into())])
+.await?;
 
 // まとめて
 let rows = vec![
     vec![("title", "A".into())],
     vec![("title", "B".into())],
 ];
-DB::table("posts").insert_many(&rows).await?;
+DB::table("posts").insert_many( & rows).await?;
 
 // 更新（返るのは件数）
 let changed = DB::table("posts")
-    .where_("id", id)
-    .update(&[("title", "改題".into())])
-    .await?;
+.where_("id", id)
+.update( & [("title", "改題".into())])
+.await?;
 
 // 削除（返るのは件数）
 let removed = DB::table("posts").where_("id", id).delete().await?;
@@ -334,7 +333,7 @@ tx.commit().await?;
 
 ### モデルを保存するとき
 
-トランザクションの中でモデルを保存するときは、**`save_using(&tx)`** を使います。
+トランザクションの中でモデルを保存するときは、 **`save_using(&tx)`** を使います。
 
 ```rust
 let tx = DB::begin().await?;
@@ -353,8 +352,8 @@ tx.commit().await?;
 ## SQL を直接書く
 
 ```rust
-let rows = DB::select("select * from posts where views > ?", &[100.into()]).await?;
-let affected = DB::statement("update posts set views = views + 1", &[]).await?;
+let rows = DB::select("select * from posts where views > ?", & [100.into()]).await?;
+let affected = DB::statement("update posts set views = views + 1", & []).await?;
 ```
 
 組み立てた SQL を見たいときは `to_sql()` が使えます。接続しません。
@@ -384,11 +383,11 @@ SQL が失敗したときは、文だけを添えて返します。
 
 ## 気をつけること
 
-| こと                         | 内容                                                                                  |
-|------------------------------|---------------------------------------------------------------------------------------|
+| こと                         | 内容                                                                                                                               |
+|------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
 | 列名に外から来た値を入れない | 値（`where_` の第2引数）は必ずプレースホルダです。式が書ける `select` / `order_by_raw` / `where_raw` / `having_raw` は検査しません |
-| `:memory:` は接続1本         | メモリ上のデータベースは接続ごとに別物になるため、1本に固定します                     |
-| 1プロセスで1つの接続プール   | 既定の接続は最初の1回だけ作られ、以後は使い回します                                   |
+| `:memory:` は接続1本         | メモリ上のデータベースは接続ごとに別物になるため、1本に固定します                                                                  |
+| 1プロセスで1つの接続プール   | 既定の接続は最初の1回だけ作られ、以後は使い回します                                                                                |
 
 ## 関連
 

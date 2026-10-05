@@ -20,12 +20,12 @@ cargo artisan key:generate
 
 ```rust
 Application::configure()
-    .with_middleware(|m| {
-        m.append(StartSession::from_env())            // 先に
-            .append(VerifyCsrfToken::new())           // 後に
-    })
-    .with_routing(|r| r.web(crate::routes::web::routes))
-    .create()
+.with_middleware( | m| {
+m.append(StartSession::from_env())            // 先に
+.append(VerifyCsrfToken::new())           // 後に
+})
+.with_routing( | r| r.web( crate::routes::web::routes))
+.create()
 ```
 
 ## 置き場所
@@ -54,10 +54,10 @@ cargo artisan session:gc
 
 ### ファイルの権限（Unix）
 
-| 対象                            | 権限   |
-|---------------------------------|--------|
-| セッションのファイル            | `0600` |
-| `storage/framework/sessions/`   | `0700` |
+| 対象                          | 権限   |
+|-------------------------------|--------|
+| セッションのファイル          | `0600` |
+| `storage/framework/sessions/` | `0700` |
 
 同じサーバーにいる別の利用者から読まれないようにしています。
 Windows では設定しません（OS の既定のままです）。
@@ -66,11 +66,11 @@ Windows では設定しません（OS の既定のままです）。
 
 `SessionStore` を実装します。
 
-| メソッド                                 | 既定の実装 |
-|------------------------------------------|------------|
+| メソッド                                 | 既定の実装     |
+|------------------------------------------|----------------|
 | `read` / `write` / `destroy`             | なし。必ず書く |
-| `destroy_for_user(user_id)`              | あり       |
-| `destroy_for_user_except(user_id, keep)` | あり       |
+| `destroy_for_user(user_id)`              | あり           |
+| `destroy_for_user_except(user_id, keep)` | あり           |
 
 - 後ろの 2 つは **実装しなくても壊れません。** 警告を出して 0 を返します。
 - `Auth::logout_all_devices()` と `logout_other_devices()` がこれを呼びます
@@ -144,9 +144,9 @@ req.session().put("user_id", id);
 
 ```rust
 StartSession::from_env().with_config(SessionConfig {
-    cookie: "myapp_session".into(),
-    same_site: SameSite::Strict,
-    ..Default::default()
+cookie: "myapp_session".into(),
+same_site: SameSite::Strict,
+..Default::default ()
 })
 ```
 
@@ -205,10 +205,10 @@ VerifyCsrfToken::new().except("/webhook")
 
 外してよいのは、次のどちらかです。
 
-| 外してよいもの                       | 相手の確かめ方           |
-|--------------------------------------|--------------------------|
-| トークンや署名で認証する API         | そのトークン・署名       |
-| 外から呼ばれる受け口（webhook）      | 署名の検証など、別の方法 |
+| 外してよいもの                  | 相手の確かめ方           |
+|---------------------------------|--------------------------|
+| トークンや署名で認証する API    | そのトークン・署名       |
+| 外から呼ばれる受け口（webhook） | 署名の検証など、別の方法 |
 
 **外すときは、必ず別の方法で相手を確かめてください。**
 

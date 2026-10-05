@@ -4,7 +4,7 @@
 
 ## 書く
 
-`app/Console/Commands/` に置きます。**2 つとも必要です。**
+`app/Console/Commands/` に置きます。 **2 つとも必要です。**
 
 ```rust
 //! app/Console/Commands/Greet.rs
@@ -19,10 +19,10 @@ pub async fn handle(args: &[String]) -> Result<()> {
 }
 ```
 
-| 書くもの                                        | 役割                          |
-|-------------------------------------------------|-------------------------------|
-| `pub const DESCRIPTION: &str`                   | `list` に出す説明。**必須**    |
-| `pub async fn handle(args: &[String]) -> Result<()>` | 中身。**必須**           |
+| 書くもの                                             | 役割                        |
+|------------------------------------------------------|-----------------------------|
+| `pub const DESCRIPTION: &str`                        | `list` に出す説明。**必須** |
+| `pub async fn handle(args: &[String]) -> Result<()>` | 中身。**必須**              |
 
 どちらかが無いと **コンパイルエラー**になります。
 
@@ -30,12 +30,12 @@ pub async fn handle(args: &[String]) -> Result<()> {
 
 ファイル名からコマンド名を作ります。
 
-| ファイル名        | コマンド名      |
-|-------------------|-----------------|
-| `Greet.rs`        | `greet`         |
-| `SendReport.rs`   | `send-report`   |
-| `ClearOldPosts.rs`| `clear-old-posts` |
-| `send_report.rs`  | `send-report`（`_` も `-` に） |
+| ファイル名         | コマンド名                     |
+|--------------------|--------------------------------|
+| `Greet.rs`         | `greet`                        |
+| `SendReport.rs`    | `send-report`                  |
+| `ClearOldPosts.rs` | `clear-old-posts`              |
+| `send_report.rs`   | `send-report`（`_` も `-` に） |
 
 **大文字の前で `-` を入れます。** Laravel の `make:command` が作る `app:send-report` に
 近い形です（頭の `app:` は付けません）。
@@ -59,7 +59,7 @@ cargo artisan greet アリス
   stats  記事とコメントの数を出す
 ```
 
-`list` は本体を呼び直すので、**フレームワークのコマンドと自作コマンドが 1 画面に並びます。**
+`list` は本体を呼び直すので、 **フレームワークのコマンドと自作コマンドが 1 画面に並びます。**
 
 ## 引数
 
@@ -85,7 +85,7 @@ pub async fn handle(args: &[String]) -> Result<()> {
 必要な形で自分で読んでください。
 
 フレームワークのコマンドは旗をコマンドごとに照合します（[artisan.md](artisan.md)）。
-自作コマンドにはその仕組みが掛かりません。**知らない旗は自分で断ってください。**
+自作コマンドにはその仕組みが掛かりません。 **知らない旗は自分で断ってください。**
 
 ## 中で何をするか
 
@@ -116,13 +116,13 @@ pub async fn handle(_args: &[String]) -> Result<()> {
 
 ## 無いもの
 
-| 項目                          | 代わりにすること                 |
-|-------------------------------|----------------------------------|
-| `$signature` の文法           | `&[String]` を自分で読む         |
-| 対話（`ask` / `confirm`）     | ありません                       |
-| 進捗バー                      | `println!` で出す                |
-| `make:command`                | ファイルを手で作る               |
-| 名前の中の `:`                | 使えません（`-` で区切る）       |
+| 項目                      | 代わりにすること           |
+|---------------------------|----------------------------|
+| `$signature` の文法       | `&[String]` を自分で読む   |
+| 対話（`ask` / `confirm`） | ありません                 |
+| 進捗バー                  | `println!` で出す          |
+| `make:command`            | ファイルを手で作る         |
+| 名前の中の `:`            | 使えません（`-` で区切る） |
 
 ## 関連
 

@@ -29,7 +29,7 @@ pub async fn handle(payload: String) -> Result<()>
 
 ## 登録する
 
-`bootstrap/app.rs` に書きます。**自動では登録しません。**
+`bootstrap/app.rs` に書きます。 **自動では登録しません。**
 
 ```rust
 pub fn app() -> Application {
@@ -45,10 +45,10 @@ pub fn app() -> Application {
 `listen` は重ねて書けます。1 つのイベントに複数の聞く側を付けられます。
 
 ```rust
-.with_events(|e| {
-    e.listen("user.registered", crate::app::listeners::notify_admin::handle)
-        .listen("user.registered", crate::app::listeners::send_slack::handle)
-        .listen("post.published", crate::app::listeners::clear_cache::handle)
+.with_events( | e| {
+e.listen("user.registered", crate::app::listeners::notify_admin::handle)
+.listen("user.registered", crate::app::listeners::send_slack::handle)
+.listen("post.published", crate::app::listeners::clear_cache::handle)
 })
 ```
 
@@ -57,21 +57,21 @@ pub fn app() -> Application {
 ## 知らせる
 
 ```rust
-Event::dispatch("user.registered", &Payload { user_id: user.id }).await?;
+Event::dispatch("user.registered", & Payload { user_id: user.id }).await?;
 ```
 
-| メソッド                          | 失敗したとき                   |
-|-----------------------------------|--------------------------------|
-| `Event::dispatch(名前, &中身)`    | エラーを返す（呼んだ側に伝わる）|
-| `Event::try_dispatch(名前, &中身)`| ログに出すだけ。先へ進む        |
-| `Event::dispatch_raw(名前, 文字)` | すでに JSON のとき              |
+| メソッド                           | 失敗したとき                     |
+|------------------------------------|----------------------------------|
+| `Event::dispatch(名前, &中身)`     | エラーを返す（呼んだ側に伝わる） |
+| `Event::try_dispatch(名前, &中身)` | ログに出すだけ。先へ進む         |
+| `Event::dispatch_raw(名前, 文字)`  | すでに JSON のとき               |
 
 聞く側は **書いた順に、1 つずつ**動きます。途中で失敗すると、そこで止まります
 （`dispatch` の場合）。
 
 ```rust
 // 聞く側が失敗しても、登録そのものは成功させたいとき
-Event::try_dispatch("user.registered", &payload).await?;
+Event::try_dispatch("user.registered", & payload).await?;
 ```
 
 ## 誰も聞いていないとき
@@ -87,9 +87,9 @@ Event::listener_count("user.registered");   // 何人聞いているか
 
 名前はただの文字列です。 **Laravel のイベントクラスに当たるものはありません。**
 
-| おすすめ                 | 例                                   |
-|--------------------------|--------------------------------------|
-| `<もの>.<起きたこと>`    | `user.registered` / `post.published` |
+| おすすめ              | 例                                   |
+|-----------------------|--------------------------------------|
+| `<もの>.<起きたこと>` | `user.registered` / `post.published` |
 
 名前を定数にしておくと、書き間違いを防げます。
 
@@ -112,29 +112,29 @@ pub struct Payload {
 聞く側では自分で読みます。
 
 ```rust
-let payload: Payload = bengara::serde_json::from_str(&payload)?;
+let payload: Payload = bengara::serde_json::from_str( & payload) ?;
 ```
 
 **型は効きません。** 知らせる側と聞く側で形を合わせてください。
 
 ## 何をどこでやるか
 
-| やること                         | 置き場所                 |
-|----------------------------------|--------------------------|
-| すぐ終わること（数を足す、印を置く） | 聞く側で直接             |
+| やること                                 | 置き場所               |
+|------------------------------------------|------------------------|
+| すぐ終わること（数を足す、印を置く）     | 聞く側で直接           |
 | 時間のかかること（メール、外部への通信） | 聞く側からキューに積む |
 
-聞く側はリクエストの中で動きます。**ここで待つと、画面の応答が遅くなります。**
+聞く側はリクエストの中で動きます。 **ここで待つと、画面の応答が遅くなります。**
 
 ## 無いもの
 
-| 項目                              | 代わりにすること                 |
-|-----------------------------------|----------------------------------|
-| イベントのクラス                  | 名前は文字列。中身は構造体       |
-| 自動登録（`app/Listeners/` を見る）| `bootstrap/app.rs` に書く        |
-| モデルのイベント（`created` など） | `Event::dispatch` を自分で呼ぶ   |
-| 購読者（`EventSubscriber`）        | `listen` を並べる                |
-| 放送（Broadcasting / WebSocket）   | ありません                       |
+| 項目                                | 代わりにすること               |
+|-------------------------------------|--------------------------------|
+| イベントのクラス                    | 名前は文字列。中身は構造体     |
+| 自動登録（`app/Listeners/` を見る） | `bootstrap/app.rs` に書く      |
+| モデルのイベント（`created` など）  | `Event::dispatch` を自分で呼ぶ |
+| 購読者（`EventSubscriber`）         | `listen` を並べる              |
+| 放送（Broadcasting / WebSocket）    | ありません                     |
 
 ## 関連
 

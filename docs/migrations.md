@@ -100,7 +100,7 @@ $ cargo artisan migrate:status
 ```rust
 t.string("email").unique();
 t.text("body").nullable();
-t.integer("views").default(0);
+t.integer("views").default (0);
 t.date_time("at").default_raw("current_timestamp");
 t.uuid("key").primary();
 ```
@@ -122,15 +122,15 @@ t.uuid("key").primary();
 ## 表に付ける指定
 
 ```rust
-schema.create("comments", |t| {
-    t.id();
-    t.foreign_id("post_id");
-    t.string("author");
-    t.timestamps();
+schema.create("comments", | t| {
+t.id();
+t.foreign_id("post_id");
+t.string("author");
+t.timestamps();
 
-    t.index(&["post_id"]);
-    t.unique(&["post_id", "author"]);
-    t.foreign("post_id").on("posts").cascade_on_delete();
+t.index(& ["post_id"]);
+t.unique(& ["post_id", "author"]);
+t.foreign("post_id").on("posts").cascade_on_delete();
 });
 ```
 
@@ -172,7 +172,7 @@ pub fn down(schema: &mut Schema) {
 ## そのほか
 
 ```rust
-schema.create_if_not_exists("posts", |t| { /* ... */ });
+schema.create_if_not_exists("posts", | t| { /* ... */ });
 schema.drop("posts");
 schema.drop_if_exists("posts");
 schema.rename("posts", "articles");
@@ -180,7 +180,7 @@ schema.drop_column("posts", "slug");
 schema.raw("pragma foreign_keys = on");   // SQL をそのまま
 ```
 
-`create_if_not_exists` は、**索引の文にも `if not exists` を付けます。**
+`create_if_not_exists` は、 **索引の文にも `if not exists` を付けます。**
 表だけを飛ばして索引で失敗する、ということはありません。
 
 ```

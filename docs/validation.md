@@ -69,11 +69,11 @@ pub async fn store(req: Request) -> Result<Response> {
 **`numeric` か `integer` が付いているときだけ、値の大小で比べます。**
 付いていなければ **文字数**で比べます。Laravel と同じです。
 
-| 書き方                         | 比べるもの |
-|--------------------------------|------------|
-| `("age", "integer\|min:18")`   | 値（18 以上） |
-| `("age", "numeric\|max:9.5")`  | 値（9.5 以下） |
-| `("title", "min:3")`           | 文字数（3 文字以上） |
+| 書き方                        | 比べるもの           |
+|-------------------------------|----------------------|
+| `("age", "integer\|min:18")`  | 値（18 以上）        |
+| `("age", "numeric\|max:9.5")` | 値（9.5 以下）       |
+| `("title", "min:3")`          | 文字数（3 文字以上） |
 
 `size` も同じ決まりです。
 
@@ -107,10 +107,10 @@ pub async fn store(req: Request) -> Result<Response> {
 
 **検査を飛ばすのは、下の 2 つのときだけです。**
 
-| 状況                           | 動き         |
-|--------------------------------|--------------|
-| 項目が送られてこなかった       | 検査しない   |
-| `nullable` が付いている        | 検査しない   |
+| 状況                             | 動き         |
+|----------------------------------|--------------|
+| 項目が送られてこなかった         | 検査しない   |
+| `nullable` が付いている          | 検査しない   |
 | **空文字（`""`）が送られてきた** | **検査する** |
 
 ```rust
@@ -175,10 +175,10 @@ private_key  credential  cvv  card  ssn  otp  pin
 ```rust
 use bengara::validation::ValidationErrors;
 
-let mut errors = ValidationErrors::default();
+let mut errors = ValidationErrors::default ();
 errors.add("title", "すでに同じ題名があります。");
-if !errors.is_empty() {
-    return Err(bengara::Error::Validation(Box::new(errors)));
+if ! errors.is_empty() {
+return Err(bengara::Error::Validation(Box::new(errors)));
 }
 ```
 

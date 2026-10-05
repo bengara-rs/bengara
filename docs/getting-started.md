@@ -189,5 +189,5 @@ bengara のプロジェクトに `src/` はありません。入口は直下の 
 - [directory-structure.md](directory-structure.md) — どこに何を置くか
 - [routing.md](routing.md) — ルートを足す
 - [artisan.md](artisan.md) — `serve` の動き
-- [deployment.md](deployment.md) — 本番に置く（**実行ファイル・`.env`・書き込める `storage/`**）
+- [deployment.md](deployment.md) — 本番に置く（ **実行ファイル・`.env`・書き込める `storage/`**）
 - [testing.md](testing.md) — テストを書く

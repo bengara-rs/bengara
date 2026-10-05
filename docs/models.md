@@ -42,9 +42,9 @@ pub struct Post {
 `insert` のあとにデータベースが決めた番号を書き戻す作りなので、
 自分で決める主キー（文字列・UUID）は送れません。
 
-主キーに書けるのは**整数の型**（`i8` / `i16` / `i32` / `i64` / `isize` /
+主キーに書けるのは **整数の型**（`i8` / `i16` / `i32` / `i64` / `isize` /
 `u8` / `u16` / `u32` / `u64` / `usize`）だけです。
-それ以外の型は、分かりやすい**コンパイルエラー**になります。
+それ以外の型は、分かりやすい **コンパイルエラー**になります。
 
 実際に使うのは **`i64`** です。
 
@@ -58,15 +58,15 @@ pub struct Post {
 
 間に合わせの動きをさせず、ビルドのときに止めます。
 
-| 書き方                                          | 理由                                   |
-|-------------------------------------------------|----------------------------------------|
-| `#[model(table = "...")]` が無い                | 表の名前は推測しない                   |
-| 主キーの型が整数でない                          | 自動採番の整数の主キーだけに対応する   |
-| `#[model(skip)]` と `#[model(primary)]` を同じフィールドに付ける | 表に無い項目が主キーにはなれない |
-| 同じ列名が2回出てくる                           | `insert` が落ちる                      |
-| 主キー以外の列が1つも無い                       | `save()` で入れるものが無い            |
-| `#[model(primary)]` を2つ以上のフィールドに付ける | 主キーが決まらない                   |
-| 型引数のある構造体に付ける                      | 対応していない                         |
+| 書き方                                                           | 理由                                 |
+|------------------------------------------------------------------|--------------------------------------|
+| `#[model(table = "...")]` が無い                                 | 表の名前は推測しない                 |
+| 主キーの型が整数でない                                           | 自動採番の整数の主キーだけに対応する |
+| `#[model(skip)]` と `#[model(primary)]` を同じフィールドに付ける | 表に無い項目が主キーにはなれない     |
+| 同じ列名が2回出てくる                                            | `insert` が落ちる                    |
+| 主キー以外の列が1つも無い                                        | `save()` で入れるものが無い          |
+| `#[model(primary)]` を2つ以上のフィールドに付ける                | 主キーが決まらない                   |
+| 型引数のある構造体に付ける                                       | 対応していない                       |
 
 ## 読む
 
@@ -77,12 +77,12 @@ let posts = Post::all().await?;               // Vec<Post>
 let total = Post::count().await?;             // i64
 
 let posts = Post::query()
-    .where_("status", "published")
-    .where_op("views", ">", 100)
-    .latest()
-    .limit(10)
-    .get()
-    .await?;
+.where_("status", "published")
+.where_op("views", ">", 100)
+.latest()
+.limit(10)
+.get()
+.await?;
 ```
 
 `find_or_fail` は見つからないとき `404` のエラーを返します。
@@ -120,13 +120,13 @@ pub async fn show(req: Request) -> Result<Response> {
 ```rust
 // 新しい行
 let mut post = Post {
-    id: 0,                       // 0 なら「まだ保存していない」
-    title: "やきそば".to_string(),
-    body: None,
-    status: "draft".to_string(),
-    views: 0,
-    created_at: String::new(),
-    updated_at: String::new(),
+id: 0,                       // 0 なら「まだ保存していない」
+title: "やきそば".to_string(),
+body: None,
+status: "draft".to_string(),
+views: 0,
+created_at: String::new(),
+updated_at: String::new(),
 };
 post.save().await?;              // insert され、post.id に ID が入る
 
@@ -309,8 +309,8 @@ UUID のように自分で決める主キーのときは、次のどちらかに
 
 ```rust
 DB::table("sessions")
-    .insert(&[("id", key.into()), ("payload", body.into())])
-    .await?;
+.insert( & [("id", key.into()), ("payload", body.into())])
+.await?;
 ```
 
 ## シーダーとファクトリ

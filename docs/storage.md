@@ -4,10 +4,10 @@
 
 ## ディスク
 
-| ディスク        | 置き場所              | 用途                           |
-|-----------------|-----------------------|--------------------------------|
-| `local`（既定） | `storage/app/`        | 外から直接は見えない           |
-| `public`        | `storage/app/public/` | 公開してよいもの               |
+| ディスク        | 置き場所              | 用途                 |
+|-----------------|-----------------------|----------------------|
+| `local`（既定） | `storage/app/`        | 外から直接は見えない |
+| `public`        | `storage/app/public/` | 公開してよいもの     |
 
 `config/filesystems.rs` を置けば増やせます。無くても動きます。
 
@@ -38,7 +38,7 @@ Storage::put("notes/memo.txt", "本文").await?;
 Storage::put_bytes("images/a.png", bytes).await?;
 
 let body: Option<String> = Storage::get("notes/memo.txt").await?;
-let bytes: Option<Vec<u8>> = Storage::get_bytes("images/a.png").await?;
+let bytes: Option<Vec<u8> > = Storage::get_bytes("images/a.png").await?;
 
 let there = Storage::exists("notes/memo.txt").await?;
 Storage::delete("notes/memo.txt").await?;
@@ -46,14 +46,14 @@ Storage::delete("notes/memo.txt").await?;
 
 関連関数（`Storage::put` など）は **既定のディスク**に対して動きます。
 
-| メソッド                       | 返るもの                   | 覚えること                      |
-|--------------------------------|----------------------------|---------------------------------|
-| `put(パス, 文字)`              | `Result<()>`               | 途中のディレクトリも作る        |
-| `put_bytes(パス, Vec<u8>)`     | `Result<()>`               |                                 |
-| `get(パス)`                    | `Result<Option<String>>`   | 無ければ `None`                 |
-| `get_bytes(パス)`              | `Result<Option<Vec<u8>>>`  |                                 |
-| `exists(パス)` / `missing(パス)` | `Result<bool>`           |                                 |
-| `delete(パス)`                 | `Result<()>`               | 無くてもエラーにしない          |
+| メソッド                         | 返るもの                  | 覚えること               |
+|----------------------------------|---------------------------|--------------------------|
+| `put(パス, 文字)`                | `Result<()>`              | 途中のディレクトリも作る |
+| `put_bytes(パス, Vec<u8>)`       | `Result<()>`              |                          |
+| `get(パス)`                      | `Result<Option<String>>`  | 無ければ `None`          |
+| `get_bytes(パス)`                | `Result<Option<Vec<u8>>>` |                          |
+| `exists(パス)` / `missing(パス)` | `Result<bool>`            |                          |
+| `delete(パス)`                   | `Result<()>`              | 無くてもエラーにしない   |
 
 ## ディスクを選ぶ
 
@@ -63,24 +63,24 @@ let disk = Storage::disk("public");
 disk.write("logo.png", bytes).await?;
 let size: Option<u64> = disk.size("logo.png").await?;
 let files: Vec<String> = disk.files("").await?;      // 下まで全部
-let real: PathBuf = disk.path("logo.png")?;          // 実際の場所
+let real: PathBuf = disk.path("logo.png") ?;          // 実際の場所
 ```
 
-| メソッド                   | 返るもの                  |
-|----------------------------|---------------------------|
-| `write(パス, Vec<u8>)`     | `Result<()>`              |
-| `read(パス)`               | `Result<Option<String>>`  |
-| `read_bytes(パス)`         | `Result<Option<Vec<u8>>>` |
-| `has(パス)`                | `Result<bool>`            |
-| `remove(パス)`             | `Result<()>`              |
-| `size(パス)`               | `Result<Option<u64>>`     |
-| `files(頭のパス)`          | `Result<Vec<String>>`     |
-| `path(パス)`               | `Result<PathBuf>`         |
+| メソッド               | 返るもの                  |
+|------------------------|---------------------------|
+| `write(パス, Vec<u8>)` | `Result<()>`              |
+| `read(パス)`           | `Result<Option<String>>`  |
+| `read_bytes(パス)`     | `Result<Option<Vec<u8>>>` |
+| `has(パス)`            | `Result<bool>`            |
+| `remove(パス)`         | `Result<()>`              |
+| `size(パス)`           | `Result<Option<u64>>`     |
+| `files(頭のパス)`      | `Result<Vec<String>>`     |
+| `path(パス)`           | `Result<PathBuf>`         |
 
 `files` が返すのは **ディスクからの相対パス**です。下のディレクトリまで全部見ます。
 
 ```rust
-Storage::default_disk()?.files("notes").await?;
+Storage::default_disk() ?.files("notes").await?;
 // => ["notes/memo.txt", "notes/2026/01.txt"]
 ```
 
@@ -88,11 +88,11 @@ Storage::default_disk()?.files("notes").await?;
 
 **利用者が決めたパスをそのまま渡して構いません。** 次のものはエラーになります。
 
-| 断るもの          | 例                  |
-|-------------------|---------------------|
-| `..` を含む       | `../../.env`        |
-| 絶対パス          | `/etc/passwd`       |
-| `:` を含む        | `C:\Windows`        |
+| 断るもの    | 例            |
+|-------------|---------------|
+| `..` を含む | `../../.env`  |
+| 絶対パス    | `/etc/passwd` |
+| `:` を含む  | `C:\Windows`  |
 
 ```rust
 pub async fn write_note(req: Request) -> Result<Response> {
@@ -108,7 +108,7 @@ pub async fn write_note(req: Request) -> Result<Response> {
 
 ## 公開するもの
 
-`public` ディスクに置いたものは、**`/storage/...` で配信されます。**
+`public` ディスクに置いたものは、 **`/storage/...` で配信されます。**
 
 ```
 storage/app/public/avatars/1.png   →   GET /storage/avatars/1.png
@@ -119,16 +119,16 @@ Storage::disk("public").write("avatars/1.png", bytes).await?;
 // これで http://localhost:8000/storage/avatars/1.png が返る
 ```
 
-| 決めごと             | 内容                                       |
-|----------------------|--------------------------------------------|
-| メソッド             | `GET` と `HEAD` だけ。ほかは 404           |
-| 無いファイル         | 404                                        |
-| ディレクトリ         | 中の `index.html` を探す                   |
-| `/storage/` だけ     | **404。** `index.html` は配信しません      |
-| 置き場所の外         | **404**（エラーの中身は見せません）        |
-| 頭のパス             | `/storage/` で固定。変えられません         |
+| 決めごと         | 内容                                  |
+|------------------|---------------------------------------|
+| メソッド         | `GET` と `HEAD` だけ。ほかは 404      |
+| 無いファイル     | 404                                   |
+| ディレクトリ     | 中の `index.html` を探す              |
+| `/storage/` だけ | **404。** `index.html` は配信しません |
+| 置き場所の外     | **404**（エラーの中身は見せません）   |
+| 頭のパス         | `/storage/` で固定。変えられません    |
 
-`/storage/` だけで来たときに `index.html` を返さないのは、**置き場所の入口を見せないため**です。
+`/storage/` だけで来たときに `index.html` を返さないのは、 **置き場所の入口を見せないため**です。
 「中身が空なら `index.html`」は `public/`（`GET /`）のための規則です。
 
 **`storage:link` はありません。** Windows でシンボリックリンクを作るには管理者権限が
@@ -167,13 +167,13 @@ app_path("Models")        // <プロジェクト>/app/Models
 
 ## 無いもの
 
-| 項目                       | 代わりにすること                   |
-|----------------------------|------------------------------------|
-| S3 などの外部の置き場所    | ありません                         |
-| `storage:link`             | `/storage/...` で直接配信します     |
-| `Storage::url(path)`       | `/storage/` ＋ パスを自分で組み立てる |
-| アップロードの受け取り（multipart） | ありません。本文をそのまま受け取る |
-| `ETag` / 範囲リクエスト     | 前段のプロキシに任せる              |
+| 項目                                | 代わりにすること                      |
+|-------------------------------------|---------------------------------------|
+| S3 などの外部の置き場所             | ありません                            |
+| `storage:link`                      | `/storage/...` で直接配信します       |
+| `Storage::url(path)`                | `/storage/` ＋ パスを自分で組み立てる |
+| アップロードの受け取り（multipart） | ありません。本文をそのまま受け取る    |
+| `ETag` / 範囲リクエスト             | 前段のプロキシに任せる                |
 
 ## 置き場所を動かす
 
@@ -185,8 +185,7 @@ APP_STORAGE_PATH=/var/lib/myapp/storage
 プロセスを2つ以上動かすときは、全プロセスで同じ場所を指してください
 （[deployment.md](deployment.md)）。
 
-`storage/` の中のディレクトリは、`cargo artisan storage:init` が作ります。
-**起動時には作りません。**
+`storage/` の中のディレクトリは、`cargo artisan storage:init` が作ります。 **起動時には作りません。**
 
 ## 関連
 

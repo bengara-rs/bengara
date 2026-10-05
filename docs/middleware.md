@@ -34,12 +34,12 @@ impl EnsureAdmin {
 
 ```rust
 Application::configure()
-    .with_middleware(|m| {
-        m.append(AddPoweredBy::handle)            // 全ルートに掛ける
-            .alias("admin", EnsureAdmin::handle)  // 名前を付ける
-    })
-    .with_routing(|r| r.web(crate::routes::web::routes).health("/up"))
-    .create()
+.with_middleware( | m| {
+m.append(AddPoweredBy::handle)            // 全ルートに掛ける
+.alias("admin", EnsureAdmin::handle)  // 名前を付ける
+})
+.with_routing( | r| r.web( crate::routes::web::routes).health("/up"))
+.create()
 ```
 
 | メソッド          | 中身                                       |
@@ -53,8 +53,8 @@ Application::configure()
 ```rust
 // routes/web.rs
 Route::get("/admin", AdminController::index)
-    .middleware("admin")
-    .name("admin.index");
+.middleware("admin")
+.name("admin.index");
 ```
 
 `.middleware()` は何回でも書けます。書いた順に通ります。
@@ -76,11 +76,11 @@ Route::get("/admin", AdminController::index)
 **`append` / `prepend` で登録した共通のミドルウェアは、ルートに当たらなかったリクエストにも
 掛かります。** Laravel と同じです。
 
-| リクエスト              | 共通のミドルウェア |
-|-------------------------|--------------------|
-| ルートに当たった        | 通る               |
-| 404（ルートが無い）     | **通る**           |
-| 405（メソッドが違う）   | **通る**           |
+| リクエスト               | 共通のミドルウェア |
+|--------------------------|--------------------|
+| ルートに当たった         | 通る               |
+| 404（ルートが無い）      | **通る**           |
+| 405（メソッドが違う）    | **通る**           |
 | `public/` の静的ファイル | **通る**           |
 
 つまり、セッションの Cookie や独自のヘッダーは **404 の応答にも付きます**。
@@ -167,10 +167,10 @@ Route::post("/login", AuthController::login).middleware("throttle");
 
 数えるのは「相手とパスの組」です。相手の決め方は次のとおりです。
 
-| 状況               | 数える相手                 |
-|--------------------|----------------------------|
-| ログインしている   | **その人**（利用者の ID）  |
-| していない         | **つないできたアドレス**   |
+| 状況                 | 数える相手                   |
+|----------------------|------------------------------|
+| ログインしている     | **その人**（利用者の ID）    |
+| していない           | **つないできたアドレス**     |
 | アドレスが分からない | 数えない。制限を掛けずに通す |
 
 ログインしている人ごとに数えるので、同じ回線にいる別の人（会社や学校）が巻き込まれません。
@@ -182,11 +182,11 @@ Route::post("/login", AuthController::login).middleware("throttle");
 
 **`X-Forwarded-For` と `X-Real-IP` は、`TRUSTED_PROXIES` に載っている相手からのものだけ見ます。**
 
-| `TRUSTED_PROXIES` | 動き                           |
-|-------------------|--------------------------------|
-| 空（既定）        | どちらのヘッダーも見ない       |
-| アドレスの列      | 載っている相手からだけ見る     |
-| `*`               | すべて信頼する                 |
+| `TRUSTED_PROXIES` | 動き                       |
+|-------------------|----------------------------|
+| 空（既定）        | どちらのヘッダーも見ない   |
+| アドレスの列      | 載っている相手からだけ見る |
+| `*`               | すべて信頼する             |
 
 - **範囲の書き方（CIDR）は書けません。** アドレスを 1 つずつ並べます。
 - 無条件に信じると、偽の値を送るだけで制限を回せます。だから既定は「見ない」です。
@@ -200,7 +200,7 @@ Route::post("/login", AuthController::login).middleware("throttle");
 厳密に守りたいときは、前段のプロキシ（nginx の `limit_req` など）で掛けてください。
 共通の置き場所に載せ替えるのは、キャッシュを作ってからです（[backlog.md](backlog.md)）。
 
-期限切れの掃除は、**件数ではなく時刻**で間隔を決めます。どれだけ混んでも、
+期限切れの掃除は、 **件数ではなく時刻**で間隔を決めます。どれだけ混んでも、
 指定した期間に 1 回だけ走ります。
 
 ## 状態を持たせたいとき

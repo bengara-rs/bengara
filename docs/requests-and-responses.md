@@ -17,16 +17,16 @@ impl PostController {
 
 ## Request
 
-| 分類     | メソッド                                                         |
-|----------|------------------------------------------------------------------|
+| 分類     | メソッド                                                          |
+|----------|-------------------------------------------------------------------|
 | 基本     | `method()` `path()` `query_string()` `full_path()` `route_name()` |
-| ルート   | `route_matched()`                                                |
-| 接続元   | `ip()`                                                           |
-| パス引数 | `param(name)` `param_as::<T>(name)` `params()`                   |
-| クエリ   | `query(key)` `query_all()`                                       |
-| ヘッダ   | `header(name)` `headers()`                                       |
-| 入力     | `input(key)` `input_all()` `form(key)` `form_all()`              |
-| 本文     | `body()` `body_text()` `json::<T>()`                             |
+| ルート   | `route_matched()`                                                 |
+| 接続元   | `ip()`                                                            |
+| パス引数 | `param(name)` `param_as::<T>(name)` `params()`                    |
+| クエリ   | `query(key)` `query_all()`                                        |
+| ヘッダ   | `header(name)` `headers()`                                        |
+| 入力     | `input(key)` `input_all()` `form(key)` `form_all()`               |
+| 本文     | `body()` `body_text()` `json::<T>()`                              |
 
 - `header(name)` は大文字小文字を区別しません。
 - `query` / `query_all` は `%xx` と `+` を元に戻します。
@@ -65,17 +65,17 @@ if !req.route_matched() {
 
 本文の上限は 2 MiB です。超えたときの返し方は 2 通りです。
 
-| 状況                               | 返すもの |
-|------------------------------------|----------|
-| 申告された長さが上限を超えている   | **413**  |
-| 読んでいる途中で失敗した           | **400**  |
+| 状況                             | 返すもの |
+|----------------------------------|----------|
+| 申告された長さが上限を超えている | **413**  |
+| 読んでいる途中で失敗した         | **400**  |
 
 読み取りの失敗は「大きすぎる」とは限りません（接続が切れただけのこともあります）。
 だから 413 と決めつけません。
 
 ### 解析は 1 回だけ
 
-`input` / `input_all` / `form_all` / `cookies` は、**1 リクエストにつき 1 回だけ**
+`input` / `input_all` / `form_all` / `cookies` は、 **1 リクエストにつき 1 回だけ**
 中身を解析します。2 回目からは取っておいた結果を返します。何度呼んでも遅くなりません。
 
 ## Response
@@ -85,7 +85,7 @@ if !req.route_matched() {
 ```rust
 Response::text("ok")
 Response::html("<h1>hi</h1>")
-Response::json(&value)?        // Result<Response>
+Response::json( & value) ?        // Result<Response>
 Response::no_content()
 Response::bytes("image/png", data)
 Response::new(204)
@@ -117,16 +117,16 @@ pub async fn hello(req: Request) -> Result<Response> {
 （フレームワークと同じ版が使われます）。
 
 ```rust
-json(&bengara::serde_json::json!({ "status": "ok" }))
+json( & bengara::serde_json::json!({ "status": "ok" }))
 ```
 
 ### 整える
 
 ```rust
 Response::text("ok")
-    .with_status(201)
-    .with_header("X-Foo", "bar")
-    .with_body("changed")
+.with_status(201)
+.with_header("X-Foo", "bar")
+.with_body("changed")
 ```
 
 | メソッド                         | 中身                                                       |
@@ -147,7 +147,7 @@ Response::text("ok")
 ```rust
 redirect().to("/login")                                  // 302
 redirect().route("home")
-redirect().route_with("posts.show", &[("post", "12")])
+redirect().route_with("posts.show", & [("post", "12")])
 redirect().to("/new").permanent()                        // 301
 redirect().to("/other").with_status(303)
 ```
@@ -214,7 +214,9 @@ return abort_with(404, "記事が見つかりません");
 | `Content-Type`     | 自分が JSON を送ってきた                         |
 
 ```json
-{ "message": "そのページはありません" }
+{
+  "message": "そのページはありません"
+}
 ```
 
 入力の検査（422）だけは、項目ごとの理由も入ります（[validation.md](validation.md)）。
@@ -224,15 +226,15 @@ return abort_with(404, "記事が見つかりません");
 ```rust
 // bootstrap/app.rs
 Application::configure()
-    .with_exceptions(|e| {
-        e.render(|error| {
-            (error.status() == 404).then(|| {
-                Response::json(&bengara::serde_json::json!({ "message": "ありません" }))
-                    .unwrap_or_else(|_| Response::text("not found"))
-                    .with_status(404)
-            })
-        })
-    })
+.with_exceptions( | e| {
+e.render( | error | {
+(error.status() == 404).then( | | {
+Response::json( & bengara::serde_json::json! ({ "message": "ありません" }))
+.unwrap_or_else( | _ | Response::text("not found"))
+.with_status(404)
+})
+})
+})
 ```
 
 - 登録した関数を **上から順に試し**、最初に `Some` を返したものを使います。
@@ -248,11 +250,11 @@ Application::configure()
 
 ルートに当たらなかった `GET` / `HEAD` は、ファイルを探します。探す順番は次のとおりです。
 
-| 順 | 探す先                                 | いつ                     |
-|----|----------------------------------------|--------------------------|
-| 1  | `storage/app/public/`                  | パスが `/storage/` で始まるとき |
-| 2  | バイナリに埋め込んだ `public/`         | リリースビルドのとき     |
-| 3  | ディスクの `public/`                   | 埋め込みに無いとき       |
+| 順 | 探す先                         | いつ                            |
+|----|--------------------------------|---------------------------------|
+| 1  | `storage/app/public/`          | パスが `/storage/` で始まるとき |
+| 2  | バイナリに埋め込んだ `public/` | リリースビルドのとき            |
+| 3  | ディスクの `public/`           | 埋め込みに無いとき              |
 
 - **`public/` はリリースビルドでバイナリに入ります。** 本番に `public/` を置く必要はありません。
 - デバッグビルドでは常にディスクを読みます。ファイルを直せばすぐ反映されます。

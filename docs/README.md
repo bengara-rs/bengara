@@ -29,22 +29,22 @@ bengara を使う人のための資料です。フレームワークの紹介は
 
 ## 周辺の機能
 
-| ページ                                       | 内容                                       |
-|----------------------------------------------|--------------------------------------------|
-| [cache.md](cache.md)                         | 結果を取っておく                           |
-| [storage.md](storage.md)                     | ファイルの置き場所                         |
-| [queue.md](queue.md)                         | キューとジョブ（`sqlite` が必要）          |
-| [scheduling.md](scheduling.md)               | 定期処理                                   |
-| [events.md](events.md)                       | イベントと、聞く側                         |
-| [mail.md](mail.md)                           | メール（**SMTP はまだありません**）        |
-| [localization.md](localization.md)           | 多言語                                     |
-| [console-commands.md](console-commands.md)   | 自分のコマンド                             |
+| ページ                                     | 内容                                |
+|--------------------------------------------|-------------------------------------|
+| [cache.md](cache.md)                       | 結果を取っておく                    |
+| [storage.md](storage.md)                   | ファイルの置き場所                  |
+| [queue.md](queue.md)                       | キューとジョブ（`sqlite` が必要）   |
+| [scheduling.md](scheduling.md)             | 定期処理                            |
+| [events.md](events.md)                     | イベントと、聞く側                  |
+| [mail.md](mail.md)                         | メール（**SMTP はまだありません**） |
+| [localization.md](localization.md)         | 多言語                              |
+| [console-commands.md](console-commands.md) | 自分のコマンド                      |
 
 ## 本番で動かす
 
-| ページ                           | 内容                                                       |
-|----------------------------------|------------------------------------------------------------|
-| [deployment.md](deployment.md)   | 置き方、`storage:init`、止め方、プロセス2つ、更新の手順     |
+| ページ                         | 内容                                                    |
+|--------------------------------|---------------------------------------------------------|
+| [deployment.md](deployment.md) | 置き方、`storage:init`、止め方、プロセス2つ、更新の手順 |
 
 ## 知っておく
 

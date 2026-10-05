@@ -95,38 +95,38 @@ APP_PORT=8000
 
 ## APP_* の一覧
 
-| 名前               | 既定                       | 用途                                                                         |
-|--------------------|----------------------------|------------------------------------------------------------------------------|
-| `APP_NAME`         | `init` 時のパッケージ名    | アプリ名。`AppConfig.name`                                                   |
-| `APP_ENV`          | `production`               | 環境名。`AppConfig.env`                                                      |
-| `APP_DEBUG`        | `false`                    | エラーページの詳細表示、ログの既定の細かさ                                   |
-| `APP_URL`          | `http://localhost:8000`    | アプリの URL。`AppConfig.url` と `url()` の土台                              |
-| `APP_KEY`          | （なし）                   | 署名と暗号化に使う鍵。**64 文字以上**。`cargo artisan key:generate` で作る   |
-| `SESSION_DRIVER`   | `file`                     | セッションの置き場所（`file` / `memory`）                                    |
-| `SESSION_LIFETIME` | `120`                      | セッションが消えるまでの分                                                   |
-| `DB_CONNECTION`    | `sqlite`                   | 既定で使う接続の名前                                                         |
-| `DB_DATABASE`      | `database/database.sqlite` | SQLite のファイル。相対パスはプロジェクト直下から                            |
-| `DB_TEST_DATABASE` | `:memory:`                 | テストで使うデータベース                                                     |
-| `HASH_ITERATIONS`  | `120000`                   | パスワードの変換の繰り返し回数（[authentication.md](authentication.md)）     |
-| `APP_HOST`         | `127.0.0.1`                | サーバーが待ち受けるホスト                                                   |
-| `APP_PORT`         | `8000`                     | サーバーが待ち受けるポート                                                   |
-| `TRUSTED_PROXIES`  | （空）                     | 信頼する前段のアドレス。下の表を参照                                         |
-| `APP_BASE_PATH`    | （なし）                   | 基準ディレクトリ。**絶対パスのみ**（[deployment.md](deployment.md)）         |
-| `APP_STORAGE_PATH` | （なし）                   | `storage/` の場所。**絶対パスのみ**                                          |
-| `APP_SHUTDOWN_TIMEOUT` | `30`                   | 停止の上限（秒）。**`0` は無制限**                                           |
-| `RUST_LOG`         | （なし）                   | ログの細かさ。無ければ `APP_DEBUG` から決まります                            |
-| `CACHE_DRIVER`     | `file`                     | キャッシュの置き場所（`file` / `memory`）（[cache.md](cache.md)）            |
-| `STORAGE_DISK`     | `local`                    | 既定のファイル置き場（[storage.md](storage.md)）                             |
-| `MAIL_DRIVER`      | `log`                      | メールの送り先（`log` / `array`）（[mail.md](mail.md)）                      |
-| `MAIL_FROM`        | `noreply@example.com`      | 差出人                                                                       |
-| `MAIL_FROM_NAME`   | `bengara`                  | 差出人の名前。既定はこの値。普通はアプリ名を書く（[mail.md](mail.md)）       |
-| `APP_LOCALE`       | `ja`                       | 画面の言語（[localization.md](localization.md)）                             |
-| `APP_FALLBACK_LOCALE` | `ja`                    | 鍵が無いときに見る言語                                                       |
+| 名前                   | 既定                       | 用途                                                                       |
+|------------------------|----------------------------|----------------------------------------------------------------------------|
+| `APP_NAME`             | `init` 時のパッケージ名    | アプリ名。`AppConfig.name`                                                 |
+| `APP_ENV`              | `production`               | 環境名。`AppConfig.env`                                                    |
+| `APP_DEBUG`            | `false`                    | エラーページの詳細表示、ログの既定の細かさ                                 |
+| `APP_URL`              | `http://localhost:8000`    | アプリの URL。`AppConfig.url` と `url()` の土台                            |
+| `APP_KEY`              | （なし）                   | 署名と暗号化に使う鍵。**64 文字以上**。`cargo artisan key:generate` で作る |
+| `SESSION_DRIVER`       | `file`                     | セッションの置き場所（`file` / `memory`）                                  |
+| `SESSION_LIFETIME`     | `120`                      | セッションが消えるまでの分                                                 |
+| `DB_CONNECTION`        | `sqlite`                   | 既定で使う接続の名前                                                       |
+| `DB_DATABASE`          | `database/database.sqlite` | SQLite のファイル。相対パスはプロジェクト直下から                          |
+| `DB_TEST_DATABASE`     | `:memory:`                 | テストで使うデータベース                                                   |
+| `HASH_ITERATIONS`      | `120000`                   | パスワードの変換の繰り返し回数（[authentication.md](authentication.md)）   |
+| `APP_HOST`             | `127.0.0.1`                | サーバーが待ち受けるホスト                                                 |
+| `APP_PORT`             | `8000`                     | サーバーが待ち受けるポート                                                 |
+| `TRUSTED_PROXIES`      | （空）                     | 信頼する前段のアドレス。下の表を参照                                       |
+| `APP_BASE_PATH`        | （なし）                   | 基準ディレクトリ。**絶対パスのみ**（[deployment.md](deployment.md)）       |
+| `APP_STORAGE_PATH`     | （なし）                   | `storage/` の場所。**絶対パスのみ**                                        |
+| `APP_SHUTDOWN_TIMEOUT` | `30`                       | 停止の上限（秒）。**`0` は無制限**                                         |
+| `RUST_LOG`             | （なし）                   | ログの細かさ。無ければ `APP_DEBUG` から決まります                          |
+| `CACHE_DRIVER`         | `file`                     | キャッシュの置き場所（`file` / `memory`）（[cache.md](cache.md)）          |
+| `STORAGE_DISK`         | `local`                    | 既定のファイル置き場（[storage.md](storage.md)）                           |
+| `MAIL_DRIVER`          | `log`                      | メールの送り先（`log` / `array`）（[mail.md](mail.md)）                    |
+| `MAIL_FROM`            | `noreply@example.com`      | 差出人                                                                     |
+| `MAIL_FROM_NAME`       | `bengara`                  | 差出人の名前。既定はこの値。普通はアプリ名を書く（[mail.md](mail.md)）     |
+| `APP_LOCALE`           | `ja`                       | 画面の言語（[localization.md](localization.md)）                           |
+| `APP_FALLBACK_LOCALE`  | `ja`                       | 鍵が無いときに見る言語                                                     |
 
 `APP_NAME` `APP_ENV` `APP_DEBUG` `APP_URL` は `config/app.rs` が読んでいるだけです。読み方を変えるのは自由です。
 `APP_HOST` `APP_PORT` `APP_BASE_PATH` `APP_STORAGE_PATH` `APP_SHUTDOWN_TIMEOUT`
-`RUST_LOG` `SESSION_*` `DB_TEST_DATABASE` `TRUSTED_PROXIES` はフレームワークが直接読みます。
-**`APP_BASE_PATH` は `.env` に書いても効きません。** `.env` の場所そのものを決める値なので、
+`RUST_LOG` `SESSION_*` `DB_TEST_DATABASE` `TRUSTED_PROXIES` はフレームワークが直接読みます。 **`APP_BASE_PATH` は `.env`
+に書いても効きません。** `.env` の場所そのものを決める値なので、
 読む前に必要になります。本物の環境変数で渡してください。
 `APP_STORAGE_PATH` と `APP_SHUTDOWN_TIMEOUT` は `.env` でも効きます。
 `DB_CONNECTION` と `DB_DATABASE` は `config/database.rs` が読んでいるだけです（[database.md](database.md)）。
@@ -142,16 +142,15 @@ APP_PORT=8000
 cargo artisan key:generate
 ```
 
-- **64 文字以上が必須です。** 短いと、セッション・署名付き URL・暗号化を使う
-  **最初のリクエストでエラーになります**。
+- **64 文字以上が必須です。** 短いと、セッション・署名付き URL・暗号化を使う **最初のリクエストでエラーになります**。
 - 空のままでも同じです。これらを使うリクエストが失敗します。
 - 鍵は用途ごとに作り分けます。`APP_KEY` をそのまま使いません。
 
-| 用途           | 作り分けの名前         |
-|----------------|------------------------|
-| セッション     | `bengara:session`      |
-| 署名付き URL   | `bengara:signed-url`   |
-| 暗号化         | `bengara:encryption`   |
+| 用途         | 作り分けの名前       |
+|--------------|----------------------|
+| セッション   | `bengara:session`    |
+| 署名付き URL | `bengara:signed-url` |
+| 暗号化       | `bengara:encryption` |
 
 **鍵の作り方を変えたので、前の版で作ったセッション・暗号文・配布済みの署名付き URL は
 無効になります。** `APP_KEY` を作り直したときと同じです。
@@ -167,11 +166,11 @@ cargo artisan key:generate
 TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 ```
 
-| 書き方       | 動き                                                  |
-|--------------|-------------------------------------------------------|
-| 空（既定）   | どちらのヘッダーも見ない。つないできた相手だけを見る  |
-| アドレスの列 | カンマ区切り。載っている相手からのヘッダーだけ見る    |
-| `*`          | すべて信頼する                                        |
+| 書き方       | 動き                                                 |
+|--------------|------------------------------------------------------|
+| 空（既定）   | どちらのヘッダーも見ない。つないできた相手だけを見る |
+| アドレスの列 | カンマ区切り。載っている相手からのヘッダーだけ見る   |
+| `*`          | すべて信頼する                                       |
 
 - **範囲の書き方（`10.0.0.0/8` のような CIDR）は読めません。** アドレスを 1 つずつ並べます。
 - 読めない値は警告を出して無視します。止まりません。
@@ -242,12 +241,12 @@ let mail = config::< crate::config::mail::MailConfig>();
 
 ## パス
 
-| 関数                | 返すもの                                                                             |
-|---------------------|--------------------------------------------------------------------------------------|
+| 関数                | 返すもの                                                                                    |
+|---------------------|---------------------------------------------------------------------------------------------|
 | `base_path()`       | 基準ディレクトリ（決め方は [deployment.md](deployment.md)。**決まらなければ起動しません**） |
-| `app_path(rel)`     | ルートからの相対パスを絶対パスにする                                                 |
-| `public_path(rel)`  | `public/` 以下のパス                                                                 |
-| `storage_path(rel)` | `storage/` 以下のパス                                                                |
+| `app_path(rel)`     | ルートからの相対パスを絶対パスにする                                                        |
+| `public_path(rel)`  | `public/` 以下のパス                                                                        |
+| `storage_path(rel)` | `storage/` 以下のパス                                                                       |
 
 `app_path()` は **Laravel と意味が違います**。Laravel は `app/` を指しますが、bengara は
 基準ディレクトリからの相対パスです（[laravel-differences.md](laravel-differences.md)）。

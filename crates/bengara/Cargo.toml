@@ -42,8 +42,8 @@ tokio = { version = "1", features = [
     "macros",
     "net",
     "signal",
-    "sync",  # 停止の合図を伝える watch チャネル
-    "time",  # 停止の上限時間
+    "sync", # 停止の合図を伝える watch チャネル
+    "time", # 停止の上限時間
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }

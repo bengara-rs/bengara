@@ -28,7 +28,7 @@ async fn 無いページは404になる() {
 - tokio ランタイムを用意する
 - テスト用の道具を関数の中に入れる
 - パスワードの変換の回数を 1,000 に下げる
-- メールの送り先を `array` にする（**本当には送りません**）
+- メールの送り先を `array` にする（ **本当には送りません**）
 
 **ソケットは開きません。** ポートの衝突を気にせず並行して実行できます。
 
@@ -42,17 +42,17 @@ async fn 無いページは404になる() {
 
 関数の中で、次のものがそのまま使えます。
 
-| 名前                 | 中身                                            |
-|----------------------|-------------------------------------------------|
-| `client`             | `TestClient`                                    |
-| `get(uri)`           | `client.get(uri)` の短縮                        |
-| `post(uri, body)`    | `client.post(uri, body)` の短縮                 |
-| `put(uri, body)`     | PUT で送る。本文の形は `post` と同じ            |
-| `patch(uri, body)`   | PATCH で送る。本文の形は `post` と同じ          |
-| `delete(uri)`        | DELETE で送る。本文は無し                       |
-| `refresh_database()` | テスト用の DB を作り直す（下の節）              |
-| `seed_database(&db)` | シーダーを流す（下の節）                        |
-| `exclusive()`        | DB 以外のプロセス共通のものを使うときの札       |
+| 名前                 | 中身                                      |
+|----------------------|-------------------------------------------|
+| `client`             | `TestClient`                              |
+| `get(uri)`           | `client.get(uri)` の短縮                  |
+| `post(uri, body)`    | `client.post(uri, body)` の短縮           |
+| `put(uri, body)`     | PUT で送る。本文の形は `post` と同じ      |
+| `patch(uri, body)`   | PATCH で送る。本文の形は `post` と同じ    |
+| `delete(uri)`        | DELETE で送る。本文は無し                 |
+| `refresh_database()` | テスト用の DB を作り直す（下の節）        |
+| `seed_database(&db)` | シーダーを流す（下の節）                  |
+| `exclusive()`        | DB 以外のプロセス共通のものを使うときの札 |
 
 `put` / `patch` の本文は `application/x-www-form-urlencoded` で送られます。
 
@@ -238,10 +238,10 @@ delete("/api/posts/1").await.assert_status(204);
 `tests/Feature/` は 1 つのバイナリで並行して走ります。
 次の 2 つはプロセスで 1 つしかないので、触るテストは `exclusive()` で札を取ります。
 
-| 触るもの                            | 理由                               |
-|-------------------------------------|------------------------------------|
-| `Mail::sent()` / `Mail::clear_sent()` | 溜まったメールがプロセスで 1 つ    |
-| `Lang`（`Lang::set` など）          | いまの言語がプロセスで 1 つ        |
+| 触るもの                              | 理由                            |
+|---------------------------------------|---------------------------------|
+| `Mail::sent()` / `Mail::clear_sent()` | 溜まったメールがプロセスで 1 つ |
+| `Lang`（`Lang::set` など）            | いまの言語がプロセスで 1 つ     |
 
 ```rust
 #[bengara::test]
@@ -278,8 +278,7 @@ async fn DBとメールの両方を使う() {
 
 ### メール
 
-送り先が `array` になっているので、`Mail::sent()` で中身を確かめます。
-**溜まったメールはテストの間ずっと残ります。**
+送り先が `array` になっているので、`Mail::sent()` で中身を確かめます。 **溜まったメールはテストの間ずっと残ります。**
 数を確かめる前に `exclusive()` の札を取り、`clear_sent()` を呼んでください（上の節）。
 
 ### キャッシュとファイル
@@ -322,7 +321,7 @@ crate::app::jobs::send_welcome::handle(r#"{"user_id":1}"#.to_string()).await.unw
 
 ```rust
 let mut schedule = Schedule::new();
-crate::routes::console::schedule(&mut schedule);
+crate::routes::console::schedule( & mut schedule);
 assert_eq!(schedule.len(), 3);
 ```
 

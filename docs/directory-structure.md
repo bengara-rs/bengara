@@ -87,11 +87,11 @@ myapp/
 
 ### `app/Jobs/` `app/Listeners/` `app/Console/Commands/` の約束
 
-| 場所                           | 書くもの                                                          |
-|--------------------------------|-------------------------------------------------------------------|
-| `app/Jobs/`                    | `pub async fn handle(payload: String) -> Result<()>`              |
-| `app/Listeners/`               | 同じ形                                                            |
-| `app/Console/Commands/`        | `pub const DESCRIPTION: &str` と `pub async fn handle(args: &[String]) -> Result<()>` |
+| 場所                    | 書くもの                                                                              |
+|-------------------------|---------------------------------------------------------------------------------------|
+| `app/Jobs/`             | `pub async fn handle(payload: String) -> Result<()>`                                  |
+| `app/Listeners/`        | 同じ形                                                                                |
+| `app/Console/Commands/` | `pub const DESCRIPTION: &str` と `pub async fn handle(args: &[String]) -> Result<()>` |
 
 - この 3 つでは、 **大文字始まりのファイルに同名の型は要りません。** 関数を置く場所として扱います。
 - `app/Jobs/` と `app/Console/Commands/` は、名前順の一覧が自動で作られて本体に渡ります。
@@ -109,15 +109,15 @@ myapp/
 
 実行時の書き込み先です。中身はリポジトリに入れません。`storage:init` が 7 つ作ります。
 
-| ディレクトリ                   | 置かれるもの               |
-|--------------------------------|----------------------------|
-| `storage/app`                  | アプリが置くファイル       |
-| `storage/app/public`           | `/storage/...` で配信する分 |
-| `storage/framework`            | 下の 3 つの親              |
-| `storage/framework/cache`      | キャッシュ                 |
-| `storage/framework/schedule`   | 定期処理の前回時刻         |
-| `storage/framework/sessions`   | セッション                 |
-| `storage/logs`                 | ログ                       |
+| ディレクトリ                 | 置かれるもの                |
+|------------------------------|-----------------------------|
+| `storage/app`                | アプリが置くファイル        |
+| `storage/app/public`         | `/storage/...` で配信する分 |
+| `storage/framework`          | 下の 3 つの親               |
+| `storage/framework/cache`    | キャッシュ                  |
+| `storage/framework/schedule` | 定期処理の前回時刻          |
+| `storage/framework/sessions` | セッション                  |
+| `storage/logs`               | ログ                        |
 
 `init` も同じ一覧を使います。本番では `./myapp storage:init` を 1 回流します
 （[deployment.md](deployment.md)）。
@@ -153,8 +153,8 @@ myapp/
 | `resources/lang/` 直下の `*.toml`                     | 上以外の `.toml`       |
 | `.env` `Cargo.toml` `build.rs` `main.rs` `artisan.rs` | データベースのファイル |
 
-  `public/` を直してもビルドは走りません。デバッグビルドはディスクを読むので、
-  そのまま反映されます。
+`public/` を直してもビルドは走りません。デバッグビルドはディスクを読むので、
+そのまま反映されます。
 
 ## 関連
 

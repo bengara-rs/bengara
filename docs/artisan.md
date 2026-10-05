@@ -43,7 +43,7 @@
 | `key:generate`         | `APP_KEY` を作って `.env` に書き込む。`--force` で上書き           |
 | `session:gc`           | 期限切れのセッションのファイルを消す                               |
 | `storage:init`         | `storage/` の下の書き込み先を作る（デプロイ時に1回）               |
-| `about`                | いまの設定と置き場所を出す。**`APP_KEY` の値は出しません**          |
+| `about`                | いまの設定と置き場所を出す。**`APP_KEY` の値は出しません**         |
 | `init`                 | Laravel と同じ構成のファイルを作る                                 |
 | `--version` / `--help` | 版・ヘルプ                                                         |
 
@@ -73,17 +73,17 @@
 
 周辺機能のコマンド。
 
-| コマンド          | 動き                                                   | 詳しくは                                   |
-|-------------------|--------------------------------------------------------|--------------------------------------------|
-| `cache:clear`     | キャッシュを全部消す                                   | [cache.md](cache.md)                       |
-| `cache:prune`     | 期限切れのキャッシュだけ消す                           | [cache.md](cache.md)                       |
-| `queue:work`      | ジョブを処理する                                       | [queue.md](queue.md)                       |
-| `queue:failed`    | 諦めたジョブの一覧                                     | [queue.md](queue.md)                       |
-| `queue:retry`     | 諦めたジョブをキューへ戻す                             | [queue.md](queue.md)                       |
-| `queue:flush`     | 諦めたジョブの記録を捨てる                             | [queue.md](queue.md)                       |
-| `schedule:run`    | いま動かすべき定期処理を動かす                         | [scheduling.md](scheduling.md)             |
-| `schedule:list`   | 定期処理の一覧                                         | [scheduling.md](scheduling.md)             |
-| `lang:list`       | 読み込まれている言語の一覧                             | [localization.md](localization.md)         |
+| コマンド        | 動き                           | 詳しくは                           |
+|-----------------|--------------------------------|------------------------------------|
+| `cache:clear`   | キャッシュを全部消す           | [cache.md](cache.md)               |
+| `cache:prune`   | 期限切れのキャッシュだけ消す   | [cache.md](cache.md)               |
+| `queue:work`    | ジョブを処理する               | [queue.md](queue.md)               |
+| `queue:failed`  | 諦めたジョブの一覧             | [queue.md](queue.md)               |
+| `queue:retry`   | 諦めたジョブをキューへ戻す     | [queue.md](queue.md)               |
+| `queue:flush`   | 諦めたジョブの記録を捨てる     | [queue.md](queue.md)               |
+| `schedule:run`  | いま動かすべき定期処理を動かす | [scheduling.md](scheduling.md)     |
+| `schedule:list` | 定期処理の一覧                 | [scheduling.md](scheduling.md)     |
+| `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
 `queue:*` は `features = ["sqlite"]` のときだけ動きます。
 
@@ -94,12 +94,12 @@
 
 **旗はコマンドごとに分かれています。** 受け付けない旗を書くと、その場でエラーになります。
 
-| コマンド       | 使える旗                                                      |
-|----------------|---------------------------------------------------------------|
-| `queue:work`   | `--queue=名前` / `--tries=3` / `--sleep=1` / `--retry-after=90` / `--once` |
-| `queue:retry`  | `--id=1`                                                      |
-| `migrate` 系   | `--database=` / `--class=` / `--step=` / `--seed` / `--force`  |
-| 上記以外       | **旗を受け付けません**                                         |
+| コマンド      | 使える旗                                                                   |
+|---------------|----------------------------------------------------------------------------|
+| `queue:work`  | `--queue=名前` / `--tries=3` / `--sleep=1` / `--retry-after=90` / `--once` |
+| `queue:retry` | `--id=1`                                                                   |
+| `migrate` 系  | `--database=` / `--class=` / `--step=` / `--seed` / `--force`              |
+| 上記以外      | **旗を受け付けません**                                                     |
 
 旗を受け付けないのは `cache:clear` / `cache:prune` / `queue:failed` / `queue:flush` /
 `schedule:run` / `schedule:list` / `lang:list` です。
@@ -142,20 +142,20 @@ cargo artisan greet アリス
 
 **見張るのはビルドに影響するファイルだけです。**
 
-| 種類         | 対象                                                         |
-|--------------|--------------------------------------------------------------|
+| 種類           | 対象                                                       |
+|----------------|------------------------------------------------------------|
 | ファイルの種類 | `.rs` と、`resources/lang/` 直下の `.toml`                 |
-| ディレクトリ | `app` `bootstrap` `config` `database` `resources` `routes`    |
-| ファイル     | `.env` `Cargo.toml` `build.rs` `main.rs` `artisan.rs`        |
+| ディレクトリ   | `app` `bootstrap` `config` `database` `resources` `routes` |
+| ファイル       | `.env` `Cargo.toml` `build.rs` `main.rs` `artisan.rs`      |
 
 次のものは **見張りません。**
 
-| 見張らないもの                         | 理由                                                     |
-|----------------------------------------|----------------------------------------------------------|
-| `public/`                              | デバッグビルドはディスクから読むので、再ビルドが要らない |
-| データベースのファイル（`-wal` / `-shm` を含む） | 本体がつなぐだけで更新時刻が変わり、毎回再起動していた |
-| `storage/` `target` `node_modules` `.git` | 重いか、ビルドに関係ない                              |
-| 隠しファイル                           | エディタの一時ファイルを拾わないため                     |
+| 見張らないもの                                   | 理由                                                     |
+|--------------------------------------------------|----------------------------------------------------------|
+| `public/`                                        | デバッグビルドはディスクから読むので、再ビルドが要らない |
+| データベースのファイル（`-wal` / `-shm` を含む） | 本体がつなぐだけで更新時刻が変わり、毎回再起動していた   |
+| `storage/` `target` `node_modules` `.git`        | 重いか、ビルドに関係ない                                 |
+| 隠しファイル                                     | エディタの一時ファイルを拾わないため                     |
 
 ### 見張り方
 
