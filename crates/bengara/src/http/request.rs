@@ -157,6 +157,17 @@ impl Request {
         parse_query(&self.query)
     }
 
+    /// ページ番号（`?page=2`）。無い・読めない・0 のときは 1 になります。
+    ///
+    /// ページ分けに渡します。Laravel は暗黙にこの値を見ますが、bengara では
+    /// `paginate(15, req.page())` のように自分で渡します（決定記録 #039）。
+    pub fn page(&self) -> u64 {
+        self.query("page")
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(1)
+            .max(1)
+    }
+
     /// ヘッダーの値（名前の大文字小文字は区別しません）。
     pub fn header(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
@@ -391,6 +402,14 @@ fn hex(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ページ番号は1から始まる() {
+        assert_eq!(Request::new("get", "/").page(), 1);
+        assert_eq!(Request::new("get", "/").with_query("page=3").page(), 3);
+        assert_eq!(Request::new("get", "/").with_query("page=0").page(), 1);
+        assert_eq!(Request::new("get", "/").with_query("page=x").page(), 1);
+    }
 
     #[test]
     fn クエリを分解できる() {

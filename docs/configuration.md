@@ -74,6 +74,10 @@ APP_ENV=local
 APP_DEBUG=true
 APP_URL=http://localhost:8000
 
+DB_CONNECTION=sqlite
+DB_DATABASE=database/database.sqlite
+DB_TEST_DATABASE=:memory:
+
 APP_HOST=127.0.0.1
 APP_PORT=8000
 
@@ -97,31 +101,47 @@ APP_PORT=8000
 | `APP_KEY` | （なし） | セッションと署名付き URL の署名に使う鍵。`cargo artisan key:generate` で作る |
 | `SESSION_DRIVER` | `file` | セッションの置き場所（`file` / `memory`） |
 | `SESSION_LIFETIME` | `120` | セッションが消えるまでの分 |
+| `DB_CONNECTION` | `sqlite` | 既定で使う接続の名前 |
+| `DB_DATABASE` | `database/database.sqlite` | SQLite のファイル。相対パスはプロジェクト直下から |
+| `DB_TEST_DATABASE` | `:memory:` | テストで使うデータベース |
 | `APP_HOST` | `127.0.0.1` | サーバーが待ち受けるホスト |
 | `APP_PORT` | `8000` | サーバーが待ち受けるポート |
 | `APP_BASE_PATH` | （なし） | プロジェクトのルート。`serve` が起動時に渡します |
 | `RUST_LOG` | （なし） | ログの細かさ。無ければ `APP_DEBUG` から決まります |
 
 `APP_NAME` `APP_ENV` `APP_DEBUG` `APP_URL` は `config/app.rs` が読んでいるだけです。読み方を変えるのは自由です。
-`APP_HOST` `APP_PORT` `APP_BASE_PATH` `RUST_LOG` `SESSION_*` はフレームワークが直接読みます。
+`APP_HOST` `APP_PORT` `APP_BASE_PATH` `RUST_LOG` `SESSION_*` `DB_TEST_DATABASE` は
+フレームワークが直接読みます。
+`DB_CONNECTION` と `DB_DATABASE` は `config/database.rs` が読んでいるだけです（[database.md](database.md)）。
 
 **`APP_KEY` が空のままだと、セッションと署名付き URL を使うリクエストが 500 になります。**
 `cargo artisan key:generate` で作ってください（[session.md](session.md)）。
 
 ## 機能フラグ
 
-bengara は使わない機能をバイナリに入れないようにしています。今あるフラグは 1 つです。
+bengara は使わない機能をバイナリに入れないようにしています。今あるフラグは 2 つです。
 
 | フラグ | 既定 | 中身 |
 |---|---|---|
 | `log-filter` | 入っている | `RUST_LOG=myapp=debug` のような細かい絞り込みを使えるようにします |
+| `sqlite` | **入っていない** | SQLite につながるようにします（[database.md](database.md)） |
 
-依存クレートを減らしたいときは外せます。外すと 3 つ減り（`matchers` / `regex-automata` / `regex-syntax`）、`RUST_LOG` は
+`log-filter` は、依存クレートを減らしたいときに外せます。外すと 3 つ減り
+（`matchers` / `regex-automata` / `regex-syntax`）、`RUST_LOG` は
 `trace` / `debug` / `info` / `warn` / `error` の 1 語だけになります。
 
 ```toml
 [dependencies]
 bengara = { version = "0.1", default-features = false }
+```
+
+`sqlite` を入れると**依存クレートが大きく増えます**（依存の木が 59 → 133）。
+データベースを使わないアプリには入れないでください。
+`cargo run -- init` で作ったプロジェクトには最初から入っています。
+
+```toml
+[dependencies]
+bengara = { version = "0.1", features = ["sqlite"] }
 ```
 
 ## 自分の設定型を増やす

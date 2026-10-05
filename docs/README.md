@@ -18,6 +18,9 @@ bengara を使う人のための資料です。フレームワークの紹介は
 | [middleware.md](middleware.md) | リクエストの前後に挟む処理、回数の制限 |
 | [validation.md](validation.md) | 入力の検査 |
 | [session.md](session.md) | セッション、Cookie、CSRF |
+| [database.md](database.md) | 接続、クエリビルダ、ページ分け、トランザクション |
+| [migrations.md](migrations.md) | 表を作る。`migrate` 系のコマンド |
+| [models.md](models.md) | `#[derive(Model)]`、リレーション、シーダー、ファクトリ |
 | [requests-and-responses.md](requests-and-responses.md) | Request / Response / リダイレクト / エラー / 静的ファイル |
 | [configuration.md](configuration.md) | `config/*.rs` と `.env` |
 | [testing.md](testing.md) | `#[bengara::test]` でのテスト |

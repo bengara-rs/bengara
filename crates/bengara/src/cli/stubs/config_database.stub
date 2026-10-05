@@ -1,0 +1,15 @@
+//! データベースの設定。Laravel の config/database.php に当たります。
+//!
+//! 値は .env から来ます。いまつなげるのは SQLite だけです。
+
+use bengara::prelude::*;
+
+pub fn config() -> DatabaseConfig {
+    // ファイルは無ければ作られます。相対パスはプロジェクト直下から見ます。
+    let database: String = env("DB_DATABASE", "database/database.sqlite");
+
+    DatabaseConfig {
+        default: env("DB_CONNECTION", "sqlite"),
+        connections: vec![ConnectionConfig::sqlite("sqlite", database)],
+    }
+}

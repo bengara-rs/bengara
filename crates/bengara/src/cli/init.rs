@@ -16,6 +16,7 @@ const DIRECTORIES: &[&str] = &[
     "app/Models",
     "bootstrap",
     "config",
+    "database/factories",
     "database/migrations",
     "database/seeders",
     "public",
@@ -31,8 +32,8 @@ const DIRECTORIES: &[&str] = &[
 const KEEP: &[&str] = &[
     "app/Http/Middleware",
     "app/Models",
+    "database/factories",
     "database/migrations",
-    "database/seeders",
     "resources/views",
     "storage/logs",
     "tests/Unit",
@@ -60,7 +61,10 @@ pub(crate) fn run(root: &Path) -> Result<()> {
         create_dir(root, dir, &mut report)?;
     }
     for dir in KEEP {
-        write_if_missing(root, &format!("{dir}/.gitkeep"), "", &mut report)?;
+        // 中身があるディレクトリには置かない。git は空のディレクトリだけを無視するため。
+        if is_empty_dir(&root.join(dir)) {
+            write_if_missing(root, &format!("{dir}/.gitkeep"), "", &mut report)?;
+        }
     }
 
     // 利用者が手で書くことになっている入口と、数行の設定ファイル。
@@ -91,6 +95,18 @@ pub(crate) fn run(root: &Path) -> Result<()> {
         root,
         "config/app.rs",
         &stub("config_app").replace("{{name}}", &name),
+        &mut report,
+    )?;
+    write_if_missing(
+        root,
+        "config/database.rs",
+        stub("config_database"),
+        &mut report,
+    )?;
+    write_if_missing(
+        root,
+        "database/seeders/DatabaseSeeder.rs",
+        stub("seeder_database"),
         &mut report,
     )?;
     write_if_missing(root, "routes/web.rs", stub("routes_web"), &mut report)?;
@@ -137,6 +153,8 @@ fn stub(name: &str) -> &'static str {
         "robots" => include_str!("stubs/robots.stub"),
         "bootstrap_app" => include_str!("stubs/bootstrap_app.stub"),
         "config_app" => include_str!("stubs/config_app.stub"),
+        "config_database" => include_str!("stubs/config_database.stub"),
+        "seeder_database" => include_str!("stubs/seeder_database.stub"),
         "routes_web" => include_str!("stubs/routes_web.stub"),
         "controller_home" => include_str!("stubs/controller_home.stub"),
         "test_home" => include_str!("stubs/test_home.stub"),
@@ -184,6 +202,19 @@ fn create_dir(root: &Path, relative: &str, report: &mut Report) -> Result<()> {
         .map_err(|e| Error::msg(format!("{} を作れません: {e}", path.display())))?;
     report.created.push(format!("{relative}/"));
     Ok(())
+}
+
+/// 中身が無いディレクトリか（`.gitkeep` は数えない）。
+fn is_empty_dir(path: &Path) -> bool {
+    let Ok(mut entries) = std::fs::read_dir(path) else {
+        // 読めない・無いときは「空」として扱い、.gitkeep を置かせる。
+        return true;
+    };
+    !entries.any(|entry| {
+        entry
+            .map(|e| e.file_name() != std::ffi::OsStr::new(".gitkeep"))
+            .unwrap_or(false)
+    })
 }
 
 fn write_if_missing(
@@ -308,8 +339,12 @@ fn update_manifest(manifest: &mut CargoToml, name: &str) {
     if !manifest.has_key("package", "autobins") {
         manifest.add_line("package", "autobins = false");
     }
+    // データベースは機能フラグで出し入れする。Laravel と同じく SQLite から始める。
     if !manifest.has_key("dependencies", "bengara") {
-        manifest.add_line("dependencies", &format!("bengara = \"{requirement}\""));
+        manifest.add_line(
+            "dependencies",
+            &format!("bengara = {{ version = \"{requirement}\", features = [\"sqlite\"] }}"),
+        );
     }
     if !manifest.has_key("build-dependencies", "bengara-build") {
         manifest.add_line(
@@ -367,12 +402,21 @@ mod tests {
             "robots",
             "bootstrap_app",
             "config_app",
+            "config_database",
+            "seeder_database",
             "routes_web",
             "controller_home",
             "test_home",
         ] {
             assert!(!stub(name).is_empty(), "{name} が空です");
         }
+    }
+
+    #[test]
+    fn 雛形の依存にはsqliteが入る() {
+        let mut manifest = CargoToml::load_for_test("[package]\nname = \"myapp\"\n");
+        update_manifest(&mut manifest, "myapp");
+        assert!(manifest.contains("features = [\"sqlite\"]"));
     }
 
     #[test]

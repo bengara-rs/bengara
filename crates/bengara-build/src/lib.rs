@@ -112,6 +112,10 @@ struct Generator {
     taken_flat: BTreeMap<String, usize>,
     /// `config/` 直下で見つかった設定モジュール（登録順）。
     configs: Vec<String>,
+    /// `database/migrations/` が見つかったか。
+    has_migrations: bool,
+    /// `database/seeders/` が見つかったか。
+    has_seeders: bool,
     /// 生成コードに埋め込むエラー（`compile_error!` にする）。
     errors: Vec<String>,
 }
@@ -155,8 +159,14 @@ impl Generator {
         // 同じディレクトリの中でモジュール名がぶつかっていないかを調べる。
         // 例: `User.rs` と `user.rs` はどちらも `user` になる。
         let mut taken: BTreeMap<String, String> = BTreeMap::new();
-        // マイグレーション（日付で始まるファイル）の一覧。
-        let mut migrations: Vec<String> = Vec::new();
+        // `database/migrations/` と `database/seeders/` の中身。
+        // どちらも (ファイル名, 平らなモジュール名) で覚える。
+        let in_database = target.name == "database" && depth == 1;
+        let in_migrations = in_database && dir_name == "migrations";
+        let in_seeders = in_database && dir_name == "seeders";
+        let in_factories = in_database && dir_name == "factories";
+        let mut migrations: Vec<(String, String)> = Vec::new();
+        let mut seeders: Vec<(String, String)> = Vec::new();
 
         for path in entries {
             let Some(stem) = file_stem(&path) else {
@@ -197,11 +207,17 @@ impl Generator {
             let _ = writeln!(self.tree, "pub use crate::{flat} as {module};");
 
             // PSR-4 と同じ約束。先頭が大文字のファイルは、同じ名前の型を公開する。
-            if target.reexport && starts_upper(&stem) {
+            // ただし seeders と factories は「関数を置く場所」なので、型は探さない。
+            if target.reexport && starts_upper(&stem) && !in_seeders && !in_factories {
                 let _ = writeln!(self.tree, "pub use crate::{flat}::{stem};");
             }
-            if starts_digit(&stem) {
-                migrations.push(stem.clone());
+            // database/migrations/ の、日付で始まるファイルはマイグレーション。
+            if in_migrations && starts_digit(&stem) {
+                migrations.push((stem.clone(), flat.clone()));
+            }
+            // database/seeders/ の、大文字で始まるファイルはシーダー。
+            if in_seeders && starts_upper(&stem) {
+                seeders.push((stem.clone(), flat.clone()));
             }
             // config/ の直下にある小文字のファイルは、設定として自動登録する。
             if target.name == "config" && depth == 0 && !starts_upper(&stem) {
@@ -209,13 +225,41 @@ impl Generator {
             }
         }
 
-        if !migrations.is_empty() {
+        // マイグレーションの一覧。名前順に並ぶ（読み込みの時点で並べてある）。
+        if in_migrations {
             let list = migrations
                 .iter()
-                .map(|m| format!("{m:?}"))
+                .map(|(stem, flat)| {
+                    format!(
+                        "::bengara::Migration {{ name: {stem:?}, \
+                         up: crate::{flat}::up, down: crate::{flat}::down }}"
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = writeln!(self.tree, "pub const MIGRATIONS: &[&str] = &[{list}];");
+            let _ = writeln!(
+                self.tree,
+                "pub const MIGRATIONS: &[::bengara::Migration] = &[{list}];"
+            );
+            self.has_migrations = true;
+        }
+        // シーダーの一覧。
+        if in_seeders {
+            let list = seeders
+                .iter()
+                .map(|(stem, flat)| {
+                    format!(
+                        "::bengara::Seeder {{ name: {stem:?}, \
+                         run: || ::std::boxed::Box::pin(crate::{flat}::run()) }}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                self.tree,
+                "pub const SEEDERS: &[::bengara::Seeder] = &[{list}];"
+            );
+            self.has_seeders = true;
         }
         self.stack.pop();
         self.tree.push_str("}\n");
@@ -310,6 +354,18 @@ impl Generator {
                 "        __registry.set(crate::config::{module}::config());"
             );
         }
+        // マイグレーションとシーダーの一覧。無ければ空の一覧を渡す。
+        let migrations = if self.has_migrations {
+            "|| crate::database::migrations::MIGRATIONS"
+        } else {
+            "|| &[]"
+        };
+        let seeders = if self.has_seeders {
+            "|| crate::database::seeders::SEEDERS"
+        } else {
+            "|| &[]"
+        };
+
         let _ = write!(
             code,
             "#[doc(hidden)]\n\
@@ -318,6 +374,8 @@ impl Generator {
              \x20       configs: |__registry| {{\n\
              {body}\
              \x20       }},\n\
+             \x20       migrations: {migrations},\n\
+             \x20       seeders: {seeders},\n\
              \x20   }}\n\
              }}\n"
         );

@@ -112,11 +112,43 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | `throttle:60,1` | `Throttle::from_spec("60,1")?` を `alias` に登録 |
 | 制限はキャッシュで共有される | **プロセスごとに数える**（2 プロセスなら上限は約 2 倍） |
 
+## データベース
+
+| Laravel | bengara |
+|---|---|
+| `DB::table('posts')->where('status', 'published')` | `DB::table("posts").where_("status", "published")` |
+| `->where('views', '>', 100)` | `.where_op("views", ">", 100)`（**引数の数では分けられない**） |
+| `->where(function ($q) {...})` | `.where_group(\|q\| ...)` |
+| `->paginate(15)` が `?page=` を見る | `.paginate(15, req.page())`（**引数で渡す**） |
+| `->get()` が Collection を返す | `.get().await?` が `Vec<Row>` を返す |
+| `$row->title` | `row.get::<String>("title")?` |
+| MySQL / PostgreSQL / SQLite / SQL Server | **SQLite だけ**（機能フラグ `sqlite`） |
+| `DB::transaction(fn () => ...)` | `let tx = DB::begin().await?;` … `tx.commit().await?;` |
+| 日時は `Carbon` | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作る |
+
+## モデルとマイグレーション
+
+| Laravel | bengara |
+|---|---|
+| `class Post extends Model` | `#[derive(Model)]` ＋ `#[model(table = "posts")]` |
+| 表の名前はクラス名から推測 | **書く。** 推測しません |
+| `$post->comments` で自動的に読む | `post.comments().get().await?`（**遅延ロードは無い**） |
+| `with('comments')` でまとめ読み | `where_in` ＋ `group_by` で2回に分ける |
+| `Post::create([...])` | 構造体を作って `post.save().await?` |
+| `$casts` で型を変える | 構造体の宣言がそのまま型 |
+| `Post::factory()->count(3)->create()` | `database/factories/` のただの関数 |
+| `up()` / `down()` は `Schema::create(...)` | 同じ。ただし**同期の関数** |
+| `$table->string('title')->change()` | **無い**（SQLite が苦手なため） |
+| `unique:posts,title` のバリデーション規則 | **無い。** `exists()` をクエリで書く |
+| `php artisan migrate` | `cargo artisan migrate`（本番は `./myapp migrate`） |
+| `RefreshDatabase` トレイト | `let _db = refresh_database().await;` |
+
 ## 読み込みのしかた
 
 | Laravel | bengara |
 |---|---|
 | 必要になってから読む（遅延ロード） | **遅延ロードは無い。** ルートと設定は起動時にすべて組み立てて固定する |
+| モデルのリレーションも遅延ロード | **しない。** `await` を書いたときだけ問い合わせが走る |
 | サービスコンテナ・サービスプロバイダ | 無い。設定は型をキーにした保管だけ |
 | ファサード | 無い。`use bengara::prelude::*;` の自由関数を使う |
 

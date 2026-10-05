@@ -1,10 +1,35 @@
 //! bengara の手続きマクロ。
 //!
-//! 今あるのは `#[bengara::test]` だけです。
+//! - `#[bengara::test]`：テスト関数に付ける。
+//! - `#[derive(Model)]`：構造体と表を結びつける。
+
+mod model;
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, ItemFn};
+
+/// `app/Models/` の構造体に付けて、表と結びつける。
+///
+/// ```ignore
+/// #[derive(Model)]
+/// #[model(table = "posts")]
+/// pub struct Post {
+///     pub id: i64,
+///     pub title: String,
+/// }
+/// ```
+///
+/// | 指定 | 置き場所 | 既定 |
+/// |---|---|---|
+/// | `#[model(table = "posts")]` | 構造体 | 必須 |
+/// | `#[model(primary)]` | フィールド | `id` という名前のフィールド |
+/// | `#[model(column = "名前")]` | フィールド | フィールド名と同じ |
+/// | `#[model(skip)]` | フィールド | 表にない項目として扱う |
+#[proc_macro_derive(Model, attributes(model))]
+pub fn derive_model(item: TokenStream) -> TokenStream {
+    model::derive(item)
+}
 
 /// `tests/` 以下のテスト関数に付ける。
 ///
@@ -20,7 +45,7 @@ use syn::{parse_macro_input, ItemFn};
 /// - `.env` と `config/` を読み込む（1回だけ）
 /// - `bootstrap/app.rs` のアプリを組み立てる
 /// - tokio のランタイムを用意して、本体を直接呼ぶ
-/// - 関数の中で `client`、`get`、`post` を使えるようにする
+/// - 関数の中で `client`、`get`、`post`、`refresh_database`、`seed_database` を使えるようにする
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
@@ -73,6 +98,11 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let __client = ::core::clone::Clone::clone(&client);
                         async move { __client.get(&__uri).await }
                     };
+                    // DB を使うテストは、これを `let _db = refresh_database().await;` で受け取る。
+                    #[allow(unused_variables)]
+                    let refresh_database = || async { ::bengara::testing::refresh_database().await };
+                    #[allow(unused_variables)]
+                    let seed_database = || async { ::bengara::testing::seed_database().await };
                     #[allow(unused_variables)]
                     let post = |__uri: &str, __body: &str| {
                         let __uri = ::std::string::String::from(__uri);

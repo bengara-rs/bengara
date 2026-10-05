@@ -37,6 +37,15 @@ impl CargoToml {
         Ok(true)
     }
 
+    /// 文字列から組み立てる（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn load_for_test(text: &str) -> Self {
+        Self {
+            lines: text.lines().map(str::to_string).collect(),
+            changed: false,
+        }
+    }
+
     /// `[package]` の `name`。
     pub(crate) fn package_name(&self) -> Option<String> {
         self.value_in("package", "name")

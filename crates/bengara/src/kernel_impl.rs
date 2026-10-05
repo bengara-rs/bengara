@@ -23,13 +23,13 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     config_registry::install(registry);
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(error) = dispatch(&args, factory) {
+    if let Err(error) = dispatch(&args, hooks, factory) {
         eprintln!("エラー: {error}");
         std::process::exit(1);
     }
 }
 
-fn dispatch(args: &[String], factory: fn() -> Application) -> Result<()> {
+fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Result<()> {
     let (command, rest) = match args.split_first() {
         Some((first, rest)) => (first.as_str(), rest),
         // 引数なしはサーバーの起動。
@@ -48,6 +48,10 @@ fn dispatch(args: &[String], factory: fn() -> Application) -> Result<()> {
         }
         "key:generate" => generate_key(),
         "session:gc" => sweep_sessions(),
+        // DB のコマンド（migrate / db:seed など）。
+        name if crate::database::commands::is_command(name) => {
+            crate::database::commands::run(name, rest, (hooks.migrations)(), (hooks.seeders)())
+        }
         "init" => crate::cli::init_here(),
         "--version" | "-V" | "version" => {
             println!("bengara {}", env!("CARGO_PKG_VERSION"));
@@ -246,6 +250,11 @@ fn print_routes(app: &Application) {
 }
 
 fn print_help() {
+    let database = crate::database::commands::COMMANDS
+        .iter()
+        .map(|(name, description)| format!("  {name:<20} {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     println!(
         "\
 本体のコマンド
@@ -259,6 +268,10 @@ fn print_help() {
   init                 Laravel と同じ構成のファイルを作る（最初の1回だけ）
   --version            版番号を出す
   --help               このヘルプを出す
+
+データベースのコマンド
+{database}
+  どれにも --database=<接続の名前> を付けられます。
 
 開発用のコマンド（init と、serve の自動再ビルド）は artisan 側です。
 
@@ -285,8 +298,11 @@ fn init_tracing() {
     #[cfg(feature = "log-filter")]
     let builder = {
         use tracing_subscriber::EnvFilter;
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(format!("{default},hyper=warn,tower=warn")));
+        // sqlx は投げた SQL を1本ずつ出すので、既定では黙らせる。
+        // 見たいときは `RUST_LOG=info,sqlx=debug` のように指定する。
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(format!("{default},hyper=warn,tower=warn,sqlx=warn"))
+        });
         tracing_subscriber::fmt().with_env_filter(filter)
     };
 
@@ -328,4 +344,13 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
         (hooks.configs)(&mut registry);
         config_registry::install(registry);
     }
+    // マイグレーションの一覧を、あとで `refresh_database()` から使えるようにしておく。
+    let _ = TEST_HOOKS.set(hooks);
+}
+
+static TEST_HOOKS: std::sync::OnceLock<Hooks> = std::sync::OnceLock::new();
+
+/// テストのときに覚えておいた `Hooks`。
+pub(crate) fn test_hooks() -> Hooks {
+    TEST_HOOKS.get().copied().unwrap_or_default()
 }

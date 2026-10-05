@@ -22,9 +22,13 @@ myapp/
 ├── artisan.rs                   fn main() { bengara::artisan() }
 ├── build.rs                     fn main() { bengara_build::discover() }
 ├── app/Http/Controllers/        コントローラ
+├── app/Models/                  モデル
 ├── bootstrap/app.rs             アプリの組み立て
 ├── config/app.rs                設定
-├── database/                    （まだ使いません）
+├── config/database.rs           データベースの設定
+├── database/migrations/         表を作る手順
+├── database/seeders/            初期データ
+├── database/factories/          テスト用のデータを作る関数
 ├── public/                      静的ファイル
 ├── resources/views/             （まだ使いません）
 ├── routes/web.rs                ルート定義
@@ -60,7 +64,21 @@ myapp/
 | ディレクトリ | snake_case のモジュールへ。`app/Http/Controllers/` → `crate::app::http::controllers` |
 | 大文字始まりのファイル | `app/Models/User.rs` → 型 `crate::app::models::User` と モジュール `crate::app::models::user` |
 | 小文字始まりのファイル | `routes/web.rs` → `crate::routes::web` |
-| 日付で始まるファイル | 先頭に `m` を付けたモジュール名になり、`MIGRATIONS` 定数に名前の一覧ができる |
+| 日付で始まるファイル | 先頭に `m` を付けたモジュール名になる（`2026_…` → `m2026_…`） |
+
+### `database/` の約束
+
+| 場所 | 書くもの |
+|---|---|
+| `database/migrations/` の、日付で始まるファイル | `pub fn up(schema: &mut Schema)` と `pub fn down(schema: &mut Schema)` |
+| `database/seeders/` の、大文字始まりのファイル | `pub async fn run() -> Result<()>` |
+| `database/factories/` | ただの関数（決まりはありません） |
+
+- `migrations/` と `seeders/` は、名前順の一覧が自動で作られて本体に渡ります。
+  **登録の作業はありません。**
+- `seeders/` と `factories/` では、**大文字始まりのファイルに同名の型は要りません。**
+  関数を置く場所として扱います。
+- 詳しくは [migrations.md](migrations.md) と [models.md](models.md) にあります。
 
 ### 取り込まれないもの
 

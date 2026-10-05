@@ -12,12 +12,14 @@ bengara は、Laravel と同じディレクトリ構成・同じ書き味で Web
 - **シングルバイナリ** — リリースビルドの成果物は実行ファイル 1 つ。設定ファイルを本番に置かなくても動きます。
 - **Cargo だけで完結** — `cargo artisan ...` で開発用コマンドが使えます。グローバルなツールのインストールは不要です。
 - **環境に依存しない** — ランタイムも言語処理系も要りません。ビルドした実行ファイルを置くだけです。
+- **いま書けるもの** — ルーティング、ミドルウェア、入力の検査、セッションと CSRF、
+  データベース（SQLite）、マイグレーション、モデル、テスト。
 
 ## 5分で動かす
 
 ```sh
 cargo new myapp && cd myapp
-cargo add bengara
+cargo add bengara --features sqlite   # データベースを使わないなら --features は不要
 # main.rs を一時的に fn main() { bengara::run() } にする（init 前はこれだけ動く）
 cargo run -- init
 cargo artisan serve        # → http://127.0.0.1:8000
@@ -42,11 +44,15 @@ myapp/
 ├── artisan.rs                   fn main() { bengara::artisan() }
 ├── app/
 │   ├── Http/Controllers/HomeController.rs
-│   ├── Http/Middleware/         （まだ使いません）
-│   └── Models/                  （まだ使いません）
+│   ├── Http/Middleware/         ミドルウェア
+│   └── Models/                  モデル
 ├── bootstrap/app.rs             アプリの組み立て
 ├── config/app.rs                設定
-├── database/migrations/ seeders/（まだ使いません）
+├── config/database.rs           データベースの設定
+├── database/
+│   ├── migrations/              表を作る手順
+│   ├── seeders/DatabaseSeeder.rs 初期データ
+│   └── factories/               テスト用のデータを作る関数
 ├── public/robots.txt            静的ファイル
 ├── resources/views/             （まだ使いません）
 ├── routes/web.rs                ルート定義
@@ -137,7 +143,11 @@ async fn トップページが表示される() {
 | コマンド | 動き |
 |---|---|
 | 引数なし / `serve` | HTTP サーバーを起動（`--host` / `--port`） |
-| `route:list` | 登録されているルートの表（METHOD / URI / NAME） |
+| `route:list` | 登録されているルートの表（METHOD / URI / NAME / MIDDLEWARE） |
+| `key:generate` | `APP_KEY` を作って `.env` に書き込む |
+| `session:gc` | 期限切れのセッションを消す |
+| `migrate` / `migrate:status` / `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` | マイグレーション |
+| `db:seed` / `db:wipe` | 初期データ / 表を全部消す |
 | `init` | Laravel と同じ構成のファイルを作る |
 | `--version` / `--help` | 版・ヘルプ |
 
@@ -145,7 +155,8 @@ async fn トップページが表示される() {
 
 ## まだ無いもの
 
-ミドルウェア、テンプレート、データベース、認証などはまだありません。
+テンプレート（ビュー）、認証、キャッシュ、キュー、メールはまだありません。
+データベースは **SQLite だけ**です（MySQL と PostgreSQL は未実装）。
 一覧は [docs/backlog.md](docs/backlog.md) にまとめてあります。
 
 ## 必要なもの

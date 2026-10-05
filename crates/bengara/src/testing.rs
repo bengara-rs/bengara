@@ -292,6 +292,81 @@ impl TestResponse {
     }
 }
 
+/// DB を使うテストの順番を守るための札。
+///
+/// `refresh_database()` が返します。これを持っている間、ほかの DB テストは待ちます。
+/// テストが終わると自動で手放されます。
+pub struct DatabaseGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::fmt::Debug for DatabaseGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DatabaseGuard")
+    }
+}
+
+/// DB を使うテストの順番を決める錠。
+static DATABASE_LOCK: Mutex<()> = Mutex::new(());
+
+/// テスト用のデータベースを空から作り直す。
+///
+/// ```ignore
+/// #[bengara::test]
+/// async fn 記事を保存できる() {
+///     let _db = refresh_database().await;
+///     // ...
+/// }
+/// ```
+///
+/// - 置き場所は `DB_TEST_DATABASE`（既定は `:memory:`）です。開発用の DB には触りません。
+/// - 表を全部消してから `database/migrations/` を流します。
+/// - **返ってきた札を受け取ってください**（`let _db = ...`）。手放すと順番が守られません。
+///
+/// # パニック
+///
+/// つなげないときや、マイグレーションが失敗したときはパニックします。
+/// テストの中なので、そこで止まるほうが分かりやすいためです。
+// 錠を `await` の向こうまで持ち越すのは意図どおりです。これが DB を使うテストの
+// 順番を守る仕組みで、持ち越さないと意味がありません。テストの中だけで使います。
+#[allow(clippy::await_holding_lock)]
+pub async fn refresh_database() -> DatabaseGuard {
+    let guard = DATABASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    crate::database::connect_for_tests()
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "テスト用のデータベースにつなげません: {e}\n\
+                 Cargo.toml に features = [\"sqlite\"] が入っているか確かめてください"
+            )
+        });
+
+    let hooks = kernel_impl::test_hooks();
+    let migrations = (hooks.migrations)();
+    let migrator = crate::database::migrator::Migrator::connect(None)
+        .await
+        .unwrap_or_else(|e| panic!("テスト用のデータベースを用意できません: {e}"));
+    migrator
+        .fresh(migrations)
+        .await
+        .unwrap_or_else(|e| panic!("テスト用のマイグレーションに失敗しました: {e}"));
+
+    DatabaseGuard { _guard: guard }
+}
+
+/// シーダーをテストから流す。`refresh_database()` の後に呼びます。
+///
+/// # パニック
+///
+/// シーダーが失敗したときはパニックします。
+pub async fn seed_database() {
+    let hooks = kernel_impl::test_hooks();
+    crate::database::migrator::seed((hooks.seeders)(), None)
+        .await
+        .unwrap_or_else(|e| panic!("シーダーの実行に失敗しました: {e}"));
+}
+
 /// `#[bengara::test]` が呼ぶ入口。利用者が直接呼ぶことはありません。
 #[doc(hidden)]
 pub fn run<F, Fut>(hooks: Hooks, factory: fn() -> Application, body: F)

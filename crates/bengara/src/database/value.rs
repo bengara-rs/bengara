@@ -1,0 +1,420 @@
+//! DB とやりとりする値（`Value`）と、結果の1行（`Row`）。
+//!
+//! sqlx の型を利用者に見せないための層です。ここを通るので、下回りを差し替えても
+//! アプリのコードは変わりません。
+
+use crate::error::{Error, Result};
+
+/// DB に渡す値、DB から来た値。
+///
+/// 文字列と数値は、読み出すときに多少の読み替えをします（`Int` を `String` で読める、など）。
+/// SQLite は型をゆるく扱うので、そのほうが扱いやすいためです。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    /// `NULL`。
+    Null,
+    /// 真偽。SQLite では 0 / 1 になります。
+    Bool(bool),
+    /// 整数。
+    Int(i64),
+    /// 小数。
+    Float(f64),
+    /// 文字列。
+    Text(String),
+    /// バイト列。
+    Bytes(Vec<u8>),
+}
+
+impl Value {
+    /// `NULL` か。
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    /// 値の種類の名前。エラーのメッセージに使います。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Value::Null => "NULL",
+            Value::Bool(_) => "真偽",
+            Value::Int(_) => "整数",
+            Value::Float(_) => "小数",
+            Value::Text(_) => "文字列",
+            Value::Bytes(_) => "バイト列",
+        }
+    }
+
+    /// JSON に直す。`Bytes` は数値の配列になります。
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(v) => serde_json::Value::Bool(*v),
+            Value::Int(v) => serde_json::Value::from(*v),
+            Value::Float(v) => serde_json::Number::from_f64(*v)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Value::Text(v) => serde_json::Value::String(v.clone()),
+            Value::Bytes(v) => serde_json::Value::from(v.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Null => f.write_str(""),
+            Value::Bool(v) => write!(f, "{v}"),
+            Value::Int(v) => write!(f, "{v}"),
+            Value::Float(v) => write!(f, "{v}"),
+            Value::Text(v) => f.write_str(v),
+            Value::Bytes(v) => write!(f, "{} バイト", v.len()),
+        }
+    }
+}
+
+impl serde::Serialize for Value {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
+    }
+}
+
+/// `Value` に変えられるもの。`where_` や `insert` の引数で使います。
+///
+/// `impl<T: Into<Value>> IntoValue for T` なので、`From<T> for Value` がある型は
+/// そのまま渡せます。
+pub trait IntoValue {
+    /// `Value` に変える。
+    fn into_value(self) -> Value;
+}
+
+impl<T: Into<Value>> IntoValue for T {
+    fn into_value(self) -> Value {
+        self.into()
+    }
+}
+
+macro_rules! from_int {
+    ($($t:ty),*) => {
+        $(impl From<$t> for Value {
+            fn from(v: $t) -> Self {
+                Value::Int(v as i64)
+            }
+        })*
+    };
+}
+from_int!(i8, i16, i32, i64, u8, u16, u32, isize, usize);
+
+impl From<u64> for Value {
+    fn from(v: u64) -> Self {
+        // i64 に収まらない値は、桁を落とさないように文字列にする。
+        match i64::try_from(v) {
+            Ok(v) => Value::Int(v),
+            Err(_) => Value::Text(v.to_string()),
+        }
+    }
+}
+
+impl From<bool> for Value {
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
+}
+
+impl From<f32> for Value {
+    fn from(v: f32) -> Self {
+        Value::Float(v as f64)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        Value::Float(v)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::Text(v.to_string())
+    }
+}
+
+impl From<String> for Value {
+    fn from(v: String) -> Self {
+        Value::Text(v)
+    }
+}
+
+impl From<&String> for Value {
+    fn from(v: &String) -> Self {
+        Value::Text(v.clone())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(v: Vec<u8>) -> Self {
+        Value::Bytes(v)
+    }
+}
+
+impl From<&[u8]> for Value {
+    fn from(v: &[u8]) -> Self {
+        Value::Bytes(v.to_vec())
+    }
+}
+
+impl<T: Into<Value>> From<Option<T>> for Value {
+    fn from(v: Option<T>) -> Self {
+        match v {
+            Some(v) => v.into(),
+            None => Value::Null,
+        }
+    }
+}
+
+/// `Value` から取り出せる型。`row.get::<i64>("id")?` の `i64` の側です。
+pub trait FromValue: Sized {
+    /// 取り出す。種類が違うときはエラー。
+    fn from_value(value: &Value) -> Result<Self>;
+}
+
+fn mismatch<T>(value: &Value, want: &str) -> Result<T> {
+    Err(Error::msg(format!(
+        "{} の値を {want} として読めません",
+        value.kind()
+    )))
+}
+
+impl FromValue for i64 {
+    fn from_value(value: &Value) -> Result<Self> {
+        match value {
+            Value::Int(v) => Ok(*v),
+            Value::Bool(v) => Ok(i64::from(*v)),
+            Value::Float(v) => Ok(*v as i64),
+            Value::Text(v) => v
+                .trim()
+                .parse()
+                .map_err(|_| Error::msg(format!("`{v}` を整数として読めません"))),
+            other => mismatch(other, "整数"),
+        }
+    }
+}
+
+impl FromValue for i32 {
+    fn from_value(value: &Value) -> Result<Self> {
+        let v = i64::from_value(value)?;
+        i32::try_from(v).map_err(|_| Error::msg(format!("{v} は i32 に収まりません")))
+    }
+}
+
+impl FromValue for u32 {
+    fn from_value(value: &Value) -> Result<Self> {
+        let v = i64::from_value(value)?;
+        u32::try_from(v).map_err(|_| Error::msg(format!("{v} は u32 に収まりません")))
+    }
+}
+
+impl FromValue for u64 {
+    fn from_value(value: &Value) -> Result<Self> {
+        let v = i64::from_value(value)?;
+        u64::try_from(v).map_err(|_| Error::msg(format!("{v} は u64 に収まりません")))
+    }
+}
+
+impl FromValue for f64 {
+    fn from_value(value: &Value) -> Result<Self> {
+        match value {
+            Value::Float(v) => Ok(*v),
+            Value::Int(v) => Ok(*v as f64),
+            Value::Text(v) => v
+                .trim()
+                .parse()
+                .map_err(|_| Error::msg(format!("`{v}` を小数として読めません"))),
+            other => mismatch(other, "小数"),
+        }
+    }
+}
+
+impl FromValue for bool {
+    fn from_value(value: &Value) -> Result<Self> {
+        match value {
+            Value::Bool(v) => Ok(*v),
+            Value::Int(v) => Ok(*v != 0),
+            Value::Text(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Ok(true),
+                "0" | "false" | "no" | "off" | "" => Ok(false),
+                _ => Err(Error::msg(format!("`{v}` を真偽として読めません"))),
+            },
+            other => mismatch(other, "真偽"),
+        }
+    }
+}
+
+impl FromValue for String {
+    fn from_value(value: &Value) -> Result<Self> {
+        match value {
+            Value::Text(v) => Ok(v.clone()),
+            Value::Int(v) => Ok(v.to_string()),
+            Value::Float(v) => Ok(v.to_string()),
+            Value::Bool(v) => Ok(v.to_string()),
+            Value::Bytes(v) => String::from_utf8(v.clone())
+                .map_err(|_| Error::msg("バイト列を文字列として読めません")),
+            other => mismatch(other, "文字列"),
+        }
+    }
+}
+
+impl FromValue for Vec<u8> {
+    fn from_value(value: &Value) -> Result<Self> {
+        match value {
+            Value::Bytes(v) => Ok(v.clone()),
+            Value::Text(v) => Ok(v.as_bytes().to_vec()),
+            other => mismatch(other, "バイト列"),
+        }
+    }
+}
+
+impl FromValue for Value {
+    fn from_value(value: &Value) -> Result<Self> {
+        Ok(value.clone())
+    }
+}
+
+impl<T: FromValue> FromValue for Option<T> {
+    fn from_value(value: &Value) -> Result<Self> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        T::from_value(value).map(Some)
+    }
+}
+
+/// 結果の1行。
+///
+/// ```ignore
+/// let row = DB::table("posts").find(1).await?.unwrap();
+/// let title: String = row.get("title")?;
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Row {
+    columns: Vec<String>,
+    values: Vec<Value>,
+}
+
+impl Row {
+    /// 列の名前と値から作る。下回りのドライバが使います。
+    pub fn new(columns: Vec<String>, values: Vec<Value>) -> Self {
+        Self { columns, values }
+    }
+
+    /// 列の値を型で取り出す。列が無い・型が合わないときはエラー。
+    pub fn get<T: FromValue>(&self, column: &str) -> Result<T> {
+        let value = self.value(column).ok_or_else(|| {
+            Error::msg(format!(
+                "列 `{column}` がありません（ある列: {}）",
+                self.columns.join(", ")
+            ))
+        })?;
+        T::from_value(value).map_err(|e| Error::msg(format!("列 `{column}` を読めません: {e}")))
+    }
+
+    /// 列の値を型で取り出す。読めなければ `None`。
+    pub fn try_get<T: FromValue>(&self, column: &str) -> Option<T> {
+        self.value(column).and_then(|v| T::from_value(v).ok())
+    }
+
+    /// 列の値をそのまま借りる。
+    pub fn value(&self, column: &str) -> Option<&Value> {
+        let index = self.columns.iter().position(|c| c == column)?;
+        self.values.get(index)
+    }
+
+    /// 左から数えた位置で値を借りる。
+    pub fn at(&self, index: usize) -> Option<&Value> {
+        self.values.get(index)
+    }
+
+    /// 列の名前の一覧。
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// 列の数。
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// 列が1つも無いか。
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// JSON のオブジェクトに直す。
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(self.columns.len());
+        for (name, value) in self.columns.iter().zip(&self.values) {
+            map.insert(name.clone(), value.to_json());
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+impl serde::Serialize for Row {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
+    }
+}
+
+/// 更新系の結果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Affected {
+    /// 変わった行の数。
+    pub rows: u64,
+    /// 自動採番された ID（`insert` のとき）。
+    pub last_insert_id: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 数値と文字列は読み替えられる() {
+        assert_eq!(i64::from_value(&Value::Text("12".into())).unwrap(), 12);
+        assert_eq!(String::from_value(&Value::Int(12)).unwrap(), "12");
+        assert!(bool::from_value(&Value::Int(1)).unwrap());
+        assert!(!bool::from_value(&Value::Text("off".into())).unwrap());
+    }
+
+    #[test]
+    fn 読めない値はエラーになる() {
+        assert!(i64::from_value(&Value::Text("やきそば".into())).is_err());
+        assert!(i64::from_value(&Value::Null).is_err());
+        assert_eq!(Option::<i64>::from_value(&Value::Null).unwrap(), None);
+    }
+
+    #[test]
+    fn option_は_null_になる() {
+        let none: Option<&str> = None;
+        assert_eq!(Value::from(none), Value::Null);
+        assert_eq!(Value::from(Some("x")), Value::Text("x".into()));
+    }
+
+    #[test]
+    fn 行から列を読める() {
+        let row = Row::new(
+            vec!["id".into(), "title".into()],
+            vec![Value::Int(1), Value::Text("やきそば".into())],
+        );
+        assert_eq!(row.get::<i64>("id").unwrap(), 1);
+        assert_eq!(row.get::<String>("title").unwrap(), "やきそば");
+        assert_eq!(row.len(), 2);
+        assert!(row.get::<i64>("none").is_err());
+        assert_eq!(row.try_get::<i64>("none"), None);
+        assert_eq!(row.to_json()["title"], "やきそば");
+    }
+}

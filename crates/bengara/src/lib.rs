@@ -24,6 +24,7 @@
 mod application;
 mod cli;
 mod config_registry;
+pub mod database;
 mod env_vars;
 mod error;
 mod http;
@@ -38,6 +39,10 @@ pub mod testing;
 
 pub use application::{Application, ApplicationBuilder, Exceptions, Routing};
 pub use config_registry::{config, try_config, AppConfig, Registry};
+pub use database::{
+    now, Affected, Blueprint, ConnectionConfig, DatabaseConfig, Driver, Migration, Model,
+    ModelQuery, Paginator, QueryBuilder, Row, Schema, Seeder, SeederFuture, Transaction, Value, DB,
+};
 pub use env_vars::{env, FromEnv};
 pub use error::{Error, Result};
 pub use http::{
@@ -50,6 +55,9 @@ pub use paths::{app_path, base_path, public_path, storage_path};
 
 /// `#[bengara::test]`：`tests/` 以下のテスト関数に付ける。
 pub use bengara_macros::test;
+
+/// `#[derive(Model)]`：`app/Models/` の構造体に付けて、表と結びつける。
+pub use bengara_macros::Model;
 
 /// serde をそのまま使えるようにしておく。
 ///
@@ -68,11 +76,19 @@ pub use {serde, serde_json};
 pub struct Hooks {
     /// `config/` 直下の各ファイルの `config()` を呼んで登録する。
     pub configs: fn(&mut Registry),
+    /// `database/migrations/` のマイグレーションの一覧（名前順）。
+    pub migrations: fn() -> &'static [Migration],
+    /// `database/seeders/` のシーダーの一覧（名前順）。
+    pub seeders: fn() -> &'static [Seeder],
 }
 
 impl Default for Hooks {
     fn default() -> Self {
-        Self { configs: |_| {} }
+        Self {
+            configs: |_| {},
+            migrations: || &[],
+            seeders: || &[],
+        }
     }
 }
 
@@ -137,4 +153,12 @@ pub mod prelude {
     // セッションまわりは `session::` のまま使うと長いので、よく使う型だけ入れておきます。
     pub use crate::session::{Session, SessionConfig, StartSession, VerifyCsrfToken};
     pub use crate::validation::{Validated, ValidationErrors};
+
+    // データベース。`#[derive(Model)]` とトレイトの `Model` は名前が同じですが、
+    // Rust では別の種類の名前なので両方使えます。
+    pub use crate::database::{
+        now, Affected, Blueprint, ConnectionConfig, DatabaseConfig, Driver, Migration, Model,
+        ModelQuery, Paginator, QueryBuilder, Row, Schema, Seeder, Transaction, Value, DB,
+    };
+    pub use bengara_macros::Model;
 }

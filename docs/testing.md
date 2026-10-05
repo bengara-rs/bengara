@@ -125,6 +125,56 @@ get("/").await
 
 テスト関数は日本語で書けます。実行結果には `__bengara_tests_feature_home_test::トップページが表示される` のような名前で出ます。
 
+## データベースを使うテスト
+
+先頭で `let _db = refresh_database().await;` と書きます。
+
+```rust
+#[bengara::test]
+async fn 記事を保存して読み出せる() {
+    let _db = refresh_database().await;
+
+    let id = DB::table("posts")
+        .insert_get_id(&[("title", "やきそば".into())])
+        .await
+        .unwrap();
+
+    let post = DB::table("posts").find(id).await.unwrap().unwrap();
+    assert_eq!(post.get::<String>("title").unwrap(), "やきそば");
+}
+```
+
+これが返す札（`_db`）を持っている間だけ DB を使えます。
+
+| すること | 内容 |
+|---|---|
+| つなぐ先 | `.env` の `DB_TEST_DATABASE`（既定 `:memory:`）。**開発用の DB には触りません** |
+| 表 | 全部消してから `database/migrations/` を流し直します |
+| 順番 | 札を持っている間、ほかの DB テストは待ちます |
+
+- **札は必ず受け取ってください**（`let _db = ...`）。`refresh_database().await;` だけだと
+  その場で手放され、ほかのテストと混ざります。
+- DB を使わないテストは待たされません。
+- シーダーも流したいときは `seed_database().await;` を続けて呼びます。
+
+```rust
+#[bengara::test]
+async fn 一覧が見える() {
+    let _db = refresh_database().await;
+    seed_database().await;
+
+    get("/api/articles").await.assert_ok();
+}
+```
+
+テストを流すときは、機能フラグを忘れないでください。
+
+```sh
+cargo test
+```
+
+`Cargo.toml` に `features = ["sqlite"]` が書かれていれば、そのまま動きます。
+
 ## ユニットテスト
 
 `tests/Unit/` のファイルも同じように自動検出されます。
@@ -134,3 +184,5 @@ get("/").await
 
 - [routing.md](routing.md)
 - [requests-and-responses.md](requests-and-responses.md)
+- [database.md](database.md) — 接続とクエリ
+- [models.md](models.md) — モデルとシーダー

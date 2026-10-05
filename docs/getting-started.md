@@ -5,6 +5,15 @@
 bengara 自身のコードは edition 2021 で書いていますが、依存クレートの hyper-util が edition 2024 を要求します。
 そのため Rust 1.82 では依存の解決に失敗し、実際の下限は 1.85 になります。
 
+> **1.85 でデータベース（`features = ["sqlite"]`）を使うとき**は、依存を1つ古い版に固定してください。
+> sqlx がたどる `icu_*` が、新しい版では Rust 1.88 以上を要求します。
+>
+> ```sh
+> cargo update idna_adapter --precise 1.2.0
+> ```
+>
+> 1.88 以上の Rust を使うなら、何もしなくて構いません。
+
 ## 手順
 
 ### 1. プロジェクトを作る
@@ -33,10 +42,20 @@ cargo run -- init
 `init` がすることは 3 つです。
 
 - 足りないディレクトリとファイルを作る（既にあるファイルには触りません）
-- `Cargo.toml` に `[[bin]]`、`default-run`、`autobins = false`、`[build-dependencies]`、`[profile.release]` を足す
+- `Cargo.toml` に `[[bin]]`、`default-run`、`autobins = false`、`[build-dependencies]`、`[profile.release]` を足す。
+  `bengara` の依存は `features = ["sqlite"]` 付きで書き足します（データベースを使うため）
 - `src/main.rs` を消し、`src/` が空になれば `src/` も消す
 
 何度実行しても壊れません。足りないものだけを作り足します。
+
+> `cargo add bengara` を先に実行していると、`features` が付きません。
+> データベースを使うときは `Cargo.toml` を次の形にしてください。
+>
+> ```toml
+> bengara = { version = "0.1", features = ["sqlite"] }
+> ```
+>
+> データベースを使わないなら、そのままで構いません（依存が 74 個少なくなります）。
 
 ### 4. 起動する
 
@@ -46,7 +65,18 @@ cargo artisan serve
 
 → http://127.0.0.1:8000
 
-### 5. テストとリリースビルド
+### 5. データベースを用意する
+
+`init` が `config/database.rs` と `database/` を作っています。
+表を作る手順を `database/migrations/` に置いて、流します。
+
+```sh
+cargo artisan migrate
+```
+
+書き方は [migrations.md](migrations.md) にあります。使わないなら飛ばして構いません。
+
+### 6. テストとリリースビルド
 
 ```sh
 cargo test

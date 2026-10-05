@@ -1,0 +1,10 @@
+//! 最初に入れておくデータ。Laravel の DatabaseSeeder に当たります。
+//!
+//! `cargo artisan db:seed` で流れます。ほかのシーダーを呼ぶときは、
+//! `crate::database::seeders::other_seeder::run().await?` のように書きます。
+
+use bengara::prelude::*;
+
+pub async fn run() -> Result<()> {
+    Ok(())
+}

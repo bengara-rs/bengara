@@ -39,6 +39,22 @@
 | `init` | Laravel と同じ構成のファイルを作る |
 | `--version` / `--help` | 版・ヘルプ |
 
+データベースのコマンド（`features = ["sqlite"]` のとき）。詳しくは
+[migrations.md](migrations.md) にあります。
+
+| コマンド | 動き |
+|---|---|
+| `migrate` | まだ流していないマイグレーションを流す（`--seed` でシーダーも） |
+| `migrate:status` | 流したかどうかを一覧にする |
+| `migrate:rollback` | 最後のバッチを巻き戻す（`--step=2` で2バッチ分） |
+| `migrate:reset` | 全部巻き戻す |
+| `migrate:refresh` | 全部巻き戻してから流し直す |
+| `migrate:fresh` | 表を全部消してから流し直す（`--force` が要る場合あり） |
+| `db:seed` | シーダーを流す（`--class=DatabaseSeeder`） |
+| `db:wipe` | 表を全部消す |
+
+どれにも `--database=接続の名前` を付けられます。
+
 ホストとポートの既定は `.env` の `APP_HOST`（既定 `127.0.0.1`）と `APP_PORT`（既定 `8000`）です。
 
 `init` 前の `main.rs`（`fn main() { bengara::run() }`）は `init` と `--version` だけを受け付けます。

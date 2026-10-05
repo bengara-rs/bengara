@@ -18,6 +18,14 @@ default = ["log-filter"]
 # RUST_LOG は trace/debug/info/warn/error の1語だけになる。
 log-filter = ["tracing-subscriber/env-filter"]
 
+# データベース。既定では入りません。使うドライバを利用者が選びます。
+#   bengara = { version = "0.1", features = ["sqlite"] }
+# フラグが無いときも database モジュールはコンパイルされ、実際に接続しようとした
+# ときだけ「features = ["sqlite"] を付けてください」というエラーになります。
+sqlite = ["database", "sqlx/sqlite"]
+# ドライバ共通の土台。単体では指定しません。
+database = ["sqlx"]
+
 [dependencies]
 bengara-macros = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -28,6 +36,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 getrandom = { version = "0.4.3", features = ["std"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# docs.rs では SQLite 付きの状態で説明を出す。
+[package.metadata.docs.rs]
+features = ["sqlite"]
