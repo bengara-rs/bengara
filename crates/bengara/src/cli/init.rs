@@ -396,14 +396,15 @@ fn update_manifest(manifest: &mut CargoToml, name: &str) {
         manifest.add_line("profile.release", "strip = true");
     }
     // 繰り返しの節なので、末尾にまとめて足す。
-    if !manifest.contains("path = \"main.rs\"") {
+    // 空白と引用符の書き方が違っても二重に足さないよう、値で見る。
+    if !manifest.has_path("main.rs") {
         manifest.append_block(&[
             "[[bin]]",
             &format!("name = \"{name}\""),
             "path = \"main.rs\"",
         ]);
     }
-    if !manifest.contains("path = \"artisan.rs\"") {
+    if !manifest.has_path("artisan.rs") {
         manifest.append_block(&["[[bin]]", "name = \"artisan\"", "path = \"artisan.rs\""]);
     }
 }
@@ -456,6 +457,25 @@ mod tests {
         let mut manifest = CargoToml::load_for_test("[package]\nname = \"myapp\"\n");
         update_manifest(&mut manifest, "myapp");
         assert!(manifest.contains("features = [\"sqlite\"]"));
+    }
+
+    #[test]
+    fn 書き方が違うbinは二重に足さない() {
+        // 空白なしと単引用符。どちらも「すでにある」と見なす。
+        let mut manifest = CargoToml::load_for_test(
+            "[package]\nname = \"myapp\"\n\n[[bin]]\nname = \"myapp\"\npath=\"main.rs\"\n\n[[bin]]\nname = \"artisan\"\npath = 'artisan.rs'\n",
+        );
+        update_manifest(&mut manifest, "myapp");
+        assert_eq!(manifest.count_lines("[[bin]]"), 2);
+    }
+
+    #[test]
+    fn 節の形の依存は二重に足さない() {
+        let mut manifest = CargoToml::load_for_test(
+            "[package]\nname = \"myapp\"\n\n[dependencies.bengara]\nversion = \"0.1\"\nfeatures = [\"sqlite\"]\n",
+        );
+        update_manifest(&mut manifest, "myapp");
+        assert_eq!(manifest.count_lines("bengara = {"), 0);
     }
 
     #[test]

@@ -18,11 +18,16 @@
 //! ```text
 //! * * * * * cd /path/to/app && ./myapp schedule:run >> /dev/null 2>&1
 //! ```
+//!
+//! 前回いつ動いたかは `storage/framework/schedule/` にファイルで残します。
+//! **キャッシュには置きません。** `CACHE_DRIVER=memory` だと、1分ごとに起動する
+//! 別のプロセスからは前回の時刻が見えず、`Every::Hour` が毎分走ってしまうためです。
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// 処理が返す非同期の結果。
 pub type TaskFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -85,9 +90,12 @@ impl Task {
         self.every
     }
 
-    /// キャッシュに入れる鍵（前回いつ動いたか）。
-    fn cache_key(&self) -> String {
-        format!("bengara_schedule:{}", self.name)
+    /// 前回いつ動いたかを覚えるファイルの名前。
+    ///
+    /// 名前には日本語も空白も入るので、SHA-256 の16進にします。
+    /// 元の名前はファイルの1行目に書くので、中を見れば分かります。
+    fn state_file(&self) -> String {
+        crate::support::crypto::to_hex(&crate::support::crypto::sha256(self.name.as_bytes()))
     }
 }
 
@@ -155,23 +163,65 @@ pub(crate) fn is_due(last_run: Option<i64>, every: Every, now: i64) -> bool {
     }
 }
 
+/// 前回いつ動いたかを置くディレクトリ。
+pub(crate) fn state_dir() -> PathBuf {
+    // join を 2 回に分けて、Windows でも区切りが混ざらないようにする。
+    crate::paths::storage_path("framework").join("schedule")
+}
+
+/// 置き場所を用意する。
+///
+/// `storage/` そのものが無いなら、作らずに知らせます（決定記録 #023）。
+fn ensure_state_dir(dir: &Path) -> Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let storage = crate::paths::storage_path("");
+    if !storage.is_dir() {
+        return Err(Error::msg(format!(
+            "{} がありません。デプロイのときに storage/ を作ってください",
+            storage.display()
+        )));
+    }
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+/// 前回動いた時刻（UNIX 秒）を読む。無い・壊れていれば `None`。
+fn read_last_run(dir: &Path, task: &Task) -> Option<i64> {
+    let raw = std::fs::read_to_string(dir.join(task.state_file())).ok()?;
+    // 1行目は名前（人が見るため）、2行目が時刻。
+    raw.lines().nth(1)?.trim().parse().ok()
+}
+
+/// 前回動いた時刻を書く。
+fn write_last_run(dir: &Path, task: &Task, now: i64) -> Result<()> {
+    let path = dir.join(task.state_file());
+    std::fs::write(&path, format!("{}\n{now}\n", task.name))?;
+    Ok(())
+}
+
 /// 動かすべきものを動かす。返るのは動かした名前です。
 pub(crate) async fn run_due(schedule: &Schedule) -> Result<Vec<String>> {
+    let dir = state_dir();
+    ensure_state_dir(&dir)?;
+    run_due_in(&dir, schedule).await
+}
+
+/// 置き場所を指定して動かす（テストから使います）。
+async fn run_due_in(dir: &Path, schedule: &Schedule) -> Result<Vec<String>> {
     let now = crate::support::time::now_seconds();
     let mut done = Vec::new();
 
     for task in &schedule.tasks {
-        let key = task.cache_key();
-        let last_run = crate::cache::Cache::get(&key)
-            .await?
-            .and_then(|v| v.trim().parse::<i64>().ok());
+        let last_run = read_last_run(dir, task);
 
         if !is_due(last_run, task.every, now) {
             continue;
         }
 
         // 先に時刻を書く。処理が失敗しても、次の1分でまた走らないようにするため。
-        crate::cache::Cache::forever(&key, now.to_string()).await?;
+        write_last_run(dir, task, now)?;
 
         let started = std::time::Instant::now();
         match (task.run)().await {
@@ -191,11 +241,12 @@ pub(crate) async fn run_due(schedule: &Schedule) -> Result<Vec<String>> {
 }
 
 /// 登録されている処理を表で出す（`schedule:list`）。
-pub(crate) async fn print_list(schedule: &Schedule) -> Result<()> {
+pub(crate) fn print_list(schedule: &Schedule) {
     if schedule.is_empty() {
         println!("登録されている処理はありません（routes/console.rs を確かめてください）");
-        return Ok(());
+        return;
     }
+    let dir = state_dir();
     // 日本語は端末で 2 文字分の幅を取るので、文字数ではなく幅でそろえる。
     use crate::support::text;
 
@@ -220,9 +271,7 @@ pub(crate) async fn print_list(schedule: &Schedule) -> Result<()> {
         text::pad("間隔", every_width)
     );
     for task in &schedule.tasks {
-        let last = crate::cache::Cache::get(&task.cache_key())
-            .await?
-            .and_then(|v| v.trim().parse::<i64>().ok())
+        let last = read_last_run(&dir, task)
             .map(crate::support::time::format_timestamp)
             .unwrap_or_else(|| "まだ".to_string());
         println!(
@@ -232,7 +281,6 @@ pub(crate) async fn print_list(schedule: &Schedule) -> Result<()> {
         );
     }
     println!("\n{} 件", schedule.len());
-    Ok(())
 }
 
 #[cfg(test)]
@@ -289,12 +337,85 @@ mod tests {
     }
 
     #[test]
-    fn 鍵は名前から作る() {
+    fn 覚えるファイルの名前は名前から作る() {
         let mut schedule = Schedule::new();
-        schedule.job("毎日の集計", Every::Day, || async { Ok(()) });
-        assert_eq!(
-            schedule.tasks()[0].cache_key(),
-            "bengara_schedule:毎日の集計"
-        );
+        schedule
+            .job("毎日の集計", Every::Day, || async { Ok(()) })
+            .job("別の処理", Every::Day, || async { Ok(()) });
+
+        let first = schedule.tasks()[0].state_file();
+        // 日本語でもファイル名に使える形になる。
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        // 名前が違えば別のファイル。同じ名前なら同じファイル。
+        assert_ne!(first, schedule.tasks()[1].state_file());
+        assert_eq!(first, schedule.tasks()[0].state_file());
+    }
+
+    /// テスト用の空ディレクトリ。
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bengara-schedule-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn 前回の時刻はファイルに残る() {
+        let dir = temp_dir("state");
+        let mut schedule = Schedule::new();
+        schedule.job("1時間ごとの処理", Every::Hour, || async { Ok(()) });
+
+        // 1 回目は動く。
+        let done = run_due_in(&dir, &schedule).await.unwrap();
+        assert_eq!(done, vec!["1時間ごとの処理".to_string()]);
+
+        // 2 回目は、前回の時刻がファイルに残っているので動かない。
+        // （キャッシュに置いていたときは、別プロセスだと毎回動いてしまった）
+        let done = run_due_in(&dir, &schedule).await.unwrap();
+        assert!(done.is_empty());
+
+        // 中身は「名前」と「UNIX 秒」の 2 行。
+        let raw = std::fs::read_to_string(dir.join(schedule.tasks()[0].state_file())).unwrap();
+        let mut lines = raw.lines();
+        assert_eq!(lines.next(), Some("1時間ごとの処理"));
+        assert!(lines.next().unwrap().parse::<i64>().unwrap() > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 毎分の処理は毎回動く() {
+        let dir = temp_dir("minute");
+        let mut schedule = Schedule::new();
+        schedule.job("毎分の処理", Every::Minute, || async { Ok(()) });
+
+        assert_eq!(run_due_in(&dir, &schedule).await.unwrap().len(), 1);
+        assert_eq!(run_due_in(&dir, &schedule).await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 失敗しても時刻は残る() {
+        let dir = temp_dir("failed");
+        let mut schedule = Schedule::new();
+        schedule.job("失敗する処理", Every::Hour, || async {
+            Err(crate::error::Error::msg("わざと失敗"))
+        });
+
+        // 失敗したので動いた一覧には入らない。
+        assert!(run_due_in(&dir, &schedule).await.unwrap().is_empty());
+        // それでも時刻は残るので、次の 1 分でまた走らない。
+        assert!(read_last_run(&dir, &schedule.tasks()[0]).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 置き場所はstorageの下() {
+        assert!(state_dir().ends_with("schedule"));
+        assert!(state_dir().starts_with(crate::paths::storage_path("")));
     }
 }

@@ -90,6 +90,23 @@ pub(crate) struct Status {
     pub present: bool,
 }
 
+/// 札が取れなかったときのエラー文。
+///
+/// `held` に持ち主が入っているときだけ「他のプロセスが実行中」と言います。
+/// 入っていないときは、入らなかった本当の理由（`detail`）をそのまま見せます。
+fn lock_error(held: Option<(String, String)>, detail: &str) -> Error {
+    match held {
+        Some((owner, at)) => Error::msg(format!(
+            "別のプロセスがマイグレーションを実行中です（{owner} が {at} に開始）。\n\
+             終わってからもう一度実行してください。\n\
+             途中で落ちて札が残っているときは、`migrate:unlock` で消せます。"
+        )),
+        None => Error::msg(format!(
+            "実行中の札（{LOCK_TABLE}）を置けませんでした: {detail}"
+        )),
+    }
+}
+
 /// マイグレーションを実行する側。
 pub(crate) struct Migrator {
     backend: Arc<dyn Backend>,
@@ -158,21 +175,22 @@ impl Migrator {
             ])
             .await;
 
-        if inserted.is_ok() {
-            return Ok(());
-        }
-
-        // 入らなかった。誰が持っているかを見せて止める。
-        let held = self.lock_holder().await.unwrap_or(None);
-        let detail = match held {
-            Some((owner, at)) => format!("（{owner} が {at} に開始）"),
-            None => String::new(),
+        let error = match inserted {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
         };
-        Err(Error::msg(format!(
-            "別のプロセスがマイグレーションを実行中です{detail}。\n\
-             終わってからもう一度実行してください。\n\
-             途中で落ちて札が残っているときは、`migrate:unlock` で消せます。"
-        )))
+
+        // 入らなかった理由を確かめる。札が実在するときだけ「実行中」と言う。
+        // 列が合わない古い表が残っていたときやディスクの問題でも insert は失敗するので、
+        // 一律に「実行中」と断定すると、直し方を間違えます。
+        Err(match self.lock_holder().await {
+            Ok(held) => lock_error(held, &error.to_string()),
+            // 札を読むこともできなかった。持ち主が居る証拠は無い。
+            Err(read) => lock_error(
+                None,
+                &format!("{error}\n  札を読もうとしても失敗しました: {read}"),
+            ),
+        })
     }
 
     /// 札を返す。取れていなくても失敗にしません。
@@ -361,22 +379,26 @@ impl Migrator {
         if tables.is_empty() {
             return Ok(Vec::new());
         }
-        // 外部キーの順番を気にせず消せるように、いったん外す。
-        if self.driver() == Driver::Sqlite {
-            self.source
-                .execute("pragma foreign_keys = off", &[])
-                .await?;
-        }
         let mut schema = Schema::new(self.driver());
         for table in &tables {
             schema.drop_if_exists(table);
         }
-        for sql in schema.into_statements() {
-            self.source.execute(&sql, &[]).await?;
-        }
+        let statements = schema.into_statements();
+
+        // 1つのトランザクションの中で流す。
+        // `pragma foreign_keys` は**接続ごと**の設定なので、プールから取り直すと
+        // 別の接続に当たりえます。途中で失敗したときに、外したままの接続が
+        // プールに戻るのも防ぎます。
+        let tx = self.begin().await?;
         if self.driver() == Driver::Sqlite {
-            self.source.execute("pragma foreign_keys = on", &[]).await?;
+            // 外部キーの順番を気にせず消せるように、この中だけ確かめを後回しにする。
+            // `defer_foreign_keys` は確定のときに自動で元へ戻ります。
+            tx.statement("pragma defer_foreign_keys = on", &[]).await?;
         }
+        for sql in &statements {
+            tx.statement(sql, &[]).await?;
+        }
+        tx.commit().await?;
         Ok(tables)
     }
 
@@ -471,6 +493,42 @@ mod tests {
         });
         let sql = schema.to_sql().join("\n");
         assert!(sql.contains("primary key"), "{sql}");
+    }
+
+    #[test]
+    fn 札が取れない理由で文が変わる() {
+        // 札が実在するときだけ「実行中」と言う。
+        let held = Some(("host:1234".to_string(), "2026-10-06 00:00:00".to_string()));
+        let message = lock_error(held, "UNIQUE constraint failed").to_string();
+        assert!(
+            message.contains("別のプロセスがマイグレーションを実行中"),
+            "{message}"
+        );
+        assert!(message.contains("host:1234"), "{message}");
+        assert!(message.contains("migrate:unlock"), "{message}");
+
+        // 札が無いときは、元のエラーを添えて返す。
+        let message =
+            lock_error(None, "table migration_locks has no column named owner").to_string();
+        assert!(!message.contains("実行中です"), "{message}");
+        assert!(message.contains("has no column named owner"), "{message}");
+        assert!(message.contains(LOCK_TABLE), "{message}");
+    }
+
+    #[test]
+    fn 表を全部消す文は_if_exists_付きになる() {
+        // drop_all_tables はこの形の文を、1つのトランザクションの中で流す。
+        let mut schema = Schema::new(Driver::Sqlite);
+        for table in ["posts", "comments"] {
+            schema.drop_if_exists(table);
+        }
+        assert_eq!(
+            schema.to_sql(),
+            [
+                "drop table if exists \"posts\"".to_string(),
+                "drop table if exists \"comments\"".to_string(),
+            ]
+        );
     }
 
     #[test]

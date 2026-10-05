@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use crate::config_registry::app_config;
 use crate::error::Error;
-use crate::http::middleware::{Middlewares, Next};
-use crate::http::response::error_response;
+use crate::http::handler::{Erased, ErasedHandler};
+use crate::http::middleware::{Middleware, Middlewares, Next};
+use crate::http::response::{error_response, RenderOptions};
 use crate::http::routing::{Matched, RouteDef, Routes};
 use crate::http::{Request, Response};
 use crate::paths;
@@ -23,6 +24,8 @@ pub struct Application {
 
 struct Inner {
     routes: Routes,
+    /// 共通ミドルウェアだけの並び。404 や静的ファイルにも通すので、ルートの外に持ちます。
+    global: Arc<[Arc<dyn Middleware>]>,
     public_dir: PathBuf,
     /// `/storage/...` で配信する置き場所（`storage/app/public/`）。
     storage_public_dir: PathBuf,
@@ -93,42 +96,96 @@ impl Application {
     /// 1本のリクエストを処理する。ソケットを使わないので、テストからも呼べます。
     pub(crate) async fn handle(&self, mut req: Request) -> Response {
         let is_head = req.method() == "HEAD";
-        let options = crate::http::response::RenderOptions::new(self.inner.debug, wants_json(&req))
+        let options = RenderOptions::new(self.inner.debug, wants_json(&req))
             .with_exceptions(self.inner.exceptions.clone());
-        let response = match self.inner.routes.find(req.method(), req.path()) {
-            Matched::Found { def, params } => {
-                req.set_params(params);
-                req.set_route_name(def.name.clone());
-                let future = match &def.stack {
-                    Some(stack) => {
-                        Next::new(stack.clone(), def.handler.clone(), options.clone()).run(req)
-                    }
-                    None => def.handler.call(req),
-                };
-                // ハンドラのパニックを1リクエストに閉じ込める。
-                match tokio::spawn(future).await {
-                    Ok(result) => crate::http::response::render(result, options.clone()),
-                    Err(join_error) => {
-                        let error = Error::msg(panic_message(&join_error));
-                        tracing::error!("ハンドラがパニックしました: {error}");
-                        error_response(&error, options)
-                    }
-                }
+
+        // 共通ミドルウェアは、ルートに当たらなかったときも通します（Laravel と同じ）。
+        // そのため、ここでは並びを1本だけ回し、分岐は最内側のハンドラに寄せます。
+        let inner = self.innermost(&mut req, &options);
+        let future = Next::new(self.inner.global.clone(), inner, options.clone()).run(req);
+
+        // ミドルウェアとハンドラのパニックを1リクエストに閉じ込める。
+        // 並びの一番外で包むので、共通ミドルウェアの中で起きたものも 500 になります。
+        let response = match tokio::spawn(future).await {
+            Ok(result) => crate::http::response::render(result, options),
+            Err(join_error) => {
+                let error = Error::msg(panic_message(join_error, options.debug));
+                tracing::error!("ハンドラがパニックしました: {error}");
+                error_response(&error, options)
             }
-            Matched::MethodNotAllowed { mut allowed } => {
-                allowed.sort_unstable();
-                let error = Error::Http {
-                    status: 405,
-                    message: String::new(),
-                };
-                error_response(&error, options.clone()).with_header("allow", allowed.join(", "))
-            }
-            Matched::NotFound => self.serve_static_or_404(&req, options.clone()).await,
         };
+
         if is_head {
+            // 本文を空にする**前**に、元の長さを Content-Length にしておく。
+            // HEAD は「GET と同じヘッダーで、本文だけが無いもの」です。
+            // 204 と 304 は長さを付けてはいけないので、そのときだけ付けません。
+            let length = response.body().len();
+            let response = if matches!(response.status(), 204 | 304) {
+                response
+            } else {
+                response.with_header("content-length", length.to_string())
+            };
             response.with_body(Vec::new())
         } else {
             response
+        }
+    }
+
+    /// 最内側のハンドラを決める（ルート本体・405・静的ファイル・404）。
+    ///
+    /// パス引数とルート名は、ミドルウェアからも見えるように**ここで**載せます。
+    fn innermost(&self, req: &mut Request, options: &RenderOptions) -> Arc<dyn ErasedHandler> {
+        match self.inner.routes.find(req.method(), req.path()) {
+            Matched::Found { def, params } => {
+                let handler = def.handler.clone();
+                let stack = def.stack.clone();
+                let name = def.name.clone();
+                let options = options.clone();
+                req.set_params(params);
+                req.set_route_name(name);
+                req.set_matched(true);
+                Arc::new(Erased::new(move |req: Request| {
+                    let handler = handler.clone();
+                    let stack = stack.clone();
+                    let options = options.clone();
+                    async move {
+                        // ルートごとの並びは、共通の並びの内側で回す。
+                        match stack {
+                            Some(stack) => Next::new(stack, handler, options).run(req).await,
+                            None => handler.call(req).await,
+                        }
+                    }
+                }))
+            }
+            Matched::MethodNotAllowed { mut allowed } => {
+                // HEAD は GET で受けると決めているので、GET があれば HEAD も並べる。
+                if allowed.contains(&"GET") && !allowed.contains(&"HEAD") {
+                    allowed.push("HEAD");
+                }
+                allowed.sort_unstable();
+                let allow = allowed.join(", ");
+                let options = options.clone();
+                Arc::new(Erased::new(move |_req: Request| {
+                    let allow = allow.clone();
+                    let options = options.clone();
+                    async move {
+                        let error = Error::Http {
+                            status: 405,
+                            message: String::new(),
+                        };
+                        Ok(error_response(&error, options).with_header("allow", allow))
+                    }
+                }))
+            }
+            Matched::NotFound => {
+                let app = self.clone();
+                let options = options.clone();
+                Arc::new(Erased::new(move |req: Request| {
+                    let app = app.clone();
+                    let options = options.clone();
+                    async move { Ok(app.serve_static_or_404(&req, options).await) }
+                }))
+            }
         }
     }
 
@@ -212,11 +269,27 @@ fn wants_json(req: &Request) -> bool {
     })
 }
 
-fn panic_message(join_error: &tokio::task::JoinError) -> String {
+/// パニックしたハンドラの、見せる文を決める。
+///
+/// `panic!("...")` に書かれた文は `debug` のときだけ添えます。
+/// 本番で出すと、内部の事情をそのまま外へ見せてしまいます。
+fn panic_message(join_error: tokio::task::JoinError, debug: bool) -> String {
     if join_error.is_cancelled() {
         return "処理が打ち切られました".to_string();
     }
-    "ハンドラの中でパニックが起きました".to_string()
+    let base = "ハンドラの中でパニックが起きました";
+    if !debug || !join_error.is_panic() {
+        return base.to_string();
+    }
+    let payload = join_error.into_panic();
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    match detail {
+        Some(detail) => format!("{base}: {detail}"),
+        None => base.to_string(),
+    }
 }
 
 /// `Application` の組み立て。
@@ -292,14 +365,16 @@ impl ApplicationBuilder {
         }
         // 名前を実体に置き換え、ルートごとに1本の並びにして固定する。
         // ここで済ませておけば、リクエスト処理中は読むだけで済む。
+        // 共通のものは別に1本持つので、ルートの並びには入れない（二重に通さない）。
         if !self.middleware.is_empty() {
             for def in &mut defs {
-                let stack = self.middleware.stack_for(&def.middleware);
+                let stack = self.middleware.aliased_stack(&def.middleware);
                 if !stack.is_empty() {
                     def.stack = Some(stack);
                 }
             }
         }
+        let global = self.middleware.global_stack();
 
         // 聞く側を固定する。以後は読むだけ。
         crate::events::install(self.events);
@@ -307,6 +382,7 @@ impl ApplicationBuilder {
         Application {
             inner: Arc::new(Inner {
                 routes: Routes::build(defs),
+                global,
                 public_dir: paths::app_path("public"),
                 storage_public_dir: crate::storage::Storage::public_root(),
                 debug: app_config().debug,
@@ -348,5 +424,95 @@ impl Routing {
     pub fn health(mut self, path: &str) -> Self {
         self.health = Some(crate::http::routing::normalize(path));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Result as AppResult;
+    use crate::http::{Next, Route};
+
+    async fn ok() -> AppResult<Response> {
+        Ok(Response::text("ok"))
+    }
+
+    /// 共通ミドルウェアの見本（Laravel の AddPoweredBy に当たる形）。
+    async fn powered_by(req: Request, next: Next) -> AppResult<Response> {
+        let response = next.run(req).await?;
+        Ok(response
+            .with_header("x-powered-by", "bengara")
+            .with_added_header("x-mark", "global"))
+    }
+
+    /// ルートに付けるミドルウェアの見本。
+    async fn marker(req: Request, next: Next) -> AppResult<Response> {
+        let response = next.run(req).await?;
+        Ok(response.with_added_header("x-mark", "route"))
+    }
+
+    fn app() -> Application {
+        Application::configure()
+            .with_middleware(|m| m.append(powered_by).alias("marked", marker))
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/", ok);
+                    Route::post("/posts", ok);
+                    Route::get("/admin", ok).middleware("marked");
+                })
+            })
+            .create()
+    }
+
+    fn marks(response: &Response) -> Vec<&str> {
+        response
+            .headers()
+            .iter()
+            .filter(|(k, _)| k == "x-mark")
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn 共通ミドルウェアは404にも通る() {
+        let response = app().handle(Request::new("GET", "/missing")).await;
+        assert_eq!(response.status(), 404);
+        assert_eq!(response.header("x-powered-by"), Some("bengara"));
+    }
+
+    #[tokio::test]
+    async fn 共通ミドルウェアは405にも通る() {
+        let response = app().handle(Request::new("DELETE", "/")).await;
+        assert_eq!(response.status(), 405);
+        assert_eq!(response.header("x-powered-by"), Some("bengara"));
+        // HEAD は GET で受けるので、GET があれば HEAD も並べる。
+        assert_eq!(response.header("allow"), Some("GET, HEAD"));
+    }
+
+    #[tokio::test]
+    async fn 共通が外側でルートのものが内側() {
+        let response = app().handle(Request::new("GET", "/admin")).await;
+        assert_eq!(response.status(), 200);
+        // 戻りは内側から順に書き足されるので、ルートのものが先に並ぶ。
+        assert_eq!(marks(&response), vec!["route", "global"]);
+    }
+
+    #[tokio::test]
+    async fn 共通は二重に通らない() {
+        let response = app().handle(Request::new("GET", "/")).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(marks(&response), vec!["global"]);
+    }
+
+    #[tokio::test]
+    async fn headは本文を外してもcontent_lengthを残す() {
+        let response = app().handle(Request::new("HEAD", "/")).await;
+        assert_eq!(response.status(), 200);
+        assert!(response.body().is_empty(), "本文は返さない");
+        assert_eq!(
+            response.header("content-length"),
+            Some("2"),
+            "`ok` の 2 バイト"
+        );
     }
 }

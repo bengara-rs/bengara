@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use sqlx::sqlite::{
     SqliteArguments, SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
-    SqliteRow,
+    SqliteQueryResult, SqliteRow,
 };
 use sqlx::{Column, Row as SqlxRow, Sqlite, ValueRef};
 
@@ -47,18 +47,36 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
     Ok(Arc::new(SqliteBackend { pool }))
 }
 
+/// どの経路でも同じ設定を付ける。
+///
+/// `url` で指したときと `database` で指したときの挙動をそろえるためです。
+fn tune(options: SqliteConnectOptions, settings: &ConnectionConfig) -> SqliteConnectOptions {
+    let options = options
+        .foreign_keys(settings.foreign_keys)
+        // 他のプロセスが書いている間、すぐに諦めない。
+        .busy_timeout(Duration::from_secs(5));
+    if settings.is_memory() {
+        // メモリの上にはファイルが無いので、作成も WAL も要らない。
+        return options;
+    }
+    options
+        .create_if_missing(true)
+        // 読みと書きが同時に起きても待たされにくくする。
+        .journal_mode(SqliteJournalMode::Wal)
+}
+
 /// 接続の指定を組み立てる。
 fn build_options(settings: &ConnectionConfig) -> Result<SqliteConnectOptions> {
     if !settings.url.is_empty() {
-        return SqliteConnectOptions::from_str(&settings.url)
-            .map_err(|e| Error::msg(format!("接続文字列が読めません（{}）: {e}", settings.url)))
-            .map(|o| o.foreign_keys(settings.foreign_keys));
+        let options = SqliteConnectOptions::from_str(&settings.url)
+            .map_err(|e| Error::msg(format!("接続文字列が読めません（{}）: {e}", settings.url)))?;
+        return Ok(tune(options, settings));
     }
 
     if settings.is_memory() {
-        return Ok(SqliteConnectOptions::from_str("sqlite::memory:")
-            .map_err(|e| Error::msg(format!("メモリ上の SQLite を用意できません: {e}")))?
-            .foreign_keys(settings.foreign_keys));
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .map_err(|e| Error::msg(format!("メモリ上の SQLite を用意できません: {e}")))?;
+        return Ok(tune(options, settings));
     }
 
     // 相対パスは基準ディレクトリから見る。
@@ -77,13 +95,7 @@ fn build_options(settings: &ConnectionConfig) -> Result<SqliteConnectOptions> {
         }
     }
 
-    Ok(SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .foreign_keys(settings.foreign_keys)
-        // 読みと書きが同時に起きても待たされにくくする。
-        .journal_mode(SqliteJournalMode::Wal)
-        .busy_timeout(Duration::from_secs(5)))
+    Ok(tune(SqliteConnectOptions::new().filename(path), settings))
 }
 
 /// SQLite の接続プール。
@@ -112,10 +124,7 @@ impl Backend for SqliteBackend {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| failed(sql, e))?;
-            Ok(Affected {
-                rows: result.rows_affected(),
-                last_insert_id: Some(result.last_insert_rowid()),
-            })
+            Ok(affected(&result))
         })
     }
 
@@ -167,10 +176,7 @@ impl RawTx for SqliteTx {
                 .execute(&mut *self.tx)
                 .await
                 .map_err(|e| failed(sql, e))?;
-            Ok(Affected {
-                rows: result.rows_affected(),
-                last_insert_id: Some(result.last_insert_rowid()),
-            })
+            Ok(affected(&result))
         })
     }
 
@@ -192,6 +198,20 @@ impl RawTx for SqliteTx {
                 .await
                 .map_err(|e| Error::msg(format!("トランザクションを巻き戻せません: {e}")))
         })
+    }
+}
+
+/// 更新系の結果を `Affected` に直す。
+///
+/// `last_insert_rowid()` は接続ごとに「最後に入れた行」を覚えています。
+/// update / delete / DDL では意味が無く、行が入らなかったときは
+/// **同じ接続で前に入れた古い番号**が返ります。
+/// そのまま渡すと取り違えるので、1行も変わらなかったときは入れません。
+fn affected(result: &SqliteQueryResult) -> Affected {
+    let rows = result.rows_affected();
+    Affected {
+        rows,
+        last_insert_id: (rows > 0).then(|| result.last_insert_rowid()),
     }
 }
 
@@ -339,6 +359,46 @@ mod tests {
         tx.commit().await.unwrap();
         let rows = db.fetch_all("select * from t", &[]).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn 行が変わらないときは採番の番号を返さない() {
+        let db = memory().await;
+        db.execute("create table t (a integer)", &[]).await.unwrap();
+
+        let inserted = db
+            .execute("insert into t (a) values (1)", &[])
+            .await
+            .unwrap();
+        assert_eq!(inserted.last_insert_id, Some(1), "insert では番号が返る");
+
+        // 当てはまる行が無い update。古い rowid を返してはいけない。
+        let updated = db
+            .execute("update t set a = 2 where a = 99", &[])
+            .await
+            .unwrap();
+        assert_eq!(updated.rows, 0);
+        assert_eq!(updated.last_insert_id, None);
+
+        // DDL も同じ。
+        let created = db.execute("create table u (a integer)", &[]).await.unwrap();
+        assert_eq!(created.last_insert_id, None);
+    }
+
+    #[tokio::test]
+    async fn 接続文字列の経路も同じ設定を通る() {
+        // `url` で指したときも `database` のときと同じ道（tune）を通ること。
+        let settings = ConnectionConfig::sqlite("test", "ignored")
+            .url("sqlite::memory:")
+            .foreign_keys(false);
+        let db = connect(&settings).await.expect("つながる");
+        let rows = db.fetch_all("pragma foreign_keys", &[]).await.unwrap();
+        assert_eq!(rows[0].at(0), Some(&Value::Int(0)), "外した設定が効く");
+
+        let settings = ConnectionConfig::sqlite("test", "ignored").url("sqlite::memory:");
+        let db = connect(&settings).await.expect("つながる");
+        let rows = db.fetch_all("pragma foreign_keys", &[]).await.unwrap();
+        assert_eq!(rows[0].at(0), Some(&Value::Int(1)), "既定では効いている");
     }
 
     #[tokio::test]

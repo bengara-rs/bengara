@@ -4,13 +4,17 @@
 
 ## 準備
 
-**`APP_KEY` が要ります。** 署名に使います。
+**`APP_KEY` が要ります。** Cookie の署名に使います。
 
 ```sh
 cargo artisan key:generate
 ```
 
-`.env` に書き込まれます。 **この鍵を変えると、いまのセッションと署名付き URL は全部無効になります。**
+- `.env` に書き込まれます。
+- **64 文字以上が必須です。** 短いと、最初のリクエストでエラーになります。
+- **この鍵を変えると、いまのセッションと署名付き URL は全部無効になります。**
+
+くわしくは [configuration.md](configuration.md) の APP_KEY を見てください。
 
 `bootstrap/app.rs` に登録します。 **順番が大事です。**
 
@@ -39,11 +43,39 @@ Application::configure()
 **プロセスを2つ以上動かすときは、全プロセスが同じ `storage/` を見るようにしてください。**
 `memory` はプロセスをまたげないので本番では使えません。
 
+置き場所は `StartSession` に渡したものが、 **そのリクエストのセッションに結びつきます。**
+`req.session()` の操作は、必ずその置き場所に向かいます。
+
 期限切れは読むときに消えますが、ファイルを掃除するコマンドもあります。
 
 ```sh
 cargo artisan session:gc
 ```
+
+### ファイルの権限（Unix）
+
+| 対象                            | 権限   |
+|---------------------------------|--------|
+| セッションのファイル            | `0600` |
+| `storage/framework/sessions/`   | `0700` |
+
+同じサーバーにいる別の利用者から読まれないようにしています。
+Windows では設定しません（OS の既定のままです）。
+
+### 自分で置き場所を作る
+
+`SessionStore` を実装します。
+
+| メソッド                                 | 既定の実装 |
+|------------------------------------------|------------|
+| `read` / `write` / `destroy`             | なし。必ず書く |
+| `destroy_for_user(user_id)`              | あり       |
+| `destroy_for_user_except(user_id, keep)` | あり       |
+
+- 後ろの 2 つは **実装しなくても壊れません。** 警告を出して 0 を返します。
+- `Auth::logout_all_devices()` と `logout_other_devices()` がこれを呼びます
+  （[authentication.md](authentication.md)）。
+- 必要になったときに足してください。利用者で引く方法は置き場所ごとに違います。
 
 ## 使う
 
@@ -93,6 +125,12 @@ req.session().put("user_id", id);
 人のブラウザにあらかじめ ID を仕込んでおく攻撃（セッション固定）を防ぎます。
 ログアウトは `invalidate()` です。
 
+**`regenerate()` は CSRF トークンも作り直します。** Laravel と同じです。
+
+- ログイン前に受け取ったトークンは、ログイン後には使えません。
+- ログイン後にフォームを出すときは、トークンを取り直してください。
+- SPA では、ログインのあとにトークンを配るルートをもう一度呼びます。
+
 ## Cookie の既定
 
 | 属性       | 既定                          | 意味                                 |
@@ -141,13 +179,48 @@ pub async fn token(req: Request) -> Result<Response> {
 
 以後は `X-CSRF-TOKEN` ヘッダーに入れて送ります。
 
+### ルートが無いときは確かめない
+
+**ルートに当たらなかったリクエストでは、CSRF を確かめません。**
+無いページへの POST は 419 ではなく 404 のままです。
+
+共通のミドルウェアがルートの無いリクエストにも掛かる話は
+[middleware.md](middleware.md) にあります。
+
 ### 確かめない場所
 
 ```rust
-VerifyCsrfToken::new().except("/api/*").except("/webhook")
+VerifyCsrfToken::new().except("/webhook")
 ```
 
-末尾の `*` で前方一致になります。 **外から呼ばれる受け口（webhook）は、別の方法で相手を確かめてください。**
+末尾の `*` で前方一致になります。
+
+**外すのは、Cookie で認証しない API だけ**
+
+**`/api/*` のようにまとめて外さないでください。**
+
+- `StartSession` は **全ルートに掛かります**。だから `/api/*` も Cookie で認証されます。
+- そこで CSRF だけ外すと、 **別のサイトから Cookie に便乗して書き込めます。**
+- 支えているのは `SameSite=Lax` だけ、という状態になります。
+
+外してよいのは、次のどちらかです。
+
+| 外してよいもの                       | 相手の確かめ方           |
+|--------------------------------------|--------------------------|
+| トークンや署名で認証する API         | そのトークン・署名       |
+| 外から呼ばれる受け口（webhook）      | 署名の検証など、別の方法 |
+
+**外すときは、必ず別の方法で相手を確かめてください。**
+
+**`*` の直前は `/` にする**
+
+```rust
+.except("/admin*")     // /administration にも当たる
+.except("/admin/*")    // /admin/ の下だけ
+```
+
+`*` の直前が `/` でないと、思っていない所まで外れます。
+登録のときに **警告が出ます**（起動時に 1 回）。禁止はしていません。
 
 ## 自分で Cookie を扱う
 
@@ -171,9 +244,12 @@ Ok(response.with_cookie(&cookie))
 
 ## まだ無いもの
 
-DB / Redis への保存、1回だけ有効なトークン、認証（ログインそのもの）はありません。
+DB / Redis への保存と、1回だけ有効なトークンはありません。
 [backlog.md](backlog.md) を参照してください。
+
+ログインの仕組みは **あります**。[authentication.md](authentication.md) を見てください。
 
 ---
 
-関連: [middleware.md](middleware.md) / [validation.md](validation.md) / [configuration.md](configuration.md)
+関連: [middleware.md](middleware.md) / [validation.md](validation.md) /
+[configuration.md](configuration.md) / [authentication.md](authentication.md)

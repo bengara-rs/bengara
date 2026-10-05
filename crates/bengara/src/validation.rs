@@ -277,25 +277,23 @@ pub(crate) fn validate(input: &Input, rules: &[(&str, &str)]) -> Result<Validate
         let nullable = parsed.contains(&Rule::Nullable);
         let required = parsed.contains(&Rule::Required);
 
-        if is_blank {
-            if required {
-                errors.add(field, format!("{field} は必ず入力してください。"));
-                continue;
+        if is_blank && required {
+            errors.add(field, format!("{field} は必ず入力してください。"));
+            continue;
+        }
+        // 検査を飛ばすのは、**送られてこなかった**ときと `nullable` が付いているときだけ。
+        // 空文字は飛ばしません（Laravel と同じ）。飛ばすと `in` や `email` が素通りします。
+        if is_blank && (raw.is_none() || nullable) {
+            // 送られてきた項目と `nullable` の項目だけ、空文字として入れておく。
+            if raw.is_some() || nullable {
+                out.insert(field.to_string(), String::new());
             }
-            // 空でよい項目は、ここで打ち切る。空文字に長さや型の規則を当てない。
-            if nullable || raw.is_none() {
-                if raw.is_some() || nullable {
-                    out.insert(field.to_string(), String::new());
-                }
-                continue;
-            }
-            out.insert(field.to_string(), String::new());
             continue;
         }
 
         let before = errors.total();
         for rule in &parsed {
-            check(rule, field, value, input, &mut errors);
+            check(rule, field, value, input, &parsed, &mut errors);
         }
         if errors.total() == before {
             out.insert(field.to_string(), value.to_string());
@@ -309,7 +307,18 @@ pub(crate) fn validate(input: &Input, rules: &[(&str, &str)]) -> Result<Validate
     }
 }
 
-fn check(rule: &Rule, field: &str, value: &str, input: &Input, errors: &mut ValidationErrors) {
+/// 1つの規則を当てる。
+///
+/// `rules` はその項目に付いた規則の一覧です。`min` などが「値で比べるか、文字数で比べるか」を
+/// 決めるために要ります。
+fn check(
+    rule: &Rule,
+    field: &str,
+    value: &str,
+    input: &Input,
+    rules: &[Rule],
+    errors: &mut ValidationErrors,
+) {
     match rule {
         Rule::Required | Rule::Nullable => {}
 
@@ -377,8 +386,9 @@ fn check(rule: &Rule, field: &str, value: &str, input: &Input, errors: &mut Vali
             }
         }
 
-        // 数値なら値そのもの、そうでなければ文字数で比べる（Laravel と同じ考え方）。
-        Rule::Min(min) => match measure(value) {
+        // `numeric` か `integer` が付いているときだけ値そのもの、
+        // そうでなければ文字数で比べる（Laravel と同じ考え方）。
+        Rule::Min(min) => match measure(value, rules) {
             Measure::Number(n) if n < *min => {
                 errors.add(
                     field,
@@ -393,7 +403,7 @@ fn check(rule: &Rule, field: &str, value: &str, input: &Input, errors: &mut Vali
             }
             _ => {}
         },
-        Rule::Max(max) => match measure(value) {
+        Rule::Max(max) => match measure(value, rules) {
             Measure::Number(n) if n > *max => {
                 errors.add(
                     field,
@@ -408,7 +418,7 @@ fn check(rule: &Rule, field: &str, value: &str, input: &Input, errors: &mut Vali
             }
             _ => {}
         },
-        Rule::Between(lo, hi) => match measure(value) {
+        Rule::Between(lo, hi) => match measure(value, rules) {
             Measure::Number(n) if n < *lo || n > *hi => {
                 errors.add(
                     field,
@@ -490,11 +500,23 @@ enum Measure {
     Length(usize),
 }
 
-/// 数値として読めれば値、読めなければ文字数で測る。
-fn measure(value: &str) -> Measure {
-    match value.parse::<f64>() {
-        Ok(n) if n.is_finite() => Measure::Number(n),
-        _ => Measure::Length(value.chars().count()),
+/// 値で測るか、文字数で測るかを決める。
+///
+/// `numeric` か `integer` が付いているときだけ値で測ります（Laravel と同じ）。
+/// 付いていない項目を値で測ると、`password=9` が `min:8` を通り、
+/// `password=12345678` が `max:72` で落ちます。
+fn measure(value: &str, rules: &[Rule]) -> Measure {
+    let by_value = rules
+        .iter()
+        .any(|rule| matches!(rule, Rule::Numeric | Rule::Integer));
+    let number = if by_value {
+        value.parse::<f64>().ok().filter(|n| n.is_finite())
+    } else {
+        None
+    };
+    match number {
+        Some(n) => Measure::Number(n),
+        None => Measure::Length(value.chars().count()),
     }
 }
 
@@ -593,11 +615,12 @@ mod tests {
     }
 
     #[test]
-    fn minとmaxは数値なら値文字なら長さで見る() {
-        // 数値として読めるので値で比べる。
-        assert!(!errors_of(&input(&[("n", "3")]), &[("n", "min:5")]).is_empty());
-        assert!(errors_of(&input(&[("n", "7")]), &[("n", "min:5")]).is_empty());
-        // 数値として読めないので文字数で比べる。
+    fn minとmaxはnumericかintegerが付いていれば値で見る() {
+        // 値で比べる。
+        assert!(!errors_of(&input(&[("n", "3")]), &[("n", "integer|min:5")]).is_empty());
+        assert!(errors_of(&input(&[("n", "7")]), &[("n", "integer|min:5")]).is_empty());
+        assert!(errors_of(&input(&[("n", "7.5")]), &[("n", "numeric|min:5")]).is_empty());
+        // 付いていなければ文字数で比べる。
         assert!(errors_of(&input(&[("s", "abcdef")]), &[("s", "min:5")]).is_empty());
         assert!(!errors_of(&input(&[("s", "abc")]), &[("s", "min:5")]).is_empty());
         // 日本語は見た目の文字数で数える。
@@ -606,11 +629,51 @@ mod tests {
     }
 
     #[test]
+    fn 数値に見える文字列は文字数で測る() {
+        // パスワードは文字数で測る。値で測ると 9 が min:8 を通ってしまう。
+        assert!(
+            !errors_of(
+                &input(&[("password", "9")]),
+                &[("password", "required|min:8|max:72")]
+            )
+            .is_empty(),
+            "1 文字なので落ちる"
+        );
+        assert!(
+            errors_of(
+                &input(&[("password", "12345678")]),
+                &[("password", "required|min:8|max:72")]
+            )
+            .is_empty(),
+            "8 文字なので通る"
+        );
+        // 題名も同じ。桁数の多い数字でも 50 文字には届かない。
+        assert!(errors_of(&input(&[("title", "9999999")]), &[("title", "max:50")]).is_empty());
+        // integer が付いていれば値で測る。
+        assert!(!errors_of(&input(&[("n", "5")]), &[("n", "integer|min:8")]).is_empty());
+    }
+
+    #[test]
     fn betweenとsize() {
-        assert!(errors_of(&input(&[("n", "5")]), &[("n", "between:1,10")]).is_empty());
-        assert!(!errors_of(&input(&[("n", "11")]), &[("n", "between:1,10")]).is_empty());
+        assert!(errors_of(&input(&[("n", "5")]), &[("n", "integer|between:1,10")]).is_empty());
+        assert!(!errors_of(&input(&[("n", "11")]), &[("n", "integer|between:1,10")]).is_empty());
+        // 規則が無ければ文字数で見る（`11` は 2 文字なので通る）。
+        assert!(errors_of(&input(&[("s", "11")]), &[("s", "between:1,10")]).is_empty());
         assert!(errors_of(&input(&[("s", "abc")]), &[("s", "size:3")]).is_empty());
         assert!(!errors_of(&input(&[("s", "ab")]), &[("s", "size:3")]).is_empty());
+    }
+
+    #[test]
+    fn 空文字にも規則を当てる() {
+        // 空文字は「送られてきた値」なので検査する。
+        assert!(!errors_of(&input(&[("role", "")]), &[("role", "in:admin,user")]).is_empty());
+        assert!(!errors_of(&input(&[("email", "")]), &[("email", "email")]).is_empty());
+        // nullable が付いていれば飛ばす。
+        assert!(errors_of(&input(&[("age", "")]), &[("age", "nullable|integer")]).is_empty());
+        // 送られてこなければ、nullable が無くても飛ばす（従来どおり）。
+        assert!(errors_of(&input(&[]), &[("role", "in:admin,user")]).is_empty());
+        let ok = validate(&input(&[]), &[("role", "in:admin,user")]).unwrap();
+        assert!(!ok.has("role"), "送られてこなかった項目は入らない");
     }
 
     #[test]

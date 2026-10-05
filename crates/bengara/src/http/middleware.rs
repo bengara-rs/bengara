@@ -148,13 +148,23 @@ impl Middlewares {
         }
     }
 
-    /// ルート1本分の並びを組み立てる。共通のものが先、ルートのものが後。
+    /// 共通のミドルウェアだけの並び。
+    ///
+    /// 404・405・静的ファイルにも通すので、ルートの外側で1本だけ回します。
+    pub(crate) fn global_stack(&self) -> Arc<[Arc<dyn Middleware>]> {
+        self.global.clone().into()
+    }
+
+    /// 名前で指定された分だけの並び（共通のものは**入りません**）。
+    ///
+    /// 共通のものは `global_stack()` としてルートの外側で回すので、ここでは足しません。
+    /// 通る順は「共通 → ルートのもの」のままです。
     ///
     /// # パニック
     ///
     /// 登録していない名前が使われていると、起動時にパニックします。
-    pub(crate) fn stack_for(&self, names: &[String]) -> Arc<[Arc<dyn Middleware>]> {
-        let mut stack: Vec<Arc<dyn Middleware>> = self.global.clone();
+    pub(crate) fn aliased_stack(&self, names: &[String]) -> Arc<[Arc<dyn Middleware>]> {
+        let mut stack: Vec<Arc<dyn Middleware>> = Vec::with_capacity(names.len());
         for name in names {
             let Some(found) = self.aliases.get(name) else {
                 panic!(
@@ -191,6 +201,15 @@ mod tests {
 
     fn taken(log: &Log) -> Vec<&'static str> {
         log.lock().unwrap().clone()
+    }
+
+    /// 1本のリクエストが通る並び（共通 → ルートのもの）。
+    ///
+    /// 実際は共通の分をルートの外側で回しますが、通る順は同じです。
+    fn stack_for(mw: &Middlewares, names: &[String]) -> Arc<[Arc<dyn Middleware>]> {
+        let mut stack: Vec<Arc<dyn Middleware>> = mw.global_stack().to_vec();
+        stack.extend(mw.aliased_stack(names).iter().cloned());
+        stack.into()
     }
 
     /// 「入る」「出る」を記録して、ヘッダーを足すだけのミドルウェアを作る。
@@ -247,7 +266,7 @@ mod tests {
         let mw = Middlewares::default()
             .append(recorder(&log, "first"))
             .append(recorder(&log, "second"));
-        let response = run(mw.stack_for(&[]), &log).await;
+        let response = run(stack_for(&mw, &[]), &log).await;
         assert_eq!(
             taken(&log),
             vec!["first", "second", "handler", "out", "out"]
@@ -262,7 +281,7 @@ mod tests {
         let mw = Middlewares::default()
             .append(recorder(&log, "first"))
             .append(stopper(&log));
-        let response = run(mw.stack_for(&[]), &log).await;
+        let response = run(stack_for(&mw, &[]), &log).await;
         // 打ち切られるので handler は通らない。外側の first は戻りを処理できる。
         assert_eq!(taken(&log), vec!["first", "stop", "out"]);
         assert_eq!(response.status(), 403);
@@ -275,7 +294,7 @@ mod tests {
         let mw = Middlewares::default()
             .append(recorder(&log, "global"))
             .alias("named", recorder(&log, "named"));
-        run(mw.stack_for(&["named".to_string()]), &log).await;
+        run(stack_for(&mw, &["named".to_string()]), &log).await;
         assert_eq!(
             taken(&log),
             vec!["global", "named", "handler", "out", "out"]
@@ -288,7 +307,7 @@ mod tests {
         let mw = Middlewares::default()
             .append(recorder(&log, "later"))
             .prepend(recorder(&log, "earlier"));
-        run(mw.stack_for(&[]), &log).await;
+        run(stack_for(&mw, &[]), &log).await;
         assert_eq!(
             taken(&log),
             vec!["earlier", "later", "handler", "out", "out"]
@@ -300,7 +319,7 @@ mod tests {
         let log = log();
         let mw = Middlewares::default().alias("named", recorder(&log, "named"));
         let names = vec!["named".to_string(), "named".to_string()];
-        run(mw.stack_for(&names), &log).await;
+        run(stack_for(&mw, &names), &log).await;
         assert_eq!(taken(&log), vec!["named", "named", "handler", "out", "out"]);
     }
 
@@ -308,7 +327,7 @@ mod tests {
     fn 何も登録しなければ空() {
         let mw = Middlewares::default();
         assert!(mw.is_empty());
-        assert!(mw.stack_for(&[]).is_empty());
+        assert!(stack_for(&mw, &[]).is_empty());
     }
 
     #[test]
@@ -316,7 +335,7 @@ mod tests {
     fn 知らない名前はパニックする() {
         let log = log();
         let mw = Middlewares::default().alias("admin", recorder(&log, "admin"));
-        let _ = mw.stack_for(&["missing".to_string()]);
+        let _ = mw.aliased_stack(&["missing".to_string()]);
     }
 
     #[test]

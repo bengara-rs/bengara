@@ -4,6 +4,11 @@
 //! - Windows では実行中の exe を上書きできないため、別の場所にコピーしてから起動します。
 //! - 変更の監視は更新時刻の見張り（既定 0.4 秒ごと）で行います。OS ごとの通知の仕組みに
 //!   頼らないので、依存クレートが増えず、どの OS でも同じように動きます。
+//! - 見張るのは**ビルドに影響するファイルだけ**です（`.rs` と `resources/lang/*.toml`）。
+//!   データベースのファイルは、つないだだけで更新時刻が変わるため見張りません。
+//!   `public/` も見張りません（デバッグビルドではディスクから読むので、再ビルドが要りません）。
+//! - **`serve` は本体を即座に止めます。** `APP_SHUTDOWN_TIMEOUT` の猶予を確かめたいときは、
+//!   `serve` を使わずに本体を直接動かしてください（`cargo run -- serve`）。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,18 +20,36 @@ use super::cargo_toml::CargoToml;
 use crate::error::{Error, Result};
 
 /// 見張るディレクトリ。
+///
+/// `public/` は入れません。デバッグビルドでは `public/` をディスクから読むので、
+/// CSS を1行直すたびに再ビルドと再起動が走るのは損だからです。
 const WATCH_DIRS: &[&str] = &[
     "app",
     "bootstrap",
     "config",
     "database",
-    "public",
     "resources",
     "routes",
 ];
 
 /// 見張るファイル。
 const WATCH_FILES: &[&str] = &[".env", "Cargo.toml", "build.rs", "main.rs", "artisan.rs"];
+
+/// 掘らないディレクトリの名前。重いものと、ビルドに関係ないもの。
+const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "storage"];
+
+/// 見張らないファイルの終わり方。
+///
+/// データベースのファイルは、本体がつないだだけで `-wal` と `-shm` の更新時刻が
+/// 変わります。見張ると、リクエストのたびに再起動してしまいます。
+const DATABASE_SUFFIXES: &[&str] = &[
+    ".sqlite",
+    ".sqlite-wal",
+    ".sqlite-shm",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+];
 
 /// 見張る間隔。
 const POLL: Duration = Duration::from_millis(400);
@@ -46,7 +69,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
         .map_err(|e| Error::msg(format!("{} を作れません: {e}", run_dir.display())))?;
     clean_old_copies(&run_dir);
 
-    println!("bengara serve: {name} を見張ります（Ctrl+C で終了）\n");
+    println!("bengara serve: {name} を見張ります（Ctrl+C で終了）");
+    println!(
+        "serve は本体を即座に止めます。停止の猶予（APP_SHUTDOWN_TIMEOUT）を確かめるときは、\n\
+         本体を直接動かしてください。\n"
+    );
 
     let mut generation: u32 = 0;
     let mut child: Option<Child> = None;
@@ -99,8 +126,17 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
         match build(root, &name) {
             Ok(exe) => {
                 stop(&mut child);
+                // 止めた後なら、前の世代のコピーを消せる（Windows でも）。
+                // 消せないものは次の起動時に片付けるので、ここでは気にしない。
+                clean_old_copies(&run_dir);
                 generation += 1;
-                child = Some(start(root, &run_dir, &exe, &name, generation, args)?);
+                // 2回目以降の失敗で見張りを終わらせない。直せばまた試せる。
+                match start(root, &run_dir, &exe, &name, generation, args) {
+                    Ok(started) => child = Some(started),
+                    Err(error) => eprintln!(
+                        "起動できませんでした: {error}\nファイルを変更すると、もう一度試します。\n"
+                    ),
+                }
             }
             Err(error) => {
                 if child.is_some() {
@@ -192,6 +228,9 @@ fn start(
 }
 
 /// 動いている本体を止める。
+///
+/// **即座に止めます**（SIGKILL / TerminateProcess）。処理中のリクエストは待ちません。
+/// `APP_SHUTDOWN_TIMEOUT` の猶予を確かめたいときは、本体を直接動かしてください。
 fn stop(child: &mut Option<Child>) {
     let Some(mut running) = child.take() else {
         return;
@@ -203,7 +242,10 @@ fn stop(child: &mut Option<Child>) {
     let _ = running.wait();
 }
 
-/// 前回の `serve` が残したコピーを消す（できる範囲で）。
+/// 残っているコピーを消す（できる範囲で）。
+///
+/// 起動時と、本体を止めた直後に呼びます。動いている本体のコピーは消せませんが、
+/// そのときは黙って残します（次の機会に消えます）。
 fn clean_old_copies(run_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(run_dir) else {
         return;
@@ -236,20 +278,71 @@ fn walk(dir: &Path, map: &mut BTreeMap<PathBuf, SystemTime>) {
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // 隠しファイルとビルド結果は見張らない。
-        if name.starts_with('.') || name == "target" {
-            continue;
-        }
         match entry.file_type() {
-            Ok(file_type) if file_type.is_dir() => walk(&path, map),
+            Ok(file_type) if file_type.is_dir() => {
+                if !skip_dir(&name) {
+                    walk(&path, map);
+                }
+            }
             Ok(_) => {
-                if let Some(time) = modified(&path) {
-                    map.insert(path, time);
+                if is_watched_file(&path) {
+                    if let Some(time) = modified(&path) {
+                        map.insert(path, time);
+                    }
                 }
             }
             Err(_) => {}
         }
     }
+}
+
+/// 掘らないディレクトリか。隠しディレクトリと、重いもの。
+fn skip_dir(name: &str) -> bool {
+    name.starts_with('.') || SKIP_DIRS.contains(&name)
+}
+
+/// ビルドに影響するファイルか。
+///
+/// `.rs` と、`resources/lang/` の `.toml` だけを見張ります。
+/// データベースのファイルは、`.rs` でなくても念のため名前でも外します。
+fn is_watched_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    // 隠しファイルと、エディタが作る一時ファイルは見張らない。
+    if name.starts_with('.') || is_database_file(name) {
+        return false;
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rs") => true,
+        Some("toml") => in_lang_dir(path),
+        _ => false,
+    }
+}
+
+/// データベースのファイルか（`-wal` と `-shm` を含む）。
+fn is_database_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    DATABASE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// `resources/lang/` の直下にあるか。
+fn in_lang_dir(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let is_lang = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "lang");
+    let in_resources = parent
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "resources");
+    is_lang && in_resources
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -282,5 +375,48 @@ mod tests {
         let stdout =
             r#"{"reason":"compiler-artifact","target":{"name":"myapp"},"executable":null}"#;
         assert_eq!(executable_from(stdout, "myapp"), None);
+    }
+
+    #[test]
+    fn ソースと言語ファイルだけを見張る() {
+        assert!(is_watched_file(Path::new(
+            "app/Http/Controllers/HomeController.rs"
+        )));
+        assert!(is_watched_file(Path::new(
+            "database/migrations/2026_01_01_000000_create_users_table.rs"
+        )));
+        assert!(is_watched_file(Path::new("resources/lang/ja.toml")));
+        // 言語の置き場所の外にある toml は見張らない。
+        assert!(!is_watched_file(Path::new("config/other.toml")));
+        assert!(!is_watched_file(Path::new("resources/lang/sub/ja.toml")));
+        // ビルドに関係ないもの。
+        assert!(!is_watched_file(Path::new("public/css/app.css")));
+        assert!(!is_watched_file(Path::new("app/.hidden.rs")));
+    }
+
+    #[test]
+    fn データベースのファイルは見張らない() {
+        for name in [
+            "database/database.sqlite",
+            "database/database.sqlite-wal",
+            "database/database.sqlite-shm",
+            "database/app.db",
+            "database/app.db-wal",
+            "database/app.db-shm",
+            "database/DATABASE.SQLITE-WAL",
+        ] {
+            assert!(!is_watched_file(Path::new(name)), "{name} を見張っています");
+        }
+    }
+
+    #[test]
+    fn 重いディレクトリは掘らない() {
+        assert!(skip_dir("target"));
+        assert!(skip_dir("node_modules"));
+        assert!(skip_dir(".git"));
+        assert!(skip_dir(".idea"));
+        assert!(skip_dir("storage"));
+        assert!(!skip_dir("Controllers"));
+        assert!(!skip_dir("migrations"));
     }
 }

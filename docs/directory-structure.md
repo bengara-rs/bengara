@@ -105,6 +105,23 @@ myapp/
 中身を書き換えると `cargo build` が走り直します。詳しくは
 [localization.md](localization.md) にあります。
 
+### `storage/` の約束
+
+実行時の書き込み先です。中身はリポジトリに入れません。`storage:init` が 7 つ作ります。
+
+| ディレクトリ                   | 置かれるもの               |
+|--------------------------------|----------------------------|
+| `storage/app`                  | アプリが置くファイル       |
+| `storage/app/public`           | `/storage/...` で配信する分 |
+| `storage/framework`            | 下の 3 つの親              |
+| `storage/framework/cache`      | キャッシュ                 |
+| `storage/framework/schedule`   | 定期処理の前回時刻         |
+| `storage/framework/sessions`   | セッション                 |
+| `storage/logs`                 | ログ                       |
+
+`init` も同じ一覧を使います。本番では `./myapp storage:init` を 1 回流します
+（[deployment.md](deployment.md)）。
+
 ### `routes/console.rs` の約束
 
 `pub fn schedule(s: &mut Schedule)` を書きます。無ければ定期処理はありません。
@@ -128,8 +145,16 @@ myapp/
 - 自動検出は **パニックしません**。モジュール名にできないファイル名や、同じディレクトリでの名前の衝突は、
   コンパイルエラー（`compile_error!`）として出ます。メッセージの通りに直してください。
 - ファイルを足したのに見つからないときは、`build.rs` が走り直していない可能性があります。
-  `cargo artisan serve` は `app bootstrap config database public resources routes` の中と、
-  `.env Cargo.toml build.rs main.rs artisan.rs` を見張っているので、通常は自動で拾います。
+  `cargo artisan serve` が見張るのは、ビルドに影響するファイルだけです。
+
+| 見張る                                                | 見張らない             |
+|-------------------------------------------------------|------------------------|
+| `.rs`                                                 | `public/` の中身       |
+| `resources/lang/` 直下の `*.toml`                     | 上以外の `.toml`       |
+| `.env` `Cargo.toml` `build.rs` `main.rs` `artisan.rs` | データベースのファイル |
+
+  `public/` を直してもビルドは走りません。デバッグビルドはディスクを読むので、
+  そのまま反映されます。
 
 ## 関連
 

@@ -406,9 +406,7 @@ fn print_help(hooks: Hooks) {
 周辺機能のコマンド
 {extras}
 
-開発用のコマンド（init と、serve の自動再ビルド）は artisan 側です。
-
-  cargo artisan list
+開発用のコマンド（serve の自動再ビルドなど）は `cargo artisan list` に出ます。
 "
     );
     // アプリが app/Console/Commands/ に置いたものも出す。

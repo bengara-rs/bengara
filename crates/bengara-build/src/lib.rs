@@ -278,7 +278,22 @@ impl Generator {
                 }
             };
             match toml::parse(&text) {
-                Ok(pairs) => self.lang.push((locale, pairs)),
+                Ok(mut pairs) => {
+                    // 鍵の昇順（`str` の辞書順）に並べる。実行時はこの並びを前提に引きます。
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    // 同じ鍵が2回書かれていたら教える。本来の TOML はエラーだし、
+                    // 黙って先に書いた方が勝つと、直し方が分からないため。
+                    for pair in pairs.windows(2) {
+                        if pair[0].0 == pair[1].0 {
+                            self.errors.push(format!(
+                                "{} に鍵 `{}` が2回書かれています",
+                                path.display(),
+                                pair[0].0
+                            ));
+                        }
+                    }
+                    self.lang.push((locale, pairs));
+                }
                 Err(reason) => self.errors.push(format!("{} の {reason}", path.display())),
             }
         }
@@ -308,16 +323,23 @@ impl Generator {
         let mut taken: BTreeMap<String, String> = BTreeMap::new();
         // `database/migrations/` と `database/seeders/` の中身。
         // どちらも (ファイル名, 平らなモジュール名) で覚える。
-        let in_database = target.name == "database" && depth == 1;
+        //
+        // 置き場所は、深さだけでなく**親の名前まで**確かめます。`finish()` が
+        // `crate::database::migrations::MIGRATIONS` のような決まったパスを参照するので、
+        // `app/Foo/Commands/` のような別の場所で立ってしまうと解決できなくなります。
+        let in_database =
+            target.name == "database" && depth == 1 && parents_are(dir, &["database"]);
         let in_migrations = in_database && dir_name.eq_ignore_ascii_case("migrations");
         let in_seeders = in_database && dir_name.eq_ignore_ascii_case("seeders");
         let in_factories = in_database && dir_name.eq_ignore_ascii_case("factories");
         // `app/Jobs/` と `app/Console/Commands/` も、関数を置く場所として扱う。
-        let in_jobs = target.name == "app" && depth == 1 && dir_name.eq_ignore_ascii_case("jobs");
-        let in_listeners =
-            target.name == "app" && depth == 1 && dir_name.eq_ignore_ascii_case("listeners");
-        let in_commands =
-            target.name == "app" && depth == 2 && dir_name.eq_ignore_ascii_case("commands");
+        let in_app = target.name == "app" && depth == 1 && parents_are(dir, &["app"]);
+        let in_jobs = in_app && dir_name.eq_ignore_ascii_case("jobs");
+        let in_listeners = in_app && dir_name.eq_ignore_ascii_case("listeners");
+        let in_commands = target.name == "app"
+            && depth == 2
+            && dir_name.eq_ignore_ascii_case("commands")
+            && parents_are(dir, &["console", "app"]);
         let function_dir = in_seeders || in_factories || in_jobs || in_commands || in_listeners;
         let mut migrations: Vec<(String, String)> = Vec::new();
         let mut seeders: Vec<(String, String)> = Vec::new();
@@ -340,7 +362,19 @@ impl Generator {
                 continue;
             }
 
-            if !is_rust_file(&path) || skip_file(&stem) {
+            if !is_rust_file(&path) {
+                continue;
+            }
+            if skip_file(&stem) {
+                // `mod.rs` は Rust の癖で意味を持つ名前なので取り込みません。
+                // 黙って無視すると、置いた人には何も伝わらないので知らせます。
+                if stem == "mod" {
+                    warn(&format!(
+                        "{} は取り込みません。bengara はファイル名をそのままモジュール名にするので、\
+                         mod.rs は要りません",
+                        path.display()
+                    ));
+                }
                 continue;
             }
             let Some(module) = self.module_name(&stem, &path) else {
@@ -355,6 +389,9 @@ impl Generator {
             } else {
                 ""
             };
+            // 平らな名前はエラーの文やバックトレースに出ます。元のファイルを
+            // すぐ引けるように、宣言の直前に元のパスをコメントで添えます。
+            let _ = writeln!(self.flat, "// {}", path.display());
             let _ = writeln!(
                 self.flat,
                 "{cfg}#[path = {:?}] #[doc(hidden)] #[allow(dead_code)] pub mod {flat};",
@@ -365,23 +402,40 @@ impl Generator {
             // PSR-4 と同じ約束。先頭が大文字のファイルは、同じ名前の型を公開する。
             // ただし seeders と factories は「関数を置く場所」なので、型は探さない。
             if target.reexport && starts_upper(&stem) && !function_dir {
-                let _ = writeln!(self.tree, "pub use crate::{flat}::{stem};");
+                // ファイル名をそのまま型の名前として書くので、識別子に使えるか確かめる。
+                // `My-Model.rs` はモジュール名にはできるが、型の名前にはできない。
+                if is_ident(&stem) {
+                    let _ = writeln!(self.tree, "pub use crate::{flat}::{stem};");
+                } else {
+                    self.errors.push(format!(
+                        "{} の名前は Rust の型の名前に使えません。`-` や空白を使わず、\
+                         英数字と `_` だけにしてください",
+                        path.display()
+                    ));
+                }
             }
             // database/migrations/ の、日付で始まるファイルはマイグレーション。
-            if in_migrations && starts_digit(&stem) {
-                migrations.push((stem.clone(), flat.clone()));
+            if in_migrations {
+                if starts_digit(&stem) {
+                    migrations.push((stem.clone(), flat.clone()));
+                } else {
+                    warn(&format!(
+                        "{} は日付で始まらないので、マイグレーションの一覧に入りません",
+                        path.display()
+                    ));
+                }
             }
             // database/seeders/ の、大文字で始まるファイルはシーダー。
-            if in_seeders && starts_upper(&stem) {
-                seeders.push((stem.clone(), flat.clone()));
+            if in_seeders {
+                collect_upper(&path, &stem, "シーダー", &mut seeders, &flat);
             }
             // app/Jobs/ の、大文字で始まるファイルはジョブ。
-            if in_jobs && starts_upper(&stem) {
-                jobs.push((stem.clone(), flat.clone()));
+            if in_jobs {
+                collect_upper(&path, &stem, "ジョブ", &mut jobs, &flat);
             }
             // app/Console/Commands/ の、大文字で始まるファイルは自作コマンド。
-            if in_commands && starts_upper(&stem) {
-                commands.push((stem.clone(), flat.clone()));
+            if in_commands {
+                collect_upper(&path, &stem, "コマンド", &mut commands, &flat);
             }
             // routes/console.rs があれば、定期処理の登録を呼ぶ。
             if target.name == "routes" && depth == 0 && stem == "console" {
@@ -481,13 +535,20 @@ impl Generator {
         name.push('_');
         name.push_str(module);
 
-        // 万一ぶつかったら連番を足す。
+        // 万一ぶつかったら連番を足す。黙って変えると、エラーの文に出た名前から
+        // どのファイルか分からなくなるので、1行知らせる。
         let count = self.taken_flat.entry(name.clone()).or_insert(0);
         *count += 1;
         if *count == 1 {
             name
         } else {
-            format!("{name}_{count}")
+            let unique = format!("{name}_{count}");
+            warn(&format!(
+                "平らなモジュール名 `{name}` が重なったので `{unique}` にしました。\
+                 `app/Http/user.rs` と `app/HttpUser.rs` のように、\
+                 つなげると同じ名前になるファイルがあります"
+            ));
+            unique
         }
     }
 
@@ -552,11 +613,18 @@ impl Generator {
     /// static __BENGARA_LANG_JA: &[(&str, &str)] = &[("messages.welcome", "ようこそ")];
     /// static __BENGARA_LANG: ::bengara::LangTable = &[("ja", __BENGARA_LANG_JA)];
     /// ```
+    ///
+    /// **並びの約束**：鍵の表は鍵の昇順、言語の表は言語名の昇順です。
+    /// 実行時の引き当て（`lang.rs`）がこの並びを前提にします。
+    /// 鍵の並べ替えは `read_lang` で、言語の並べ替えはここで行います。
     fn lang_code(&self) -> String {
         let mut code = String::new();
         let mut locales = Vec::new();
 
-        for (index, (locale, pairs)) in self.lang.iter().enumerate() {
+        let mut sorted: Vec<&(String, Vec<(String, String)>)> = self.lang.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (index, (locale, pairs)) in sorted.into_iter().enumerate() {
             let name = format!("__BENGARA_LANG_{index}");
             let entries = pairs
                 .iter()
@@ -705,6 +773,57 @@ fn skip_dir(name: &str) -> bool {
     name.starts_with('.') || name == "target"
 }
 
+/// 大文字で始まるファイルだけを一覧に入れる。外れたものは警告で知らせる。
+///
+/// 黙って外すと `cargo artisan migrate` などが「何もしない」だけになり、
+/// 理由がどこにも出ないためです（取り込み自体はできているので、ビルドは止めません）。
+fn collect_upper(
+    path: &Path,
+    stem: &str,
+    kind: &str,
+    list: &mut Vec<(String, String)>,
+    flat: &str,
+) {
+    if starts_upper(stem) {
+        list.push((stem.to_string(), flat.to_string()));
+    } else {
+        warn(&format!(
+            "{} は大文字で始まらないので、{kind}の一覧に入りません",
+            path.display()
+        ));
+    }
+}
+
+/// 上のディレクトリの名前が、与えた並び（下から上へ）と一致するか。
+///
+/// `app/Console/Commands` なら `parents_are(dir, &["console", "app"])` が真になります。
+/// 大文字と小文字は区別しません。
+fn parents_are(dir: &Path, names: &[&str]) -> bool {
+    let mut current = dir;
+    for name in names {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        match parent.file_name().and_then(|n| n.to_str()) {
+            Some(found) if found.eq_ignore_ascii_case(name) => current = parent,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Rust の識別子として使える名前か（型名の再エクスポートに使う）。
+fn is_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_') && !is_keyword(name)
+}
+
 fn starts_upper(stem: &str) -> bool {
     stem.starts_with(|c: char| c.is_ascii_uppercase())
 }
@@ -776,6 +895,76 @@ mod tests {
     #[test]
     fn 連続する大文字は1文字ずつ区切る() {
         assert_eq!(to_module_name("API").unwrap(), "a_p_i");
+    }
+
+    #[test]
+    fn 置き場所は親の名前まで確かめる() {
+        assert!(parents_are(
+            Path::new("app/Console/Commands"),
+            &["console", "app"]
+        ));
+        // app/Foo/Commands/ は自作コマンドの置き場所ではない。
+        assert!(!parents_are(
+            Path::new("app/Foo/Commands"),
+            &["console", "app"]
+        ));
+        assert!(parents_are(Path::new("database/migrations"), &["database"]));
+        assert!(!parents_are(Path::new("tests/migrations"), &["database"]));
+        assert!(!parents_are(Path::new("migrations"), &["database"]));
+    }
+
+    #[test]
+    fn 型の名前に使える名前だけを見分ける() {
+        assert!(is_ident("HomeController"));
+        assert!(is_ident("User2"));
+        assert!(!is_ident("My-Model"));
+        assert!(!is_ident("My Model"));
+        assert!(!is_ident("2Model"));
+        assert!(!is_ident("type"));
+        assert!(!is_ident(""));
+    }
+
+    #[test]
+    fn 言語の表は言語名の昇順になる() {
+        let mut generator = Generator::default();
+        generator.lang.push((
+            "ja".to_string(),
+            vec![("m.a".to_string(), "値".to_string())],
+        ));
+        generator.lang.push(("en".to_string(), Vec::new()));
+        let code = generator.lang_code();
+        let table = code.lines().last().unwrap().to_string();
+        assert!(table.find("\"en\"").unwrap() < table.find("\"ja\"").unwrap());
+    }
+
+    #[test]
+    fn 鍵は昇順に並び重複は知らせる() {
+        let root = env::temp_dir().join(format!(
+            "bengara_build_lang_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let dir = root.join("resources/lang");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("ja.toml"), "[m]\nb = \"2\"\na = \"1\"\n").unwrap();
+        fs::write(dir.join("en.toml"), "[m]\na = \"1\"\na = \"2\"\n").unwrap();
+
+        let mut generator = Generator::default();
+        generator.read_lang(&root);
+
+        let ja = generator
+            .lang
+            .iter()
+            .find(|(locale, _)| locale == "ja")
+            .unwrap();
+        let keys: Vec<&str> = ja.1.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["m.a", "m.b"]);
+        assert!(generator
+            .errors
+            .iter()
+            .any(|e| e.contains("m.a") && e.contains("2回")));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -76,16 +76,57 @@ cargo artisan migrate
 
 書き方は [migrations.md](migrations.md) にあります。使わないなら飛ばして構いません。
 
-### 6. テストとリリースビルド
+### 6. テストを書く
 
 ```sh
 cargo test
+```
+
+`#[bengara::test]` を付けると、テストの中で使える道具が入ります。
+
+| 名前                                        | 中身                                      |
+|---------------------------------------------|-------------------------------------------|
+| `client`                                    | リクエストを送る口                        |
+| `get` / `post` / `put` / `patch` / `delete` | その方法で1本送る                         |
+| `refresh_database()`                        | DB を作り直す。戻り値は順番を守るための札 |
+| `seed_database(&db)`                        | 初期データを入れる。札を渡す              |
+| `exclusive()`                               | DB 以外の共通のもの（メール・言語）の札   |
+
+```rust
+#[bengara::test]
+async fn 記事が作れる() {
+    let db = refresh_database().await;
+    seed_database(&db).await;
+    post("/posts", "title=hello").await.assert_redirect("/posts");
+}
+```
+
+くわしくは [testing.md](testing.md) にあります。
+
+### 7. リリースビルド
+
+```sh
 cargo build --release
 ```
 
-リリースビルドでは実行ファイルが 2 つできます（本体と `artisan`）。本番に置くのは本体だけで足ります。
-**`public/` もバイナリに入るので、置くのは実行ファイルと `.env` の2つだけです**
-（[deployment.md](deployment.md)）。
+実行ファイルが 2 つできます（本体と `artisan`）。本番に置くのは本体だけで足ります。
+`public/` と設定はバイナリに入ります。本体の大きさは **約 6.3 MB**（`sqlite` 機能つき）です。
+
+本番に置くものは 3 つです（[deployment.md](deployment.md)）。
+
+| 置くもの              | なぜ                       |
+|-----------------------|----------------------------|
+| 実行ファイル（本体）  | `public/` と設定は中にある |
+| `.env`                | 環境ごとの値               |
+| 書き込める `storage/` | 実行時の書き込み先         |
+
+`storage/` の下は `./myapp storage:init` が作ります。作るのは 7 つです。
+
+```
+storage/app  storage/app/public  storage/framework
+storage/framework/cache  storage/framework/schedule  storage/framework/sessions
+storage/logs
+```
 
 ## つまずきやすい点
 
@@ -148,4 +189,5 @@ bengara のプロジェクトに `src/` はありません。入口は直下の 
 - [directory-structure.md](directory-structure.md) — どこに何を置くか
 - [routing.md](routing.md) — ルートを足す
 - [artisan.md](artisan.md) — `serve` の動き
-- [deployment.md](deployment.md) — 本番に置く（**実行ファイルと `.env` だけ**）
+- [deployment.md](deployment.md) — 本番に置く（**実行ファイル・`.env`・書き込める `storage/`**）
+- [testing.md](testing.md) — テストを書く

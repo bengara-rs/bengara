@@ -124,6 +124,11 @@ DB::table("posts").where_op("views", ">", 100)
 
 `where_in` に空の一覧を渡すと、 **必ず 0 件**になります（`1 = 0` を置きます）。
 
+`where_raw` の `?` は **値の置き場所としてだけ**使えます。
+
+- `?` の数と渡した値の数が合わないと、終端のメソッド（`get()` など）でエラーになります。
+- 文字列の中の `?` も置き場所として数えます。`'a?b'` のような書き方はできません。
+
 ### 並べる・絞る・束ねる
 
 ```rust
@@ -142,6 +147,7 @@ DB::table("posts")
 | `select(&["id", "title"])` / `add_select("body")` | 取る列                     |
 | `distinct()`                                      | 重なりを捨てる             |
 | `order_by(col)` / `order_by_desc(col)`            | 並べる                     |
+| `order_by_raw("sql")`                             | 並べ方を SQL で書く        |
 | `latest()` / `oldest()`                           | `created_at` の降順 / 昇順 |
 | `latest_by(col)` / `oldest_by(col)`               | 列を指定して並べる         |
 | `limit(n)` / `offset(n)` / `take(n)` / `skip(n)`  | 件数                       |
@@ -151,6 +157,23 @@ DB::table("posts")
 
 **並びが一意になるようにしてください。** 同じ値の行が複数あると、
 ページの境目で同じ行が2回出ることがあります（`latest()` に `order_by_desc("id")` を足すなど）。
+
+**列名と演算子は確かめます。**
+`order_by` / `order_by_desc` / `group_by` / `having_op` に渡せる列名は、
+**英数字と `_` `.` だけ**です。演算子は許可一覧で照合します。
+
+- 外れていると **終端のメソッドを呼んだとき**にエラーになります（組み立てのときではありません）。
+- 外から来た文字列をそのまま渡しても、SQL に混ざりません。
+- 式を書きたいときは `order_by_raw` / `having_raw` / `where_raw` を使います。
+
+```rust
+DB::table("posts")
+    .order_by_raw("case when pinned then 0 else 1 end asc")
+    .order_by_desc("id")
+```
+
+`order_by_raw` は **引用も検査もしません。** 外から来た文字列を渡さないでください。
+`select` も式が書けるので、同じように扱ってください。
 
 ### 1件だけ・1つの値だけ
 
@@ -162,6 +185,16 @@ let title = DB::table("posts").where_("id", 1)
 let titles = DB::table("posts").pluck::<String>("title").await?; // Vec<String>
 ```
 
+`value` と `pluck` は **1列だけ取って、その位置から値を読みます。**
+名前では引かないので、表名を付けた `users.name` や別名付きの式も渡せます。
+
+```rust
+let names = DB::table("posts")
+    .join("users", "users.id", "=", "posts.user_id")
+    .pluck::<String>("users.name")
+    .await?;
+```
+
 ### 数える
 
 ```rust
@@ -170,6 +203,27 @@ let any = DB::table("posts").where_("status", "draft").exists().await?; // bool
 let none = DB::table("posts").doesnt_exist().await?;
 let sum = DB::table("posts").sum::<i64>("views").await?;              // Option<i64>
 // avg / min / max も同じ形
+```
+
+`count()` の数え方は、付いている指定で変わります。
+
+| 付いている指定 | `count()` が返すもの   |
+|----------------|------------------------|
+| 何も無い       | 行の数                 |
+| `group_by`     | **グループの数**       |
+| `distinct`     | 重なりを除いた行の数   |
+
+`paginate` の `total` も同じ数え方です。
+
+**`sum` / `avg` / `min` / `max` は `group_by` と併用できません。** エラーになります。
+グループごとの値が欲しいときは、`select` に式を書いて `get()` します。
+
+```rust
+DB::table("posts")
+    .select(&["status", "sum(views) as views"])
+    .group_by(&["status"])
+    .get()
+    .await?;
 ```
 
 ## 書く
@@ -208,7 +262,21 @@ DB::table("posts").truncate().await?;
 値は `.into()` で `Value` にします。`&str` / `String` / 整数 / 小数 / 真偽 /
 `Vec<u8>` / `Option<T>`（`None` は `null`）が渡せます。
 
-> **条件を書かない `update` と `delete` は全行が対象です。** Laravel と同じ振る舞いです。
+`u64` は `i64` に収まらない値も扱えます。収まらないときは文字列として入れ、
+読み出しでも `u64` に戻します。
+
+### `update` と `delete` の決まり
+
+- **条件を書かないと全行が対象です。** Laravel と同じです。
+- **`join` を付けるとエラーです。** 組み立てた SQL に入らないので、黙って全件に当たります。
+- **`limit` / `offset` を付けるとエラーです。** 理由は `join` と同じです。
+
+件数を絞って書き換えたいときは、先に主キーを取り出して `where_in` で絞ります。
+
+```rust
+let ids: Vec<i64> = DB::table("posts").latest().limit(10).pluck::<i64>("id").await?;
+DB::table("posts").where_in("id", &ids).update(&[("status", "archived".into())]).await?;
+```
 
 ### 日時
 
@@ -264,6 +332,24 @@ tx.commit().await?;
 - `DB::table(...)` は **トランザクションの外**です。混ぜないでください。
 - **1本ずつ `await` してください。** 同時に2本投げるとエラーになります。
 
+### モデルを保存するとき
+
+トランザクションの中でモデルを保存するときは、**`save_using(&tx)`** を使います。
+
+```rust
+let tx = DB::begin().await?;
+let mut post = Post::draft("やきそば");
+post.save_using(&tx).await?;
+tx.commit().await?;
+```
+
+`save()` / `delete()` / `fresh()` は **既定の接続**を使います。
+
+- 書き込みがトランザクションの外に出ます。`rollback()` しても残ります。
+- `:memory:` のデータベースは接続が1本なので、空くのを待って固まります。
+
+詳しくは [models.md](models.md) にあります。
+
 ## SQL を直接書く
 
 ```rust
@@ -300,7 +386,7 @@ SQL が失敗したときは、文だけを添えて返します。
 
 | こと                         | 内容                                                                                  |
 |------------------------------|---------------------------------------------------------------------------------------|
-| 列名に外から来た値を入れない | 列名と表名は SQL にそのまま置きます。値（`where_` の第2引数）は必ずプレースホルダです |
+| 列名に外から来た値を入れない | 値（`where_` の第2引数）は必ずプレースホルダです。式が書ける `select` / `order_by_raw` / `where_raw` / `having_raw` は検査しません |
 | `:memory:` は接続1本         | メモリ上のデータベースは接続ごとに別物になるため、1本に固定します                     |
 | 1プロセスで1つの接続プール   | 既定の接続は最初の1回だけ作られ、以後は使い回します                                   |
 

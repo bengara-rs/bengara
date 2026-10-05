@@ -8,6 +8,7 @@ mod init;
 mod serve;
 
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 
 use crate::error::{Error, Result};
 
@@ -44,6 +45,9 @@ pub(crate) fn artisan() {
     let result = match command {
         "list" | "help" | "--help" | "-h" => {
             print_artisan_help();
+            // 実行時のコマンドは本体しか知らない（自作コマンドを含む）。
+            // Laravel の `artisan list` と同じく、全部を1画面で出す。
+            delegate_list(&root);
             Ok(())
         }
         "--version" | "-V" => {
@@ -79,23 +83,42 @@ fn project_root() -> PathBuf {
 
 /// `migrate` などの実行時コマンドを本体に渡す。
 fn delegate(root: &Path, args: &[String]) -> Result<()> {
-    let cargo = cargo_command();
-    let manifest = root.join("Cargo.toml");
-    let status = std::process::Command::new(&cargo)
-        .arg("run")
-        .arg("-q")
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .arg("--")
-        .args(args)
-        .status()
-        .map_err(|e| Error::msg(format!("{} を実行できません: {e}", cargo.display())))?;
-
+    let status = spawn_app(root, args, false)?;
     if status.success() {
         Ok(())
     } else {
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+/// `list` のときだけ使う、本体への受け渡し。
+///
+/// アプリがビルドできないときは、何も言わずに諦めます。アプリが壊れていても
+/// `artisan` が動くことが、`artisan` を別のバイナリにしている理由だからです。
+fn delegate_list(root: &Path) {
+    let _ = spawn_app(root, &["list".to_string()], true);
+}
+
+/// 本体（`cargo run -- ...`）を動かして、終了の状態を返す。
+///
+/// `quiet` のときは、ビルドの失敗を画面に出しません。
+fn spawn_app(root: &Path, args: &[String], quiet: bool) -> Result<ExitStatus> {
+    let cargo = cargo_command();
+    let manifest = root.join("Cargo.toml");
+    std::process::Command::new(&cargo)
+        .arg("run")
+        .arg("-q")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .stderr(if quiet {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
+        .arg("--")
+        .args(args)
+        .status()
+        .map_err(|e| Error::msg(format!("{} を実行できません: {e}", cargo.display())))
 }
 
 /// 実行中の cargo のパス。同じツールチェーンを使うためです。
@@ -148,13 +171,9 @@ bengara {version} — cargo artisan
   serve [--host <ホスト>] [--port <ポート>]
                           サーバーを起動し、変更があれば再ビルドして再起動する
   init                    Laravel と同じ構成のファイルを作る（最初の1回だけ）
-  list                    このヘルプを出す
+  list                    この一覧を出す
 
-実行時のコマンド（本体に渡します）
-
-  route:list              登録されているルートを一覧にする
-
-  このほかの引数は、そのまま本体（cargo run -- ...）に渡されます。
+  serve は本体を即座に止めます。停止の猶予を確かめるときは本体を直接動かしてください。
 ",
         version = env!("CARGO_PKG_VERSION")
     );

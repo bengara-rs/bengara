@@ -11,6 +11,8 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, LitStr};
 /// 1つのフィールドの情報。
 struct Field {
     ident: syn::Ident,
+    /// フィールドの型。主キーが整数かを見るために持っています。
+    ty: syn::Type,
     /// 列の名前。
     column: String,
     /// 主キーか。
@@ -18,6 +20,14 @@ struct Field {
     /// 表には無い項目か。
     skip: bool,
 }
+
+/// 自動採番の主キーに使える型。
+///
+/// いまの作りは「insert の後に、データベースが決めた番号を書き戻す」ものなので、
+/// 整数だけに対応します。
+const INTEGER_TYPES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",
+];
 
 pub(crate) fn derive(item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
@@ -47,9 +57,25 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
+    check_duplicate_columns(&used)?;
+
     let primary = pick_primary(&used, &input)?;
+    check_primary_type(primary)?;
     let primary_column = primary.column.clone();
     let primary_ident = primary.ident.clone();
+
+    // save() は主キー以外の列を insert / update します。1つも無いと実行できません。
+    // 実行のときに初めて分かるのでは遅いので、ここで止めます。
+    if !used.iter().any(|f| f.column != primary_column) {
+        return Err(syn::Error::new(
+            input.ident.span(),
+            format!(
+                "{name} には主キー `{primary_column}` 以外の列がありません。\
+                 save() で入れるものが無いので、列になるフィールドを1つ以上置いてください。\
+                 表には無い項目には `#[model(skip)]` を付けます"
+            ),
+        ));
+    }
 
     let columns: Vec<LitStr> = used
         .iter()
@@ -67,6 +93,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     });
 
     // attributes: 主キー以外の列と値。
+    // 主キーは常に外します。自動採番なので、insert で送るとデータベースが決めた番号と
+    // 食い違います（整数の主キーだけに対応しているのは、そのためです）。
     // `#[model(primary)]` を書かずに `id` を使っている場合もあるので、列名で比べる。
     let primary_name = primary_column.clone();
     let writes = used
@@ -150,11 +178,18 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
 
             fn set_key(&mut self, __value: ::bengara::database::Value) {
-                self.#primary_ident =
-                    match ::bengara::database::FromValue::from_value(&__value) {
-                        ::core::result::Result::Ok(__v) => __v,
-                        ::core::result::Result::Err(_) => ::core::default::Default::default(),
-                    };
+                match ::bengara::database::FromValue::from_value(&__value) {
+                    ::core::result::Result::Ok(__v) => self.#primary_ident = __v,
+                    // 読めなかったときは値を変えない。
+                    // 黙って既定値（0 など）で上書きすると、別の行を指してしまう。
+                    ::core::result::Result::Err(__e) => {
+                        ::bengara::database::warn_key_not_set(
+                            #table_lit,
+                            #primary_lit,
+                            &__e,
+                        );
+                    }
+                }
             }
 
             #touch
@@ -210,6 +245,7 @@ fn collect_fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
         let mut info = Field {
             column: ident.to_string(),
             ident,
+            ty: field.ty.clone(),
             primary: false,
             skip: false,
         };
@@ -236,9 +272,76 @@ fn collect_fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
                 ))
             })?;
         }
+        // `skip` は「表には無い項目」、`primary` は「表の主キー」。両方は成り立たない。
+        // 以前は skip が先に効いて、primary が黙って無視されていた。
+        if info.skip && info.primary {
+            return Err(syn::Error::new(
+                info.ident.span(),
+                "`#[model(skip)]` と `#[model(primary)]` は同じフィールドには付けられません。\
+                 表に無い項目なら `skip` だけ、主キーなら `primary` だけにしてください",
+            ));
+        }
         out.push(info);
     }
     Ok(out)
+}
+
+/// 同じ列名が2回出てこないか。
+///
+/// `COLUMNS` と `attributes()` に同じ名前が2つ入ると、`insert` が落ちます。
+fn check_duplicate_columns(fields: &[&Field]) -> syn::Result<()> {
+    for (index, field) in fields.iter().enumerate() {
+        if let Some(found) = fields[..index].iter().find(|f| f.column == field.column) {
+            return Err(syn::Error::new(
+                field.ident.span(),
+                format!(
+                    "列 `{}` が2回出てきます（`{}` と `{}`）。\
+                     `#[model(column = \"別の名前\")]` で分けるか、\
+                     表に無い項目なら `#[model(skip)]` を付けてください",
+                    field.column, found.ident, field.ident
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 主キーの型が整数か。
+fn check_primary_type(primary: &Field) -> syn::Result<()> {
+    if is_integer_type(&primary.ty) {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        primary.ty.span(),
+        format!(
+            "主キー `{}` の型が整数ではありません。\
+             いまは自動採番の整数の主キーだけに対応しています。\n\
+             使えるのは {} です。\n\
+             insert の後にデータベースが決めた番号を書き戻す作りなので、\
+             自分で決めた主キー（文字列・UUID など）は送れません。\n\
+             どうしても使いたいときは、`#[derive(Model)]` をやめて \
+             `bengara::database::Model` を自分で実装してください。",
+            primary.column,
+            INTEGER_TYPES.join(" / ")
+        ),
+    ))
+}
+
+/// 整数の型か。`i64` のような、型引数の無い名前だけを見ます。
+fn is_integer_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    let Some(last) = path.path.segments.last() else {
+        return false;
+    };
+    if !last.arguments.is_empty() {
+        return false;
+    }
+    INTEGER_TYPES.contains(&last.ident.to_string().as_str())
 }
 
 /// 主キーを決める。`#[model(primary)]` が無ければ `id` を使う。

@@ -361,10 +361,11 @@ impl Routes {
         let matched = router.at(path).ok()?;
         // 照合は符号化されたパスで行い、取り出した値だけを元に戻す。
         // 先に全体を戻すと、`%2F` が区切りの `/` と区別できなくなる。
+        // `+` は空白にしない（`+` が空白なのはフォームの規則で、パスには当てはまらない）。
         let params = matched
             .params
             .iter()
-            .map(|(k, v)| (k.to_string(), super::request::percent_decode(v)))
+            .map(|(k, v)| (k.to_string(), super::request::percent_decode_strict(v)))
             .collect();
         Some(Matched::Found {
             def: &self.defs[*matched.value],
@@ -426,7 +427,8 @@ fn fill(pattern: &str, params: &[(&str, &str)]) -> Result<String> {
                 "ルート `{pattern}` の `{{` が閉じていません"
             )));
         };
-        let key = after[..end].trim_start_matches('*');
+        let name = &after[..end];
+        let key = name.trim_start_matches('*');
         let value = params
             .iter()
             .find(|(k, _)| *k == key)
@@ -436,11 +438,36 @@ fn fill(pattern: &str, params: &[(&str, &str)]) -> Result<String> {
                     "ルート `{pattern}` のパス引数 `{key}` が足りません"
                 ))
             })?;
-        out.push_str(value);
+        // `{*path}` は複数のセグメントを表すので `/` を残す。
+        out.push_str(&encode_segment(value, name.starts_with('*')));
         rest = &after[end + 1..];
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// パス引数の値を、1セグメント分としてパーセントエンコードする。
+///
+/// 照合は符号化されたパスで行うので、組み立てる側もそろえないと形が変わります。
+/// そろえないと `("name", "a/b")` が `/hello/a/b` になり、別のルートになってしまいます。
+/// 逃がす文字は `http/url.rs` の `encode()` と同じ規則です。
+fn encode_segment(value: &str, keep_slash: bool) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let c = *byte;
+        let keep = c.is_ascii_alphanumeric()
+            || matches!(c, b'-' | b'_' | b'.' | b'~')
+            || (keep_slash && c == b'/');
+        if keep {
+            out.push(c as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(c >> 4) as usize] as char);
+            out.push(HEX[(c & 0x0f) as usize] as char);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -464,6 +491,49 @@ mod tests {
         );
         assert_eq!(fill("/", &[]).unwrap(), "/");
         assert!(fill("/posts/{post}", &[]).is_err());
+    }
+
+    #[test]
+    fn パス引数はエンコードして埋める() {
+        // `/` を残すとルートの形が変わるので `%2F` にする。
+        assert_eq!(
+            fill("/posts/{post}", &[("post", "a/b")]).unwrap(),
+            "/posts/a%2Fb"
+        );
+        // ワイルドカードは複数のセグメントを表すので `/` を残す。
+        assert_eq!(
+            fill("/files/{*path}", &[("path", "a/b.txt")]).unwrap(),
+            "/files/a/b.txt"
+        );
+        // 日本語も逃がす。
+        assert_eq!(
+            fill("/hello/{name}", &[("name", "あ")]).unwrap(),
+            "/hello/%E3%81%82"
+        );
+        // 記号も逃がす。`-` `_` `.` `~` はそのまま。
+        assert_eq!(
+            fill("/q/{term}", &[("term", "a b?c#d")]).unwrap(),
+            "/q/a%20b%3Fc%23d"
+        );
+        assert_eq!(
+            fill("/q/{term}", &[("term", "a-b_c.d~e")]).unwrap(),
+            "/q/a-b_c.d~e"
+        );
+    }
+
+    #[test]
+    fn 埋めた値はそのまま照合できる() {
+        let defs = collect(|| {
+            Route::get("/hello/{name}", ok);
+        });
+        let routes = Routes::build(defs);
+        let path = fill("/hello/{name}", &[("name", "a/b")]).unwrap();
+        match routes.find("GET", &path) {
+            Matched::Found { params, .. } => {
+                assert_eq!(params, vec![("name".to_string(), "a/b".to_string())]);
+            }
+            _ => panic!("当たらなかった"),
+        }
     }
 
     async fn ok() -> Result<Response> {
@@ -604,6 +674,20 @@ mod tests {
         match routes.find("GET", "/hello/%E3%81%82") {
             Matched::Found { params, .. } => {
                 assert_eq!(params, vec![("name".to_string(), "あ".to_string())]);
+            }
+            _ => panic!("当たらなかった"),
+        }
+    }
+
+    #[test]
+    fn パス引数のプラスは空白にしない() {
+        let defs = collect(|| {
+            Route::get("/hello/{name}", ok);
+        });
+        let routes = Routes::build(defs);
+        match routes.find("GET", "/hello/a+b") {
+            Matched::Found { params, .. } => {
+                assert_eq!(params, vec![("name".to_string(), "a+b".to_string())]);
             }
             _ => panic!("当たらなかった"),
         }

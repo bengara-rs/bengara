@@ -201,22 +201,35 @@ impl FromValue for i64 {
     }
 }
 
-impl FromValue for i32 {
-    fn from_value(value: &Value) -> Result<Self> {
-        let v = i64::from_value(value)?;
-        i32::try_from(v).map_err(|_| Error::msg(format!("{v} は i32 に収まりません")))
-    }
+/// `i64` から幅の狭い整数へ読み替える実装を、型ごとに作る。
+///
+/// 入らない値は、どの型に入れようとしたかを添えてエラーにします。
+macro_rules! from_value_int {
+    ($($t:ty),* $(,)?) => {
+        $(impl FromValue for $t {
+            fn from_value(value: &Value) -> Result<Self> {
+                let v = i64::from_value(value)?;
+                <$t>::try_from(v).map_err(|_| {
+                    Error::msg(format!("{v} は {} に収まりません", stringify!($t)))
+                })
+            }
+        })*
+    };
 }
 
-impl FromValue for u32 {
-    fn from_value(value: &Value) -> Result<Self> {
-        let v = i64::from_value(value)?;
-        u32::try_from(v).map_err(|_| Error::msg(format!("{v} は u32 に収まりません")))
-    }
-}
+// `#[derive(Model)]` が主キーに許す整数は、ここに実装があるものと同じにそろえます。
+// そろっていないと、主キーの型を変えたときに読みにくいエラーが出ます。
+from_value_int!(i8, i16, i32, isize, u8, u16, usize);
 
 impl FromValue for u64 {
     fn from_value(value: &Value) -> Result<Self> {
+        // `i64` に収まらない値は `Value::Text` で入る（`From<u64> for Value`）。
+        // 往復できるように、文字列のときは先に u64 として読む。
+        if let Value::Text(v) = value {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                return Ok(parsed);
+            }
+        }
         let v = i64::from_value(value)?;
         u64::try_from(v).map_err(|_| Error::msg(format!("{v} は u64 に収まりません")))
     }
@@ -398,6 +411,22 @@ mod tests {
     }
 
     #[test]
+    fn 大きなu64は往復できる() {
+        // i64 に収まらないので Text で入る。読み戻しても同じ値になること。
+        let stored = Value::from(u64::MAX);
+        assert_eq!(stored, Value::Text(u64::MAX.to_string()));
+        assert_eq!(u64::from_value(&stored).unwrap(), u64::MAX);
+
+        // 収まる値はこれまでどおり Int のまま。
+        assert_eq!(Value::from(7u64), Value::Int(7));
+        assert_eq!(u64::from_value(&Value::Int(7)).unwrap(), 7);
+
+        // 負の数は u64 として読めない。
+        assert!(u64::from_value(&Value::Int(-1)).is_err());
+        assert!(u64::from_value(&Value::Text("やきそば".into())).is_err());
+    }
+
+    #[test]
     fn option_は_null_になる() {
         let none: Option<&str> = None;
         assert_eq!(Value::from(none), Value::Null);
@@ -416,5 +445,23 @@ mod tests {
         assert!(row.get::<i64>("none").is_err());
         assert_eq!(row.try_get::<i64>("none"), None);
         assert_eq!(row.to_json()["title"], "やきそば");
+    }
+
+    #[test]
+    fn 幅の狭い整数も読める() {
+        // `#[derive(Model)]` が主キーに許す整数は、ここに実装があるものと同じ。
+        assert_eq!(i8::from_value(&Value::Int(7)).unwrap(), 7i8);
+        assert_eq!(i16::from_value(&Value::Int(7)).unwrap(), 7i16);
+        assert_eq!(isize::from_value(&Value::Int(7)).unwrap(), 7isize);
+        assert_eq!(u8::from_value(&Value::Int(7)).unwrap(), 7u8);
+        assert_eq!(u16::from_value(&Value::Int(7)).unwrap(), 7u16);
+        assert_eq!(usize::from_value(&Value::Int(7)).unwrap(), 7usize);
+    }
+
+    #[test]
+    fn 入らない値は型の名前を添えて断る() {
+        let error = i8::from_value(&Value::Int(1000)).unwrap_err().to_string();
+        assert!(error.contains("i8"), "{error}");
+        assert!(u8::from_value(&Value::Int(-1)).is_err());
     }
 }

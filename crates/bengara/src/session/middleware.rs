@@ -147,6 +147,9 @@ impl Middleware for StartSession {
                 }
                 None => Session::empty(),
             };
+            // 置き場所をこのセッションに結びつける。
+            // `Auth::logout_other_devices()` が、同じ利用者のほかのセッションを消せるようになる。
+            let session = session.with_store(store.clone());
 
             let id_before = session.id();
             req.set_session(session.clone());
@@ -197,9 +200,14 @@ impl Middleware for StartSession {
     }
 }
 
-/// 署名の鍵。`APP_KEY` から作ります。
+/// セッション Cookie の署名に使うラベル。
+///
+/// `APP_KEY` をそのまま使わず、用途ごとに別の鍵を作ります。
+const SIGNING_LABEL: &str = "bengara:session";
+
+/// 署名の鍵。`APP_KEY` から用途ごとに作ります。
 fn signing_key() -> Result<Vec<u8>> {
-    Ok(crate::config_registry::app_config().signing_key()?.to_vec())
+    crate::config_registry::app_config().derived_key(SIGNING_LABEL)
 }
 
 /// `値|署名` の形にする。
@@ -251,7 +259,25 @@ impl VerifyCsrfToken {
     /// ```ignore
     /// VerifyCsrfToken::new().except("/api/*")
     /// ```
+    ///
+    /// `*` は**区切り（`/`）も含めた残り全部**に当たります。
+    /// つまり `/api/*` は `/api/`・`/api/posts`・`/api/posts/1` に当たり、
+    /// `/apiX` には当たりません。
+    ///
+    /// `*` の直前が `/` でないとき（`/admin*` など）は、`/administration` のような
+    /// 別のパスまで外してしまいます。断らずに通しますが、**警告を出します。**
+    /// 前方一致そのものは使い道があるので禁止はせず、
+    /// 書き間違いだけ気づけるようにしました。
     pub fn except(mut self, pattern: &str) -> Self {
+        // 警告は登録のとき（起動時）に 1 回だけ出す。リクエストごとに調べない。
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            if !prefix.is_empty() && !prefix.ends_with('/') {
+                tracing::warn!(
+                    "VerifyCsrfToken::except(\"{pattern}\") は {prefix} で始まる\
+                     すべてのパスに当たります。`{prefix}/*` のつもりではありませんか"
+                );
+            }
+        }
         self.except.push(pattern.to_string());
         self
     }
@@ -273,6 +299,10 @@ impl Middleware for VerifyCsrfToken {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
         let safe = matches!(req.method(), "GET" | "HEAD" | "OPTIONS");
         let excepted = self.is_excepted(req.path());
+        // ルートが無いなら守る対象も無い。確かめずに通して 404 / 405 を返させる。
+        // 共通のミドルウェアはルートに当たらなかったリクエストにも掛かるので、
+        // ここで見分けないと、無いページへの POST が 404 ではなく 419 になります。
+        let no_route = !req.route_matched();
 
         Box::pin(async move {
             let Some(session) = req.try_session() else {
@@ -283,7 +313,7 @@ impl Middleware for VerifyCsrfToken {
             };
 
             // 読むだけの操作は確かめない。トークンだけ用意しておく。
-            if safe || excepted {
+            if safe || excepted || no_route {
                 ensure_token(session);
                 return next.run(req).await;
             }
@@ -390,6 +420,43 @@ mod tests {
         assert!(mw.is_excepted("/webhook"));
         assert!(!mw.is_excepted("/webhooks"));
         assert!(!mw.is_excepted("/admin"));
+    }
+
+    #[test]
+    fn アスタリスクは区切りの先まで当たる() {
+        let mw = VerifyCsrfToken::new().except("/api/*");
+        assert!(mw.is_excepted("/api/"), "区切りだけでも当たる");
+        assert!(mw.is_excepted("/api/posts"));
+        assert!(mw.is_excepted("/api/posts/1"), "さらに下も当たる");
+        assert!(!mw.is_excepted("/apiX"), "区切りが違えば当たらない");
+        assert!(!mw.is_excepted("/api"), "区切りが無ければ当たらない");
+    }
+
+    #[test]
+    fn 区切りの無いアスタリスクも前方一致で当たる() {
+        // 書き間違いの可能性があるので警告は出すが、動きは変えない。
+        let mw = VerifyCsrfToken::new().except("/admin*");
+        assert!(mw.is_excepted("/admin"));
+        assert!(mw.is_excepted("/admin/users"));
+        assert!(mw.is_excepted("/administration"), "警告つきで当たる");
+        assert!(!mw.is_excepted("/adm"));
+    }
+
+    #[test]
+    fn セッションの鍵は用途ごとに分かれている() {
+        // `APP_KEY` の生バイトではなく、ラベルを混ぜた鍵を使う。
+        assert_eq!(SIGNING_LABEL, "bengara:session");
+        let app_key = "a".repeat(64);
+        let config = crate::AppConfig {
+            name: "test".into(),
+            env: "testing".into(),
+            debug: false,
+            url: "http://localhost".into(),
+            key: app_key.clone(),
+        };
+        let session = config.derived_key(SIGNING_LABEL).unwrap();
+        assert_ne!(session, app_key.as_bytes());
+        assert_ne!(session, config.derived_key("bengara:signed-url").unwrap());
     }
 
     #[test]

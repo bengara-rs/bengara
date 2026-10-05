@@ -36,6 +36,38 @@ pub struct Post {
 表の名前を推測しないのは、英語の複数形が一定でないためです
 （`person` → `people`、`category` → `categories`）。1行書くほうが確実です。
 
+### 主キーは自動採番の整数だけ
+
+**`#[derive(Model)]` は、自動採番の整数の主キー専用です。**
+`insert` のあとにデータベースが決めた番号を書き戻す作りなので、
+自分で決める主キー（文字列・UUID）は送れません。
+
+主キーに書けるのは**整数の型**（`i8` / `i16` / `i32` / `i64` / `isize` /
+`u8` / `u16` / `u32` / `u64` / `usize`）だけです。
+それ以外の型は、分かりやすい**コンパイルエラー**になります。
+
+実際に使うのは **`i64`** です。
+
+- 行から読める整数の型は `i64` / `i32` / `u32` / `u64` の4つです。
+- ほかの整数の型は、行を読む側でコンパイルエラーになります。
+
+文字列の主キーを使いたいときは、`#[derive(Model)]` をやめて
+`bengara::database::Model` を自分で実装してください。
+
+### コンパイルエラーになる書き方
+
+間に合わせの動きをさせず、ビルドのときに止めます。
+
+| 書き方                                          | 理由                                   |
+|-------------------------------------------------|----------------------------------------|
+| `#[model(table = "...")]` が無い                | 表の名前は推測しない                   |
+| 主キーの型が整数でない                          | 自動採番の整数の主キーだけに対応する   |
+| `#[model(skip)]` と `#[model(primary)]` を同じフィールドに付ける | 表に無い項目が主キーにはなれない |
+| 同じ列名が2回出てくる                           | `insert` が落ちる                      |
+| 主キー以外の列が1つも無い                       | `save()` で入れるものが無い            |
+| `#[model(primary)]` を2つ以上のフィールドに付ける | 主キーが決まらない                   |
+| 型引数のある構造体に付ける                      | 対応していない                         |
+
 ## 読む
 
 ```rust
@@ -77,7 +109,11 @@ pub async fn show(req: Request) -> Result<Response> {
 | `update(&[...])` / `delete()`         | `u64`（件数）          |
 | `paginate(per_page, page)`            | `Paginator<Post>`      |
 
+- `update` と `delete` に `limit` / `offset` を付けるとエラーになります。
+- `order_by` に渡せる列名は英数字と `_` `.` だけです。式は書けません。
+
 生の行が欲しいときは `query_builder()` でクエリビルダを取り出せます。
+`order_by_raw` のようにモデル側に無いメソッドも、ここから使えます。
 
 ## 書く
 
@@ -106,7 +142,7 @@ post.delete().await?;            // 返るのは件数
 ```
 
 `save()` は主キーを見て `insert` と `update` を選びます。
-主キーが空（`0` / `null` / `""`）なら新しい行です。
+主キーが `0` なら新しい行です。
 
 ### `created_at` と `updated_at`
 
@@ -234,22 +270,42 @@ pub async fn index(req: Request) -> Result<Response> {
 
 ## トランザクションの中で使う
 
+**トランザクションの中では `_using` の付いたメソッドを使います。**
+
 ```rust
 let tx = DB::begin().await?;
 
 let posts = Post::on(&tx).where_("status", "draft").get().await?;
-Post::query().using(&tx).where_("id", 1).delete().await?;
+
+let mut post = Post::draft("やきそば");
+post.save_using(&tx).await?;
 
 tx.commit().await?;
 ```
 
-`save()` と `delete()`（モデルのメソッド）は、いまは **既定の接続**を使います。
-トランザクションの中で入れたいときは、`tx.table(...)` か `Post::on(&tx)` を使ってください。
+| 既定の接続を使う | トランザクションの中で流す |
+|------------------|----------------------------|
+| `post.save()`    | `post.save_using(&tx)`     |
+| `post.delete()`  | `post.delete_using(&tx)`   |
+| `post.fresh()`   | `post.fresh_using(&tx)`    |
+| `Post::query()`  | `Post::on(&tx)`            |
+
+`save()` / `delete()` / `fresh()` は **既定の接続**を使います。
+トランザクションの中で呼ぶと、次の2つが起きます。
+
+- 書き込みがトランザクションの外に出ます。`rollback()` しても残ります。
+- `:memory:` のデータベースは接続が1本なので、空くのを待って固まります。
+
+`fresh_using(&tx)` は、同じトランザクションの中から読み直します。
+`save_using(&tx)` で保存した内容は、`commit()` するまで外からは見えません。
 
 ## 文字列の主キー
 
-`save()` は **自動採番の整数**の主キーを前提にしています。
-UUID のように自分で決める主キーのときは、クエリビルダで入れてください。
+`#[derive(Model)]` は **自動採番の整数**の主キー専用です。
+UUID のように自分で決める主キーのときは、次のどちらかにします。
+
+- クエリビルダ（`DB::table(...)`）で入れる。
+- `bengara::database::Model` を自分で実装する。
 
 ```rust
 DB::table("sessions")

@@ -29,7 +29,10 @@ use crate::error::{Error, Result};
 use crate::session::Session;
 
 /// セッションに入れる鍵の名前。
-const KEY: &str = "bengara_auth_id";
+///
+/// `SessionStore` が「この利用者のセッション」を探すときにも見ます
+/// （`destroy_for_user`）。
+pub(crate) const AUTH_ID_KEY: &str = "bengara_auth_id";
 
 /// 表と結びついた「ログインできる人」。
 ///
@@ -82,7 +85,7 @@ impl<'a> Auth<'a> {
 
     /// ログイン中の主キーの値。
     pub fn id(&self) -> Option<String> {
-        self.session?.get(KEY).filter(|v| !v.is_empty())
+        self.session?.get(AUTH_ID_KEY).filter(|v| !v.is_empty())
     }
 
     /// 照合せずにログインする。登録の直後などに使います。
@@ -97,14 +100,79 @@ impl<'a> Auth<'a> {
         let session = self.session()?;
         // 他人のセッション ID を押し付ける攻撃（セッション固定化）を防ぐ。
         session.regenerate();
-        session.put(KEY, id.to_string());
+        session.put(AUTH_ID_KEY, id.to_string());
         Ok(())
     }
 
     /// ログアウトする。セッションの中身を捨て、ID も作り直します。
+    ///
+    /// **このセッションだけを切ります。** 同じ利用者が別のブラウザや別の端末で
+    /// ログインしていても、そちらは切れません。
+    /// 他の端末も切るときは [`logout_other_devices`](Self::logout_other_devices) を
+    /// 使ってください。
     pub fn logout(&self) -> Result<()> {
         self.session()?.invalidate();
         Ok(())
+    }
+
+    /// 同じ利用者のセッションのうち、**このセッション以外**を切る。消した数を返す。
+    ///
+    /// パスワードを変えたあとに呼びます。変えただけでは、盗まれたセッションが
+    /// 期限まで生き残ります。
+    ///
+    /// ```ignore
+    /// // パスワードを書き換えたあとで
+    /// req.auth().logout_other_devices()?;
+    /// ```
+    ///
+    /// - ログインしていなければ何もせず `0` を返します。
+    /// - 置き場所の中を全部見ます。**時間のかかる操作です**が、呼ぶ回数は少ないので
+    ///   索引は持ちません。
+    /// - 自分で作った `SessionStore` が `destroy_for_user_except` を実装していなければ、
+    ///   警告を出して `0` を返します。
+    pub fn logout_other_devices(&self) -> Result<usize> {
+        let session = self.session()?;
+        let Some(user_id) = self.id() else {
+            return Ok(0);
+        };
+        session
+            .store()?
+            .destroy_for_user_except(&user_id, &session.id())
+    }
+
+    /// 同じ利用者のセッションを**全部**切る。消した数を返す。
+    ///
+    /// このセッションも切れるので、呼んだ本人もログアウトします。
+    /// 「全部の端末からログアウト」のボタンに使います。
+    ///
+    /// 注意は [`logout_other_devices`](Self::logout_other_devices) と同じです。
+    pub fn logout_all_devices(&self) -> Result<usize> {
+        let session = self.session()?;
+        let Some(user_id) = self.id() else {
+            return Ok(0);
+        };
+        let removed = session.store()?.destroy_for_user(&user_id)?;
+        // いまのセッションは、置き場所から消したうえで Cookie も作り直す。
+        self.logout()?;
+        Ok(removed)
+    }
+
+    /// **指定した利用者**のセッションを全部切る。消した数を返す。
+    ///
+    /// パスワードの再設定のように、**本人がログインしていない場面**で使います。
+    /// ログイン中の人が自分の他の端末を切るときは
+    /// [`logout_other_devices`](Self::logout_other_devices) を使ってください。
+    ///
+    /// ```ignore
+    /// // パスワードを書き換えたあとで、その人のセッションを全部切る
+    /// req.auth().logout_user(user.key())?;
+    /// ```
+    ///
+    /// 注意は [`logout_other_devices`](Self::logout_other_devices) と同じです。
+    pub fn logout_user(&self, user_id: impl std::fmt::Display) -> Result<usize> {
+        self.session()?
+            .store()?
+            .destroy_for_user(&user_id.to_string())
     }
 
     /// ログイン中の利用者を DB から読む。
@@ -268,6 +336,83 @@ mod tests {
         assert_eq!(auth.id(), None);
         assert!(auth.login_using_id(1).is_err());
         assert!(auth.logout().is_err());
+        assert!(auth.logout_other_devices().is_err());
+        assert!(auth.logout_all_devices().is_err());
+    }
+
+    #[test]
+    fn ログインしていなければ他の端末は切らない() {
+        let session = Session::empty();
+        let auth = Auth::new(Some(&session));
+        assert_eq!(auth.logout_other_devices().unwrap(), 0);
+        assert_eq!(auth.logout_all_devices().unwrap(), 0);
+    }
+
+    #[test]
+    fn 他の端末のセッションだけ切れる() {
+        use crate::session::{MemoryStore, SessionStore};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let store = Arc::new(MemoryStore::new(60));
+
+        // 置き場所はセッションに結びつく。`StartSession` がこれをやります。
+        let session = Session::empty().with_store(store.clone());
+        let auth = Auth::new(Some(&session));
+        auth.login_using_id(7).unwrap();
+        let mine = session.id();
+
+        let data = |user_id: &str| {
+            let mut data = BTreeMap::new();
+            data.insert(AUTH_ID_KEY.to_string(), user_id.to_string());
+            data
+        };
+        store.write(&mine, &data("7")).unwrap();
+        store.write("sameuser", &data("7")).unwrap();
+        store.write("otheruser", &data("8")).unwrap();
+
+        assert_eq!(auth.logout_other_devices().unwrap(), 1);
+        assert!(store.read(&mine).unwrap().is_some(), "自分は残る");
+        assert!(
+            store.read("sameuser").unwrap().is_none(),
+            "他の端末は切れる"
+        );
+        assert!(
+            store.read("otheruser").unwrap().is_some(),
+            "他の利用者は残る"
+        );
+
+        // 全部切ると自分も切れ、ログアウトもする。
+        assert_eq!(auth.logout_all_devices().unwrap(), 1);
+        assert!(store.read(&mine).unwrap().is_none());
+        assert!(!auth.check(), "呼んだ本人もログアウトする");
+    }
+
+    #[test]
+    fn 利用者を指定して切れる() {
+        use crate::session::{MemoryStore, SessionStore};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let store = Arc::new(MemoryStore::new(60));
+        // パスワードの再設定の場面。本人はログインしていない。
+        let session = Session::empty().with_store(store.clone());
+        let auth = Auth::new(Some(&session));
+        assert!(!auth.check());
+
+        let data = |user_id: &str| {
+            let mut data = BTreeMap::new();
+            data.insert(AUTH_ID_KEY.to_string(), user_id.to_string());
+            data
+        };
+        store.write("a", &data("7")).unwrap();
+        store.write("b", &data("7")).unwrap();
+        store.write("c", &data("8")).unwrap();
+
+        assert_eq!(auth.logout_user(7).unwrap(), 2);
+        assert!(store.read("a").unwrap().is_none());
+        assert!(store.read("b").unwrap().is_none());
+        assert!(store.read("c").unwrap().is_some(), "他の利用者は残る");
     }
 
     #[cfg(not(feature = "encryption"))]

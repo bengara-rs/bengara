@@ -8,11 +8,24 @@
 
 ## 送り先
 
+`.env` に書きます。下は「自分のアプリ名を入れた」例です。
+
 ```
 MAIL_DRIVER=log
 MAIL_FROM=noreply@example.com
 MAIL_FROM_NAME=myapp
 ```
+
+書かなかったときに使われる値は次のとおりです。
+
+| 設定              | 既定                  | 意味                       |
+|-------------------|-----------------------|----------------------------|
+| `MAIL_DRIVER`     | `log`                 | どこへ送るか               |
+| `MAIL_FROM`       | `noreply@example.com` | 差出人のアドレス           |
+| `MAIL_FROM_NAME`  | `bengara`             | 差出人の名前               |
+
+**`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名にしたいときは、上の例のように
+`.env` へ書いてください。
 
 | `MAIL_DRIVER`  | 何をするか                            |
 |----------------|---------------------------------------|
@@ -29,6 +42,7 @@ pub fn config() -> MailConfig {
     MailConfig {
         driver: env("MAIL_DRIVER", "log"),
         from: env("MAIL_FROM", "noreply@example.com"),
+        // 第2引数は「このアプリでの既定」です。bengara の既定は `bengara` です。
         from_name: env("MAIL_FROM_NAME", "myapp"),
     }
 }
@@ -142,6 +156,9 @@ async fn お知らせを送る() {
 
 溜まったメールは **テストの間ずっと残ります。** 数を確かめる前に `clear_sent()` を呼んでください。
 
+溜まる場所はプロセス共通です。テストは並んで走るので、**`Mail::sent()` で数を確かめるテストは
+`bengara::testing::exclusive()` で札を取ってください**（[testing.md](testing.md)）。
+
 `MAIL_DRIVER` を **本物の環境変数**で渡したときは、そちらを使います
 （`.env` の値はテストに効きません）。
 
@@ -156,6 +173,9 @@ MAIL_DRIVER=log cargo test
 ```rust
 bengara::mail::install_mailer(Box::new(MyMailer));
 ```
+
+**効くのは 1 回目だけです。** 2 回目以降は何もせず、警告をログに出します。
+`bootstrap/app.rs` の中など、1 か所から 1 回だけ呼んでください。
 
 ## 無いもの
 

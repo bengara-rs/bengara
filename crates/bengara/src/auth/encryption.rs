@@ -14,18 +14,29 @@ use crate::error::{Error, Result};
 use crate::support::crypto;
 
 /// 使い捨ての値（nonce）の長さ。
+///
+/// 毎回 OS の乱数から 96 ビットを取り直すので、**同じ鍵で使い回すことはありません。**
+/// 96 ビットだと、同じ鍵で 2 の 32 乗（約 43 億）件を超えたあたりから
+/// 偶然ぶつかる確率が無視できなくなります。そこまで使う見込みが出たら、
+/// nonce が 192 ビットの `XChaCha20Poly1305` に替える余地があります。
+/// いまは替えません。
 const NONCE_BYTES: usize = 12;
+
+/// 暗号化に使う鍵のラベル。
+///
+/// `APP_KEY` の生バイトも `sha256(APP_KEY)` も使いません。
+/// セッション Cookie の署名や署名付き URL と**別の鍵**にしておきます。
+const ENCRYPTION_LABEL: &str = "bengara:encryption";
 
 /// `APP_KEY` から 32 バイトの鍵を作る。
 fn cipher() -> Result<ChaCha20Poly1305> {
-    let app_key = crate::config_registry::app_config().signing_key()?;
-    Ok(cipher_from(app_key))
+    let derived = crate::config_registry::app_config().derived_key(ENCRYPTION_LABEL)?;
+    Ok(cipher_from_derived(&derived))
 }
 
-/// 任意の鍵から作る（テストで固定の鍵を使うため）。
-fn cipher_from(app_key: &[u8]) -> ChaCha20Poly1305 {
-    let key_bytes = crypto::sha256(app_key);
-    let key = Key::from_slice(&key_bytes);
+/// 用途ごとに導出した 32 バイトの鍵から作る。
+fn cipher_from_derived(derived: &[u8]) -> ChaCha20Poly1305 {
+    let key = Key::from_slice(derived);
     ChaCha20Poly1305::new(key)
 }
 
@@ -76,6 +87,11 @@ fn broken() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 任意の長さの鍵から作る（テストで固定の鍵を使うため）。
+    fn cipher_from(app_key: &[u8]) -> ChaCha20Poly1305 {
+        cipher_from_derived(&crypto::sha256(app_key))
+    }
 
     /// テストは固定の鍵で試す。`APP_KEY` の設定順に左右されないようにするため。
     fn test_cipher() -> ChaCha20Poly1305 {
@@ -134,6 +150,32 @@ mod tests {
         let cipher = test_cipher();
         let encrypted = encrypt_with(&cipher, "").unwrap();
         assert_eq!(decrypt_with(&cipher, &encrypted).unwrap(), "");
+    }
+
+    #[test]
+    fn 暗号鍵は用途ごとに導出する() {
+        // `sha256(APP_KEY)` でも `APP_KEY` の生バイトでもないこと。
+        let app_key = "a".repeat(64);
+        let config = crate::AppConfig {
+            name: "test".into(),
+            env: "testing".into(),
+            debug: false,
+            url: "http://localhost".into(),
+            key: app_key.clone(),
+        };
+        let derived = config.derived_key(ENCRYPTION_LABEL).unwrap();
+        assert_eq!(derived.len(), 32);
+        assert_ne!(derived.as_slice(), app_key.as_bytes());
+        assert_ne!(
+            derived.as_slice(),
+            crypto::sha256(app_key.as_bytes()).as_slice()
+        );
+        assert_ne!(derived, config.derived_key("bengara:session").unwrap());
+
+        // 導出した鍵で往復できる。
+        let cipher = cipher_from_derived(&derived);
+        let encrypted = encrypt_with(&cipher, "ひみつ").unwrap();
+        assert_eq!(decrypt_with(&cipher, &encrypted).unwrap(), "ひみつ");
     }
 
     #[test]

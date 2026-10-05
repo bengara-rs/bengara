@@ -23,12 +23,26 @@ pub enum Error {
     ///
     /// `Box` に入れているのは、`Error` 全体が大きくなるのを防ぐためです。
     Validation(Box<crate::validation::ValidationErrors>),
+    /// ほかのエラーをそのまま包む。500 になります。
+    ///
+    /// `Message(String)` と違い、**元のエラーを残します**。`source()` から
+    /// 原因の連鎖をたどれます。
+    Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl Error {
     /// メッセージからエラーを作る。
     pub fn msg(message: impl Into<String>) -> Self {
         Error::Message(message.into())
+    }
+
+    /// ほかのエラーを包む。原因の連鎖を残したいときに使います。
+    ///
+    /// ```ignore
+    /// let parsed: u32 = text.parse().map_err(Error::other)?;
+    /// ```
+    pub fn other(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Error::Other(Box::new(error))
     }
 
     /// HTTP のステータスを指定したエラーを作る。
@@ -69,6 +83,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "入出力エラー: {e}"),
             Error::Json(e) => write!(f, "JSON エラー: {e}"),
             Error::Validation(e) => write!(f, "入力の検査に落ちました: {e}"),
+            Error::Other(e) => write!(f, "{e}"),
         }
     }
 }
@@ -78,6 +93,8 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Json(e) => Some(e),
+            // 包んだエラーを返して、原因の連鎖をつなぐ。
+            Error::Other(e) => Some(&**e),
             _ => None,
         }
     }
@@ -130,5 +147,37 @@ pub(crate) fn reason_phrase(status: u16) -> &'static str {
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn 包んだエラーは原因をたどれる() {
+        let io = std::io::Error::new(std::io::ErrorKind::NotFound, "ファイルがありません");
+        let error = Error::other(io);
+
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("ファイルがありません"));
+        // Message(String) と違い、元のエラーが残る。
+        let source = error.source().expect("原因がある");
+        assert!(source.to_string().contains("ファイルがありません"));
+    }
+
+    #[test]
+    fn 文字列のエラーには原因がない() {
+        assert!(Error::msg("ただの文").source().is_none());
+    }
+
+    #[test]
+    fn 入出力とjsonの原因もたどれる() {
+        let io = Error::Io(std::io::Error::other("壊れた"));
+        assert!(io.source().is_some());
+
+        let json = Error::Json(serde_json::from_str::<i32>("あ").unwrap_err());
+        assert!(json.source().is_some());
     }
 }

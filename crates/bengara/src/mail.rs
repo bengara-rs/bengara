@@ -43,10 +43,13 @@ impl Default for MailConfig {
     }
 }
 
-fn config() -> MailConfig {
-    crate::try_config::<MailConfig>()
-        .cloned()
-        .unwrap_or_default()
+/// いまの設定。
+///
+/// `try_config` は `&'static` を返すので**借りて回します**。クローンすると
+/// `Mail::to` 1 回につき `MailConfig` のコピーが走ります。
+fn config() -> &'static MailConfig {
+    static FALLBACK: OnceLock<MailConfig> = OnceLock::new();
+    crate::try_config::<MailConfig>().unwrap_or_else(|| FALLBACK.get_or_init(MailConfig::default))
 }
 
 /// 組み立てたメール1通。
@@ -155,8 +158,12 @@ impl Mailer for ArrayMailer {
 static MAILER: OnceLock<Box<dyn Mailer>> = OnceLock::new();
 
 /// 送り先を差し替える。`bootstrap/app.rs` かテストから呼びます。
+///
+/// 1回目だけ効きます。2回目以降は何もせず、警告を出します。
 pub fn install_mailer(mailer: Box<dyn Mailer>) {
-    let _ = MAILER.set(mailer);
+    if MAILER.set(mailer).is_err() {
+        tracing::warn!("メールの送り先は既に決まっています。この install_mailer は効きません");
+    }
 }
 
 /// テストのときに `array` を使う。`#[bengara::test]` が呼びます。
@@ -194,7 +201,7 @@ impl Mail {
             message: Message {
                 to: vec![address.into()],
                 from: if config.from_name.is_empty() {
-                    config.from
+                    config.from.clone()
                 } else {
                     format!("{} <{}>", config.from_name, config.from)
                 },

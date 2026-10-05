@@ -19,6 +19,7 @@ pub(crate) const STORAGE_DIRECTORIES: &[&str] = &[
     "app/public",
     "framework",
     "framework/cache",
+    "framework/schedule",
     "framework/sessions",
     "logs",
 ];
@@ -148,6 +149,7 @@ mod tests {
         assert!(STORAGE_DIRECTORIES.contains(&"app"));
         assert!(STORAGE_DIRECTORIES.contains(&"app/public"));
         assert!(STORAGE_DIRECTORIES.contains(&"framework/cache"));
+        assert!(STORAGE_DIRECTORIES.contains(&"framework/schedule"));
         assert!(STORAGE_DIRECTORIES.contains(&"framework/sessions"));
         assert!(STORAGE_DIRECTORIES.contains(&"logs"));
     }

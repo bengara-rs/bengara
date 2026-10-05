@@ -1,5 +1,8 @@
 //! リクエスト。
 
+use std::net::{IpAddr, SocketAddr};
+use std::sync::OnceLock;
+
 use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
@@ -16,7 +19,21 @@ pub struct Request {
     params: Vec<(String, String)>,
     body: Vec<u8>,
     route_name: Option<String>,
+    /// ルートに当たったか。
+    ///
+    /// 共通のミドルウェアは 404 や 405 にも掛かるので、
+    /// 「守る対象のルートがあるのか」を見分けたいミドルウェア（CSRF の確認など）が使います。
+    matched: bool,
     session: Option<crate::session::Session>,
+    /// つないできた相手のアドレス。前段のプロキシがいればそのアドレスです。
+    remote_addr: Option<SocketAddr>,
+    /// 解析した結果の置き場所。1リクエストに1回だけ解析します。
+    ///
+    /// `OnceLock` なので、入れ替えはできても書き換えはできません。
+    /// `Clone` は中身ごと複製します（解析済みなら、複製も解析済みのままです）。
+    form_cache: OnceLock<Vec<(String, String)>>,
+    input_cache: OnceLock<Vec<(String, String)>>,
+    cookie_cache: OnceLock<Vec<(String, String)>>,
 }
 
 impl Request {
@@ -30,7 +47,12 @@ impl Request {
             params: Vec::new(),
             body: Vec::new(),
             route_name: None,
+            matched: false,
             session: None,
+            remote_addr: None,
+            form_cache: OnceLock::new(),
+            input_cache: OnceLock::new(),
+            cookie_cache: OnceLock::new(),
         }
     }
 
@@ -49,12 +71,31 @@ impl Request {
         self
     }
 
+    /// つないできた相手のアドレスを載せる。`server.rs` が入れます。
+    pub(crate) fn with_remote_addr(mut self, addr: SocketAddr) -> Self {
+        self.remote_addr = Some(addr);
+        self
+    }
+
     pub(crate) fn set_params(&mut self, params: Vec<(String, String)>) {
         self.params = params;
     }
 
     pub(crate) fn set_route_name(&mut self, name: Option<String>) {
         self.route_name = name;
+    }
+
+    /// ルートに当たったことを覚える。`Application` が照合の直後に呼びます。
+    pub(crate) fn set_matched(&mut self, matched: bool) {
+        self.matched = matched;
+    }
+
+    /// ルートに当たったか。
+    ///
+    /// 共通のミドルウェアは 404 と 405 にも掛かります。
+    /// 「ルートがあるときだけ確かめたい」ミドルウェアは、これを見てください。
+    pub fn route_matched(&self) -> bool {
+        self.matched
     }
 
     pub(crate) fn set_session(&mut self, session: crate::session::Session) {
@@ -199,12 +240,27 @@ impl Request {
             .max(1)
     }
 
+    /// つないできた相手の IP アドレス。Laravel の `$request->ip()` に当たります。
+    ///
+    /// **返すのは実際につないできた相手だけです。** `X-Forwarded-For` は見ません。
+    /// 前段にプロキシがいるときは、そのプロキシのアドレスになります。
+    /// 転送元を知りたいときは、`TRUSTED_PROXIES` を見る `Throttle` と同じ考え方で、
+    /// 自分で `header("x-forwarded-for")` を確かめてください。
+    ///
+    /// `#[bengara::test]` から送ったときは `127.0.0.1` です（ソケットは開きません）。
+    /// ソケットも使わず、アドレスも入れずに作ったときだけ `None` になります。
+    pub fn ip(&self) -> Option<IpAddr> {
+        self.remote_addr.map(|addr| addr.ip())
+    }
+
     /// ヘッダーの値（名前の大文字小文字は区別しません）。
+    ///
+    /// 同じ名前が何本も来たときは、最初の1本だけを返します。
+    /// 全部を見る必要がある `Cookie` は `cookies()` を使ってください。
     pub fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .find(|(k, _)| *k == name)
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 
@@ -227,18 +283,30 @@ impl Request {
     ///
     /// 署名つきのセッション Cookie を読むときは `req.session()` を使ってください。
     pub fn cookie(&self, name: &str) -> Option<String> {
-        self.cookies()
-            .into_iter()
+        self.cookie_pairs()
+            .iter()
             .find(|(k, _)| k == name)
-            .map(|(_, v)| v)
+            .map(|(_, v)| v.clone())
     }
 
     /// Cookie の一覧。
+    ///
+    /// `Cookie` ヘッダーは HTTP/2 で何本かに分かれて来ることがあるので、全部を見ます。
     pub fn cookies(&self) -> Vec<(String, String)> {
-        match self.header("cookie") {
-            Some(raw) => super::cookie::parse_cookie_header(raw),
-            None => Vec::new(),
-        }
+        self.cookie_pairs().to_vec()
+    }
+
+    /// Cookie を解析した結果。1リクエストに1回だけ解析します。
+    fn cookie_pairs(&self) -> &[(String, String)] {
+        self.cookie_cache.get_or_init(|| {
+            let mut out = Vec::new();
+            for (name, value) in &self.headers {
+                if name.eq_ignore_ascii_case("cookie") {
+                    out.extend(super::cookie::parse_cookie_header(value));
+                }
+            }
+            out
+        })
     }
 
     /// 本文を JSON として読む。
@@ -271,19 +339,26 @@ impl Request {
 
     /// フォームの値（最初に見つかったもの）。
     pub fn form(&self, key: &str) -> Option<String> {
-        self.form_all()
-            .into_iter()
+        self.form_pairs()
+            .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+            .map(|(_, v)| v.clone())
     }
 
     /// フォームの一覧。本文がフォームでなければ空。
     pub fn form_all(&self) -> Vec<(String, String)> {
-        if self.is_form() {
-            parse_query(&self.body_text())
-        } else {
-            Vec::new()
-        }
+        self.form_pairs().to_vec()
+    }
+
+    /// フォームを解析した結果。1リクエストに1回だけ解析します。
+    fn form_pairs(&self) -> &[(String, String)] {
+        self.form_cache.get_or_init(|| {
+            if self.is_form() {
+                parse_query(&self.body_text())
+            } else {
+                Vec::new()
+            }
+        })
     }
 
     /// クエリと本文をまとめた入力の一覧。
@@ -292,36 +367,46 @@ impl Request {
     /// 本文は、フォームなら組として、JSON なら最上位の値だけを読みます
     /// （入れ子は `req.json::<T>()` で読んでください）。
     pub fn input_all(&self) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        if self.is_form() {
-            out.extend(self.form_all());
-        } else if self.is_json_body() {
-            if let Ok(serde_json::Value::Object(map)) =
-                serde_json::from_slice::<serde_json::Value>(&self.body)
-            {
-                for (k, v) in map {
-                    // 文字列はそのまま、数値や真偽値は見たままの文字にする。
-                    let text = match v {
-                        serde_json::Value::String(s) => s,
-                        serde_json::Value::Null => String::new(),
-                        other => other.to_string(),
-                    };
-                    out.push((k, text));
+        self.input_pairs().to_vec()
+    }
+
+    /// クエリと本文をまとめた結果。1リクエストに1回だけ解析します。
+    ///
+    /// CSRF の検査が `_token` を見て、ハンドラが `validate()` を呼ぶので、
+    /// 1本のリクエストで何度も聞かれます。毎回解析すると本文の分だけ無駄になります。
+    pub(crate) fn input_pairs(&self) -> &[(String, String)] {
+        self.input_cache.get_or_init(|| {
+            let mut out = Vec::new();
+            if self.is_form() {
+                out.extend_from_slice(self.form_pairs());
+            } else if self.is_json_body() {
+                if let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_slice::<serde_json::Value>(&self.body)
+                {
+                    for (k, v) in map {
+                        // 文字列はそのまま、数値や真偽値は見たままの文字にする。
+                        let text = match v {
+                            serde_json::Value::String(s) => s,
+                            serde_json::Value::Null => String::new(),
+                            other => other.to_string(),
+                        };
+                        out.push((k, text));
+                    }
                 }
             }
-        }
-        out.extend(self.query_all());
-        out
+            out.extend(self.query_all());
+            out
+        })
     }
 
     /// クエリと本文から、名前で1つ取り出す。
     ///
     /// 探す順は **本文 → クエリ** です。
     pub fn input(&self, key: &str) -> Option<String> {
-        self.input_all()
-            .into_iter()
+        self.input_pairs()
+            .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+            .map(|(_, v)| v.clone())
     }
 
     /// 入力を検査する。
@@ -337,13 +422,13 @@ impl Request {
     /// 戻り値には**検査した項目だけ**が入ります。
     /// 落ちたとき、セッションがあれば入力を覚えておきます（`session.old("title")` で読めます）。
     pub fn validate(&self, rules: &[(&str, &str)]) -> Result<crate::validation::Validated> {
-        let pairs = self.input_all();
-        let input = crate::validation::Input::new(pairs.clone());
+        let input = crate::validation::Input::new(self.input_pairs().to_vec());
         match crate::validation::validate(&input, rules) {
             Ok(ok) => Ok(ok),
             Err(e) => {
+                // 覚え直させる入力は、ここだけで作る。`redact` を通さない道を作らない。
                 if let Some(session) = self.try_session() {
-                    session.flash_input(&redact(pairs));
+                    session.flash_input(&redact(self.input_pairs()));
                 }
                 Err(e)
             }
@@ -351,17 +436,44 @@ impl Request {
     }
 }
 
+/// セッションに残してはいけない名前。
+///
+/// 名前のどこかにこの語が入っていれば落とします（`new_password_confirmation` も落ちます）。
+const SENSITIVE: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "pass",
+    "secret",
+    "token",
+    "key",
+    "api_key",
+    "apikey",
+    "private_key",
+    "credential",
+    "cvv",
+    "card",
+    "ssn",
+    "otp",
+    "pin",
+];
+
 /// 覚えておいてはいけない入力を落とす。
 ///
-/// パスワードの類いは、入力し直しを省く値ではありません。セッションに残しません。
-fn redact(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+/// パスワードの類いは、入力し直しを省く値ではありません。セッションのファイルに
+/// 平文で書かれてしまうので、ここで落とします。
+fn redact(pairs: &[(String, String)]) -> Vec<(String, String)> {
     pairs
-        .into_iter()
-        .filter(|(k, _)| {
-            let k = k.to_ascii_lowercase();
-            !(k.contains("password") || k.contains("secret") || k.contains("token"))
-        })
+        .iter()
+        .filter(|(k, _)| !is_sensitive(k))
+        .cloned()
         .collect()
+}
+
+/// 残してはいけない名前か。
+fn is_sensitive(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE.iter().any(|word| lower.contains(word))
 }
 
 /// `a=1&b=2` を組に分ける。値は `%xx` と `+` を元に戻します。
@@ -483,5 +595,96 @@ mod tests {
         let req = Request::new("post", "/").with_body(b"{\"a\":1}".to_vec());
         let v: serde_json::Value = req.json().unwrap();
         assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn cookieヘッダーが2本来ても全部読む() {
+        let req = Request::new("get", "/").with_headers(vec![
+            ("cookie".into(), "a=1".into()),
+            ("Cookie".into(), "b=2".into()),
+        ]);
+        assert_eq!(
+            req.cookies(),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+            ]
+        );
+        assert_eq!(req.cookie("b").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn 接続元のアドレスを返す() {
+        let req = Request::new("get", "/");
+        assert_eq!(req.ip(), None, "ソケットを使わなければ分からない");
+
+        let addr: SocketAddr = "203.0.113.9:4321".parse().unwrap();
+        let req = Request::new("get", "/").with_remote_addr(addr);
+        assert_eq!(
+            req.ip().map(|ip| ip.to_string()).as_deref(),
+            Some("203.0.113.9")
+        );
+    }
+
+    #[test]
+    fn 入力は1回だけ解析する() {
+        let req = Request::new("post", "/")
+            .with_headers(vec![(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )])
+            .with_body(b"a=1&b=2".to_vec())
+            .with_query("c=3");
+        // 何度呼んでも同じ結果。2回目は覚えたものを返す。
+        let first = req.input_pairs().as_ptr();
+        assert_eq!(req.input("a").as_deref(), Some("1"));
+        assert_eq!(req.input("c").as_deref(), Some("3"));
+        assert_eq!(req.input_all().len(), 3);
+        assert_eq!(req.input_pairs().as_ptr(), first, "解析し直していない");
+        assert_eq!(req.form("b").as_deref(), Some("2"));
+        assert!(
+            req.form_all().iter().all(|(k, _)| k != "c"),
+            "クエリは入らない"
+        );
+    }
+
+    #[test]
+    fn 覚えてはいけない入力を落とす() {
+        let banned = [
+            "password",
+            "password_confirmation",
+            "passwd",
+            "pwd",
+            "pass",
+            "secret",
+            "token",
+            "_token",
+            "api_key",
+            "apiKey",
+            "private_key",
+            "credential",
+            "credentials",
+            "cvv",
+            "card",
+            "card_number",
+            "ssn",
+            "otp",
+            "pin",
+            "key",
+        ];
+        for name in banned {
+            assert!(is_sensitive(name), "{name} は残してはいけない");
+        }
+        for name in ["title", "email", "age", "body"] {
+            assert!(!is_sensitive(name), "{name} は残してよい");
+        }
+
+        let pairs = vec![
+            ("title".to_string(), "のこる".to_string()),
+            ("password".to_string(), "きえる".to_string()),
+            ("api_key".to_string(), "きえる".to_string()),
+        ];
+        let kept = redact(&pairs);
+        assert_eq!(kept, vec![("title".to_string(), "のこる".to_string())]);
     }
 }

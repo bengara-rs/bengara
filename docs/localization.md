@@ -50,25 +50,36 @@ APP_FALLBACK_LOCALE=ja
 | `APP_LOCALE`          | 最初の言語                               |
 | `APP_FALLBACK_LOCALE` | その言語に鍵が無いときに見る先           |
 
-途中で変えられます。
+途中でも変えられます。切り替え方は 2 つです。
+
+| 書き方                      | 効く範囲                       | 使う場面                       |
+|-----------------------------|--------------------------------|--------------------------------|
+| `Lang::with(言語, 処理)`    | 渡した処理の中だけ             | **リクエストごとに変えるとき** |
+| `Lang::set(言語)`           | **プロセス全体**（戻らない）   | 起動時に 1 回だけ決めるとき    |
 
 ```rust
-Lang::set("en");
-Lang::current();        // "en"
+Lang::current();        // "ja"
 Lang::available();      // ["en", "ja"]
 Lang::has("fr");        // false
 ```
 
-リクエストごとに切り替えるなら、ミドルウェアか画面の先頭で呼びます。
+### リクエストごとに変える
+
+`Lang::with` を使います。処理が終わると元の言語に戻ります。
 
 ```rust
 pub async fn show(req: Request) -> Result<Response> {
-    if let Some(locale) = req.query("locale") {
-        Lang::set(locale);
-    }
-    json(&bengara::serde_json::json!({ "welcome": __("messages.welcome") }))
+    let locale = req.query("locale").unwrap_or_else(Lang::current);
+
+    Lang::with(locale, async {
+        json(&bengara::serde_json::json!({ "welcome": __("messages.welcome") }))
+    })
+    .await
 }
 ```
+
+**`Lang::set` をリクエストの中で呼ばないでください。** プロセス全体に効くので、
+同時に来た別のリクエストの言語も変わります。
 
 ## 鍵が無いとき
 
@@ -93,11 +104,15 @@ __("messages.ない鍵");   // => "messages.ない鍵"
 ```toml
 greeting = "こんにちは、:name さん"
 count = ":total 件のうち :done 件が終わりました"
+name_both = ":name（:name_kanji）"
 ```
 
 ```rust
 __with("messages.count", &[("total", "10"), ("done", "3")]);
 ```
+
+**差し替えは長い名前から順に当てます。** `:name` と `:name_kanji` のように
+片方がもう片方の頭と同じでも、短いほうが先に当たって壊れることはありません。
 
 **エスケープはしません。** HTML に出すときは `escape_html` を通してください。
 
@@ -115,6 +130,14 @@ __with("messages.count", &[("total", "10"), ("done", "3")]);
 節の外に書いた鍵は、そのままの鍵になります（`title = "x"` → `title`）。
 
 **読めない行があるとビルドが止まります。** 行番号と理由を出すので、その行を直してください。
+
+**同じ鍵を 2 回書いてもビルドが止まります。** どちらが勝つか分からない状態にしません。
+
+```toml
+[messages]
+welcome = "ようこそ"
+welcome = "いらっしゃい"   # => resources/lang/ja.toml に鍵 `messages.welcome` が2回書かれています
+```
 
 ## 一覧を見る
 

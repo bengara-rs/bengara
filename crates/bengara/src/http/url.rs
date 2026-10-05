@@ -13,6 +13,12 @@ const SIGNATURE: &str = "signature";
 /// 期限を入れるクエリの名前。
 const EXPIRES: &str = "expires";
 
+/// 署名に使う鍵の用途名。
+///
+/// `APP_KEY` をそのまま使わず、用途ごとに別の鍵を作ります。
+/// どれか1つの署名を手がかりにされても、ほかの用途へ広がらないようにするためです。
+const SIGNING_LABEL: &str = "bengara:signed-url";
+
 /// パスから、アプリの URL をつないだ絶対 URL を作る。
 ///
 /// 元になるのは `APP_URL` です。
@@ -68,7 +74,9 @@ pub fn temporary_signed_url(
 }
 
 fn build_signed(path: &str, params: &[(&str, &str)], expires: Option<u64>) -> Result<String> {
-    let key = crate::config_registry::app_config().signing_key()?.to_vec();
+    let key = crate::config_registry::app_config().derived_key(SIGNING_LABEL)?;
+
+    check_signable_path(path)?;
 
     let mut pairs: Vec<(String, String)> = params
         .iter()
@@ -113,7 +121,7 @@ fn build_signed(path: &str, params: &[(&str, &str)], expires: Option<u64>) -> Re
 /// }
 /// ```
 pub fn has_valid_signature(req: &super::Request) -> Result<bool> {
-    let key = crate::config_registry::app_config().signing_key()?.to_vec();
+    let key = crate::config_registry::app_config().derived_key(SIGNING_LABEL)?;
 
     let mut pairs = Vec::new();
     let mut given = None;
@@ -143,6 +151,26 @@ pub fn has_valid_signature(req: &super::Request) -> Result<bool> {
         return Ok(false);
     };
     Ok(crypto::constant_time_eq(&expected, &given))
+}
+
+/// 署名付き URL にできるパスか確かめる。
+///
+/// 確かめる側は、符号化されたままの `req.path()` を使います。組み立てる側がここで
+/// path を符号化すると、すでに符号化された path（`route_with` の結果）を二重に
+/// 符号化してしまい、どちらが生の値かを見分けられません。
+/// そこで黙って直さず、**署名が必ず合わなくなる文字**が入っていたらエラーにします。
+/// 気づかないまま「いつも 403 になる」より、作ったところで止まるほうが分かります。
+fn check_signable_path(path: &str) -> Result<()> {
+    let bad = path
+        .chars()
+        .find(|c| *c == '?' || *c == '#' || !c.is_ascii());
+    match bad {
+        Some(bad) => Err(Error::msg(format!(
+            "署名付き URL のパスに `{bad}` は使えません。\
+             パーセントエンコードしてから渡してください（確かめる側は符号化されたパスを見ます）"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// 署名の対象にする文字列。
@@ -215,5 +243,22 @@ mod tests {
     #[test]
     fn 空のクエリでも形が崩れない() {
         assert_eq!(canonical_query(&[]), "");
+    }
+
+    #[test]
+    fn 署名できないパスは作る時点で断る() {
+        // 符号化された形ならそのまま通る（確かめる側と同じ文字列になる）。
+        assert!(check_signable_path("/unsubscribe").is_ok());
+        assert!(check_signable_path("/hello/%E3%81%82").is_ok());
+        assert!(check_signable_path("/a+b").is_ok());
+
+        // 確かめる側の `req.path()` と必ず食い違うものは断る。
+        for bad in ["/hello/あ", "/search?q=1", "/page#top"] {
+            let error = check_signable_path(bad).unwrap_err();
+            assert!(
+                error.to_string().contains("使えません"),
+                "{bad} は断るはず: {error}"
+            );
+        }
     }
 }

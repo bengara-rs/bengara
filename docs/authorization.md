@@ -9,11 +9,11 @@
 フレームワークが持っているのは、真偽値から 403 を作る `authorize` だけです。
 
 ```rust
-authorize(PostPolicy::update( & user, & post)) ?;
+authorize(PostPolicy::update(&user, &post))?;
 ```
 
 文字列で引く表（Laravel の `Gate::define`）はありません。
-関数呼び出しなので、 **名前を間違えればコンパイルで止まります。**
+関数呼び出しなので、**名前を間違えればコンパイルで止まります。**
 
 ## 書く
 
@@ -73,7 +73,8 @@ pub async fn update(req: Request) -> Result<Response> {
 }
 ```
 
-3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。 **止まる順番も、この並びのとおり**です（401 → 404 → 403）。
+3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。
+**止まる順番も、この並びのとおり**です（401 → 404 → 403）。
 
 | 関数                               | すること                                           |
 |------------------------------------|----------------------------------------------------|
@@ -88,8 +89,9 @@ pub async fn update(req: Request) -> Result<Response> {
 真偽値なので、止めずに分岐もできます。
 
 ```rust
-let can_edit = PostPolicy::update( & user, & post);
-json( & bengara::serde_json::json!({
+let can_edit = PostPolicy::update(&user, &post);
+
+json(&bengara::serde_json::json!({
     "title": post.title,
     "can_edit": can_edit,     // 画面でボタンを出すかどうか
 }))
@@ -104,9 +106,10 @@ json( & bengara::serde_json::json!({
 async fn 他人の記事は直せない() {
     let _db = refresh_database().await;
 
-    let mut alice = User::register("アリス", "alice@example.com", "password123");
+    // パスワードの変換は時間がかかるので、非同期版を使う
+    let mut alice = User::register("アリス", "alice@example.com", "password123").await.unwrap();
     alice.save().await.unwrap();
-    let mut bob = User::register("ボブ", "bob@example.com", "password123");
+    let mut bob = User::register("ボブ", "bob@example.com", "password123").await.unwrap();
     bob.save().await.unwrap();
 
     let mut post = Post::draft("下書き").owned_by(&alice);
@@ -120,9 +123,9 @@ async fn 他人の記事は直せない() {
 画面ごしに確かめるなら、ログインしてから叩きます。
 
 ```rust
-bob.send("PUT", "/api/my/articles/1", b"title=x".to_vec(), & [FORM])
-.await
-.assert_status(403);
+bob.send("PUT", "/api/my/articles/1", b"title=x".to_vec(), &[FORM])
+    .await
+    .assert_status(403);
 ```
 
 ## Laravel との違い

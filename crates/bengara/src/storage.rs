@@ -12,6 +12,7 @@
 //! | `public` | `storage/app/public/` |
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
 
@@ -70,10 +71,14 @@ impl DiskConfig {
     }
 }
 
-fn config() -> StorageConfig {
+/// いまの設定。
+///
+/// `try_config` は `&'static` を返すので**借りて回します**。クローンすると
+/// `Storage::get` 1 回につき `StorageConfig` のコピーが何度も走ります。
+fn config() -> &'static StorageConfig {
+    static FALLBACK: OnceLock<StorageConfig> = OnceLock::new();
     crate::try_config::<StorageConfig>()
-        .cloned()
-        .unwrap_or_default()
+        .unwrap_or_else(|| FALLBACK.get_or_init(StorageConfig::default))
 }
 
 /// ファイルの読み書き。`Storage::disk("名前")` で置き場所を選べます。
@@ -84,8 +89,7 @@ pub struct Storage {
 impl Storage {
     /// 既定の置き場所。
     pub fn default_disk() -> Result<Self> {
-        let config = config();
-        Self::named(&config.default)
+        Self::named(&config().default)
     }
 
     /// 名前で置き場所を選ぶ。

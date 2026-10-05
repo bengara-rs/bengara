@@ -358,8 +358,16 @@ impl Blueprint {
             if unique { "unique" } else { "index" }
         );
         let quoted: Vec<String> = columns.iter().map(|c| grammar::quote(driver, c)).collect();
+        // 表が `if not exists` なら索引にも付ける。
+        // 付けないと、2回流したときに索引の作成だけが落ちる。
+        let guard = match self.mode {
+            Mode::Create {
+                if_not_exists: true,
+            } => "if not exists ",
+            _ => "",
+        };
         format!(
-            "create {}index {} on {} ({})",
+            "create {}index {guard}{} on {} ({})",
             if unique { "unique " } else { "" },
             grammar::quote(driver, &name),
             grammar::quote(driver, &self.table),
@@ -373,6 +381,25 @@ impl Blueprint {
         sql.push(' ');
 
         if column.kind == ColumnType::Id {
+            // 自動採番の主キーは型名1つで全部書くので、ほかの指定を置く場所がない。
+            // 黙って捨てると気づけないので警告を出す。
+            // ここは同期の組み立てで `Result` を返せず、エラーにするとパニックしか
+            // 残らないため、警告にしてあります（`index()` は別の文になるので効きます）。
+            if column.nullable || column.default.is_some() || column.unique {
+                tracing::warn!(
+                    "{}.{} は自動採番の主キーなので、nullable / default / unique は無視します",
+                    self.table,
+                    column.name
+                );
+            }
+            if self.mode == Mode::Alter {
+                tracing::warn!(
+                    "{}.{} に id() を使っています。alter table add column では \
+                     自動採番の主キーを足せないので、この SQL は流れません",
+                    self.table,
+                    column.name
+                );
+            }
             sql.push_str(auto_increment_sql(driver));
             return sql;
         }
@@ -662,7 +689,15 @@ fn default_sql(driver: Driver, default: &DefaultValue) -> String {
             Driver::Postgres => v.to_string(),
             _ => i32::from(*v).to_string(),
         },
-        DefaultValue::Value(Value::Text(v)) => format!("'{}'", v.replace('\'', "''")),
+        DefaultValue::Value(Value::Text(v)) => {
+            let escaped = v.replace('\'', "''");
+            // MySQL は既定で `\` が逃がし文字。重ねないと引用が閉じない。
+            let escaped = match driver {
+                Driver::MySql => escaped.replace('\\', "\\\\"),
+                _ => escaped,
+            };
+            format!("'{escaped}'")
+        }
         DefaultValue::Value(Value::Bytes(_)) => "null".into(),
     }
 }
@@ -790,6 +825,57 @@ mod tests {
         });
         assert!(schema.to_sql()[0].contains("default 'it''s'"));
         assert!(schema.to_sql()[0].contains("default current_timestamp"));
+    }
+
+    #[test]
+    fn 無ければ作るときは索引にも_if_not_exists_が付く() {
+        let mut schema = sqlite();
+        schema.create_if_not_exists("users", |t| {
+            t.id();
+            t.string("name").index();
+            t.unique(&["name"]);
+        });
+        let sql = schema.to_sql();
+        assert!(sql[0].starts_with("create table if not exists \"users\""));
+        assert_eq!(
+            sql[1],
+            "create index if not exists \"users_name_index\" on \"users\" (\"name\")"
+        );
+        assert_eq!(
+            sql[2],
+            "create unique index if not exists \"users_name_unique\" on \"users\" (\"name\")"
+        );
+
+        // ふつうの create には付けない（これまでどおり）。
+        let mut schema = sqlite();
+        schema.create("users", |t| {
+            t.id();
+            t.string("name").index();
+        });
+        assert_eq!(
+            schema.to_sql()[1],
+            "create index \"users_name_index\" on \"users\" (\"name\")"
+        );
+    }
+
+    #[test]
+    fn mysql_の既定値は逆斜線も逃がす() {
+        let mut schema = Schema::new(Driver::MySql);
+        schema.create("t", |t| {
+            t.string("a").default("a\\");
+        });
+        assert!(
+            schema.to_sql()[0].contains("default 'a\\\\'"),
+            "{}",
+            schema.to_sql()[0]
+        );
+
+        // SQLite と PostgreSQL では `\` は普通の文字なので触らない。
+        let mut schema = sqlite();
+        schema.create("t", |t| {
+            t.string("a").default("a\\");
+        });
+        assert!(schema.to_sql()[0].contains("default 'a\\'"));
     }
 
     #[test]

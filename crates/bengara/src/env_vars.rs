@@ -12,6 +12,11 @@ use std::path::Path;
 ///     debug: env("APP_DEBUG", false),
 /// }
 /// ```
+///
+/// **空文字は未設定と同じ扱いです。** 前後の空白を落として空になった値も含みます。
+/// `.env` に `MAIL_FROM_NAME=` と書いても `default` が入るので、
+/// **この書き方で値を空にはできません。** 空にしたいときは、設定を読む側で
+/// `env("MAIL_FROM_NAME", "")` のように既定値そのものを空にしてください。
 pub fn env<T: FromEnv>(key: &str, default: impl Into<T>) -> T {
     match std::env::var(key) {
         Ok(raw) => {

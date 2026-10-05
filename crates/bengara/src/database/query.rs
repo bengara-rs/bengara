@@ -90,6 +90,15 @@ impl Where {
     }
 }
 
+/// 並べ方。
+#[derive(Debug, Clone)]
+enum Order {
+    /// 列の名前で並べる。
+    Column { column: String, desc: bool },
+    /// SQL をそのまま書く。
+    Raw(String),
+}
+
 /// 表の結合。
 #[derive(Debug, Clone)]
 struct TableJoin {
@@ -107,7 +116,9 @@ struct TableJoin {
 pub struct QueryBuilder {
     source: Source,
     driver: Driver,
-    /// 設定の読み出しで失敗していたら、終端メソッドでこのエラーを返す。
+    /// 組み立てのときに見つけた間違い。終端メソッドでこのエラーを返す。
+    ///
+    /// 組み立ての途中でパニックさせないため、最初の1つだけ覚えておきます。
     deferred_error: Option<String>,
     table: String,
     columns: Vec<String>,
@@ -116,7 +127,7 @@ pub struct QueryBuilder {
     wheres: Vec<Where>,
     groups: Vec<String>,
     havings: Vec<Where>,
-    orders: Vec<(String, bool)>,
+    orders: Vec<Order>,
     limit: Option<u64>,
     offset: Option<u64>,
 }
@@ -134,16 +145,11 @@ impl std::fmt::Debug for QueryBuilder {
 impl QueryBuilder {
     /// 新しく組み立てを始める。`DB::table(...)` から呼ばれます。
     pub(crate) fn new(source: Source, table: impl Into<String>) -> Self {
-        let (driver, deferred_error) = match source.driver() {
-            Ok(driver) => (driver, None),
-            // ここでエラーにすると `DB::table()` が Result を返すことになる。
-            // 組み立ては続けさせて、実行するときに知らせる。
-            Err(e) => (Driver::Sqlite, Some(e.to_string())),
-        };
+        let driver = resolve_driver(&source);
         Self {
             source,
             driver,
-            deferred_error,
+            deferred_error: None,
             table: table.into(),
             columns: Vec::new(),
             distinct: false,
@@ -158,15 +164,54 @@ impl QueryBuilder {
     }
 
     /// 投げ先を差し替える。モデルのクエリから使います。
+    ///
+    /// 組み立てのときに見つけた間違い（`deferred_error`）は残します。
     pub(crate) fn with_source(mut self, source: Source) -> Self {
-        let (driver, deferred_error) = match source.driver() {
-            Ok(driver) => (driver, None),
-            Err(e) => (Driver::Sqlite, Some(e.to_string())),
-        };
+        self.driver = resolve_driver(&source);
         self.source = source;
-        self.driver = driver;
-        self.deferred_error = deferred_error;
         self
+    }
+
+    /// 後で知らせる間違いを積む。最初の1つだけ残します。
+    fn defer(&mut self, message: impl Into<String>) {
+        if self.deferred_error.is_none() {
+            self.deferred_error = Some(message.into());
+        }
+    }
+
+    /// 列の名前として受け付けるか確かめる。
+    ///
+    /// 外れていたら組み立ては続けて、終端メソッドでエラーにします。
+    fn check_column(&mut self, place: &str, column: &str) {
+        if !grammar::is_plain_identifier(column) {
+            self.defer(format!(
+                "{place} に渡した列名 `{column}` は使えません。\
+                 英数字と `_` `.` だけが使えます。\
+                 式を書きたいときは order_by_raw / having_raw / where_raw を使ってください"
+            ));
+        }
+    }
+
+    /// 比べる演算子として受け付けるか確かめる。
+    fn check_operator(&mut self, place: &str, operator: &str) {
+        if !grammar::is_allowed_operator(operator) {
+            self.defer(format!(
+                "{place} に渡した演算子 `{operator}` は使えません（使えるもの: {}）",
+                grammar::OPERATORS.join(", ")
+            ));
+        }
+    }
+
+    /// 生の SQL に書いた `?` の数と、渡した値の数が合っているか確かめる。
+    fn check_raw(&mut self, place: &str, sql: &str, bindings: &[Value]) {
+        let holes = sql.matches('?').count();
+        if holes != bindings.len() {
+            self.defer(format!(
+                "{place} に書いた `?` の数（{holes}）と、渡した値の数（{}）が合っていません。\
+                 `?` は値の置き場所としてのみ使えます",
+                bindings.len()
+            ));
+        }
     }
 
     /// つながる先のデータベースの種類。
@@ -177,6 +222,9 @@ impl QueryBuilder {
     // ---- 取る列 ----
 
     /// 取る列を決める。
+    ///
+    /// ここは**式も書けます**（`count(*) as total` など）。引用せずそのまま置くので、
+    /// 外から来た文字列をそのまま渡さないでください。
     pub fn select(mut self, columns: &[&str]) -> Self {
         self.columns = columns.iter().map(|c| (*c).to_string()).collect();
         self
@@ -202,7 +250,11 @@ impl QueryBuilder {
     }
 
     /// 列と値を演算子で比べる。
-    pub fn where_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+    ///
+    /// 演算子は許可一覧（`=` `!=` `<` `<=` `>` `>=` `like` `is` など）で照合します。
+    /// 外れているときは終端メソッドでエラーになります。
+    pub fn where_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+        self.check_operator("where_op", operator);
         self.push_basic(Glue::And, column, operator, value.into_value())
     }
 
@@ -211,8 +263,9 @@ impl QueryBuilder {
         self.push_basic(Glue::Or, column, "=", value.into_value())
     }
 
-    /// `or` でつないで、列と値を演算子で比べる。
-    pub fn or_where_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+    /// `or` でつないで、列と値を演算子で比べる。演算子は許可一覧で照合します。
+    pub fn or_where_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+        self.check_operator("or_where_op", operator);
         self.push_basic(Glue::Or, column, operator, value.into_value())
     }
 
@@ -290,8 +343,9 @@ impl QueryBuilder {
         self.push_basic(Glue::And, column, "like", pattern.into_value())
     }
 
-    /// 列と列を比べる。
+    /// 列と列を比べる。演算子は許可一覧で照合します。
     pub fn where_column(mut self, left: &str, operator: &str, right: &str) -> Self {
+        self.check_operator("where_column", operator);
         self.wheres.push(Where::Column {
             boolean: Glue::And,
             left: left.to_string(),
@@ -302,7 +356,12 @@ impl QueryBuilder {
     }
 
     /// SQL を直接書く。値はプレースホルダ（`?`）で渡します。
+    ///
+    /// **`?` は値の置き場所としてのみ使えます。** 文字列の中に書いた `?` も
+    /// 値の置き場所として数えるので、`'a?b'` のような書き方はできません。
+    /// `?` の数と値の数が合わないときは、終端メソッドでエラーになります。
     pub fn where_raw(mut self, sql: &str, bindings: &[Value]) -> Self {
+        self.check_raw("where_raw", sql, bindings);
         self.wheres.push(Where::Raw {
             boolean: Glue::And,
             sql: sql.to_string(),
@@ -311,8 +370,9 @@ impl QueryBuilder {
         self
     }
 
-    /// `or` でつないで SQL を直接書く。
+    /// `or` でつないで SQL を直接書く。`?` は値の置き場所としてのみ使えます。
     pub fn or_where_raw(mut self, sql: &str, bindings: &[Value]) -> Self {
+        self.check_raw("or_where_raw", sql, bindings);
         self.wheres.push(Where::Raw {
             boolean: Glue::Or,
             sql: sql.to_string(),
@@ -327,6 +387,9 @@ impl QueryBuilder {
     /// .where_("status", "published")
     /// .where_group(|q| q.where_("views", 0).or_where_op("views", ">", 100))
     /// ```
+    ///
+    /// **使われるのは条件だけです。** クロージャの中で `select` / `limit` /
+    /// `order_by` を触っても捨てられます。
     pub fn where_group(self, build: impl FnOnce(QueryBuilder) -> QueryBuilder) -> Self {
         self.push_group(Glue::And, build)
     }
@@ -342,6 +405,10 @@ impl QueryBuilder {
         build: impl FnOnce(QueryBuilder) -> QueryBuilder,
     ) -> Self {
         let nested = build(QueryBuilder::new(self.source.clone(), self.table.clone()));
+        // 中で見つけた間違いも引き継ぐ。捨てると気づけない。
+        if let Some(message) = nested.deferred_error {
+            self.defer(message);
+        }
         if !nested.wheres.is_empty() {
             self.wheres.push(Where::Nested {
                 boolean,
@@ -410,13 +477,24 @@ impl QueryBuilder {
     // ---- 束ね・並び・件数 ----
 
     /// 列で束ねる。
+    ///
+    /// 列名は英数字と `_` `.` だけが使えます。外れているときは終端メソッドで
+    /// エラーになります。
     pub fn group_by(mut self, columns: &[&str]) -> Self {
+        for column in columns {
+            self.check_column("group_by", column);
+        }
         self.groups.extend(columns.iter().map(|c| (*c).to_string()));
         self
     }
 
     /// 束ねた結果を絞る。
+    ///
+    /// 列名は英数字と `_` `.` だけ、演算子は許可一覧で照合します。
+    /// 式で絞りたいときは `having_raw` を使ってください。
     pub fn having_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+        self.check_column("having_op", column);
+        self.check_operator("having_op", operator);
         self.havings.push(Where::Basic {
             boolean: Glue::And,
             column: column.to_string(),
@@ -426,8 +504,9 @@ impl QueryBuilder {
         self
     }
 
-    /// 束ねた結果を SQL で絞る。
+    /// 束ねた結果を SQL で絞る。`?` は値の置き場所としてのみ使えます。
     pub fn having_raw(mut self, sql: &str, bindings: &[Value]) -> Self {
+        self.check_raw("having_raw", sql, bindings);
         self.havings.push(Where::Raw {
             boolean: Glue::And,
             sql: sql.to_string(),
@@ -437,14 +516,37 @@ impl QueryBuilder {
     }
 
     /// 昇順に並べる。
+    ///
+    /// 列名は英数字と `_` `.` だけが使えます。外れているときは終端メソッドで
+    /// エラーになります。式で並べたいときは `order_by_raw` を使ってください。
     pub fn order_by(mut self, column: &str) -> Self {
-        self.orders.push((column.to_string(), false));
+        self.check_column("order_by", column);
+        self.orders.push(Order::Column {
+            column: column.to_string(),
+            desc: false,
+        });
         self
     }
 
-    /// 降順に並べる。
+    /// 降順に並べる。列名は英数字と `_` `.` だけが使えます。
     pub fn order_by_desc(mut self, column: &str) -> Self {
-        self.orders.push((column.to_string(), true));
+        self.check_column("order_by_desc", column);
+        self.orders.push(Order::Column {
+            column: column.to_string(),
+            desc: true,
+        });
+        self
+    }
+
+    /// 並べ方を SQL で直接書く。
+    ///
+    /// ```ignore
+    /// .order_by_raw("case when pinned then 0 else 1 end asc")
+    /// ```
+    ///
+    /// **外から来た文字列をそのまま渡さないでください。** 引用も検査もしません。
+    pub fn order_by_raw(mut self, sql: &str) -> Self {
+        self.orders.push(Order::Raw(sql.to_string()));
         self
     }
 
@@ -502,6 +604,11 @@ impl QueryBuilder {
     /// 組み立てた `select` の SQL と、渡す値の一覧を返す。
     ///
     /// 接続しないので、テストやデバッグで使えます。
+    ///
+    /// 接続の設定が読めないとき（名前の間違いなど）は、SQLite の書き方を仮に使います。
+    /// つまり**本当に投げる方言とは違う SQL が返ることがあります。**
+    /// その場合は終端メソッド（`get` など）がエラーになります。
+    /// 組み立てのときに見つけた間違い（使えない列名など）も、ここでは出ません。
     pub fn to_sql(&self) -> (String, Vec<Value>) {
         let mut c = Compiler::new(self.driver);
         c.sql.push_str("select ");
@@ -574,12 +681,13 @@ impl QueryBuilder {
         let orders: Vec<String> = self
             .orders
             .iter()
-            .map(|(column, desc)| {
-                format!(
+            .map(|order| match order {
+                Order::Column { column, desc } => format!(
                     "{} {}",
                     grammar::quote(self.driver, column),
                     if *desc { "desc" } else { "asc" }
-                )
+                ),
+                Order::Raw(sql) => sql.clone(),
             })
             .collect();
         c.sql.push_str(" order by ");
@@ -592,9 +700,13 @@ impl QueryBuilder {
             c.sql.push_str(&format!(" limit {limit}"));
         }
         if let Some(offset) = self.offset {
-            // SQLite と MySQL は limit が無いと offset を受け付けない。
             if self.limit.is_none() {
-                c.sql.push_str(" limit -1");
+                // SQLite と MySQL は limit が無いと offset を受け付けない。
+                // PostgreSQL では `limit -1` が構文エラーなので `limit all` を使う。
+                c.sql.push_str(match self.driver {
+                    Driver::Postgres => " limit all",
+                    _ => " limit -1",
+                });
             }
             c.sql.push_str(&format!(" offset {offset}"));
         }
@@ -687,11 +799,35 @@ impl QueryBuilder {
         }
     }
 
+    /// 終端メソッドの頭で呼ぶ確かめ。
+    ///
+    /// 設定が読めないこと（接続の名前が無いなど）も、組み立ての間違いも、
+    /// ここで初めてエラーにします。`DB::table()` を `Result` にしないためです。
     fn check(&self) -> Result<()> {
+        self.source.driver()?;
         match &self.deferred_error {
             Some(message) => Err(Error::msg(message.clone())),
             None => Ok(()),
         }
+    }
+
+    /// `update` / `delete` で使えない指定が付いていないか。
+    ///
+    /// 黙って全件に当てるより、エラーにしたほうが安全です。
+    fn check_write(&self, what: &str) -> Result<()> {
+        if !self.joins.is_empty() {
+            return Err(Error::msg(format!(
+                "join を付けた問い合わせでは {what} できません。where で絞ってください"
+            )));
+        }
+        if self.limit.is_some() || self.offset.is_some() {
+            return Err(Error::msg(format!(
+                "limit / offset を付けた問い合わせでは {what} できません。\
+                 黙って全件に当たるのを防ぐためです。\
+                 先に主キーを取り出して、where_in で絞ってください"
+            )));
+        }
+        Ok(())
     }
 
     // ---- 実行 ----
@@ -715,25 +851,105 @@ impl QueryBuilder {
     }
 
     /// 最初の行の、ある列の値を取る。
+    ///
+    /// `users.name` のように表名を付けた指定や、別名付きの式も渡せます。
+    /// 1列だけ取るので、名前ではなく**位置**から読むためです。
     pub async fn value<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
         let row = self.clone().select(&[column]).first().await?;
-        match row {
-            Some(row) => row.get::<T>(column).map(Some),
+        match row.as_ref().and_then(|row| row.at(0)) {
+            Some(value) => T::from_value(value)
+                .map(Some)
+                .map_err(|e| Error::msg(format!("`{column}` を読めません: {e}"))),
             None => Ok(None),
         }
     }
 
     /// ある列だけを一覧で取る。
+    ///
+    /// `pluck::<String>("users.name")` のように表名を付けても取れます。
+    /// SQLite が返す列名は `name` になりますが、**位置**から読むためです。
     pub async fn pluck<T: FromValue>(&self, column: &str) -> Result<Vec<T>> {
         let rows = self.clone().select(&[column]).get().await?;
-        rows.iter().map(|row| row.get::<T>(column)).collect()
+        rows.iter()
+            .map(|row| match row.at(0) {
+                Some(value) => T::from_value(value)
+                    .map_err(|e| Error::msg(format!("`{column}` を読めません: {e}"))),
+                None => Err(Error::msg(format!("`{column}` の値が返りませんでした"))),
+            })
+            .collect()
     }
 
     /// 件数を数える。
+    ///
+    /// `group_by` が付いているときは**グループの数**を返します。
+    /// `distinct()` が付いているときは重なりを除いて数えます。
     pub async fn count(&self) -> Result<i64> {
-        self.aggregate::<i64>("count", "*")
-            .await
-            .map(|v| v.unwrap_or(0))
+        self.check()?;
+        let (sql, bindings) = self.count_sql();
+        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        match rows.first().and_then(|row| row.at(0)) {
+            None | Some(Value::Null) => Ok(0),
+            Some(value) => i64::from_value(value),
+        }
+    }
+
+    /// `count` の SQL を組み立てる。
+    ///
+    /// `group_by` と `distinct` で形が変わります。そのまま `count(*)` を足すと、
+    /// `group_by` ではグループごとの件数（＝最初のグループの件数）になり、
+    /// `distinct` では重なりを除かない件数になります。
+    fn count_sql(&self) -> (String, Vec<Value>) {
+        if !self.groups.is_empty() {
+            // 束ねた結果の「行の数」を数えたいので、副問い合わせの外から数える。
+            return self.sub_count_sql();
+        }
+        if self.distinct {
+            // 数える列が1つに決まるなら `count(distinct 列)`。
+            // 決まらない（指定なし・複数・式）ときは副問い合わせで数える。
+            return match self.distinct_count_column() {
+                Some(column) => self.plain_count_sql(&format!("count(distinct {column})")),
+                None => self.sub_count_sql(),
+            };
+        }
+        self.plain_count_sql("count(*)")
+    }
+
+    /// `count(distinct …)` に使える列。1列だけ指定されているときだけ決まります。
+    fn distinct_count_column(&self) -> Option<String> {
+        let [column] = self.columns.as_slice() else {
+            return None;
+        };
+        if !grammar::is_plain_identifier(column) {
+            return None;
+        }
+        Some(grammar::quote(self.driver, column))
+    }
+
+    /// 並びと件数の指定を外した問い合わせ。集計はこの形で組み立てます。
+    fn for_aggregate(&self) -> Self {
+        let mut query = self.clone();
+        query.orders.clear();
+        query.limit = None;
+        query.offset = None;
+        query
+    }
+
+    /// 集計の式を1つだけ取る形。
+    fn plain_count_sql(&self, expression: &str) -> (String, Vec<Value>) {
+        let mut query = self.for_aggregate();
+        // 重なりは `count(distinct …)` の側で見るので、ここでは外す。
+        query.distinct = false;
+        query.columns = vec![format!("{expression} as bengara_aggregate")];
+        query.to_sql()
+    }
+
+    /// 副問い合わせの外から数える形。
+    fn sub_count_sql(&self) -> (String, Vec<Value>) {
+        let (inner, bindings) = self.for_aggregate().to_sql();
+        (
+            format!("select count(*) as bengara_aggregate from ({inner}) as bengara_sub"),
+            bindings,
+        )
     }
 
     /// 1件でもあるか。
@@ -773,18 +989,27 @@ impl QueryBuilder {
     }
 
     async fn aggregate<T: FromValue>(&self, function: &str, column: &str) -> Result<Option<T>> {
+        self.check()?;
+        if !self.groups.is_empty() {
+            // 束ねた結果に対する sum / avg / min / max は、1つの値に決まらない。
+            // 黙って最初のグループの値を返すのをやめて、書き方を伝える。
+            return Err(Error::msg(format!(
+                "group_by と {function}() は組み合わせられません。\
+                 グループごとの値が欲しいときは、select に `{function}(列) as 名前` を書いて \
+                 get() してください"
+            )));
+        }
         let column = if column == "*" {
             "*".to_string()
         } else {
             grammar::quote(self.driver, column)
         };
-        let mut query = self.clone();
-        query.orders.clear();
-        query.limit = None;
-        query.offset = None;
         let expression = format!("{function}({column}) as bengara_aggregate");
-        let rows = query.select(&[expression.as_str()]).get().await?;
-        match rows.first().and_then(|row| row.value("bengara_aggregate")) {
+        let mut query = self.for_aggregate();
+        query.columns = vec![expression];
+        let rows = query.get().await?;
+        // 1列だけ取るので、名前ではなく位置から読む。
+        match rows.first().and_then(|row| row.at(0)) {
             Some(Value::Null) | None => Ok(None),
             Some(value) => T::from_value(value).map(Some),
         }
@@ -888,8 +1113,12 @@ impl QueryBuilder {
     }
 
     /// 条件に当てはまる行を更新する。返るのは変わった件数です。
+    ///
+    /// **`join` と `limit` / `offset` は使えません。** 組み立てた SQL に入らないので、
+    /// 黙って全件に当たってしまいます。付いているときはエラーにします。
     pub async fn update(&self, values: &[(&str, Value)]) -> Result<u64> {
         self.check()?;
+        self.check_write("update")?;
         if values.is_empty() {
             return Err(Error::msg("update に渡す列がありません"));
         }
@@ -911,8 +1140,11 @@ impl QueryBuilder {
     }
 
     /// 条件に当てはまる行を消す。返るのは消した件数です。
+    ///
+    /// **`join` と `limit` / `offset` は使えません。** 理由は `update` と同じです。
     pub async fn delete(&self) -> Result<u64> {
         self.check()?;
+        self.check_write("delete")?;
         let mut c = Compiler::new(self.driver);
         c.sql.push_str("delete from ");
         c.sql.push_str(&grammar::quote(self.driver, &self.table));
@@ -937,6 +1169,9 @@ impl QueryBuilder {
     }
 
     /// ページ分けして取る。ページは1から数えます。
+    ///
+    /// `total` は `count()` と同じ数え方です（`group_by` ならグループの数、
+    /// `distinct` なら重なりを除いた数）。
     pub async fn paginate(&self, per_page: u64, page: u64) -> Result<Paginator<Row>> {
         let per_page = per_page.max(1);
         let page = page.max(1);
@@ -949,6 +1184,14 @@ impl QueryBuilder {
             current_page: page,
         })
     }
+}
+
+/// 投げ先から、SQL の組み立てに使うドライバを決める。
+///
+/// 設定が読めないときは SQLite を仮に使います。本当のエラーは終端メソッド
+/// （`check`）で返します。
+fn resolve_driver(source: &Source) -> Driver {
+    source.driver().unwrap_or(Driver::Sqlite)
 }
 
 /// SQL と値を組み立てる途中の入れ物。
@@ -975,6 +1218,9 @@ impl Compiler {
     }
 
     /// 利用者が書いた SQL を足す。`?` を使っている場合は番号を振り直す。
+    ///
+    /// `?` の数と値の数が合っているかは、組み立てのとき
+    /// （`QueryBuilder::check_raw`）に確かめます。
     fn push_raw(&mut self, sql: &str, bindings: &[Value]) {
         if self.driver != Driver::Postgres {
             self.sql.push_str(sql);
@@ -1176,6 +1422,150 @@ mod tests {
             .to_sql();
         assert_eq!(sql, "select * from \"posts\" where length(title) > ?");
         assert_eq!(bindings, vec![Value::Int(3)]);
+    }
+
+    #[test]
+    fn 危ない列名は終端でエラーになる() {
+        let danger = "id; drop table posts --";
+        for query in [
+            builder().order_by(danger),
+            builder().order_by_desc(danger),
+            builder().group_by(&[danger]),
+            builder().having_op(danger, ">", 1),
+        ] {
+            let message = query.check().expect_err("断られる").to_string();
+            assert!(message.contains("使えません"), "{message}");
+            assert!(message.contains(danger), "{message}");
+        }
+    }
+
+    #[test]
+    fn 危ない演算子は終端でエラーになる() {
+        let danger = "= 1 or 1";
+        for query in [
+            builder().where_op("id", danger, 1),
+            builder().or_where_op("id", danger, 1),
+            builder().having_op("total", danger, 1),
+            builder().where_column("a", danger, "b"),
+        ] {
+            let message = query.check().expect_err("断られる").to_string();
+            assert!(message.contains("演算子"), "{message}");
+        }
+    }
+
+    #[test]
+    fn 普通の列名と演算子は通る() {
+        let query = builder()
+            .order_by("created_at")
+            .order_by_desc("users.id")
+            .group_by(&["post_id"])
+            .having_op("total", ">=", 2)
+            .where_op("views", "<", 10)
+            .where_op("title", "NOT LIKE", "%x%")
+            .where_column("a", "=", "b");
+        query.check().expect("通る");
+    }
+
+    #[test]
+    fn 並び順は生でも書ける() {
+        let query = builder().order_by_raw("case when pinned then 0 else 1 end asc");
+        query.check().expect("通る");
+        let (sql, _) = query.to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" order by case when pinned then 0 else 1 end asc"
+        );
+    }
+
+    #[test]
+    fn 束ねたときの件数はグループの数を数える() {
+        let (sql, bindings) = builder()
+            .where_("status", "published")
+            .group_by(&["post_id"])
+            .count_sql();
+        assert_eq!(
+            sql,
+            "select count(*) as bengara_aggregate from (\
+             select * from \"posts\" where \"status\" = ? group by \"post_id\"\
+             ) as bengara_sub"
+        );
+        assert_eq!(bindings, vec![Value::Text("published".into())]);
+    }
+
+    #[test]
+    fn 重なりを除いた件数を数える() {
+        // 列が1つに決まるときは count(distinct 列)。
+        let (sql, _) = builder().distinct().select(&["author_id"]).count_sql();
+        assert_eq!(
+            sql,
+            "select count(distinct \"author_id\") as bengara_aggregate from \"posts\""
+        );
+
+        // 決まらないときは副問い合わせ。
+        let (sql, _) = builder().distinct().count_sql();
+        assert_eq!(
+            sql,
+            "select count(*) as bengara_aggregate from (\
+             select distinct * from \"posts\"\
+             ) as bengara_sub"
+        );
+    }
+
+    #[test]
+    fn 条件なしの件数はそのまま数える() {
+        let (sql, _) = builder().latest().limit(10).count_sql();
+        assert_eq!(sql, "select count(*) as bengara_aggregate from \"posts\"");
+    }
+
+    #[test]
+    fn 生のsqlは値の数を確かめる() {
+        let message = builder()
+            .where_raw("length(title) > ?", &[])
+            .check()
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("合っていません"), "{message}");
+        builder()
+            .where_raw("length(title) > ?", &[Value::Int(3)])
+            .check()
+            .expect("数が合えば通る");
+    }
+
+    #[test]
+    fn postgres_では_offset_だけでも通る形にする() {
+        let query = QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder()
+        };
+        let (sql, _) = query.offset(5).to_sql();
+        assert_eq!(sql, "select * from \"posts\" limit all offset 5");
+    }
+
+    #[tokio::test]
+    async fn 結合や件数を付けた更新と削除は断る() {
+        let joined = builder().join("c", "c.post_id", "=", "posts.id");
+        let message = joined
+            .update(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("join"), "{message}");
+
+        let limited = builder().limit(1);
+        let message = limited
+            .update(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("limit"), "{message}");
+
+        let message = builder()
+            .limit(1)
+            .delete()
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("limit"), "{message}");
     }
 
     #[test]

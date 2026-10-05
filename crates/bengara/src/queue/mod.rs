@@ -15,6 +15,7 @@ mod worker;
 
 pub(crate) use worker::{
     failed_count, failed_list, retry_failed, run as work, Options as WorkerOptions,
+    DEFAULT_RETRY_AFTER,
 };
 
 use std::future::Future;
@@ -106,14 +107,42 @@ impl Queue {
             .await
     }
 
-    /// 待っているジョブの数。
+    /// 表に残っているジョブの数。
+    ///
+    /// **すぐ処理できる数ではありません。** 下の `size_on` と同じで、処理中
+    /// （予約済み）・遅延待ち・再挑戦待ちも数に入ります。すぐ処理できる数は
+    /// [`Queue::ready_size`] を使ってください。
     pub async fn size() -> Result<i64> {
         Self::size_on(DEFAULT_QUEUE).await
     }
 
-    /// そのキューで待っているジョブの数。
+    /// そのキューの表に残っているジョブの数。
+    ///
+    /// `queue` の列だけで数えます。つまり次の 3 つも含みます。
+    ///
+    /// - 処理中のもの（`reserved_at` が入っている）
+    /// - 遅延待ちのもの（`Queue::later` で入れた、`available_at` が未来）
+    /// - 再挑戦待ちのもの（失敗して待ち時間を伸ばしたもの）
     pub async fn size_on(queue: &str) -> Result<i64> {
         DB::table(TABLE).where_("queue", queue).count().await
+    }
+
+    /// いますぐ処理できるジョブの数。
+    ///
+    /// 処理中・遅延待ち・再挑戦待ちを除いた数です。
+    pub async fn ready_size() -> Result<i64> {
+        Self::ready_size_on(DEFAULT_QUEUE).await
+    }
+
+    /// そのキューで、いますぐ処理できるジョブの数。
+    pub async fn ready_size_on(queue: &str) -> Result<i64> {
+        let now = crate::support::time::format_timestamp(crate::support::time::now_seconds());
+        DB::table(TABLE)
+            .where_("queue", queue)
+            .where_null("reserved_at")
+            .where_op("available_at", "<=", now)
+            .count()
+            .await
     }
 
     /// 諦めたジョブの数。

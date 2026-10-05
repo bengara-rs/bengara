@@ -14,7 +14,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("cache:prune", "期限切れのキャッシュだけ消す"),
     (
         "queue:work",
-        "キューのジョブを処理する（--once / --tries=3 / --sleep=1 / --queue=名前）",
+        "キューのジョブを処理する（--once / --tries=3 / --sleep=1 / --retry-after=90 / --queue=名前）",
     ),
     ("queue:failed", "諦めたジョブの一覧"),
     ("queue:retry", "諦めたジョブをキューへ戻す（--id=1 で1件）"),
@@ -31,7 +31,7 @@ pub(crate) fn is_command(name: &str) -> bool {
 
 /// コマンドを実行する。
 pub(crate) fn run(name: &str, args: &[String], hooks: Hooks) -> Result<()> {
-    let options = Options::parse(args)?;
+    let options = Options::parse(name, args)?;
     runtime()?.block_on(execute(name, &options, hooks))
 }
 
@@ -58,12 +58,19 @@ async fn execute(name: &str, options: &Options, hooks: Hooks) -> Result<()> {
             println!("キャッシュを消しました。");
         }
         "cache:prune" => {
-            let dir = crate::paths::storage_path("framework").join("cache");
-            let removed = crate::cache::store::sweep_expired(&dir)?;
-            println!(
-                "期限切れのキャッシュを {removed} 件消しました（{}）",
-                dir.display()
-            );
+            // 置き場所の都合はキャッシュ側に任せる。ここでパスを組み立てると、
+            // `install_store` で場所を変えたアプリで無関係なディレクトリを見ます。
+            match crate::cache::Cache::prune().await? {
+                Some(removed) => match crate::cache::Cache::location() {
+                    Some(place) => {
+                        println!("期限切れのキャッシュを {removed} 件消しました（{place}）")
+                    }
+                    None => println!("期限切れのキャッシュを {removed} 件消しました。"),
+                },
+                None => println!(
+                    "このキャッシュには期限切れの掃除がありません（CACHE_DRIVER を確かめてください）"
+                ),
+            }
         }
         "queue:work" => {
             let stop = stop_signal();
@@ -72,6 +79,7 @@ async fn execute(name: &str, options: &Options, hooks: Hooks) -> Result<()> {
                 tries: options.tries,
                 sleep: options.sleep,
                 once: options.once,
+                retry_after: options.retry_after,
             };
             crate::queue::work((hooks.jobs)(), &worker, stop).await?;
         }
@@ -101,7 +109,7 @@ async fn execute(name: &str, options: &Options, hooks: Hooks) -> Result<()> {
         }
         "schedule:list" => {
             let schedule = build_schedule(hooks);
-            crate::schedule::print_list(&schedule).await?;
+            crate::schedule::print_list(&schedule);
         }
         "lang:list" => {
             crate::lang::install((hooks.lang)());
@@ -163,6 +171,7 @@ struct Options {
     tries: u32,
     sleep: u64,
     once: bool,
+    retry_after: i64,
     id: Option<i64>,
 }
 
@@ -173,36 +182,81 @@ impl Default for Options {
             tries: 3,
             sleep: 1,
             once: false,
+            retry_after: crate::queue::DEFAULT_RETRY_AFTER,
             id: None,
         }
     }
 }
 
+/// そのコマンドが受け付ける旗。
+///
+/// **コマンドごとに分けます。** 全コマンドで共通にすると、
+/// `cache:clear --tries=9` のような書き間違いが黙って通ります。
+/// 値を取る旗は `=` まで書いておきます。
+fn allowed_flags(command: &str) -> &'static [&'static str] {
+    match command {
+        "queue:work" => &[
+            "--queue=",
+            "--tries=",
+            "--sleep=",
+            "--retry-after=",
+            "--once",
+        ],
+        "queue:retry" => &["--id="],
+        // 残りは旗を取りません。
+        _ => &[],
+    }
+}
+
 impl Options {
-    fn parse(args: &[String]) -> Result<Self> {
+    fn parse(command: &str, args: &[String]) -> Result<Self> {
+        let allowed = allowed_flags(command);
         let mut options = Self::default();
+
         for arg in args {
+            // `--tries=5` は `--tries=`、`--once` は `--once` として見分ける。
+            let flag = match arg.split_once('=') {
+                Some((name, _)) => format!("{name}="),
+                None => arg.clone(),
+            };
+            if !allowed.contains(&flag.as_str()) {
+                return Err(Error::msg(format!(
+                    "`{command}` は `{arg}` を受け付けません（{}）",
+                    describe_flags(allowed)
+                )));
+            }
+
             if let Some(value) = arg.strip_prefix("--queue=") {
                 options.queue = value.to_string();
             } else if let Some(value) = arg.strip_prefix("--tries=") {
                 options.tries = parse_number(value, "--tries")?;
             } else if let Some(value) = arg.strip_prefix("--sleep=") {
                 options.sleep = parse_number(value, "--sleep")?;
+            } else if let Some(value) = arg.strip_prefix("--retry-after=") {
+                options.retry_after = parse_number(value, "--retry-after")?;
             } else if let Some(value) = arg.strip_prefix("--id=") {
                 options.id = Some(parse_number(value, "--id")?);
             } else if arg == "--once" {
                 options.once = true;
-            } else {
-                return Err(Error::msg(format!(
-                    "`{arg}` は受け付けません（使えるのは --queue= / --tries= / --sleep= / --id= / --once）"
-                )));
             }
         }
+
         if options.tries == 0 {
             return Err(Error::msg("--tries は 1 以上にしてください"));
         }
+        if options.retry_after <= 0 {
+            return Err(Error::msg("--retry-after は 1 以上にしてください"));
+        }
         Ok(options)
     }
+}
+
+/// 受け付ける旗を人が読む形にする。
+fn describe_flags(allowed: &[&str]) -> String {
+    if allowed.is_empty() {
+        return "このコマンドは旗を取りません".to_string();
+    }
+    format!("使えるのは {}", allowed.join(" / "))
 }
 
 fn parse_number<T: std::str::FromStr>(value: &str, name: &str) -> Result<T> {
@@ -221,36 +275,62 @@ mod tests {
 
     #[test]
     fn 既定の指定() {
-        let options = Options::parse(&[]).unwrap();
+        let options = Options::parse("queue:work", &[]).unwrap();
         assert_eq!(options.queue, "default");
         assert_eq!(options.tries, 3);
         assert_eq!(options.sleep, 1);
         assert!(!options.once);
+        assert_eq!(options.retry_after, 90);
         assert_eq!(options.id, None);
     }
 
     #[test]
     fn 指定を読める() {
-        let options = Options::parse(&args(&[
-            "--queue=mail",
-            "--tries=5",
-            "--sleep=3",
-            "--once",
-            "--id=12",
-        ]))
+        let options = Options::parse(
+            "queue:work",
+            &args(&[
+                "--queue=mail",
+                "--tries=5",
+                "--sleep=3",
+                "--retry-after=300",
+                "--once",
+            ]),
+        )
         .unwrap();
         assert_eq!(options.queue, "mail");
         assert_eq!(options.tries, 5);
         assert_eq!(options.sleep, 3);
+        assert_eq!(options.retry_after, 300);
         assert!(options.once);
+
+        let options = Options::parse("queue:retry", &args(&["--id=12"])).unwrap();
         assert_eq!(options.id, Some(12));
     }
 
     #[test]
     fn 知らない指定と0回は断る() {
-        assert!(Options::parse(&args(&["--nope"])).is_err());
-        assert!(Options::parse(&args(&["--tries=x"])).is_err());
-        assert!(Options::parse(&args(&["--tries=0"])).is_err());
+        assert!(Options::parse("queue:work", &args(&["--nope"])).is_err());
+        assert!(Options::parse("queue:work", &args(&["--tries=x"])).is_err());
+        assert!(Options::parse("queue:work", &args(&["--tries=0"])).is_err());
+        assert!(Options::parse("queue:work", &args(&["--retry-after=0"])).is_err());
+    }
+
+    #[test]
+    fn 旗はコマンドごとに分かれている() {
+        // 前は全コマンド共通だったので、これが黙って通っていた。
+        let error = Options::parse("cache:clear", &args(&["--tries=9"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cache:clear"), "{error}");
+        assert!(error.contains("旗を取りません"), "{error}");
+
+        // `--id=` は queue:retry だけ。
+        assert!(Options::parse("queue:retry", &args(&["--id=1"])).is_ok());
+        assert!(Options::parse("queue:work", &args(&["--id=1"])).is_err());
+        assert!(Options::parse("queue:retry", &args(&["--once"])).is_err());
+
+        // 旗を取らないコマンドは、旗が無ければ通る。
+        assert!(Options::parse("cache:prune", &[]).is_ok());
     }
 
     #[test]

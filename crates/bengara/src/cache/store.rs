@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::error::{Error, Result};
@@ -19,6 +20,8 @@ use crate::support::time;
 /// - **複数のプロセスから同時に使われます。** プロセスのメモリだけに置かないでください。
 /// - 期限切れは読み込みのときに捨ててください。
 /// - 読み書きはブロックしてかまいません（`spawn_blocking` の中で呼びます）。
+///
+/// `increment` 以下には既定の実装が付いています。足しても、既にある実装は壊れません。
 pub trait CacheStore: Send + Sync + 'static {
     /// 入れる。`seconds` が `None` なら期限なし。
     fn put(&self, key: &str, value: &str, seconds: Option<u64>) -> Result<()>;
@@ -31,6 +34,63 @@ pub trait CacheStore: Send + Sync + 'static {
 
     /// 全部消す。
     fn flush(&self) -> Result<()>;
+
+    /// あるか。
+    ///
+    /// 既定の実装は値を読んで捨てます。値が大きいときは自分で実装してください。
+    fn has(&self, key: &str) -> Result<bool> {
+        Ok(self.get(key)?.is_some())
+    }
+
+    /// 数を足して、足した後の値を返す。無ければ 0 から始めます。
+    ///
+    /// **既定の実装は「読む → 足す → 書く」の3手に分かれているので、
+    /// 同時に呼ばれると数を落とします。** 正しく数えたい置き場所は、
+    /// 自分で排他を取って実装してください。
+    ///
+    /// **期限は引き継ぎません**（期限なしで書き直します）。回数の記録に使う前提です。
+    fn increment(&self, key: &str, by: i64) -> Result<i64> {
+        let current = parse_number(key, self.get(key)?)?;
+        let next = current + by;
+        self.put(key, &next.to_string(), None)?;
+        Ok(next)
+    }
+
+    /// 読み書きがブロックするか。
+    ///
+    /// `true`（既定）のときだけ、裏のスレッド（`spawn_blocking`）を経由します。
+    /// メモリだけで済む置き場所は `false` にすると、無駄な往復がなくなります。
+    fn blocking(&self) -> bool {
+        true
+    }
+
+    /// 期限切れのものだけ消して、消した件数を返す（`cache:prune`）。
+    ///
+    /// 既定の実装は何もしません。[`CacheStore::prunable`] も合わせて `true` にしてください。
+    fn prune(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// 期限切れの掃除ができるか。`cache:prune` の表示を変えるために見ます。
+    fn prunable(&self) -> bool {
+        false
+    }
+
+    /// 置き場所を人に見せる言い方（コマンドの表示用）。言えないときは `None`。
+    fn location(&self) -> Option<String> {
+        None
+    }
+}
+
+/// キャッシュに入っている文字を数として読む。
+fn parse_number(key: &str, raw: Option<String>) -> Result<i64> {
+    match raw {
+        Some(found) => found
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| Error::msg(format!("`{key}` の値は数ではありません"))),
+        None => Ok(0),
+    }
 }
 
 /// 1件ぶんの中身。ファイルにはこの形で入ります。
@@ -64,6 +124,26 @@ impl Entry {
     }
 }
 
+/// 書き込み途中の一時ファイルに付ける連番。
+///
+/// 鍵が違えば一時ファイルも違う名前になるように、プロセス番号と合わせて使います。
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 同じプロセスの中で `increment` を直列化する錠。
+///
+/// プロセスをまたぐ分は錠ファイルで守ります。
+static INCREMENT_LOCK: Mutex<()> = Mutex::new(());
+
+/// 一時ファイルがこの秒数より古ければ、書き込みに失敗した残骸と見なして消す。
+const TEMP_STALE_SECS: u64 = 300;
+
+/// 錠ファイルがこの秒数より古ければ、置いたプロセスが落ちたと見なして外す。
+const LOCK_STALE_SECS: u64 = 10;
+
+/// 錠を取るのを諦めるまでの回数と、1回あたりの待ち時間（ミリ秒）。
+const LOCK_TRIES: u32 = 100;
+const LOCK_SLEEP_MS: u64 = 10;
+
 /// `storage/framework/cache/` にファイルとして置く。既定の置き場所です。
 ///
 /// 1つの鍵が1つのファイルになります。
@@ -80,12 +160,36 @@ impl FileCache {
 
     /// `storage/framework/cache/` に置く（既定）。
     pub fn default_path() -> Self {
+        Self::new(Self::default_dir())
+    }
+
+    /// 既定の置き場所。**パスの定義はここ1か所だけです。**
+    pub(crate) fn default_dir() -> PathBuf {
         // join を 2 回に分けて、Windows でも区切りが混ざらないようにする。
-        Self::new(crate::paths::storage_path("framework").join("cache"))
+        crate::paths::storage_path("framework").join("cache")
     }
 
     fn path_of(&self, key: &str) -> PathBuf {
         self.dir.join(key)
+    }
+
+    /// 書き込み途中に使う名前。
+    ///
+    /// `with_extension("tmp")` は最後の `.` 以降を置き換えるので、`test.put` と
+    /// `test.count` が同じ `test.tmp` を共有してしまいます。鍵の後ろに
+    /// プロセス番号と連番を足して、鍵をまたいでも重ならない名前にします。
+    fn temp_path_of(&self, key: &str) -> PathBuf {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        self.dir
+            .join(format!("{key}.{}.{seq}.tmp", std::process::id()))
+    }
+
+    /// 1つの鍵を守る錠ファイルの場所。
+    ///
+    /// 本体と混ざらないよう、別のディレクトリに置きます（`read_dir` では
+    /// ファイルだけを見ているので、掃除の対象にもなりません）。
+    fn lock_path_of(&self, key: &str) -> PathBuf {
+        self.dir.join("locks").join(format!("{key}.lock"))
     }
 
     fn ensure_dir(&self) -> Result<()> {
@@ -110,9 +214,13 @@ impl CacheStore for FileCache {
         self.ensure_dir()?;
         let path = self.path_of(key);
         // 書いている途中の中身を読まれないよう、別の名前で書いてから置き換える。
-        let temp = path.with_extension("tmp");
+        let temp = self.temp_path_of(key);
         std::fs::write(&temp, Entry::encode(value, seconds))?;
-        std::fs::rename(&temp, &path)?;
+        if let Err(e) = std::fs::rename(&temp, &path) {
+            // 置き換えに失敗したら、書きかけを残さない。
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::Io(e));
+        }
         Ok(())
     }
 
@@ -151,11 +259,100 @@ impl CacheStore for FileCache {
             Err(e) => return Err(Error::Io(e)),
         };
         for entry in entries.flatten() {
-            if entry.path().is_file() {
-                let _ = std::fs::remove_file(entry.path());
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
             }
+            // 別のプロセスが書いている途中の一時ファイルは消さない。
+            // 消すと、向こうの `rename` が NotFound で失敗します。
+            if is_temp_path(&path) && !is_stale(&path, TEMP_STALE_SECS) {
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
         }
         Ok(())
+    }
+
+    fn has(&self, key: &str) -> Result<bool> {
+        // 中身を読まないと期限が分からないので、`get` と同じ手順で見る。
+        Ok(self.get(key)?.is_some())
+    }
+
+    /// 錠を取ってから「読む → 足す → 書く」を行う。
+    ///
+    /// 同じプロセスの中は `Mutex`、プロセスをまたぐ分は錠ファイルで守ります。
+    /// 錠ファイルは `create_new(true)` で作るので、作れた側だけが進めます。
+    ///
+    /// **期限は引き継ぎません**（期限なしで書き直します）。Laravel の
+    /// `increment` は元の期限を保つので、そこは挙動が違います。
+    fn increment(&self, key: &str, by: i64) -> Result<i64> {
+        self.ensure_dir()?;
+        let _process = INCREMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _file = FileLock::acquire(&self.lock_path_of(key))?;
+
+        let current = parse_number(key, self.get(key)?)?;
+        let next = current + by;
+        self.put(key, &next.to_string(), None)?;
+        Ok(next)
+    }
+
+    fn prune(&self) -> Result<usize> {
+        sweep_expired(&self.dir)
+    }
+
+    fn prunable(&self) -> bool {
+        true
+    }
+
+    fn location(&self) -> Option<String> {
+        Some(self.dir.display().to_string())
+    }
+}
+
+/// 1つの鍵を守る錠ファイル。手放すと消えます。
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// 錠を取る。取れなければ少し待って試し直し、諦めたらエラーにします。
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        for _ in 0..LOCK_TRIES {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(_) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if is_stale(path, LOCK_STALE_SECS) {
+                        // 錠を取ったプロセスが落ちたと見なして外す。
+                        tracing::warn!("古い錠 {} を外します", path.display());
+                        let _ = std::fs::remove_file(path);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(LOCK_SLEEP_MS));
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+        Err(Error::msg(format!(
+            "キャッシュの錠 {} を取れませんでした",
+            path.display()
+        )))
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -210,6 +407,58 @@ impl CacheStore for MemoryCache {
         self.lock().clear();
         Ok(())
     }
+
+    /// Mutex の中で読んで書く。数を落としません。
+    ///
+    /// **期限は引き継ぎません**（期限なしで書き直します）。
+    fn increment(&self, key: &str, by: i64) -> Result<i64> {
+        let mut entries = self.lock();
+        let current = match entries.get(key).and_then(|raw| Entry::decode(raw)) {
+            // 期限切れは 0 から数え直す。
+            Some(entry) if !entry.expired() => entry
+                .value
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| Error::msg(format!("`{key}` の値は数ではありません")))?,
+            _ => 0,
+        };
+        let next = current + by;
+        entries.insert(key.to_string(), Entry::encode(&next.to_string(), None));
+        Ok(next)
+    }
+
+    /// メモリだけなのでブロックしません（裏のスレッドを経由しません）。
+    fn blocking(&self) -> bool {
+        false
+    }
+}
+
+/// 書き込み途中の一時ファイルの名前か。
+///
+/// `put` が作る `鍵.プロセス番号.連番.tmp` だけを一時ファイルと見なします。
+/// `.tmp` で終わるだけの名前（鍵が `a.tmp` のとき）は本体として扱います。
+fn is_temp_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    let mut parts = rest.rsplit('.');
+    let digits = |part: Option<&str>| {
+        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    // 連番・プロセス番号・鍵の3つに分かれていること。
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_some()
+}
+
+/// 最後に書かれてから `secs` 秒以上たっているか。分からないときは偽。
+fn is_stale(path: &Path, secs: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age.as_secs() >= secs)
 }
 
 /// 期限切れのファイルを消す。`cache:clear` と `cache:prune` が使います。
@@ -223,6 +472,14 @@ pub(crate) fn sweep_expired(dir: &Path) -> Result<usize> {
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
+            continue;
+        }
+        if is_temp_path(&path) {
+            // 書き込み中かもしれないので**読まない**。十分古いものだけ残骸として消す。
+            // 読んで「壊れている」と判断して消すと、向こうの `rename` が失敗します。
+            if is_stale(&path, TEMP_STALE_SECS) && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
             continue;
         }
         let expired = match std::fs::read_to_string(&path) {
@@ -350,6 +607,143 @@ mod tests {
         assert_eq!(sweep_expired(&dir).unwrap(), 2, "期限切れと壊れたもの");
         assert!(dir.join("keep").exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// テスト用の空ディレクトリ。名前が重ならないように連番を足す。
+    fn temp_dir(label: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("bengara-{label}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn 拡張子だけ違う鍵は別の一時ファイルを使う() {
+        let dir = temp_dir("tmpname");
+        let store = FileCache::new(&dir);
+
+        // `with_extension("tmp")` だと両方 `test.tmp` になってしまう。
+        let a = store.temp_path_of("test.put");
+        let b = store.temp_path_of("test.count");
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_str().unwrap().ends_with(".tmp"));
+
+        // 同じ鍵でも、呼ぶたびに別の名前になる。
+        assert_ne!(store.temp_path_of("test.put"), a);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tmpで終わる鍵も壊れない() {
+        let dir = temp_dir("tmpkey");
+        let store = FileCache::new(&dir);
+
+        store.put("a.tmp", "1", Some(60)).unwrap();
+        assert_eq!(store.get("a.tmp").unwrap().as_deref(), Some("1"));
+        // 一時ファイルと見なされないので、本体として掃除の対象になる。
+        assert!(!is_temp_path(&dir.join("a.tmp")));
+        assert!(is_temp_path(&dir.join("a.tmp.1234.5.tmp")));
+
+        store.put("b", "2", Some(0)).unwrap();
+        assert_eq!(sweep_expired(&dir).unwrap(), 1, "期限切れの b だけ");
+        assert!(dir.join("a.tmp").exists());
+
+        store.flush().unwrap();
+        assert_eq!(store.get("a.tmp").unwrap(), None, "flush で消える");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 掃除は新しい一時ファイルを残す() {
+        let dir = temp_dir("tmpsweep");
+        let store = FileCache::new(&dir);
+
+        // 書き込み途中に見える一時ファイル。
+        let writing = store.temp_path_of("key");
+        std::fs::write(&writing, "まだ書いている途中").unwrap();
+
+        assert_eq!(sweep_expired(&dir).unwrap(), 0, "新しい一時ファイルは残す");
+        assert!(writing.exists());
+
+        store.flush().unwrap();
+        assert!(writing.exists(), "flush でも消さない");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 数を足せる() {
+        let dir = temp_dir("incr");
+        let store = FileCache::new(&dir);
+
+        assert_eq!(store.increment("n", 1).unwrap(), 1);
+        assert_eq!(store.increment("n", 2).unwrap(), 3);
+        assert_eq!(store.increment("n", -1).unwrap(), 2);
+        assert_eq!(store.get("n").unwrap().as_deref(), Some("2"));
+        // 錠は手放したら残らない。
+        assert!(!store.lock_path_of("n").exists());
+
+        // 数でない値はエラーにする。
+        store.put("word", "あ", None).unwrap();
+        assert!(store.increment("word", 1).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn メモリの置き場所も数を足せる() {
+        let store = MemoryCache::new();
+        assert_eq!(store.increment("n", 1).unwrap(), 1);
+        assert_eq!(store.increment("n", 2).unwrap(), 3);
+        assert_eq!(store.increment("n", -4).unwrap(), -1);
+
+        store.put("word", "あ", None).unwrap();
+        assert!(store.increment("word", 1).is_err());
+
+        // 期限切れは 0 から数え直す。
+        store.put("old", "5", Some(0)).unwrap();
+        assert_eq!(store.increment("old", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn ブロックするかを言える() {
+        assert!(
+            FileCache::new("どこか").blocking(),
+            "ファイルはブロックする"
+        );
+        assert!(!MemoryCache::new().blocking());
+    }
+
+    #[test]
+    fn 掃除ができるかを言える() {
+        let store = FileCache::new("どこか");
+        assert!(store.prunable());
+        assert_eq!(store.location().as_deref(), Some("どこか"));
+
+        let memory = MemoryCache::new();
+        assert!(!memory.prunable());
+        assert_eq!(memory.prune().unwrap(), 0);
+        assert_eq!(memory.location(), None);
+    }
+
+    #[test]
+    fn あるかを調べられる() {
+        let store = MemoryCache::new();
+        store.put("a", "1", Some(60)).unwrap();
+        assert!(store.has("a").unwrap());
+        assert!(!store.has("b").unwrap());
+
+        let dir = temp_dir("has");
+        let file = FileCache::new(&dir);
+        file.put("a", "1", Some(60)).unwrap();
+        assert!(file.has("a").unwrap());
+        assert!(!file.has("b").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

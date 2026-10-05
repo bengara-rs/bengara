@@ -100,10 +100,18 @@ pub struct AppConfig {
     pub url: String,
     /// 署名に使う鍵（`APP_KEY`）。
     ///
-    /// セッションと署名付き URL で使います。**空のままだと、それらを使うときにエラーになります。**
+    /// セッションと署名付き URL で使います。**空のまま、または短すぎると、
+    /// それらを使うときにエラーになります。**
     /// `cargo artisan key:generate` で作ってください。
     pub key: String,
 }
+
+/// `APP_KEY` に求める最低の長さ（文字数）。
+///
+/// `cargo artisan key:generate` は 32 バイトを16進にした 64 文字を作ります。
+/// それより短い値は、手で書いたものと考えて断ります。
+/// `APP_KEY=x` のような 1 文字でも HMAC は動いてしまうので、入口で止めます。
+pub(crate) const MIN_KEY_CHARS: usize = 64;
 
 impl Default for AppConfig {
     /// `config/app.rs` が無いときに使われる値。環境変数から組み立てます。
@@ -130,13 +138,42 @@ impl AppConfig {
     }
 
     /// 署名に使う鍵を取り出す。設定されていなければ、直し方を書いたエラーを返す。
+    ///
+    /// 長さも確かめます。短い鍵でも HMAC は計算できてしまうので、
+    /// 気づけるのはここだけです。
     pub(crate) fn signing_key(&self) -> crate::error::Result<&[u8]> {
         if self.key.is_empty() {
             return Err(crate::Error::msg(
                 "APP_KEY が設定されていません。`cargo artisan key:generate` で作って .env に入れてください",
             ));
         }
+        let length = self.key.chars().count();
+        if length < MIN_KEY_CHARS {
+            return Err(crate::Error::msg(format!(
+                "APP_KEY が短すぎます（いま {length} 文字、{MIN_KEY_CHARS} 文字以上が必要です）。\
+                 `cargo artisan key:generate --force` で作り直して .env に入れてください"
+            )));
+        }
         Ok(self.key.as_bytes())
+    }
+
+    /// 用途ごとに別の鍵を作る。
+    ///
+    /// `APP_KEY` の生バイトを、セッション Cookie の署名・署名付き URL の署名・暗号化で
+    /// そのまま使い回すと、どれか1つに署名を作らせる隙ができたときに他へ波及します。
+    /// 用途を表す `label` を混ぜて、別々の鍵にしておきます。
+    ///
+    /// 中身は `hmac_sha256(APP_KEY, label)` です。`label` は用途ごとに決め打ちで、
+    /// 外から来た値は渡しません。
+    ///
+    /// | 用途 | `label` |
+    /// |---|---|
+    /// | セッション Cookie の署名 | `bengara:session` |
+    /// | 署名付き URL の署名 | `bengara:signed-url` |
+    /// | 暗号化（`encrypt` / `decrypt`） | `bengara:encryption` |
+    pub(crate) fn derived_key(&self, label: &str) -> crate::error::Result<Vec<u8>> {
+        let app_key = self.signing_key()?;
+        Ok(crate::support::crypto::hmac_sha256(app_key, label.as_bytes()).to_vec())
     }
 }
 
@@ -168,5 +205,72 @@ mod tests {
     fn 未登録の型は見つからない() {
         let r = Registry::new();
         assert_eq!(r.get::<Sample>(), None);
+    }
+
+    /// 鍵だけを差し替えた設定を作る。
+    fn with_key(key: &str) -> AppConfig {
+        AppConfig {
+            name: "test".into(),
+            env: "testing".into(),
+            debug: false,
+            url: "http://localhost".into(),
+            key: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn app_keyが空なら作り方を知らせる() {
+        let error = with_key("").signing_key().unwrap_err();
+        assert!(error.to_string().contains("設定されていません"), "{error}");
+        assert!(error.to_string().contains("key:generate"), "{error}");
+    }
+
+    #[test]
+    fn app_keyが短ければ長さを添えて断る() {
+        let error = with_key("x").signing_key().unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("短すぎます"), "{text}");
+        assert!(text.contains("いま 1 文字"), "{text}");
+        assert!(text.contains("64 文字以上"), "{text}");
+        assert!(text.contains("key:generate"), "{text}");
+
+        // 1 文字足りないだけでも断る。
+        let error = with_key(&"a".repeat(63)).signing_key().unwrap_err();
+        assert!(error.to_string().contains("いま 63 文字"), "{error}");
+    }
+
+    #[test]
+    fn app_keyがちょうどの長さなら通る() {
+        let key = "a".repeat(MIN_KEY_CHARS);
+        assert_eq!(with_key(&key).signing_key().unwrap(), key.as_bytes());
+    }
+
+    #[test]
+    fn app_keyが長くても通る() {
+        let key = "a".repeat(200);
+        assert_eq!(with_key(&key).signing_key().unwrap(), key.as_bytes());
+    }
+
+    #[test]
+    fn 用途ごとに違う鍵になる() {
+        let config = with_key(&"a".repeat(MIN_KEY_CHARS));
+        let session = config.derived_key("bengara:session").unwrap();
+        let encryption = config.derived_key("bengara:encryption").unwrap();
+
+        assert_eq!(session.len(), 32, "SHA-256 の長さ");
+        assert_ne!(session, encryption, "ラベルが違えば鍵も違う");
+        assert_ne!(
+            session,
+            config.key.as_bytes(),
+            "APP_KEY の生バイトはそのまま使わない"
+        );
+        // 同じラベルなら毎回同じ（決め打ちの導出なので、保存した値が読めなくならない）。
+        assert_eq!(session, config.derived_key("bengara:session").unwrap());
+    }
+
+    #[test]
+    fn 鍵が短ければ導出もできない() {
+        let error = with_key("x").derived_key("bengara:session").unwrap_err();
+        assert!(error.to_string().contains("短すぎます"), "{error}");
     }
 }

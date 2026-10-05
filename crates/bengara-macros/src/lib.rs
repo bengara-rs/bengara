@@ -45,7 +45,8 @@ pub fn derive_model(item: TokenStream) -> TokenStream {
 /// - `.env` と `config/` を読み込む（1回だけ）
 /// - `bootstrap/app.rs` のアプリを組み立てる
 /// - tokio のランタイムを用意して、本体を直接呼ぶ
-/// - 関数の中で `client`、`get`、`post`、`refresh_database`、`seed_database` を使えるようにする
+/// - 関数の中で `client`、`get`、`post`、`put`、`patch`、`delete`、
+///   `refresh_database`、`seed_database` を使えるようにする
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
@@ -101,14 +102,54 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // DB を使うテストは、これを `let _db = refresh_database().await;` で受け取る。
                     #[allow(unused_variables)]
                     let refresh_database = || async { ::bengara::testing::refresh_database().await };
-                    #[allow(unused_variables)]
-                    let seed_database = || async { ::bengara::testing::seed_database().await };
+                    // シーダーは札（`refresh_database()` の戻り）を受け取る。
+                    // 札を取っていないテストから呼べないように、型で縛ってある。
+                    #[allow(unused_imports)]
+                    use ::bengara::testing::{exclusive, seed_database};
                     #[allow(unused_variables)]
                     let post = |__uri: &str, __body: &str| {
                         let __uri = ::std::string::String::from(__uri);
                         let __body = ::std::string::String::from(__body);
                         let __client = ::core::clone::Clone::clone(&client);
                         async move { __client.post(&__uri, &__body).await }
+                    };
+                    // PUT / PATCH / DELETE。Route::put などに合わせて揃えてある。
+                    // 本文の形は post と同じ（application/x-www-form-urlencoded）。
+                    #[allow(unused_variables)]
+                    let put = |__uri: &str, __body: &str| {
+                        let __uri = ::std::string::String::from(__uri);
+                        let __body = ::std::string::String::from(__body);
+                        let __client = ::core::clone::Clone::clone(&client);
+                        async move {
+                            __client.send(
+                                "PUT",
+                                &__uri,
+                                __body.into_bytes(),
+                                &[("content-type", "application/x-www-form-urlencoded")],
+                            ).await
+                        }
+                    };
+                    #[allow(unused_variables)]
+                    let patch = |__uri: &str, __body: &str| {
+                        let __uri = ::std::string::String::from(__uri);
+                        let __body = ::std::string::String::from(__body);
+                        let __client = ::core::clone::Clone::clone(&client);
+                        async move {
+                            __client.send(
+                                "PATCH",
+                                &__uri,
+                                __body.into_bytes(),
+                                &[("content-type", "application/x-www-form-urlencoded")],
+                            ).await
+                        }
+                    };
+                    #[allow(unused_variables)]
+                    let delete = |__uri: &str| {
+                        let __uri = ::std::string::String::from(__uri);
+                        let __client = ::core::clone::Clone::clone(&client);
+                        async move {
+                            __client.send("DELETE", &__uri, ::std::vec::Vec::new(), &[]).await
+                        }
                     };
                     #body
                 },

@@ -37,6 +37,13 @@ type Data = BTreeMap<String, String>;
 #[derive(Clone)]
 pub struct Session {
     inner: Arc<Mutex<Inner>>,
+    /// このセッションを置いてある場所。`StartSession` が入れます。
+    ///
+    /// 同じ利用者のほかのセッションを消すとき（`Auth::logout_other_devices()` など）に使います。
+    /// プロセス全体の置き場所を1つ覚える形にすると、アプリを2つ組み立てたとき
+    /// （テストが並んで走るときなど）に別のアプリの置き場所を触ってしまうため、
+    /// **リクエストに結びつけて持ち歩きます。**
+    store: Option<Arc<dyn SessionStore>>,
 }
 
 struct Inner {
@@ -66,12 +73,29 @@ impl Session {
                 regenerated: false,
                 flushed: false,
             })),
+            store: None,
         }
     }
 
     /// 空のセッションを作る（初めて来た人）。
     pub(crate) fn empty() -> Self {
         Self::new(new_id(), Data::new(), Data::new())
+    }
+
+    /// 置き場所を結びつける。`StartSession` が呼びます。
+    pub(crate) fn with_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// 結びついている置き場所。無ければ、直し方を書いたエラーを返す。
+    pub(crate) fn store(&self) -> crate::error::Result<Arc<dyn SessionStore>> {
+        self.store.clone().ok_or_else(|| {
+            crate::Error::msg(
+                "セッションの置き場所が結びついていません。bootstrap/app.rs の \
+                 with_middleware で StartSession を登録してください",
+            )
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -155,12 +179,20 @@ impl Session {
     /// ID を作り直す。**ログインの直後に必ず呼んでください。**
     ///
     /// 人のブラウザにあらかじめ ID を仕込んでおく攻撃（セッション固定）を防ぎます。
-    /// 中身は引き継ぎます。
+    /// 中身は引き継ぎますが、**CSRF のトークンは忘れます**（Laravel の
+    /// `Session::regenerate()` が `regenerateToken()` も呼ぶのと同じ）。
+    /// ログイン前にトークンを知られていると、作り直さないかぎりログイン後も通ってしまいます。
+    ///
+    /// ここでは消すだけです。次に必要になったときに作り直されます。
     pub fn regenerate(&self) {
         let mut inner = self.lock();
         inner.id = new_id();
         inner.dirty = true;
         inner.regenerated = true;
+        // `forget()` は同じ Mutex を取るので、ここで直に消す。
+        inner.data.remove(middleware::CSRF_KEY);
+        inner.flash.remove(middleware::CSRF_KEY);
+        inner.old_flash.remove(middleware::CSRF_KEY);
     }
 
     /// ログアウト用。中身を捨てて ID も作り直します。
@@ -321,6 +353,36 @@ mod tests {
         s.regenerate();
         assert_ne!(s.id(), before, "ID は変わる");
         assert_eq!(s.get("a").as_deref(), Some("1"), "中身は残る");
+    }
+
+    #[test]
+    fn idを作り直すとcsrfトークンも変わる() {
+        let s = session();
+        let before = csrf_token(&s);
+        s.regenerate();
+        assert!(
+            s.get(super::middleware::CSRF_KEY).is_none(),
+            "いったん忘れる"
+        );
+
+        // 次に必要になったときに作り直される。
+        let after = csrf_token(&s);
+        assert_ne!(after, before, "ログイン前のトークンは通らなくなる");
+        assert_eq!(after.len(), 64);
+    }
+
+    #[test]
+    fn 持ち越し中のcsrfトークンも忘れる() {
+        let mut old_flash = Data::new();
+        old_flash.insert(
+            super::middleware::CSRF_KEY.to_string(),
+            "もれたトークン".into(),
+        );
+        let s = Session::new("id".into(), Data::new(), old_flash);
+        s.flash(super::middleware::CSRF_KEY, "これも消える");
+
+        s.regenerate();
+        assert!(s.get(super::middleware::CSRF_KEY).is_none());
     }
 
     #[test]

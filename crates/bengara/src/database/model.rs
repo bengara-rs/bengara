@@ -55,12 +55,22 @@ pub trait Model: Sized + Send + Sync + 'static {
             || self.key() == Value::Text(String::new())
     }
 
-    /// クエリを組み立てる。
+    /// クエリを組み立てる。既定の接続を使います。
     fn query() -> ModelQuery<Self> {
         ModelQuery::new(Source::Default)
     }
 
     /// トランザクションの中でクエリを組み立てる。
+    ///
+    /// ```ignore
+    /// let tx = DB::begin().await?;
+    /// let posts = Post::on(&tx).where_("status", "draft").get().await?;
+    /// Post::on(&tx).where_("status", "draft").delete().await?;
+    /// tx.commit().await?;
+    /// ```
+    ///
+    /// すでに組み立てたクエリを後から差し替えるときは
+    /// [`ModelQuery::using`] を使ってください。
     fn on(tx: &Transaction) -> ModelQuery<Self> {
         ModelQuery::new(tx.source())
     }
@@ -94,54 +104,115 @@ pub trait Model: Sized + Send + Sync + 'static {
     }
 
     /// 保存する。新しい行なら足し、そうでなければ更新します。
+    ///
+    /// **既定の接続を使います。** トランザクションの中で保存したいときは
+    /// [`save_using(&tx)`](Model::save_using) を使ってください。
+    /// `save()` のままだと、保存はトランザクションの外に出ます。
+    /// `rollback()` しても残りますし、`:memory:` のデータベースでは接続が1本なので
+    /// 空くのを待って固まります。
     fn save(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
-            let creating = self.is_new();
-            self.touch_timestamps(creating);
-            let attributes = self.attributes();
-            if attributes.is_empty() {
-                return Err(Error::msg(format!(
-                    "{} には主キー以外の列がありません",
-                    Self::TABLE
-                )));
-            }
-            if creating {
-                let id = super::DB::table(Self::TABLE)
-                    .insert_get_id_as(&attributes, Self::PRIMARY_KEY)
-                    .await?;
-                self.set_key(Value::Int(id));
-            } else {
-                super::DB::table(Self::TABLE)
-                    .where_(Self::PRIMARY_KEY, self.key())
-                    .update(&attributes)
-                    .await?;
-            }
-            Ok(())
-        }
+        save_to(self, Source::Default)
+    }
+
+    /// トランザクションの中で保存する。
+    ///
+    /// ```ignore
+    /// let tx = DB::begin().await?;
+    /// let mut post = Post { id: 0, title: "やきそば".into() };
+    /// post.save_using(&tx).await?;
+    /// tx.commit().await?;
+    /// ```
+    fn save_using(
+        &mut self,
+        tx: &Transaction,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        save_to(self, tx.source())
     }
 
     /// 消す。返るのは消した件数です。
+    ///
+    /// **既定の接続を使います。** トランザクションの中で消したいときは
+    /// [`delete_using(&tx)`](Model::delete_using) を使ってください。
     fn delete(&self) -> impl std::future::Future<Output = Result<u64>> + Send {
-        async move {
-            if self.is_new() {
-                return Ok(0);
-            }
-            super::DB::table(Self::TABLE)
-                .where_(Self::PRIMARY_KEY, self.key())
-                .delete()
-                .await
-        }
+        delete_from(self, Source::Default)
+    }
+
+    /// トランザクションの中で消す。
+    fn delete_using(
+        &self,
+        tx: &Transaction,
+    ) -> impl std::future::Future<Output = Result<u64>> + Send {
+        delete_from(self, tx.source())
     }
 
     /// もう一度読み直す。
+    ///
+    /// **既定の接続を使います。** トランザクションの中で読み直したいときは
+    /// [`fresh_using(&tx)`](Model::fresh_using) を使ってください。
+    /// `save_using(&tx)` で保存した内容は、まだ外から見えません。
     fn fresh(&self) -> impl std::future::Future<Output = Result<Option<Self>>> + Send {
-        async move {
-            Self::query()
-                .where_(Self::PRIMARY_KEY, self.key())
-                .first()
-                .await
-        }
+        fresh_from(self, Source::Default)
     }
+
+    /// トランザクションの中で読み直す。
+    fn fresh_using(
+        &self,
+        tx: &Transaction,
+    ) -> impl std::future::Future<Output = Result<Option<Self>>> + Send {
+        fresh_from(self, tx.source())
+    }
+}
+
+/// `save()` と `save_using()` の中身。投げ先だけが違います。
+async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
+    let creating = model.is_new();
+    model.touch_timestamps(creating);
+    let attributes = model.attributes();
+    if attributes.is_empty() {
+        return Err(Error::msg(format!(
+            "{} には主キー以外の列がありません",
+            T::TABLE
+        )));
+    }
+    let query = QueryBuilder::new(source, T::TABLE);
+    if creating {
+        let id = query.insert_get_id_as(&attributes, T::PRIMARY_KEY).await?;
+        model.set_key(Value::Int(id));
+    } else {
+        query
+            .where_(T::PRIMARY_KEY, model.key())
+            .update(&attributes)
+            .await?;
+    }
+    Ok(())
+}
+
+/// `delete()` と `delete_using()` の中身。
+async fn delete_from<T: Model>(model: &T, source: Source) -> Result<u64> {
+    if model.is_new() {
+        return Ok(0);
+    }
+    QueryBuilder::new(source, T::TABLE)
+        .where_(T::PRIMARY_KEY, model.key())
+        .delete()
+        .await
+}
+
+/// `fresh()` と `fresh_using()` の中身。
+async fn fresh_from<T: Model>(model: &T, source: Source) -> Result<Option<T>> {
+    ModelQuery::<T>::new(source)
+        .where_(T::PRIMARY_KEY, model.key())
+        .first()
+        .await
+}
+
+/// `#[derive(Model)]` が生成するコードから呼ばれます。利用者が直接呼ぶものではありません。
+///
+/// `insert` が返した主キーを入れられなかったときに知らせます。
+/// 黙って既定値で上書きしないためです。
+#[doc(hidden)]
+pub fn warn_key_not_set(table: &str, column: &str, error: &dyn std::fmt::Display) {
+    tracing::warn!("{table}.{column} に insert の戻り値を入れられませんでした: {error}");
 }
 
 /// モデルを返すクエリ。中身はクエリビルダと同じです。
@@ -173,6 +244,16 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// トランザクションの中で実行するように差し替える。
+    ///
+    /// ```ignore
+    /// let tx = DB::begin().await?;
+    /// let query = Post::query().where_("status", "draft");
+    /// let posts = query.clone().using(&tx).get().await?;
+    /// query.using(&tx).update(&[("status", "published".into())]).await?;
+    /// tx.commit().await?;
+    /// ```
+    ///
+    /// 最初から中で組み立てるなら [`Model::on`] が短く書けます。
     pub fn using(self, tx: &Transaction) -> Self {
         let source = tx.source();
         self.map(|q| q.with_source(source))
@@ -387,7 +468,98 @@ impl<T: Model> std::fmt::Debug for ModelQuery<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::super::backend::{Backend, DbFuture, RawTx};
+    use super::super::grammar::Driver;
+    use super::super::value::Affected;
     use super::*;
+
+    /// 流れてきた SQL を覚えるだけの接続。
+    ///
+    /// 既定の接続（プール）とトランザクションを別に数えるので、
+    /// どちらへ流れたかが分かります。
+    #[derive(Default)]
+    struct Spy {
+        pool: Arc<Mutex<Vec<String>>>,
+        tx: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn remember(log: &Mutex<Vec<String>>, sql: &str) {
+        log.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sql.to_string());
+    }
+
+    fn joined(log: &Mutex<Vec<String>>) -> String {
+        log.lock().unwrap_or_else(|e| e.into_inner()).join("\n")
+    }
+
+    impl Backend for Spy {
+        fn driver(&self) -> Driver {
+            Driver::Sqlite
+        }
+
+        fn fetch_all<'a>(&'a self, sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Vec<Row>> {
+            remember(&self.pool, sql);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(&'a self, sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Affected> {
+            remember(&self.pool, sql);
+            Box::pin(async { Ok(affected()) })
+        }
+
+        fn begin(&self) -> DbFuture<'_, Box<dyn RawTx>> {
+            let log = Arc::clone(&self.tx);
+            Box::pin(async move { Ok(Box::new(SpyTx { log }) as Box<dyn RawTx>) })
+        }
+
+        fn table_names(&self) -> DbFuture<'_, Vec<String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct SpyTx {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RawTx for SpyTx {
+        fn fetch_all<'a>(&'a mut self, sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Vec<Row>> {
+            remember(&self.log, sql);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(&'a mut self, sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Affected> {
+            remember(&self.log, sql);
+            Box::pin(async { Ok(affected()) })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn affected() -> Affected {
+        Affected {
+            rows: 1,
+            last_insert_id: Some(7),
+        }
+    }
+
+    /// 覚える接続と、そこから始めたトランザクションを用意する。
+    async fn spy() -> (Arc<Spy>, Transaction) {
+        let found = Arc::new(Spy::default());
+        let backend: Arc<dyn Backend> = found.clone();
+        let tx = Transaction::start(backend)
+            .await
+            .expect("トランザクションが始まる");
+        (found, tx)
+    }
 
     struct Post {
         id: i64,
@@ -454,5 +626,62 @@ mod tests {
     fn デバッグ表示にsqlが出る() {
         let text = format!("{:?}", Post::query().where_("id", 1));
         assert!(text.contains("posts"));
+    }
+
+    #[tokio::test]
+    async fn save_usingはトランザクションの中に書く() {
+        let (found, tx) = spy().await;
+        let mut post = Post {
+            id: 0,
+            title: "やきそば".into(),
+        };
+        post.save_using(&tx).await.expect("保存できる");
+
+        assert_eq!(post.id, 7, "insert が返した ID が入る");
+        assert!(
+            joined(&found.pool).is_empty(),
+            "既定の接続には流れない: {}",
+            joined(&found.pool)
+        );
+        let sent = joined(&found.tx);
+        assert!(sent.contains("insert into \"posts\""), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn save_usingは更新もトランザクションの中で流す() {
+        let (found, tx) = spy().await;
+        let mut post = Post {
+            id: 3,
+            title: "やきそば".into(),
+        };
+        post.save_using(&tx).await.expect("更新できる");
+        assert!(joined(&found.pool).is_empty());
+        let sent = joined(&found.tx);
+        assert!(
+            sent.contains("update \"posts\" set \"title\" = ?"),
+            "{sent}"
+        );
+        assert!(sent.contains("where \"id\" = ?"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn delete_usingとfresh_usingもトランザクションの中で流す() {
+        let (found, tx) = spy().await;
+        let post = Post {
+            id: 3,
+            title: "やきそば".into(),
+        };
+        assert_eq!(post.delete_using(&tx).await.expect("消せる"), 1);
+        assert!(post.fresh_using(&tx).await.expect("読み直せる").is_none());
+        assert!(joined(&found.pool).is_empty(), "既定の接続には流れない");
+        let sent = joined(&found.tx);
+        assert!(
+            sent.contains("delete from \"posts\" where \"id\" = ?"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("select * from \"posts\" where \"id\" = ?"),
+            "{sent}"
+        );
     }
 }

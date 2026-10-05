@@ -35,6 +35,8 @@ pub(crate) use backend::Backend;
 
 pub use grammar::Driver;
 pub use migrator::{Migration, Seeder, SeederFuture};
+#[doc(hidden)]
+pub use model::warn_key_not_set;
 pub use model::{Model, ModelQuery};
 pub use query::{Paginator, QueryBuilder};
 pub use schema::{Blueprint, ColumnDefinition, ForeignKeyDefinition, Schema};
@@ -209,6 +211,10 @@ fn named_backend(name: &str) -> Option<Arc<dyn Backend>> {
 
 /// 設定に従って実際につなぐ。
 async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backend>> {
+    // 機能フラグが無い、または、まだ作っていないドライバは、ここで止める。
+    if !settings.driver.is_available() {
+        return Err(unavailable(settings.driver));
+    }
     #[cfg(feature = "sqlite")]
     if settings.driver == Driver::Sqlite {
         return sqlite::connect(settings).await;
@@ -288,21 +294,34 @@ impl Source {
         }
     }
 
+    /// 実際の投げ先を決める。**3分岐はここだけです。**
+    async fn target(&self) -> Result<Target> {
+        Ok(match self {
+            Source::Tx(shared) => Target::Tx(Arc::clone(shared)),
+            Source::Default => Target::Pool(backend(None).await?),
+            Source::Named(name) => Target::Pool(backend(Some(name)).await?),
+        })
+    }
+
     pub(crate) async fn fetch_all(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
-        match self {
-            Source::Tx(shared) => shared.fetch_all(sql, bindings).await,
-            Source::Default => backend(None).await?.fetch_all(sql, bindings).await,
-            Source::Named(name) => backend(Some(name)).await?.fetch_all(sql, bindings).await,
+        match self.target().await? {
+            Target::Tx(shared) => shared.fetch_all(sql, bindings).await,
+            Target::Pool(found) => found.fetch_all(sql, bindings).await,
         }
     }
 
     pub(crate) async fn execute(&self, sql: &str, bindings: &[Value]) -> Result<Affected> {
-        match self {
-            Source::Tx(shared) => shared.execute(sql, bindings).await,
-            Source::Default => backend(None).await?.execute(sql, bindings).await,
-            Source::Named(name) => backend(Some(name)).await?.execute(sql, bindings).await,
+        match self.target().await? {
+            Target::Tx(shared) => shared.execute(sql, bindings).await,
+            Target::Pool(found) => found.execute(sql, bindings).await,
         }
     }
+}
+
+/// 解決した投げ先。トランザクションの中かどうかだけが違います。
+enum Target {
+    Tx(Arc<transaction::TxShared>),
+    Pool(Arc<dyn Backend>),
 }
 
 /// データベースの入口。

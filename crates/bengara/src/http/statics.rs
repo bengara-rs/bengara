@@ -11,35 +11,40 @@
 //! 埋め込みはリリースビルドのときだけ入ります（`bengara-build` が `PROFILE` を見ます）。
 //! デバッグビルドでは常にディスクを読むので、ファイルを直せばすぐ反映されます。
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::http::Response;
 
 /// `/storage/...` で配信する頭のパス。
 pub(crate) const STORAGE_PREFIX: &str = "/storage/";
 
+/// 埋め込んだ `public/` の一覧。鍵は `public/` からの相対パス（区切りは常に `/`）。
+pub(crate) type Embedded = HashMap<&'static str, &'static [u8]>;
+
 /// バイナリに埋め込んだ `public/`。起動時に1回だけ入れ、以後は読むだけです。
-static EMBEDDED: std::sync::OnceLock<&'static [(&'static str, &'static [u8])]> =
-    std::sync::OnceLock::new();
+static EMBEDDED: OnceLock<Embedded> = OnceLock::new();
 
 /// 埋め込んだ一覧を固定する。`bengara::app!()` が生成したものを渡します。
+///
+/// ここで一度だけ `HashMap` にします。1本ずつ探すと、見つからないとき（404 になる
+/// すべてのリクエスト）に一覧を端まで見ることになります。
 pub(crate) fn install_embedded(files: &'static [(&'static str, &'static [u8])]) {
     // 2回目は黙って無視する（テストから複数回呼ばれても落ちないように）。
-    let _ = EMBEDDED.set(files);
+    let _ = EMBEDDED.set(files.iter().copied().collect());
 }
 
 /// 埋め込んだ一覧。入っていなければ空。
-pub(crate) fn embedded() -> &'static [(&'static str, &'static [u8])] {
-    EMBEDDED.get().copied().unwrap_or(&[])
+pub(crate) fn embedded() -> &'static Embedded {
+    static EMPTY: OnceLock<Embedded> = OnceLock::new();
+    EMBEDDED
+        .get()
+        .unwrap_or_else(|| EMPTY.get_or_init(Embedded::new))
 }
 
 /// バイナリに埋め込んだ `public/` から探して返す。
-///
-/// 鍵は `public/` からの相対パスで、区切りは常に `/` です。
-pub(crate) fn serve_embedded(
-    files: &'static [(&'static str, &'static [u8])],
-    request_path: &str,
-) -> Option<Response> {
+pub(crate) fn serve_embedded(files: &Embedded, request_path: &str) -> Option<Response> {
     if files.is_empty() {
         return None;
     }
@@ -47,14 +52,17 @@ pub(crate) fn serve_embedded(
     let key = to_key(&relative)?;
 
     // そのままの鍵で探し、無ければディレクトリとして index.html を探す。
-    let found = files.iter().find(|(name, _)| *name == key).or_else(|| {
-        let nested = format!("{key}/index.html");
-        files.iter().find(|(name, _)| *name == nested)
-    })?;
-
+    if let Some(body) = files.get(key.as_str()) {
+        return Some(Response::bytes(
+            content_type(Path::new(&key)),
+            body.to_vec(),
+        ));
+    }
+    let nested = format!("{key}/index.html");
+    let body = files.get(nested.as_str())?;
     Some(Response::bytes(
-        content_type(Path::new(found.0)),
-        found.1.to_vec(),
+        content_type(Path::new(&nested)),
+        body.to_vec(),
     ))
 }
 
@@ -64,6 +72,12 @@ pub(crate) fn serve_embedded(
 /// 攻撃の試みに「何が起きたか」を教えないためです。
 pub(crate) fn serve_storage(public_disk: &Path, request_path: &str) -> Option<Response> {
     let rest = request_path.strip_prefix(STORAGE_PREFIX)?;
+    // `/storage/` だけで来たときは 404。`safe_relative("")` は `index.html` を返すので、
+    // そのまま渡すと `storage/app/public/index.html` を配ってしまいます。
+    // 「空なら index.html」は `public/`（`GET /`）のための規則です。
+    if rest.is_empty() {
+        return None;
+    }
     serve(public_disk, rest)
 }
 
@@ -105,7 +119,8 @@ pub(crate) fn serve(public_dir: &Path, request_path: &str) -> Option<Response> {
 
 /// リクエストのパスを、`public/` の下から出られない相対パスに直す。
 fn safe_relative(request_path: &str) -> Option<PathBuf> {
-    let decoded = super::request::percent_decode(request_path.trim_start_matches('/'));
+    // `+` は空白にしません。`+` が空白なのはフォームの規則で、URL のパスには当てはまりません。
+    let decoded = super::request::percent_decode_strict(request_path.trim_start_matches('/'));
     if decoded.contains('\0') {
         return None;
     }
@@ -206,15 +221,19 @@ mod tests {
         assert_eq!(to_key(&PathBuf::new()), None);
     }
 
-    const EMBEDDED: &[(&str, &[u8])] = &[
+    const FILES: &[(&str, &[u8])] = &[
         ("index.html", b"<h1>top</h1>"),
         ("css/app.css", b"body{}"),
         ("docs/index.html", b"<h1>docs</h1>"),
     ];
 
+    fn files() -> Embedded {
+        FILES.iter().copied().collect()
+    }
+
     #[test]
     fn 埋め込みから配信できる() {
-        let res = serve_embedded(EMBEDDED, "/css/app.css").expect("あるはず");
+        let res = serve_embedded(&files(), "/css/app.css").expect("あるはず");
         assert_eq!(res.status(), 200);
         assert_eq!(res.body(), b"body{}");
         assert_eq!(
@@ -225,25 +244,29 @@ mod tests {
 
     #[test]
     fn 埋め込みのルートはindexを指す() {
-        let res = serve_embedded(EMBEDDED, "/").expect("あるはず");
+        let res = serve_embedded(&files(), "/").expect("あるはず");
         assert_eq!(res.body(), b"<h1>top</h1>");
     }
 
     #[test]
     fn 埋め込みのディレクトリはindexを探す() {
-        let res = serve_embedded(EMBEDDED, "/docs").expect("あるはず");
+        let res = serve_embedded(&files(), "/docs").expect("あるはず");
         assert_eq!(res.body(), b"<h1>docs</h1>");
+        assert_eq!(
+            res.header("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
     }
 
     #[test]
     fn 埋め込みに無ければnone() {
-        assert!(serve_embedded(EMBEDDED, "/none.txt").is_none());
-        assert!(serve_embedded(EMBEDDED, "/../secret").is_none());
+        assert!(serve_embedded(&files(), "/none.txt").is_none());
+        assert!(serve_embedded(&files(), "/../secret").is_none());
     }
 
     #[test]
     fn 埋め込みが空ならnone() {
-        assert!(serve_embedded(&[], "/css/app.css").is_none());
+        assert!(serve_embedded(&Embedded::new(), "/css/app.css").is_none());
     }
 
     #[test]
@@ -251,6 +274,20 @@ mod tests {
         let dir = std::env::temp_dir();
         assert!(serve_storage(&dir, "/css/app.css").is_none());
         assert!(serve_storage(&dir, "/storage").is_none());
+    }
+
+    #[test]
+    fn storageだけで来たらnone() {
+        // `/storage/` は index.html を指さない。`public/` 用の規則を持ち込まない。
+        let dir = std::env::temp_dir();
+        assert!(serve_storage(&dir, STORAGE_PREFIX).is_none());
+    }
+
+    #[test]
+    fn パスのプラスは空白にしない() {
+        assert_eq!(safe_relative("/a+b.css"), Some(PathBuf::from("a+b.css")));
+        // `%20` は空白に戻る（こちらはパスでも同じ）。
+        assert_eq!(safe_relative("/a%20b.css"), Some(PathBuf::from("a b.css")));
     }
 
     #[test]

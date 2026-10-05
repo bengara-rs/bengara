@@ -17,7 +17,7 @@ pub use store::{CacheStore, FileCache, MemoryCache};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::support::crypto;
 
 /// キャッシュの設定。`config/cache.rs` が返します。
@@ -45,18 +45,20 @@ static STORE: OnceLock<Arc<dyn CacheStore>> = OnceLock::new();
 
 /// 置き場所を差し替える。`bootstrap/app.rs` かテストから呼びます。
 ///
-/// 1回目だけ効きます。2回目以降は何もしません。
+/// 1回目だけ効きます。2回目以降は何もせず、警告を出します。
 pub fn install_store(store: Arc<dyn CacheStore>) {
-    let _ = STORE.set(store);
+    if STORE.set(store).is_err() {
+        tracing::warn!("キャッシュの置き場所は既に決まっています。この install_store は効きません");
+    }
 }
 
 /// いま使う置き場所。
 fn store() -> &'static Arc<dyn CacheStore> {
     STORE.get_or_init(|| {
-        let config = crate::try_config::<CacheConfig>()
-            .cloned()
-            .unwrap_or_default();
-        match config.driver.as_str() {
+        let driver = crate::try_config::<CacheConfig>()
+            .map(|config| config.driver.clone())
+            .unwrap_or_else(|| CacheConfig::default().driver);
+        match driver.as_str() {
             "memory" | "array" => Arc::new(MemoryCache::new()) as Arc<dyn CacheStore>,
             "file" => Arc::new(FileCache::default_path()),
             other => {
@@ -67,16 +69,37 @@ fn store() -> &'static Arc<dyn CacheStore> {
     })
 }
 
+/// 置き場所を呼ぶ。ブロックするものだけ裏のスレッドへ回します。
+async fn with_store<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce(&dyn CacheStore) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let store = store().clone();
+    if store.blocking() {
+        crate::support::blocking(move || f(store.as_ref())).await?
+    } else {
+        // メモリだけの置き場所は、Mutex 1 回のために往復しない。
+        f(store.as_ref())
+    }
+}
+
 /// 鍵をファイル名に使える形にする。
 ///
-/// 英数字と `. _ - :` だけはそのまま使います。それ以外が混じっていたら、
+/// **小文字の**英数字と `. _ - :` だけはそのまま使います。それ以外が混じっていたら、
 /// 鍵全体を SHA-256 にします（日本語の鍵でも動くように）。
+///
+/// 大文字をそのまま使わないのは、NTFS / APFS が大文字小文字を区別しないためです。
+/// `User:1` と `user:1` を素直に写すと、Windows と macOS では同じファイルになり、
+/// Linux では別のファイルになります。開発と本番で挙動が変わるのを避けるため、
+/// **大文字を含む鍵はハッシュ側に回します**（鍵の見た目は読めなくなりますが、
+/// どの OS でも必ず別の置き場所になります）。
 pub(crate) fn normalize_key(key: &str) -> String {
     let safe = !key.is_empty()
         && key.len() <= 150
-        && key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'));
+        && key.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b':')
+        });
     if safe {
         // `:` は Windows のファイル名に使えないので、置き場所側で避ける。
         key.replace(':', "~")
@@ -95,41 +118,58 @@ impl Cache {
     pub async fn put(key: &str, value: impl Into<String>, seconds: u64) -> Result<()> {
         let key = normalize_key(key);
         let value = value.into();
-        let store = store().clone();
-        crate::support::blocking(move || store.put(&key, &value, Some(seconds))).await?
+        with_store(move |store| store.put(&key, &value, Some(seconds))).await
     }
 
     /// 期限なしで入れる。
     pub async fn forever(key: &str, value: impl Into<String>) -> Result<()> {
         let key = normalize_key(key);
         let value = value.into();
-        let store = store().clone();
-        crate::support::blocking(move || store.put(&key, &value, None)).await?
+        with_store(move |store| store.put(&key, &value, None)).await
     }
 
     /// 読む。無い・期限切れなら `None`。
     pub async fn get(key: &str) -> Result<Option<String>> {
         let key = normalize_key(key);
-        let store = store().clone();
-        crate::support::blocking(move || store.get(&key)).await?
+        with_store(move |store| store.get(&key)).await
     }
 
     /// あるか。
+    ///
+    /// 値そのものは返しません（置き場所が対応していれば、中身を読まずに答えます）。
     pub async fn has(key: &str) -> Result<bool> {
-        Ok(Self::get(key).await?.is_some())
+        let key = normalize_key(key);
+        with_store(move |store| store.has(&key)).await
     }
 
     /// 消す。無くてもエラーにはしません。
     pub async fn forget(key: &str) -> Result<()> {
         let key = normalize_key(key);
-        let store = store().clone();
-        crate::support::blocking(move || store.forget(&key)).await?
+        with_store(move |store| store.forget(&key)).await
     }
 
     /// 全部消す。
     pub async fn flush() -> Result<()> {
-        let store = store().clone();
-        crate::support::blocking(move || store.flush()).await?
+        with_store(|store| store.flush()).await
+    }
+
+    /// 期限切れのものだけ消して、消した件数を返す（`cache:prune`）。
+    ///
+    /// 掃除の仕組みが無い置き場所（`memory` など）では `None` を返します。
+    pub async fn prune() -> Result<Option<usize>> {
+        with_store(|store| {
+            if store.prunable() {
+                store.prune().map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    /// いまの置き場所を人に見せる言い方（コマンドの表示用）。
+    pub fn location() -> Option<String> {
+        store().location()
     }
 
     /// 無ければ作って入れる。あればそれを返す。
@@ -151,18 +191,16 @@ impl Cache {
     }
 
     /// 数を足す。無ければ 0 から始めます。返るのは足した後の値です。
+    ///
+    /// 置き場所の `increment` に任せるので、`file` と `memory` では
+    /// 同時に呼ばれても数を落としません。
+    ///
+    /// **期限は引き継ぎません。** `Cache::put("n", "1", 60)` の後に `increment` を
+    /// 呼ぶと、期限が外れて期限なしになります（回数の記録に使う前提です）。
+    /// Laravel の `increment` は元の期限を保つので、そこは挙動が違います。
     pub async fn increment(key: &str, by: i64) -> Result<i64> {
-        let current = match Self::get(key).await? {
-            Some(found) => found
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| Error::msg(format!("`{key}` の値は数ではありません")))?,
-            None => 0,
-        };
-        let next = current + by;
-        // 数は期限なしで持つ（回数の記録に使うため）。
-        Self::forever(key, next.to_string()).await?;
-        Ok(next)
+        let key = normalize_key(key);
+        with_store(move |store| store.increment(&key, by)).await
     }
 
     /// 数を引く。
@@ -228,6 +266,18 @@ mod tests {
         // 同じ鍵なら同じ結果になる。
         assert_eq!(hashed, normalize_key("日本語の鍵"));
         assert_ne!(hashed, normalize_key("別の鍵"));
+    }
+
+    #[test]
+    fn 大文字小文字で別の置き場所になる() {
+        // NTFS / APFS は大文字小文字を区別しないので、大文字を含む鍵はハッシュにする。
+        let upper = normalize_key("User:1");
+        let lower = normalize_key("user:1");
+        assert_eq!(upper.len(), 64, "ハッシュにする");
+        assert_eq!(lower, "user~1", "小文字はそのまま");
+        assert_ne!(upper, lower);
+        // 大文字小文字を無視してもぶつからない。
+        assert_ne!(upper.to_ascii_lowercase(), lower.to_ascii_lowercase());
     }
 
     #[test]

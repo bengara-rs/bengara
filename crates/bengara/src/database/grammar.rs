@@ -63,6 +63,11 @@ pub(crate) fn placeholder(driver: Driver, index: usize) -> String {
 /// 名前を引用符でくくる。`users.id` は `"users"."id"` になります。
 ///
 /// `*`、`count(*)` のような式はそのまま返します。`as` を含む指定も触りません。
+///
+/// **そのまま返す経路は意図した逃げ道です。** `select(&["count(*) as total"])` が
+/// これに頼っています。代わりに、外から来た文字列が入りうる場所
+/// （`order_by` / `group_by` / `having_op` の列名）では
+/// [`is_plain_identifier`] で先に検査します。
 pub(crate) fn quote(driver: Driver, name: &str) -> String {
     let trimmed = name.trim();
     if is_expression(trimmed) {
@@ -82,6 +87,54 @@ fn is_expression(name: &str) -> bool {
         || name.contains(' ')
         || name.contains('"')
         || name.contains('`')
+}
+
+/// ただの列名か。英数字と `_` `.` だけを許します。
+///
+/// `*` も式も通しません。式を書きたいときは `order_by_raw` / `having_raw` /
+/// `where_raw` を使ってください。
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+/// 比べるのに使える演算子の一覧。これ以外は受け付けません。
+///
+/// 大文字小文字は区別しません。語の間の空白はいくつでもかまいません。
+pub(crate) const OPERATORS: &[&str] = &[
+    "=",
+    "!=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "<=>",
+    "like",
+    "not like",
+    "ilike",
+    "not ilike",
+    "in",
+    "not in",
+    "is",
+    "is not",
+    "between",
+    "not between",
+];
+
+/// 演算子として受け付けるか。
+pub(crate) fn is_allowed_operator(operator: &str) -> bool {
+    let normalized = operator
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    OPERATORS.contains(&normalized.as_str())
 }
 
 fn quote_part(driver: Driver, part: &str) -> String {
@@ -126,6 +179,31 @@ mod tests {
         assert_eq!(placeholder(Driver::Sqlite, 1), "?");
         assert_eq!(placeholder(Driver::MySql, 3), "?");
         assert_eq!(placeholder(Driver::Postgres, 3), "$3");
+    }
+
+    #[test]
+    fn ただの列名だけを通す() {
+        assert!(is_plain_identifier("title"));
+        assert!(is_plain_identifier("users.id"));
+        assert!(is_plain_identifier("views_2"));
+        assert!(!is_plain_identifier(""));
+        assert!(!is_plain_identifier("*"));
+        assert!(!is_plain_identifier("count(*)"));
+        assert!(!is_plain_identifier("id desc"));
+        assert!(!is_plain_identifier("id; drop table posts"));
+        assert!(!is_plain_identifier("\"id\""));
+    }
+
+    #[test]
+    fn 演算子は許可一覧で照合する() {
+        assert!(is_allowed_operator("="));
+        assert!(is_allowed_operator(">="));
+        assert!(is_allowed_operator("LIKE"));
+        assert!(is_allowed_operator("not   like"));
+        assert!(is_allowed_operator(" is not "));
+        assert!(!is_allowed_operator(""));
+        assert!(!is_allowed_operator("= 1 or 1"));
+        assert!(!is_allowed_operator("glob"));
     }
 
     #[test]

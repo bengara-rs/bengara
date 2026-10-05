@@ -11,11 +11,25 @@
 //! 超えると 429 を返し、`Retry-After` と `X-RateLimit-*` を付けます。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::error::Error;
 use crate::http::{BoxFuture, Middleware, Next, Request};
+
+/// 置き場所に置ける鍵の上限。超えたら古いものから落とします。
+const MAX_BUCKETS: usize = 10_000;
+
+/// 信頼する前段のプロキシを決める環境変数の名前。
+///
+/// カンマ区切りの IP アドレスの一覧です。特別な値 `*` は「すべて信頼する」。
+/// 未設定（空）なら、`X-Forwarded-For` と `X-Real-IP` を**どちらも見ません**。
+///
+/// `10.0.0.0/8` のような範囲（CIDR）の書き方は読めません。依存クレートを増やさないため、
+/// 範囲の解析は実装していません。アドレスを1つずつ並べてください。
+const TRUSTED_PROXIES: &str = "TRUSTED_PROXIES";
 
 /// 数え方の置き場所。
 ///
@@ -26,7 +40,15 @@ use crate::http::{BoxFuture, Middleware, Next, Request};
 pub struct Throttle {
     max: u32,
     window: Duration,
-    buckets: Mutex<HashMap<String, Bucket>>,
+    buckets: Mutex<Buckets>,
+    /// 鍵を作れなかったときの警告を、1回だけ出すための目印。
+    warned: AtomicBool,
+}
+
+/// 数え方の中身と、最後に掃除した時刻。
+struct Buckets {
+    map: HashMap<String, Bucket>,
+    last_swept: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -42,7 +64,11 @@ impl Throttle {
         Self {
             max,
             window,
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(Buckets {
+                map: HashMap::new(),
+                last_swept: Instant::now(),
+            }),
+            warned: AtomicBool::new(false),
         }
     }
 
@@ -66,19 +92,18 @@ impl Throttle {
         if max == 0 || minutes == 0 {
             return Err(Error::msg("throttle の回数と分は 1 以上にしてください"));
         }
-        Ok(Self::new(max, Duration::from_secs(minutes * 60)))
+        let seconds = minutes
+            .checked_mul(60)
+            .ok_or_else(|| Error::msg(format!("throttle の分 `{minutes}` が大きすぎます")))?;
+        Ok(Self::new(max, Duration::from_secs(seconds)))
     }
 
     /// 1回数える。通ってよければ残り回数、駄目なら待ち時間（秒）を返す。
     fn hit(&self, key: &str, now: Instant) -> Result<u32, u64> {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        self.sweep(&mut buckets, now);
 
-        // ついでに期限切れを捨てる。放っておくと際限なく増える。
-        if buckets.len() > 10_000 {
-            buckets.retain(|_, b| b.resets_at > now);
-        }
-
-        let bucket = buckets.entry(key.to_string()).or_insert(Bucket {
+        let bucket = buckets.map.entry(key.to_string()).or_insert(Bucket {
             count: 0,
             resets_at: now + self.window,
         });
@@ -93,32 +118,149 @@ impl Throttle {
         bucket.count += 1;
         Ok(self.max - bucket.count)
     }
+
+    /// 期限切れを捨てる。`window` に1回だけ走ります。
+    ///
+    /// 件数で決めると、期限内の鍵が天井を超えたままになったときに、1件も落とせない
+    /// `retain` をロックの中で毎リクエスト走らせてしまいます。時刻で間隔を決めれば、
+    /// どれだけ混んでも `window` に1回で済みます。
+    fn sweep(&self, buckets: &mut Buckets, now: Instant) {
+        if now.saturating_duration_since(buckets.last_swept) < self.window {
+            return;
+        }
+        buckets.last_swept = now;
+        buckets.map.retain(|_, b| b.resets_at > now);
+        if buckets.map.len() <= MAX_BUCKETS {
+            return;
+        }
+        // 掃除しても天井を超えるなら、期限の古い順に落として件数を抑える。
+        // 際限なく増えて落ちるより、数え直しが早まるほうがましです。
+        let mut keys: Vec<(Instant, String)> = buckets
+            .map
+            .iter()
+            .map(|(key, bucket)| (bucket.resets_at, key.clone()))
+            .collect();
+        keys.sort_unstable_by_key(|(resets_at, _)| std::cmp::Reverse(*resets_at));
+        for (_, key) in keys.into_iter().skip(MAX_BUCKETS) {
+            buckets.map.remove(&key);
+        }
+    }
+
+    /// 鍵を作れなかったことを1回だけ知らせる。
+    fn warn_no_key(&self) {
+        if !self.warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "接続元のアドレスが分からないため、throttle を掛けずに通します。\
+                 ソケットを使わない呼び出し（テストなど）で起きます"
+            );
+        }
+    }
 }
 
-/// 誰を数えるかを決める。
+/// 信頼する前段のプロキシ。
+#[derive(Debug, PartialEq, Eq)]
+enum Trusted {
+    /// 1つも信頼しない（既定）。ヘッダーは見ません。
+    None,
+    /// すべて信頼する（`*`）。
+    All,
+    /// この一覧だけ信頼する。
+    List(Vec<IpAddr>),
+}
+
+impl Trusted {
+    /// この相手の言うことを聞いてよいか。
+    fn allows(&self, peer: &IpAddr) -> bool {
+        match self {
+            Trusted::None => false,
+            Trusted::All => true,
+            Trusted::List(list) => list.contains(peer),
+        }
+    }
+}
+
+/// `TRUSTED_PROXIES` を読む。起動後は読むだけなので、1回だけ解析します。
+fn trusted_proxies() -> &'static Trusted {
+    static CACHE: OnceLock<Trusted> = OnceLock::new();
+    CACHE.get_or_init(|| parse_trusted_proxies(&std::env::var(TRUSTED_PROXIES).unwrap_or_default()))
+}
+
+/// `TRUSTED_PROXIES` の値を解析する。
+fn parse_trusted_proxies(raw: &str) -> Trusted {
+    let mut list = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part == "*" {
+            return Trusted::All;
+        }
+        match part.parse::<IpAddr>() {
+            Ok(ip) => list.push(ip),
+            Err(_) => tracing::warn!(
+                "{TRUSTED_PROXIES} の `{part}` は IP アドレスとして読めないため無視します\
+                 （範囲の書き方には対応していません）"
+            ),
+        }
+    }
+    if list.is_empty() {
+        Trusted::None
+    } else {
+        Trusted::List(list)
+    }
+}
+
+/// 誰を数えるかを決める。鍵を作れないときは `None`。
 ///
-/// ログインしていれば**その人ごと**に数えます。していなければ、
-/// `X-Forwarded-For` の先頭か `X-Real-IP` を使います。どちらも無ければパスごとにまとめます。
-///
+/// ログインしていれば**その人ごと**に数えます。していなければ**接続元のアドレス**ごとです。
 /// ログイン中の人ごとに数えると、同じ回線にいる別の人（会社や学校のネットワーク）が
 /// 巻き込まれません。
-fn key_for(req: &Request) -> String {
+///
+/// `X-Forwarded-For` と `X-Real-IP` は、接続元が `TRUSTED_PROXIES` に書かれた相手の
+/// ときだけ見ます。無条件に信じると、偽の値を送るだけで回数制限を無制限に回せます。
+fn key_for(req: &Request) -> Option<String> {
+    key_for_with(req, trusted_proxies())
+}
+
+fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
     if let Some(id) = req.auth().id() {
-        return format!("user:{id}|{}", req.path());
+        return Some(format!("user:{id}|{}", req.path()));
     }
-    let who = req
-        .header("x-forwarded-for")
+    // 接続元が分からなければ鍵を作らない。`"unknown"` のような1つの鍵にまとめると、
+    // 誰か1人が使い切るだけで全員を締め出せてしまいます。
+    let peer = req.ip()?;
+    let who = if trusted.allows(&peer) {
+        forwarded_ip(req).unwrap_or_else(|| peer.to_string())
+    } else {
+        peer.to_string()
+    };
+    Some(format!("{who}|{}", req.path()))
+}
+
+/// 前段のプロキシが伝えてきた、元の相手。
+fn forwarded_ip(req: &Request) -> Option<String> {
+    req.header("x-forwarded-for")
         .and_then(|v| v.split(',').next())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .or_else(|| req.header("x-real-ip"))
-        .unwrap_or("unknown");
-    format!("{who}|{}", req.path())
+        .or_else(|| {
+            req.header("x-real-ip")
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+        .map(str::to_string)
 }
 
 impl Middleware for Throttle {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
-        let key = key_for(&req);
+        // 鍵を作れないときは、制限を掛けずに通します。全員で1つの鍵を共有すると、
+        // 1人が使い切るだけで他の全員を締め出せる（止めたい攻撃そのものになる）ためです。
+        // 実際のサーバーでは接続元が必ず分かるので、ここに来るのはテストのときだけです。
+        let Some(key) = key_for(&req) else {
+            self.warn_no_key();
+            return next.run(req);
+        };
         let result = self.hit(&key, Instant::now());
         let max = self.max;
         let options = next.render_options();
@@ -201,30 +343,156 @@ mod tests {
         assert!(Throttle::from_spec("1,0").is_err());
     }
 
-    #[test]
-    fn 相手の見分け方() {
-        let req = Request::new("GET", "/login");
-        assert_eq!(key_for(&req), "unknown|/login");
-
-        let req = Request::new("GET", "/login")
-            .with_headers(vec![("x-forwarded-for".into(), "1.2.3.4, 5.6.7.8".into())]);
-        assert_eq!(key_for(&req), "1.2.3.4|/login", "先頭だけを使う");
-
-        let req = Request::new("GET", "/login")
-            .with_headers(vec![("x-real-ip".into(), "9.9.9.9".into())]);
-        assert_eq!(key_for(&req), "9.9.9.9|/login");
+    /// 接続元のアドレスを載せたリクエストを作る。
+    fn from(peer: &str) -> Request {
+        let addr: std::net::SocketAddr = format!("{peer}:12345").parse().expect("アドレスの形");
+        Request::new("GET", "/login").with_remote_addr(addr)
     }
 
     #[test]
-    fn 置き場所が増えすぎたら掃除する() {
+    fn 接続元が分からなければ鍵を作らない() {
+        let req = Request::new("GET", "/login");
+        assert_eq!(key_for_with(&req, &Trusted::All), None);
+    }
+
+    #[test]
+    fn 既定では接続元のアドレスで数える() {
+        let req = from("203.0.113.9");
+        assert_eq!(
+            key_for_with(&req, &Trusted::None),
+            Some("203.0.113.9|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 信頼していない相手のヘッダーは見ない() {
+        let req = from("203.0.113.9").with_headers(vec![
+            ("x-forwarded-for".into(), "1.2.3.4, 5.6.7.8".into()),
+            ("x-real-ip".into(), "9.9.9.9".into()),
+        ]);
+        // 偽の値を送られても、接続元のアドレスで数える。
+        assert_eq!(
+            key_for_with(&req, &Trusted::None),
+            Some("203.0.113.9|/login".to_string())
+        );
+        let others = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
+        assert_eq!(
+            key_for_with(&req, &others),
+            Some("203.0.113.9|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 信頼している相手のヘッダーは使う() {
+        let req = from("10.0.0.1")
+            .with_headers(vec![("x-forwarded-for".into(), "1.2.3.4, 5.6.7.8".into())]);
+        let trusted = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("1.2.3.4|/login".to_string()),
+            "先頭だけを使う"
+        );
+        assert_eq!(
+            key_for_with(&req, &Trusted::All),
+            Some("1.2.3.4|/login".to_string())
+        );
+
+        // X-Forwarded-For が無ければ X-Real-IP を見る。
+        let req = from("10.0.0.1").with_headers(vec![("x-real-ip".into(), "9.9.9.9".into())]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("9.9.9.9|/login".to_string())
+        );
+
+        // どちらも無ければ接続元のアドレス。
+        let req = from("10.0.0.1");
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("10.0.0.1|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 信頼するプロキシの一覧を解析できる() {
+        assert_eq!(parse_trusted_proxies(""), Trusted::None);
+        assert_eq!(parse_trusted_proxies("   "), Trusted::None);
+        assert_eq!(parse_trusted_proxies(","), Trusted::None);
+        assert_eq!(parse_trusted_proxies("*"), Trusted::All);
+        assert_eq!(parse_trusted_proxies("10.0.0.1, *"), Trusted::All);
+        assert_eq!(
+            parse_trusted_proxies(" 10.0.0.1 , 10.0.0.2 "),
+            Trusted::List(vec![
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+            ])
+        );
+        assert_eq!(
+            parse_trusted_proxies("::1"),
+            Trusted::List(vec!["::1".parse().unwrap()])
+        );
+        // 範囲（CIDR）は読めないので無視する。
+        assert_eq!(parse_trusted_proxies("10.0.0.0/8"), Trusted::None);
+        assert_eq!(
+            parse_trusted_proxies("10.0.0.0/8, 10.0.0.1"),
+            Trusted::List(vec!["10.0.0.1".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn 期限切れを掃除する() {
         let throttle = Throttle::new(1, Duration::from_secs(1));
         let now = Instant::now();
-        for i in 0..10_001 {
+        for i in 0..100 {
             let _ = throttle.hit(&format!("key-{i}"), now);
         }
+        assert_eq!(throttle.buckets.lock().unwrap().map.len(), 100);
+
         let later = now + Duration::from_secs(2);
         let _ = throttle.hit("trigger", later);
-        let count = throttle.buckets.lock().unwrap().len();
-        assert!(count < 10_001, "期限切れを捨てている（残り {count}）");
+        let count = throttle.buckets.lock().unwrap().map.len();
+        assert_eq!(count, 1, "期限切れを捨てて、いま数えた1件だけが残る");
+    }
+
+    #[test]
+    fn 短い間隔で呼んでも掃除は走らない() {
+        let throttle = Throttle::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        let _ = throttle.hit("a", now);
+        let swept = throttle.buckets.lock().unwrap().last_swept;
+
+        // window の中なので、何回呼んでも掃除は走らない。
+        for i in 0..10 {
+            let _ = throttle.hit(&format!("key-{i}"), now + Duration::from_secs(1));
+        }
+        assert_eq!(
+            throttle.buckets.lock().unwrap().last_swept,
+            swept,
+            "掃除していない"
+        );
+        assert_eq!(throttle.buckets.lock().unwrap().map.len(), 11);
+    }
+
+    #[test]
+    fn 掃除しても多すぎるなら天井を守る() {
+        let throttle = Throttle::new(1, Duration::from_secs(60));
+        let base = Instant::now() + Duration::from_secs(60);
+        // まず1回掃除を走らせ、基準の時刻をそろえる。
+        let _ = throttle.hit("first", base);
+
+        // 期限が base + 90 の鍵を、天井より多く積む（まだ掃除は走らない）。
+        let filling = base + Duration::from_secs(30);
+        for i in 0..(MAX_BUCKETS + 500) {
+            let _ = throttle.hit(&format!("key-{i}"), filling);
+        }
+        assert!(
+            throttle.buckets.lock().unwrap().map.len() > MAX_BUCKETS,
+            "掃除の前は超えていてよい"
+        );
+
+        // 掃除の時刻。積んだ鍵はまだ期限内なので、件数で落とすしかない。
+        let sweeping = base + Duration::from_secs(60);
+        let _ = throttle.hit("trigger", sweeping);
+        let count = throttle.buckets.lock().unwrap().map.len();
+        assert!(count <= MAX_BUCKETS + 1, "天井を守っている（残り {count}）");
     }
 }

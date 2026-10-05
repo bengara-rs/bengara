@@ -18,6 +18,15 @@ use crate::application::Application;
 use crate::http::{Request, Response};
 use crate::{kernel_impl, Hooks};
 
+/// テストから送るときの接続元のアドレス。
+///
+/// ソケットを開かないので本物の接続元はありません。`127.0.0.1` を入れておくと、
+/// 回数の制限（`Throttle`）が本番と同じように接続元ごとに数えます。
+const TEST_REMOTE_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+    0,
+);
+
 /// テスト用のクライアント。
 ///
 /// **Cookie を覚えます。** ブラウザと同じように、1つのクライアントで続けて送ると
@@ -136,10 +145,13 @@ impl TestClient {
             }
         }
 
+        // 接続元のアドレスを入れておく。入れないと `req.ip()` が空になり、
+        // 回数の制限（`Throttle`）が鍵を作れずに素通りしてしまう。
         let req = Request::new(method, path)
             .with_query(query)
             .with_headers(headers)
-            .with_body(body);
+            .with_body(body)
+            .with_remote_addr(TEST_REMOTE_ADDR);
         let response = self.app.handle(req).await;
         self.remember_cookies(&response);
         TestResponse {
@@ -306,8 +318,40 @@ impl std::fmt::Debug for DatabaseGuard {
     }
 }
 
+impl Drop for DatabaseGuard {
+    fn drop(&mut self) {
+        HOLDS_DATABASE.set(false);
+    }
+}
+
 /// DB を使うテストの順番を決める錠。
 static DATABASE_LOCK: Mutex<()> = Mutex::new(());
+
+/// DB 以外も直列化するための錠。
+static EXCLUSIVE_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// このスレッドが DB の札を持っているか。
+    static HOLDS_DATABASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// このスレッドが汎用の札を持っているか。
+    static HOLDS_EXCLUSIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 1 つのテストで札を 2 回取ろうとしていないか確かめる。
+///
+/// `std::sync::Mutex` は再入できないので、気づかないと**何も言わずに永久に止まります**。
+/// 分かるメッセージでパニックさせます。
+#[track_caller]
+fn check_reentrant(held: &'static std::thread::LocalKey<std::cell::Cell<bool>>, what: &str) {
+    if held.get() {
+        panic!(
+            "{what} を同じテストの中で 2 回呼んでいます。\n\
+             札は 1 つのテストで 1 回だけ取ってください（取り直すと永久に止まります）。\n\
+             先に取った札（`let _db = ...`）を使い回してください。"
+        );
+    }
+    held.set(true);
+}
 
 /// テスト用のデータベースを空から作り直す。
 ///
@@ -327,10 +371,14 @@ static DATABASE_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// つなげないときや、マイグレーションが失敗したときはパニックします。
 /// テストの中なので、そこで止まるほうが分かりやすいためです。
+///
+/// **1 つのテストで 2 回呼んだときもパニックします。** 錠は再入できないので、
+/// そのまま待つと何も言わずに永久に止まります。
 // 錠を `await` の向こうまで持ち越すのは意図どおりです。これが DB を使うテストの
 // 順番を守る仕組みで、持ち越さないと意味がありません。テストの中だけで使います。
 #[allow(clippy::await_holding_lock)]
 pub async fn refresh_database() -> DatabaseGuard {
+    check_reentrant(&HOLDS_DATABASE, "refresh_database()");
     let guard = DATABASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     crate::database::connect_for_tests()
@@ -357,14 +405,75 @@ pub async fn refresh_database() -> DatabaseGuard {
 
 /// シーダーをテストから流す。`refresh_database()` の後に呼びます。
 ///
+/// ```ignore
+/// #[bengara::test]
+/// async fn 初期データが入る() {
+///     let db = refresh_database().await;
+///     seed_database(&db).await;
+/// }
+/// ```
+///
+/// 札（`&DatabaseGuard`）を受け取るのは、**札を取っていないテストから
+/// 呼べないようにするため**です。型で縛っておくと、並列に走る別のテストの
+/// DB を壊しません。
+///
 /// # パニック
 ///
 /// シーダーが失敗したときはパニックします。
-pub async fn seed_database() {
+pub async fn seed_database(_db: &DatabaseGuard) {
     let hooks = kernel_impl::test_hooks();
     crate::database::migrator::seed((hooks.seeders)(), None)
         .await
         .unwrap_or_else(|e| panic!("シーダーの実行に失敗しました: {e}"));
+}
+
+/// DB 以外も直列化するための札。
+///
+/// `exclusive()` が返します。これを持っている間、ほかの `exclusive()` は待ちます。
+pub struct ExclusiveGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::fmt::Debug for ExclusiveGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExclusiveGuard")
+    }
+}
+
+impl Drop for ExclusiveGuard {
+    fn drop(&mut self) {
+        HOLDS_EXCLUSIVE.set(false);
+    }
+}
+
+/// プロセス共通のものを触るテストを直列にする。
+///
+/// `Mail::sent()` / `Mail::clear_sent()` と `Lang` はプロセス共通なので、
+/// 並列に走ると互いに干渉します。`tests/Feature` は 1 つのバイナリで
+/// 並列に走るので、**触るテストはこの札を取ってください。**
+///
+/// ```ignore
+/// #[bengara::test]
+/// async fn メールを送る() {
+///     let _lock = exclusive().await;
+///     Mail::clear_sent();
+///     // ...
+/// }
+/// ```
+///
+/// DB の札（`refresh_database()`）とは別の錠です。両方要るときは
+/// **先に `refresh_database()`、次に `exclusive()`** の順で取ってください
+/// （順番をそろえないと、取り合いで止まります）。
+///
+/// # パニック
+///
+/// 1 つのテストで 2 回呼んだときはパニックします（錠は再入できません）。
+// 錠を `await` の向こうまで持ち越すのは意図どおりです（`refresh_database` と同じ）。
+#[allow(clippy::await_holding_lock)]
+pub async fn exclusive() -> ExclusiveGuard {
+    check_reentrant(&HOLDS_EXCLUSIVE, "exclusive()");
+    let guard = EXCLUSIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ExclusiveGuard { _guard: guard }
 }
 
 /// `#[bengara::test]` が呼ぶ入口。利用者が直接呼ぶことはありません。
@@ -381,4 +490,47 @@ where
         .expect("テスト用のランタイムを作れません");
     let client = TestClient::new(factory());
     runtime.block_on(body(client));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    thread_local! {
+        /// テスト用の印。本物の錠には触らない。
+        static DUMMY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[test]
+    fn 札を二重に取ると分かる文でパニックする() {
+        // 1 回目は通る。
+        check_reentrant(&DUMMY, "refresh_database()");
+
+        // 2 回目は、黙って止まるのではなくパニックする。
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_reentrant(&DUMMY, "refresh_database()")
+        }));
+        let payload = caught.expect_err("パニックする");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("refresh_database()"), "{message}");
+        assert!(message.contains("2 回"), "{message}");
+
+        DUMMY.set(false);
+        // 手放したあとはまた取れる。
+        check_reentrant(&DUMMY, "refresh_database()");
+        DUMMY.set(false);
+    }
+
+    #[tokio::test]
+    async fn 汎用の札は手放せばまた取れる() {
+        {
+            let guard = exclusive().await;
+            assert_eq!(format!("{guard:?}"), "ExclusiveGuard");
+        }
+        // 手放したので、同じテストの中でも取り直せる。
+        let _again = exclusive().await;
+    }
 }

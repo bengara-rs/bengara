@@ -165,6 +165,11 @@ pub(crate) fn from_hex(input: &str) -> Option<Vec<u8>> {
 ///
 /// 普通の `==` は違いが見つかった時点で止まるため、かかった時間から
 /// 「何文字目まで合っていたか」が漏れます。署名の照合にはこちらを使います。
+///
+/// 途中で `std::hint::black_box` を挟みます。この書き方で最適化に
+/// 短絡された例はいまありませんが、コンパイラは「`diff` が 0 でなくなったら
+/// 答えは決まる」と気づける形をしています。`black_box` は、その推論を
+/// させないための目隠しです。依存クレートは増えません。
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -172,8 +177,9 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
+        diff = std::hint::black_box(diff);
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 /// OS から推測できない乱数をもらう。
@@ -290,6 +296,20 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn 定数時間の比較は最後まで見る() {
+        // `black_box` を挟んでも判定が変わらないこと。
+        // 先頭が違う・末尾が違う・1 バイトだけ違う、をそれぞれ確かめる。
+        assert!(!constant_time_eq(b"Xbcdefgh", b"abcdefgh"), "先頭が違う");
+        assert!(!constant_time_eq(b"abcdefgX", b"abcdefgh"), "末尾が違う");
+        assert!(!constant_time_eq(&[0u8; 32], &[1u8; 32]));
+        assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
+        // 署名の長さ（32 バイト）で、1 バイトだけ違う場合。
+        let mut other = [0u8; 32];
+        other[31] = 1;
+        assert!(!constant_time_eq(&[0u8; 32], &other));
     }
 
     /// 広く使われている PBKDF2-HMAC-SHA256 のテストベクタ

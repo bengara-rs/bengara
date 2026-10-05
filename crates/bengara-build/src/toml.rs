@@ -65,16 +65,24 @@ pub(crate) fn parse(text: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 /// 行から `#` 以降を落とす。ただし引用符の中の `#` は残す。
+///
+/// 二重引用符の中の `\` は、次の1文字を打ち消します。`\"` を終わりと数えると
+/// 引用の内と外がずれて、まるで違う理由のエラーになるためです。
+/// 単引用符の中では `\` はそのままの文字なので、飛ばしません。
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut quote: Option<u8> = None;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
         match (quote, b) {
+            (Some(b'"'), b'\\') => i += 1,
             (None, b'"') | (None, b'\'') => quote = Some(b),
             (Some(q), _) if b == q => quote = None,
             (None, b'#') => return &line[..i],
             _ => {}
         }
+        i += 1;
     }
     line
 }
@@ -164,6 +172,19 @@ mod tests {
     fn 二重引用符は逃げ方を解釈する() {
         let pairs = parse("[m]\na = \"1行目\\n2行目\\t終わり\"\n").unwrap();
         assert_eq!(pairs[0].1, "1行目\n2行目\t終わり");
+    }
+
+    #[test]
+    fn 逃がした引用符と行末のコメントが同じ行にあっても読める() {
+        let pairs = parse("[m]\na = \"引用\\\"符\" # コメント\n").unwrap();
+        assert_eq!(pairs[0].1, "引用\"符");
+    }
+
+    #[test]
+    fn 単引用符の中の円記号はそのまま() {
+        // 単引用符の中では `\` は文字。`\'` で終わりが消えたりしない。
+        let pairs = parse("[m]\na = 'C:\\path\\' # コメント\n").unwrap();
+        assert_eq!(pairs[0].1, "C:\\path\\");
     }
 
     #[test]

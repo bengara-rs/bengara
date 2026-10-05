@@ -115,6 +115,10 @@ t.uuid("key").primary();
 | `primary()`          | 主キーにする                    |
 | `comment("説明")`    | 説明（SQLite では無視されます） |
 
+**`t.id()` と `t.increments(..)` には、これらの指定が効きません。**
+自動採番の主キーは型名ひとつで全部を書くので、置く場所がありません。
+`nullable()` / `default()` / `unique()` を付けると、無視したことを警告で知らせます。
+
 ## 表に付ける指定
 
 ```rust
@@ -158,8 +162,12 @@ pub fn down(schema: &mut Schema) {
 ```
 
 **できるのは「列を足す」「索引を足す」までです。**
-列の型を変える `change()` はありません。SQLite が苦手なためです。
-型を変えたいときは、新しい表を作って移し替えてください。
+
+- 列の型を変える `change()` はありません。SQLite が苦手なためです。
+  型を変えたいときは、新しい表を作って移し替えてください。
+- **`t.id()` と `t.increments(..)` は使えません。**
+  `alter table add column` で自動採番の主キーは足せません。
+  書くと警告が出て、その文は流れません。
 
 ## そのほか
 
@@ -170,6 +178,14 @@ schema.drop_if_exists("posts");
 schema.rename("posts", "articles");
 schema.drop_column("posts", "slug");
 schema.raw("pragma foreign_keys = on");   // SQL をそのまま
+```
+
+`create_if_not_exists` は、**索引の文にも `if not exists` を付けます。**
+表だけを飛ばして索引で失敗する、ということはありません。
+
+```
+create table if not exists "users" (...)
+create index if not exists "users_name_index" on "users" ("name")
 ```
 
 組み立てた SQL を確かめたいときは、`up` の中で `schema.to_sql()` を見ます。

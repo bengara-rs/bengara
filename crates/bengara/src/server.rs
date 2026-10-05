@@ -6,7 +6,7 @@
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 
 use crate::application::Application;
 use crate::error::{Error, Result};
@@ -35,7 +35,10 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
 
         let router = axum::Router::new()
             .fallback(axum::routing::any(dispatch))
-            .with_state(app);
+            .with_state(app)
+            // 接続元のアドレスを `dispatch` で受け取れるようにする。
+            // これが無いと `X-Forwarded-For` を信じるしかなくなり、回数制限を偽装で回せる。
+            .into_make_service_with_connect_info::<SocketAddr>();
 
         // 合図を受け取った時刻を、待ち受けを閉じる側と打ち切る側の両方に伝える。
         let (signalled, mut wait_signal) = tokio::sync::watch::channel(false);
@@ -108,18 +111,23 @@ fn display_addr(addr: SocketAddr) -> String {
 /// axum から来たリクエストを `bengara` の形に直し、結果を axum の形に戻す。
 async fn dispatch(
     State(app): State<Application>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
     let (parts, body) = request.into_parts();
 
+    // 先に長さの申告を見る。上限を超えていると分かっているときだけ 413 にする。
+    if too_large(declared_length(&parts.headers)) {
+        return early_error(Error::http(413, "本文が大きすぎます"));
+    }
+
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(bytes) => bytes.to_vec(),
         Err(_) => {
-            let error = Error::http(413, "本文が大きすぎます");
-            return into_axum(crate::http::response::error_response(
-                &error,
-                crate::http::response::RenderOptions::new(false, false),
-            ));
+            // ここに来るのは、途中で接続が切れた・chunked が壊れていた・
+            // 長さの申告が無いまま上限を超えた、のどれかです。
+            // 「大きすぎる」と分かっているのは申告を見た上の分岐だけなので、ここは 400。
+            return early_error(Error::http(400, "本文を読み取れませんでした"));
         }
     };
 
@@ -137,7 +145,8 @@ async fn dispatch(
     let req = Request::new(parts.method.as_str(), parts.uri.path())
         .with_query(parts.uri.query().unwrap_or_default())
         .with_headers(headers)
-        .with_body(bytes);
+        .with_body(bytes)
+        .with_remote_addr(peer);
 
     let started = std::time::Instant::now();
     let method = req.method().to_string();
@@ -150,6 +159,32 @@ async fn dispatch(
     );
 
     into_axum(response)
+}
+
+/// `Content-Length` の申告を読む。無い・読めないときは `None`。
+fn declared_length(headers: &axum::http::HeaderMap) -> Option<usize> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// 申告された長さが上限を超えているか。
+///
+/// 申告が無ければ、読んでみるまで分かりません。読んで失敗したときは
+/// 「大きすぎる」と決めつけず 400 にします（接続が切れただけのこともあります）。
+fn too_large(declared: Option<usize>) -> bool {
+    declared.is_some_and(|length| length > MAX_BODY_BYTES)
+}
+
+/// アプリに渡す前に返すエラー。
+///
+/// 設定の読み方（`APP_DEBUG` など）に触れないので、いつも素の見せ方にします。
+fn early_error(error: Error) -> axum::response::Response {
+    into_axum(crate::http::response::error_response(
+        &error,
+        crate::http::response::RenderOptions::new(false, false),
+    ))
 }
 
 /// `bengara` のレスポンスを axum の形に変える。
@@ -303,6 +338,33 @@ mod tests {
 
         let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(display_addr(local), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn 本文の長さの申告を読む() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(declared_length(&headers), None);
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            "123".parse().expect("ヘッダーの値"),
+        );
+        assert_eq!(declared_length(&headers), Some(123));
+        headers.insert(
+            axum::http::header::CONTENT_LENGTH,
+            "abc".parse().expect("ヘッダーの値"),
+        );
+        assert_eq!(declared_length(&headers), None, "読めなければ分からない");
+    }
+
+    #[test]
+    fn 上限を超える申告だけ413にする() {
+        assert!(too_large(Some(MAX_BODY_BYTES + 1)));
+        assert!(!too_large(Some(MAX_BODY_BYTES)));
+        assert!(!too_large(Some(0)));
+        assert!(
+            !too_large(None),
+            "申告が無ければ、読んで失敗しても 413 にはしない"
+        );
     }
 
     #[test]

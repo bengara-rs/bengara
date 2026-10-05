@@ -14,6 +14,21 @@ use crate::http::handler::BoxFuture;
 use crate::http::middleware::{Middleware, Next};
 use crate::http::Request;
 
+/// 戻り先をセッションに入れておく場所。
+const INTENDED_KEY: &str = "bengara_auth_intended";
+
+/// 自分のサイトの中を指すパスか。
+///
+/// ログイン後の戻り先として覚えてよいかを決めます。`//evil.example` は
+/// 「プロトコル相対 URL」で、転送先に使うと**外のサイト**へ飛ばせます。
+/// `Location: //evil.example` はブラウザが `https://evil.example` と読むためです。
+///
+/// いまは覚えるだけで誰も読んでいませんが、読む側（Laravel の `intended()`）を
+/// あとで足すときに、入れるところで止めておくほうが見落としません。
+fn is_internal_path(path: &str) -> bool {
+    path.starts_with('/') && !path.starts_with("//")
+}
+
 /// ログイン必須にするミドルウェア。
 ///
 /// | 状況 | 返すもの |
@@ -57,8 +72,12 @@ impl Middleware for Authenticate {
         let redirect_to = self.redirect_to.clone();
         Box::pin(async move {
             // 戻り先を覚えておく（ログイン後に元の画面へ返せるように）。
+            // **自分のサイトの中だけ**を覚えます。
             if let Some(session) = req.try_session() {
-                session.put("bengara_auth_intended", req.full_path());
+                let intended = req.full_path();
+                if is_internal_path(&intended) {
+                    session.put(INTENDED_KEY, intended);
+                }
             }
 
             match redirect_to {
@@ -86,5 +105,23 @@ mod tests {
             Some("/login")
         );
         assert!(Authenticate::default().redirect_to.is_none());
+    }
+
+    #[test]
+    fn 戻り先は自分のサイトの中だけ覚える() {
+        assert!(is_internal_path("/"));
+        assert!(is_internal_path("/profile"));
+        assert!(is_internal_path("/profile?page=2"));
+
+        // プロトコル相対 URL は外のサイトを指せる。
+        assert!(!is_internal_path("//evil.example"));
+        assert!(!is_internal_path("//evil.example/login"));
+        // 絶対 URL も断る。
+        assert!(!is_internal_path("https://evil.example"));
+        // `/` で始まらないものも断る。
+        assert!(!is_internal_path(""));
+        assert!(!is_internal_path("profile"));
+
+        assert_eq!(INTENDED_KEY, "bengara_auth_intended");
     }
 }

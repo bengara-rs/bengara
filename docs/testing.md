@@ -40,13 +40,21 @@ async fn 無いページは404になる() {
 
 ## 使える道具
 
-関数の中で、次の 3 つがそのまま使えます。
+関数の中で、次のものがそのまま使えます。
 
-| 名前              | 中身                            |
-|-------------------|---------------------------------|
-| `client`          | `TestClient`                    |
-| `get(uri)`        | `client.get(uri)` の短縮        |
-| `post(uri, body)` | `client.post(uri, body)` の短縮 |
+| 名前                 | 中身                                            |
+|----------------------|-------------------------------------------------|
+| `client`             | `TestClient`                                    |
+| `get(uri)`           | `client.get(uri)` の短縮                        |
+| `post(uri, body)`    | `client.post(uri, body)` の短縮                 |
+| `put(uri, body)`     | PUT で送る。本文の形は `post` と同じ            |
+| `patch(uri, body)`   | PATCH で送る。本文の形は `post` と同じ          |
+| `delete(uri)`        | DELETE で送る。本文は無し                       |
+| `refresh_database()` | テスト用の DB を作り直す（下の節）              |
+| `seed_database(&db)` | シーダーを流す（下の節）                        |
+| `exclusive()`        | DB 以外のプロセス共通のものを使うときの札       |
+
+`put` / `patch` の本文は `application/x-www-form-urlencoded` で送られます。
 
 ### TestClient
 
@@ -157,17 +165,25 @@ async fn 記事を保存して読み出せる() {
 - **札は必ず受け取ってください**（`let _db = ...`）。`refresh_database().await;` だけだと
   その場で手放され、ほかのテストと混ざります。
 - DB を使わないテストは待たされません。
-- シーダーも流したいときは `seed_database().await;` を続けて呼びます。
+- **1 つのテストで 2 回呼ばないでください。** 札は取り直せません。
+  2 回呼ぶと、理由を書いたメッセージでパニックします。
+
+### シーダーも流す
+
+`seed_database(&db)` に、`refresh_database()` の戻りを渡します。
 
 ```rust
 #[bengara::test]
 async fn 一覧が見える() {
-    let _db = refresh_database().await;
-    seed_database().await;
+    let db = refresh_database().await;
+    seed_database(&db).await;
 
     get("/api/articles").await.assert_ok();
 }
 ```
+
+札を引数で受け取るのは、札を取っていないテストから呼べないようにするためです。
+`let _db` と書くと渡せないので、使うときは `let db` にします。
 
 テストを流すときは、機能フラグを忘れないでください。
 
@@ -187,39 +203,84 @@ cargo test
 async fn 他人の記事は直せない() {
     let _db = refresh_database().await;
 
-    let alice = client.fresh();
-    alice
-        .send("POST", "/api/login", b"email=alice@example.com&password=password123".to_vec(), &[FORM])
+    // いまの client でログインする。Cookie を使う口なので CSRF を通す
+    client
+        .post_with_csrf(
+            "/api/login",
+            "email=alice@example.com&password=password123",
+            "/csrf-token",
+        )
         .await
         .assert_ok();
 
-    let bob = client.fresh();   // 別の人
-    bob.send("PUT", "/api/my/articles/1", b"title=x".to_vec(), &[FORM])
+    // 別の人として送る
+    let bob = client.fresh();
+    bob.post_with_csrf("/api/my/articles/1", "title=x", "/csrf-token")
         .await
         .assert_status(403);
 }
+```
+
+CSRF を確かめないルート（JSON の API など）なら、`post` / `put` / `patch` / `delete` を
+そのまま使えます。
+
+```rust
+put("/api/posts/1", "title=x").await.assert_ok();
+delete("/api/posts/1").await.assert_status(204);
 ```
 
 パスワードの変換は時間がかかるので、 **テストでは回数が自動で 1,000 回に下がります**
 （本番の既定は 120,000 回）。`.env` に書いた値は見ません。
 変えたいときは `HASH_ITERATIONS=20000 cargo test` のように環境変数で渡します。
 
+## プロセス共通のものを使うテスト
+
+`tests/Feature/` は 1 つのバイナリで並行して走ります。
+次の 2 つはプロセスで 1 つしかないので、触るテストは `exclusive()` で札を取ります。
+
+| 触るもの                            | 理由                               |
+|-------------------------------------|------------------------------------|
+| `Mail::sent()` / `Mail::clear_sent()` | 溜まったメールがプロセスで 1 つ    |
+| `Lang`（`Lang::set` など）          | いまの言語がプロセスで 1 つ        |
+
+```rust
+#[bengara::test]
+async fn メールを送る() {
+    let _lock = exclusive().await;
+    Mail::clear_sent();
+    // ... 送る処理 ...
+    assert_eq!(Mail::sent().len(), 1);
+}
+```
+
+- 札は DB の札とは **別の錠**です。
+- **両方要るときは `refresh_database()` → `exclusive()` の順**で取ってください。
+  順番をそろえないと、取り合いで止まります。
+- `exclusive()` も 1 つのテストで 2 回呼ぶとパニックします。
+
+```rust
+#[bengara::test]
+async fn DBとメールの両方を使う() {
+    let _db = refresh_database().await;
+    let _lock = exclusive().await;
+    Mail::clear_sent();
+    // ...
+}
+```
+
+## 回数の制限（throttle）
+
+テストから送るリクエストの接続元は `127.0.0.1` です。
+そのため **回数の制限は本番と同じように効きます。**
+同じルートへ繰り返し送るテストでは、上限に当たって 429 が返ることを見込んでください。
+
 ## 周辺機能のテスト
 
 ### メール
 
 送り先が `array` になっているので、`Mail::sent()` で中身を確かめます。
-
-```rust
-#[bengara::test]
-async fn お知らせを送る() {
-    Mail::clear_sent();
-    // ... 送る処理 ...
-    assert_eq!(Mail::sent()[0].subject, "ようこそ");
-}
-```
-
-**溜まったメールはテストの間ずっと残ります。** 数を確かめる前に `clear_sent()` を呼んでください。
+**溜まったメールはテストの間ずっと残ります。**
+数を確かめる前に `exclusive()` の札を取り、`clear_sent()` を呼んでください（上の節）。
 
 ### キャッシュとファイル
 

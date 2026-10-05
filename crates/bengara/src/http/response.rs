@@ -67,9 +67,10 @@ impl Response {
     /// Laravel の `header()` と同じ既定です。同じ名前を何本も送りたいときは
     /// `with_added_header` を使ってください。
     pub fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
-        let name = name.to_ascii_lowercase();
-        self.headers.retain(|(existing, _)| existing != &name);
-        self.headers.push((name, value.into()));
+        // 照合は確保せずに行い、格納する名前は小文字にそろえる。
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_ascii_lowercase(), value.into()));
         self
     }
 
@@ -99,10 +100,9 @@ impl Response {
 
     /// ヘッダーの値（最初に見つかったもの）。
     pub fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .find(|(k, _)| *k == name)
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 
@@ -363,7 +363,12 @@ mod tests {
             .with_header("x-a", "1")
             .with_header("X-A", "2");
         assert_eq!(r.header("x-a"), Some("2"));
-        assert_eq!(r.headers().iter().filter(|(k, _)| k == "x-a").count(), 1);
+        assert_eq!(r.header("X-A"), Some("2"), "探すときも区別しない");
+        assert_eq!(
+            r.headers().iter().filter(|(k, _)| k == "x-a").count(),
+            1,
+            "格納する名前は小文字にそろえる"
+        );
 
         let r = Response::text("x")
             .with_added_header("set-cookie", "a=1")

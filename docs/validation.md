@@ -15,6 +15,8 @@ Laravel の Validation に当たります。
 本文は、`Content-Type` がフォーム（`application/x-www-form-urlencoded`）か JSON のときに読みます。
 JSON は **最上位の値だけ**を読みます。入れ子は `req.json::<T>()` を使ってください。
 
+解析するのは **1 リクエストにつき 1 回だけ**です。何度呼んでも遅くなりません。
+
 ## 検査する
 
 ```rust
@@ -38,6 +40,9 @@ pub async fn store(req: Request) -> Result<Response> {
 `Validated` には **検査した項目だけ** が入ります。規則を書かなかった項目は入りません。
 送られてきた値をそのまま保存してしまう事故を防ぐためです。
 
+- 送られてこなかった項目は入りません。
+- `nullable` の項目は、送られてこなくても **空文字**で入ります。
+
 | メソッド             | 中身                |
 |----------------------|---------------------|
 | `get(field)`         | 値。無ければ空文字  |
@@ -59,16 +64,69 @@ pub async fn store(req: Request) -> Result<Response> {
 
 規則は `|` でつなぎます。
 
-### min / max の数え方
+### min / max / between の数え方
 
-**数値として読めれば値そのもの、読めなければ文字数**で比べます（Laravel と同じ）。
+**`numeric` か `integer` が付いているときだけ、値の大小で比べます。**
+付いていなければ **文字数**で比べます。Laravel と同じです。
+
+| 書き方                         | 比べるもの |
+|--------------------------------|------------|
+| `("age", "integer\|min:18")`   | 値（18 以上） |
+| `("age", "numeric\|max:9.5")`  | 値（9.5 以下） |
+| `("title", "min:3")`           | 文字数（3 文字以上） |
+
+`size` も同じ決まりです。
+
+**間違えやすい例**
 
 ```rust
-("age",   "integer|min:18")   // 18 以上かどうか
-("title", "min:3")            // 3 文字以上かどうか
+("password", "required|min:8")
+```
+
+`password=9` は **落ちます**。1 文字しかないからです。
+「8 以上の数」ではなく「8 文字以上」として読みます。
+
+```rust
+("title", "max:50")
+```
+
+`title=9999999` は **通ります**。7 文字しかないからです。
+値として 50 を超えていても見ません。
+
+**数の大小で比べたいとき**
+
+`integer` か `numeric` を足します。
+
+```rust
+("age", "nullable|integer|between:0,150")
 ```
 
 文字数は見た目の文字で数えます。`あいう` は 3 文字です。
+
+### 空文字も検査する
+
+**検査を飛ばすのは、下の 2 つのときだけです。**
+
+| 状況                           | 動き         |
+|--------------------------------|--------------|
+| 項目が送られてこなかった       | 検査しない   |
+| `nullable` が付いている        | 検査しない   |
+| **空文字（`""`）が送られてきた** | **検査する** |
+
+```rust
+("role", "in:admin,user")
+```
+
+`role=""` は **落ちます**。空文字は `admin` でも `user` でもありません。
+`email=""` も `email` の規則で落ちます。
+
+空でよい項目には `nullable` を付けてください。
+
+```rust
+("role", "nullable|in:admin,user")
+```
+
+`required` を付けた項目は、空文字でも「必ず入力してください」で落ちます。
 
 ### confirmed
 
@@ -103,7 +161,14 @@ pub async fn store(req: Request) -> Result<Response> {
 req.session().old("title")   // 落ちたときに送られてきた title
 ```
 
-`password` / `secret` / `token` を名前に含む項目は **覚えません**。
+次の語を名前に含む項目は **覚えません**。セッションのファイルに平文で残るのを避けるためです。
+
+```
+password  passwd  pwd  pass  secret  token  key  api_key  apikey
+private_key  credential  cvv  card  ssn  otp  pin
+```
+
+名前のどこかに入っていれば落とします。`new_password_confirmation` も落ちます。
 
 ## 自分でエラーを組み立てる
 
