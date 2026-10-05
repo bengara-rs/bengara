@@ -40,24 +40,24 @@ async fn 無いページは404になる() {
 
 関数の中で、次の 3 つがそのまま使えます。
 
-| 名前 | 中身 |
-|---|---|
-| `client` | `TestClient` |
-| `get(uri)` | `client.get(uri)` の短縮 |
+| 名前              | 中身                            |
+|-------------------|---------------------------------|
+| `client`          | `TestClient`                    |
+| `get(uri)`        | `client.get(uri)` の短縮        |
 | `post(uri, body)` | `client.post(uri, body)` の短縮 |
 
 ### TestClient
 
-| メソッド |
-|---|
-| `get(uri)` |
-| `post(uri, body)` |
-| `post_json(uri, body)` — `body` は `&serde_json::Value` |
+| メソッド                                                                         |
+|----------------------------------------------------------------------------------|
+| `get(uri)`                                                                       |
+| `post(uri, body)`                                                                |
+| `post_json(uri, body)` — `body` は `&serde_json::Value`                          |
 | `send(method, uri, body, headers)` — `body: Vec<u8>`、`headers: &[(&str, &str)]` |
-| `post_with_csrf(uri, body, token_uri)` |
-| `csrf_token(token_uri)` |
-| `fresh()` — Cookie を捨てた別のクライアント |
-| `cookie(name)` — 覚えている Cookie |
+| `post_with_csrf(uri, body, token_uri)`                                           |
+| `csrf_token(token_uri)`                                                          |
+| `fresh()` — Cookie を捨てた別のクライアント                                      |
+| `cookie(name)` — 覚えている Cookie                                               |
 
 ```rust
 #[bengara::test]
@@ -78,7 +78,7 @@ async fn セッションがつながる() {
     client
         .send("POST", "/remember", b"value=x".to_vec(),
               &[("content-type", "application/x-www-form-urlencoded"),
-                ("x-csrf-token", &token)])
+                  ("x-csrf-token", &token)])
         .await
         .assert_ok();
 
@@ -87,12 +87,12 @@ async fn セッションがつながる() {
 }
 ```
 
-| メソッド | 中身 |
-|---|---|
-| `client.fresh()` | Cookie を捨てた、**別の人**としてのクライアント |
-| `client.cookie(name)` | いま持っている Cookie の値 |
-| `client.csrf_token(uri)` | トークンを返すルートを叩いて `token` を取り出す |
-| `client.post_with_csrf(uri, body, token_uri)` | トークンを取ってから POST する |
+| メソッド                                      | 中身                                            |
+|-----------------------------------------------|-------------------------------------------------|
+| `client.fresh()`                              | Cookie を捨てた、**別の人**としてのクライアント |
+| `client.cookie(name)`                         | いま持っている Cookie の値                      |
+| `client.csrf_token(uri)`                      | トークンを返すルートを叩いて `token` を取り出す |
+| `client.post_with_csrf(uri, body, token_uri)` | トークンを取ってから POST する                  |
 
 `send` に `cookie` ヘッダーを自分で指定したときは、そちらが優先されます。
 
@@ -102,23 +102,23 @@ async fn セッションがつながる() {
 
 ### TestResponse
 
-| 確かめる | 読む |
-|---|---|
-| `assert_ok()` | `status()` |
-| `assert_status(code)` | `body()` |
-| `assert_see(text)` | `json()` |
-| `assert_dont_see(text)` | `header(name)` |
-| `assert_header(name, value)` | |
-| `assert_redirect(location)` | |
+| 確かめる                     | 読む           |
+|------------------------------|----------------|
+| `assert_ok()`                | `status()`     |
+| `assert_status(code)`        | `body()`       |
+| `assert_see(text)`           | `json()`       |
+| `assert_dont_see(text)`      | `header(name)` |
+| `assert_header(name, value)` |                |
+| `assert_redirect(location)`  |                |
 
 `assert_*` は自分自身を返すので、つなげて書けます。
 
 ```rust
 get("/").await
-    .assert_ok()
-    .assert_header("content-type", "text/html; charset=utf-8")
-    .assert_see("myapp")
-    .assert_dont_see("エラー");
+.assert_ok()
+.assert_header("content-type", "text/html; charset=utf-8")
+.assert_see("myapp")
+.assert_dont_see("エラー");
 ```
 
 ## テスト名
@@ -146,11 +146,11 @@ async fn 記事を保存して読み出せる() {
 
 これが返す札（`_db`）を持っている間だけ DB を使えます。
 
-| すること | 内容 |
-|---|---|
+| すること | 内容                                                                            |
+|----------|---------------------------------------------------------------------------------|
 | つなぐ先 | `.env` の `DB_TEST_DATABASE`（既定 `:memory:`）。**開発用の DB には触りません** |
-| 表 | 全部消してから `database/migrations/` を流し直します |
-| 順番 | 札を持っている間、ほかの DB テストは待ちます |
+| 表       | 全部消してから `database/migrations/` を流し直します                            |
+| 順番     | 札を持っている間、ほかの DB テストは待ちます                                    |
 
 - **札は必ず受け取ってください**（`let _db = ...`）。`refresh_database().await;` だけだと
   その場で手放され、ほかのテストと混ざります。
@@ -198,7 +198,7 @@ async fn 他人の記事は直せない() {
 }
 ```
 
-パスワードの変換は時間がかかるので、**テストでは回数が自動で 1,000 回に下がります**
+パスワードの変換は時間がかかるので、 **テストでは回数が自動で 1,000 回に下がります**
 （本番の既定は 120,000 回）。`.env` に書いた値は見ません。
 変えたいときは `HASH_ITERATIONS=20000 cargo test` のように環境変数で渡します。
 

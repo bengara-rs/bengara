@@ -6,7 +6,7 @@
 ## 書く
 
 `database/migrations/` にファイルを置きます。名前は Laravel と同じ
-`日付_連番_説明.rs` です。**名前順に実行されます。**
+`日付_連番_説明.rs` です。 **名前順に実行されます。**
 
 ```rust
 // database/migrations/2026_10_05_000000_create_posts_table.rs
@@ -29,7 +29,7 @@ pub fn down(schema: &mut Schema) {
 }
 ```
 
-- `pub fn up` と `pub fn down` の**2つが必要**です。無いとコンパイルエラーになります。
+- `pub fn up` と `pub fn down` の **2つが必要**です。無いとコンパイルエラーになります。
 - **`up` / `down` は同期の関数です。** ここでやるのは SQL の組み立てだけで、
   実際に投げるのは bengara 側（ランナー）です。
 - 登録の作業はありません。ファイルを置けば `build.rs` が拾います。
@@ -47,16 +47,16 @@ cargo artisan migrate --seed   # 流してからシーダーも動かす
 ./myapp migrate
 ```
 
-| コマンド | すること |
-|---|---|
-| `migrate` | まだ流していないものを流す |
-| `migrate:status` | 流したかどうかを一覧にする |
+| コマンド           | すること                                         |
+|--------------------|--------------------------------------------------|
+| `migrate`          | まだ流していないものを流す                       |
+| `migrate:status`   | 流したかどうかを一覧にする                       |
 | `migrate:rollback` | 最後のバッチを巻き戻す（`--step=2` で2バッチ分） |
-| `migrate:reset` | 全部巻き戻す |
-| `migrate:refresh` | 全部巻き戻してから流し直す |
-| `migrate:fresh` | **表を全部消して**から流し直す |
-| `db:seed` | シーダーだけ動かす |
-| `db:wipe` | 表を全部消す |
+| `migrate:reset`    | 全部巻き戻す                                     |
+| `migrate:refresh`  | 全部巻き戻してから流し直す                       |
+| `migrate:fresh`    | **表を全部消して**から流し直す                   |
+| `db:seed`          | シーダーだけ動かす                               |
+| `db:wipe`          | 表を全部消す                                     |
 
 - どれにも `--database=接続の名前` を付けられます。既定は `DB_CONNECTION` です。
 - `migrate:fresh` と `db:wipe` は、`APP_ENV=production` のとき `--force` が無いと止まります。
@@ -75,23 +75,23 @@ $ cargo artisan migrate:status
 
 ## 列の種類
 
-| 書き方 | SQLite の型 |
-|---|---|
-| `t.id()` | 自動採番の主キー |
-| `t.increments("uid")` | 名前を決めた自動採番の主キー |
-| `t.integer("views")` / `t.big_integer("n")` | `integer` |
-| `t.foreign_id("post_id")` | `integer`（ほかの表を指す列） |
-| `t.string("title")` / `t.string_with("code", 8)` | `varchar(255)` / `varchar(8)` |
-| `t.text("body")` | `text` |
-| `t.boolean("pinned")` | `boolean` |
-| `t.float("x")` / `t.double("y")` / `t.decimal("price", 8, 2)` | `real` / `real` / `numeric(8, 2)` |
-| `t.date("on")` / `t.date_time("at")` / `t.timestamp("at")` | `date` / `datetime` |
-| `t.json("meta")` | `text` |
-| `t.binary("blob")` | `blob` |
-| `t.uuid("key")` | `varchar(36)` |
-| `t.raw_column("x", "integer")` | 型名をそのまま書く |
-| `t.timestamps()` | `created_at` と `updated_at`（どちらも null 可） |
-| `t.soft_deletes()` | `deleted_at`（null 可） |
+| 書き方                                                        | SQLite の型                                      |
+|---------------------------------------------------------------|--------------------------------------------------|
+| `t.id()`                                                      | 自動採番の主キー                                 |
+| `t.increments("uid")`                                         | 名前を決めた自動採番の主キー                     |
+| `t.integer("views")` / `t.big_integer("n")`                   | `integer`                                        |
+| `t.foreign_id("post_id")`                                     | `integer`（ほかの表を指す列）                    |
+| `t.string("title")` / `t.string_with("code", 8)`              | `varchar(255)` / `varchar(8)`                    |
+| `t.text("body")`                                              | `text`                                           |
+| `t.boolean("pinned")`                                         | `boolean`                                        |
+| `t.float("x")` / `t.double("y")` / `t.decimal("price", 8, 2)` | `real` / `real` / `numeric(8, 2)`                |
+| `t.date("on")` / `t.date_time("at")` / `t.timestamp("at")`    | `date` / `datetime`                              |
+| `t.json("meta")`                                              | `text`                                           |
+| `t.binary("blob")`                                            | `blob`                                           |
+| `t.uuid("key")`                                               | `varchar(36)`                                    |
+| `t.raw_column("x", "integer")`                                | 型名をそのまま書く                               |
+| `t.timestamps()`                                              | `created_at` と `updated_at`（どちらも null 可） |
+| `t.soft_deletes()`                                            | `deleted_at`（null 可）                          |
 
 ## 列に付ける指定
 
@@ -105,15 +105,15 @@ t.date_time("at").default_raw("current_timestamp");
 t.uuid("key").primary();
 ```
 
-| 書き方 | 意味 |
-|---|---|
-| `nullable()` | null を許す |
-| `default(値)` | 既定値 |
-| `default_raw("sql")` | 既定値を SQL で書く |
-| `unique()` | 重なりを禁じる |
-| `index()` | 索引を付ける |
-| `primary()` | 主キーにする |
-| `comment("説明")` | 説明（SQLite では無視されます） |
+| 書き方               | 意味                            |
+|----------------------|---------------------------------|
+| `nullable()`         | null を許す                     |
+| `default(値)`        | 既定値                          |
+| `default_raw("sql")` | 既定値を SQL で書く             |
+| `unique()`           | 重なりを禁じる                  |
+| `index()`            | 索引を付ける                    |
+| `primary()`          | 主キーにする                    |
+| `comment("説明")`    | 説明（SQLite では無視されます） |
 
 ## 表に付ける指定
 
@@ -130,14 +130,14 @@ schema.create("comments", |t| {
 });
 ```
 
-| 書き方 | 意味 |
-|---|---|
-| `t.index(&["a", "b"])` | 索引 |
-| `t.unique(&["email"])` | 重なりを禁じる |
-| `t.primary(&["a", "b"])` | 複合主キー |
-| `t.foreign(col).references(col).on(table)` | 外部キー |
-| `.on_delete("cascade")` / `.cascade_on_delete()` | 元の行が消えたときの動き |
-| `.on_update("restrict")` | 元の行が変わったときの動き |
+| 書き方                                           | 意味                       |
+|--------------------------------------------------|----------------------------|
+| `t.index(&["a", "b"])`                           | 索引                       |
+| `t.unique(&["email"])`                           | 重なりを禁じる             |
+| `t.primary(&["a", "b"])`                         | 複合主キー                 |
+| `t.foreign(col).references(col).on(table)`       | 外部キー                   |
+| `.on_delete("cascade")` / `.cascade_on_delete()` | 元の行が消えたときの動き   |
+| `.on_update("restrict")`                         | 元の行が変わったときの動き |
 
 索引は `create index ...` という別の文になります。名前は自動で付きます
 （`posts_status_index` のような形）。

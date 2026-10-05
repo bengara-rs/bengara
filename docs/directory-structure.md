@@ -58,26 +58,25 @@ myapp/
 
 ## 名前の付き方
 
-| 対象 | どうなるか |
-|---|---|
-| `app` `bootstrap` `config` `database` `routes` | モジュールとして公開される |
-| `tests` | `#[cfg(test)]` 付きで取り込まれる（型の再エクスポートはしない） |
-| ディレクトリ | snake_case のモジュールへ。`app/Http/Controllers/` → `crate::app::http::controllers` |
-| 大文字始まりのファイル | `app/Models/User.rs` → 型 `crate::app::models::User` と モジュール `crate::app::models::user` |
-| 小文字始まりのファイル | `routes/web.rs` → `crate::routes::web` |
-| 日付で始まるファイル | 先頭に `m` を付けたモジュール名になる（`2026_…` → `m2026_…`） |
+| 対象                                           | どうなるか                                                                                    |
+|------------------------------------------------|-----------------------------------------------------------------------------------------------|
+| `app` `bootstrap` `config` `database` `routes` | モジュールとして公開される                                                                    |
+| `tests`                                        | `#[cfg(test)]` 付きで取り込まれる（型の再エクスポートはしない）                               |
+| ディレクトリ                                   | snake_case のモジュールへ。`app/Http/Controllers/` → `crate::app::http::controllers`          |
+| 大文字始まりのファイル                         | `app/Models/User.rs` → 型 `crate::app::models::User` と モジュール `crate::app::models::user` |
+| 小文字始まりのファイル                         | `routes/web.rs` → `crate::routes::web`                                                        |
+| 日付で始まるファイル                           | 先頭に `m` を付けたモジュール名になる（`2026_…` → `m2026_…`）                                 |
 
 ### `database/` の約束
 
-| 場所 | 書くもの |
-|---|---|
+| 場所                                            | 書くもの                                                               |
+|-------------------------------------------------|------------------------------------------------------------------------|
 | `database/migrations/` の、日付で始まるファイル | `pub fn up(schema: &mut Schema)` と `pub fn down(schema: &mut Schema)` |
-| `database/seeders/` の、大文字始まりのファイル | `pub async fn run() -> Result<()>` |
-| `database/factories/` | ただの関数（決まりはありません） |
+| `database/seeders/` の、大文字始まりのファイル  | `pub async fn run() -> Result<()>`                                     |
+| `database/factories/`                           | ただの関数（決まりはありません）                                       |
 
-- `migrations/` と `seeders/` は、名前順の一覧が自動で作られて本体に渡ります。
-  **登録の作業はありません。**
-- `seeders/` と `factories/` では、**大文字始まりのファイルに同名の型は要りません。**
+- `migrations/` と `seeders/` は、名前順の一覧が自動で作られて本体に渡ります。 **登録の作業はありません。**
+- `seeders/` と `factories/` では、 **大文字始まりのファイルに同名の型は要りません。**
   関数を置く場所として扱います。
 - 詳しくは [migrations.md](migrations.md) と [models.md](models.md) にあります。
 
@@ -96,7 +95,7 @@ myapp/
 
 ## うまくいかないとき
 
-- 自動検出は**パニックしません**。モジュール名にできないファイル名や、同じディレクトリでの名前の衝突は、
+- 自動検出は **パニックしません**。モジュール名にできないファイル名や、同じディレクトリでの名前の衝突は、
   コンパイルエラー（`compile_error!`）として出ます。メッセージの通りに直してください。
 - ファイルを足したのに見つからないときは、`build.rs` が走り直していない可能性があります。
   `cargo artisan serve` は `app bootstrap config database public resources routes` の中と、

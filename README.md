@@ -131,26 +131,26 @@ async fn トップページが表示される() {
 
 ### cargo artisan（開発用）
 
-| コマンド | 動き |
-|---|---|
-| `cargo artisan serve [--host H] [--port P]` | ビルド → 起動 → 変更を見張って再ビルド・再起動 |
-| `cargo artisan init` | Laravel と同じ構成のファイルを作る |
-| `cargo artisan list` （`help` / `--help` / `-h`） | ヘルプ |
-| `cargo artisan --version` | bengara の版 |
-| 上記以外 | そのまま本体へ渡す |
+| コマンド                                          | 動き                                           |
+|---------------------------------------------------|------------------------------------------------|
+| `cargo artisan serve [--host H] [--port P]`       | ビルド → 起動 → 変更を見張って再ビルド・再起動 |
+| `cargo artisan init`                              | Laravel と同じ構成のファイルを作る             |
+| `cargo artisan list` （`help` / `--help` / `-h`） | ヘルプ                                         |
+| `cargo artisan --version`                         | bengara の版                                   |
+| 上記以外                                          | そのまま本体へ渡す                             |
 
 ### 本体（`cargo run -- ...` / 本番は `./myapp ...`）
 
-| コマンド | 動き |
-|---|---|
-| 引数なし / `serve` | HTTP サーバーを起動（`--host` / `--port`） |
-| `route:list` | 登録されているルートの表（METHOD / URI / NAME / MIDDLEWARE） |
-| `key:generate` | `APP_KEY` を作って `.env` に書き込む |
-| `session:gc` | 期限切れのセッションを消す |
-| `migrate` / `migrate:status` / `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` | マイグレーション |
-| `db:seed` / `db:wipe` | 初期データ / 表を全部消す |
-| `init` | Laravel と同じ構成のファイルを作る |
-| `--version` / `--help` | 版・ヘルプ |
+| コマンド                                                                                                  | 動き                                                         |
+|-----------------------------------------------------------------------------------------------------------|--------------------------------------------------------------|
+| 引数なし / `serve`                                                                                        | HTTP サーバーを起動（`--host` / `--port`）                   |
+| `route:list`                                                                                              | 登録されているルートの表（METHOD / URI / NAME / MIDDLEWARE） |
+| `key:generate`                                                                                            | `APP_KEY` を作って `.env` に書き込む                         |
+| `session:gc`                                                                                              | 期限切れのセッションを消す                                   |
+| `migrate` / `migrate:status` / `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` | マイグレーション                                             |
+| `db:seed` / `db:wipe`                                                                                     | 初期データ / 表を全部消す                                    |
+| `init`                                                                                                    | Laravel と同じ構成のファイルを作る                           |
+| `--version` / `--help`                                                                                    | 版・ヘルプ                                                   |
 
 `make:*` コマンドはありません（意図的な判断です。[docs/decisions.md](docs/decisions.md) を参照）。
 
@@ -166,7 +166,8 @@ async fn トップページが表示される() {
 - Rust 1.85 以上
 - edition 2021
 
-bengara 自身のコードは edition 2021 で書いていますが、依存クレートの hyper-util が edition 2024 を要求するため、実際に必要な Rust は 1.85 以上です。
+bengara 自身のコードは edition 2021 で書いていますが、依存クレートの hyper-util が edition 2024 を要求するため、実際に必要な
+Rust は 1.85 以上です。
 
 ## ドキュメント
 

@@ -9,11 +9,11 @@
 フレームワークが持っているのは、真偽値から 403 を作る `authorize` だけです。
 
 ```rust
-authorize(PostPolicy::update(&user, &post))?;
+authorize(PostPolicy::update( & user, & post)) ?;
 ```
 
 文字列で引く表（Laravel の `Gate::define`）はありません。
-関数呼び出しなので、**名前を間違えればコンパイルで止まります。**
+関数呼び出しなので、 **名前を間違えればコンパイルで止まります。**
 
 ## 書く
 
@@ -73,13 +73,12 @@ pub async fn update(req: Request) -> Result<Response> {
 }
 ```
 
-3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。
-**止まる順番も、この並びのとおり**です（401 → 404 → 403）。
+3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。 **止まる順番も、この並びのとおり**です（401 → 404 → 403）。
 
-| 関数 | すること |
-|---|---|
-| `authorize(bool)` | 偽なら 403。本文は「この操作は許可されていません」 |
-| `authorize_with(bool, メッセージ)` | 403 のメッセージを指定する |
+| 関数                               | すること                                           |
+|------------------------------------|----------------------------------------------------|
+| `authorize(bool)`                  | 偽なら 403。本文は「この操作は許可されていません」 |
+| `authorize_with(bool, メッセージ)` | 403 のメッセージを指定する                         |
 
 403 を HTML で返すか JSON で返すかは、リクエストの `Accept` で決まります
 （[requests-and-responses.md](requests-and-responses.md)）。
@@ -89,8 +88,8 @@ pub async fn update(req: Request) -> Result<Response> {
 真偽値なので、止めずに分岐もできます。
 
 ```rust
-let can_edit = PostPolicy::update(&user, &post);
-json(&bengara::serde_json::json!({
+let can_edit = PostPolicy::update( & user, & post);
+json( & bengara::serde_json::json!({
     "title": post.title,
     "can_edit": can_edit,     // 画面でボタンを出すかどうか
 }))
@@ -121,27 +120,27 @@ async fn 他人の記事は直せない() {
 画面ごしに確かめるなら、ログインしてから叩きます。
 
 ```rust
-bob.send("PUT", "/api/my/articles/1", b"title=x".to_vec(), &[FORM])
-    .await
-    .assert_status(403);
+bob.send("PUT", "/api/my/articles/1", b"title=x".to_vec(), & [FORM])
+.await
+.assert_status(403);
 ```
 
 ## Laravel との違い
 
-| Laravel | bengara |
-|---|---|
-| `Gate::define('update-post', fn ($user, $post) => ...)` | 書きません。関数を直接定義します |
-| `Gate::allows('update-post', $post)` | `PostPolicy::update(&user, &post)` |
-| `$this->authorize('update', $post)` | `authorize(PostPolicy::update(&user, &post))?` |
-| ポリシーの自動対応づけ | ありません。呼ぶ側で関数を指定します |
-| `@can('update', $post)` | 真偽値なので `if` で分けます |
+| Laravel                                                 | bengara                                        |
+|---------------------------------------------------------|------------------------------------------------|
+| `Gate::define('update-post', fn ($user, $post) => ...)` | 書きません。関数を直接定義します               |
+| `Gate::allows('update-post', $post)`                    | `PostPolicy::update(&user, &post)`             |
+| `$this->authorize('update', $post)`                     | `authorize(PostPolicy::update(&user, &post))?` |
+| ポリシーの自動対応づけ                                  | ありません。呼ぶ側で関数を指定します           |
+| `@can('update', $post)`                                 | 真偽値なので `if` で分けます                   |
 
 ## 気をつけること
 
-| こと | 内容 |
-|---|---|
-| 判定は同期の関数にする | DB を引きたくなったら、呼ぶ側で先に引いてから渡してください |
-| 先にログインを確かめる | `user_or_fail()` を先に呼べば 401 が先に返ります |
+| こと                     | 内容                                                           |
+|--------------------------|----------------------------------------------------------------|
+| 判定は同期の関数にする   | DB を引きたくなったら、呼ぶ側で先に引いてから渡してください    |
+| 先にログインを確かめる   | `user_or_fail()` を先に呼べば 401 が先に返ります               |
 | 判定を忘れないようにする | ルートを足したら、対になるテスト（他人で 403）も足してください |
 
 ## 関連

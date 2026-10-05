@@ -4,16 +4,16 @@ Laravel の Validation に当たります。
 
 ## 入力を読む
 
-| メソッド | 読むところ |
-|---|---|
-| `req.input("title")` | 本文とクエリ。**本文が優先** |
-| `req.input_all()` | 同上。全部 |
-| `req.form("title")` / `form_all()` | フォームの本文だけ |
-| `req.query("q")` / `query_all()` | クエリだけ |
-| `req.json::<T>()` | 本文を型に読む |
+| メソッド                           | 読むところ                   |
+|------------------------------------|------------------------------|
+| `req.input("title")`               | 本文とクエリ。**本文が優先** |
+| `req.input_all()`                  | 同上。全部                   |
+| `req.form("title")` / `form_all()` | フォームの本文だけ           |
+| `req.query("q")` / `query_all()`   | クエリだけ                   |
+| `req.json::<T>()`                  | 本文を型に読む               |
 
 本文は、`Content-Type` がフォーム（`application/x-www-form-urlencoded`）か JSON のときに読みます。
-JSON は**最上位の値だけ**を読みます。入れ子は `req.json::<T>()` を使ってください。
+JSON は **最上位の値だけ**を読みます。入れ子は `req.json::<T>()` を使ってください。
 
 ## 検査する
 
@@ -38,24 +38,24 @@ pub async fn store(req: Request) -> Result<Response> {
 `Validated` には **検査した項目だけ** が入ります。規則を書かなかった項目は入りません。
 送られてきた値をそのまま保存してしまう事故を防ぐためです。
 
-| メソッド | 中身 |
-|---|---|
-| `get(field)` | 値。無ければ空文字 |
-| `try_get(field)` | 値。無ければ `None` |
-| `get_as::<T>(field)` | 型を変えて取り出す |
-| `all()` | 全部の組 |
-| `has(field)` | あるか |
+| メソッド             | 中身                |
+|----------------------|---------------------|
+| `get(field)`         | 値。無ければ空文字  |
+| `try_get(field)`     | 値。無ければ `None` |
+| `get_as::<T>(field)` | 型を変えて取り出す  |
+| `all()`              | 全部の組            |
+| `has(field)`         | あるか              |
 
 ## 使える規則
 
-| 分類 | 規則 |
-|---|---|
-| 必須と省略 | `required`、`nullable` |
-| 型 | `integer`、`numeric`、`boolean` |
-| 形 | `email`、`url`、`alpha`、`alpha_num`、`alpha_dash` |
-| 大きさ | `min:n`、`max:n`、`between:a,b`、`size:n` |
-| 値 | `in:a,b,c`、`starts_with:x`、`ends_with:x` |
-| 項目どうし | `confirmed`、`same:other`、`different:other` |
+| 分類       | 規則                                               |
+|------------|----------------------------------------------------|
+| 必須と省略 | `required`、`nullable`                             |
+| 型         | `integer`、`numeric`、`boolean`                    |
+| 形         | `email`、`url`、`alpha`、`alpha_num`、`alpha_dash` |
+| 大きさ     | `min:n`、`max:n`、`between:a,b`、`size:n`          |
+| 値         | `in:a,b,c`、`starts_with:x`、`ends_with:x`         |
+| 項目どうし | `confirmed`、`same:other`、`different:other`       |
 
 規則は `|` でつなぎます。
 
@@ -103,7 +103,7 @@ pub async fn store(req: Request) -> Result<Response> {
 req.session().old("title")   // 落ちたときに送られてきた title
 ```
 
-`password` / `secret` / `token` を名前に含む項目は**覚えません**。
+`password` / `secret` / `token` を名前に含む項目は **覚えません**。
 
 ## 自分でエラーを組み立てる
 

@@ -23,16 +23,15 @@ pub struct Post {
 }
 ```
 
-| 指定 | 置き場所 | 既定 |
-|---|---|---|
-| `#[model(table = "posts")]` | 構造体 | **必須**。表の名前は推測しません |
-| `#[model(primary)]` | フィールド | `id` という名前のフィールド |
-| `#[model(column = "名前")]` | フィールド | フィールド名と同じ |
-| `#[model(skip)]` | フィールド | 表に無い項目として扱う |
+| 指定                        | 置き場所   | 既定                             |
+|-----------------------------|------------|----------------------------------|
+| `#[model(table = "posts")]` | 構造体     | **必須**。表の名前は推測しません |
+| `#[model(primary)]`         | フィールド | `id` という名前のフィールド      |
+| `#[model(column = "名前")]` | フィールド | フィールド名と同じ               |
+| `#[model(skip)]`            | フィールド | 表に無い項目として扱う           |
 
 フィールドに使える型は `i64` / `i32` / `u32` / `u64` / `f64` / `bool` / `String` /
-`Vec<u8>` と、その `Option` です。
-**null を許す列は `Option<...>` にしてください。** そうしないと読み出しでエラーになります。
+`Vec<u8>` と、その `Option` です。 **null を許す列は `Option<...>` にしてください。** そうしないと読み出しでエラーになります。
 
 表の名前を推測しないのは、英語の複数形が一定でないためです
 （`person` → `people`、`category` → `categories`）。1行書くほうが確実です。
@@ -68,15 +67,15 @@ pub async fn show(req: Request) -> Result<Response> {
 `Post::query()` が返すのは `ModelQuery<Post>` です。
 条件の書き方は[クエリビルダ](database.md)と同じで、終端だけが型付きです。
 
-| 終端 | 返るもの |
-|---|---|
-| `get()` | `Vec<Post>` |
-| `first()` | `Option<Post>` |
-| `first_or_fail()` | `Post`（無ければ 404） |
-| `count()` / `exists()` | `i64` / `bool` |
+| 終端                                  | 返るもの               |
+|---------------------------------------|------------------------|
+| `get()`                               | `Vec<Post>`            |
+| `first()`                             | `Option<Post>`         |
+| `first_or_fail()`                     | `Post`（無ければ 404） |
+| `count()` / `exists()`                | `i64` / `bool`         |
 | `pluck::<T>(col)` / `value::<T>(col)` | `Vec<T>` / `Option<T>` |
-| `update(&[...])` / `delete()` | `u64`（件数） |
-| `paginate(per_page, page)` | `Paginator<Post>` |
+| `update(&[...])` / `delete()`         | `u64`（件数）          |
+| `paginate(per_page, page)`            | `Paginator<Post>`      |
 
 生の行が欲しいときは `query_builder()` でクエリビルダを取り出せます。
 
@@ -113,10 +112,10 @@ post.delete().await?;            // 返るのは件数
 
 `created_at` / `updated_at` という `String` のフィールドがあると、`save()` が入れます。
 
-| とき | `created_at` | `updated_at` |
-|---|---|---|
-| 新しい行 | 入る | 入る |
-| 更新 | そのまま | 入る |
+| とき     | `created_at` | `updated_at` |
+|----------|--------------|--------------|
+| 新しい行 | 入る         | 入る         |
+| 更新     | そのまま     | 入る         |
 
 > **クエリビルダ（`DB::table(...)`）で直接入れたときは、時刻は入りません。**
 > `timestamps()` の列は null を許すので、そのままモデルで読むと
@@ -181,7 +180,7 @@ impl Comment {
 }
 ```
 
-読むときは `await` が付きます。**問い合わせが走る場所が目に見えます。**
+読むときは `await` が付きます。 **問い合わせが走る場所が目に見えます。**
 
 ```rust
 let comments = post.comments().get().await?;
@@ -197,7 +196,7 @@ let recent = post.comments().where_op("created_at", ">", "2026-01-01").get().awa
 ### 触っただけでは読みません
 
 Laravel の `$post->comments` は、触った瞬間に裏で問い合わせが走ります。
-bengara ではこれをやりません。**N+1**（一覧を1回引いたあと、行ごとに追加の問い合わせが走る状態）を
+bengara ではこれをやりません。 **N+1**（一覧を1回引いたあと、行ごとに追加の問い合わせが走る状態）を
 起こしにくくするためです。
 
 ### まとめて読む
@@ -217,7 +216,7 @@ for post in &posts {
 }
 ```
 
-問い合わせは**2回**です。記事の数に関係なく2回のままです。
+問い合わせは **2回**です。記事の数に関係なく2回のままです。
 
 ## ページ分け
 
@@ -244,12 +243,12 @@ Post::query().using(&tx).where_("id", 1).delete().await?;
 tx.commit().await?;
 ```
 
-`save()` と `delete()`（モデルのメソッド）は、いまは**既定の接続**を使います。
+`save()` と `delete()`（モデルのメソッド）は、いまは **既定の接続**を使います。
 トランザクションの中で入れたいときは、`tx.table(...)` か `Post::on(&tx)` を使ってください。
 
 ## 文字列の主キー
 
-`save()` は**自動採番の整数**の主キーを前提にしています。
+`save()` は **自動採番の整数**の主キーを前提にしています。
 UUID のように自分で決める主キーのときは、クエリビルダで入れてください。
 
 ```rust
@@ -277,14 +276,14 @@ pub async fn run() -> Result<()> {
 - ファイル名は大文字始まり。`pub async fn run() -> Result<()>` を定義します。
 - `cargo artisan db:seed` で `DatabaseSeeder` が動きます。
   `--class=PostSeeder` で1本だけ指定できます。
-- ほかのシーダーを呼ぶときは、**ただの関数呼び出し**です。
+- ほかのシーダーを呼ぶときは、 **ただの関数呼び出し**です。
 
 ```rust
 crate::database::seeders::post_seeder::run().await?;
 ```
 
-テスト用のデータを作る関数（Laravel のファクトリ）は `database/factories/` に置きます。
-**専用の仕組みはありません。** ただの関数です。
+テスト用のデータを作る関数（Laravel のファクトリ）は `database/factories/` に置きます。 **専用の仕組みはありません。**
+ただの関数です。
 
 ```rust
 // database/factories/PostFactory.rs

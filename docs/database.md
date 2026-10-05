@@ -5,7 +5,7 @@
 
 ## 使えるようにする
 
-データベースは**機能フラグ**です。`Cargo.toml` に書きます。
+データベースは **機能フラグ**です。`Cargo.toml` に書きます。
 
 ```toml
 [dependencies]
@@ -18,9 +18,9 @@ bengara = { version = "0.1", features = ["sqlite"] }
 > Rust 1.85（最低対応版）で使うときは、依存を1つ固定してください。
 > `cargo update idna_adapter --precise 1.2.0`（[getting-started.md](getting-started.md)）
 
-| 使えるもの | 状況 |
-|---|---|
-| SQLite | **使えます**（`features = ["sqlite"]`） |
+| 使えるもの         | 状況                                                    |
+|--------------------|---------------------------------------------------------|
+| SQLite             | **使えます**（`features = ["sqlite"]`）                 |
 | MySQL / PostgreSQL | **まだ使えません。** SQL の組み立てだけ用意してあります |
 
 フラグが無いままでもコンパイルは通ります。`DB::...` を呼んだときに、
@@ -58,15 +58,15 @@ pub fn config() -> DatabaseConfig {
 }
 ```
 
-| 指定 | 既定 | 意味 |
-|---|---|---|
-| `max_connections(n)` | 5 | 同時に張る接続の数。`:memory:` のときは 1 に固定されます |
-| `foreign_keys(b)` | 真 | SQLite で外部キーの制約を効かせるか |
-| `url(s)` | 空 | 接続文字列を直接書く。書くと `database` より優先します |
+| 指定                 | 既定 | 意味                                                     |
+|----------------------|------|----------------------------------------------------------|
+| `max_connections(n)` | 5    | 同時に張る接続の数。`:memory:` のときは 1 に固定されます |
+| `foreign_keys(b)`    | 真   | SQLite で外部キーの制約を効かせるか                      |
+| `url(s)`             | 空   | 接続文字列を直接書く。書くと `database` より優先します   |
 
-- SQLite のファイルは**無ければ作ります。** 置くディレクトリは先に用意してください。
+- SQLite のファイルは **無ければ作ります。** 置くディレクトリは先に用意してください。
 - 相対パスはプロジェクト直下（`base_path()`）から見ます。
-- 接続は**最初に使ったときに**張ります。起動は速いままです。
+- 接続は **最初に使ったときに**張ります。起動は速いままです。
 
 ## 読む
 
@@ -101,21 +101,20 @@ let maybe = row.try_get::<i64>("views");      // 読めなければ None
 
 ### 条件
 
-| 書き方 | 意味 |
-|---|---|
-| `where_("status", "published")` | 等しい |
-| `where_op("views", ">", 100)` | 演算子を指定する |
-| `or_where(...)` / `or_where_op(...)` | `or` でつなぐ |
-| `where_in("id", &[1, 2, 3])` / `where_not_in` | 一覧のどれか |
-| `where_null("body")` / `where_not_null` | `null` かどうか |
-| `where_between("views", 0, 100)` / `where_not_between` | 範囲 |
-| `where_like("title", "%そば%")` | 形に当てはまる |
-| `where_column("updated_at", ">", "created_at")` | 列と列を比べる |
-| `where_raw("length(title) > ?", &[3.into()])` | SQL を直接書く |
-| `where_group(\|q\| q.where_("a", 1).or_where("b", 2))` | 括弧でくくる |
+| 書き方                                                 | 意味             |
+|--------------------------------------------------------|------------------|
+| `where_("status", "published")`                        | 等しい           |
+| `where_op("views", ">", 100)`                          | 演算子を指定する |
+| `or_where(...)` / `or_where_op(...)`                   | `or` でつなぐ    |
+| `where_in("id", &[1, 2, 3])` / `where_not_in`          | 一覧のどれか     |
+| `where_null("body")` / `where_not_null`                | `null` かどうか  |
+| `where_between("views", 0, 100)` / `where_not_between` | 範囲             |
+| `where_like("title", "%そば%")`                        | 形に当てはまる   |
+| `where_column("updated_at", ">", "created_at")`        | 列と列を比べる   |
+| `where_raw("length(title) > ?", &[3.into()])`          | SQL を直接書く   |
+| `where_group(\|q\| q.where_("a", 1).or_where("b", 2))` | 括弧でくくる     |
 
-`where` は Rust の予約語なので `where_` です。
-**等しいかどうかは `where_`、それ以外は `where_op`** に分かれています。
+`where` は Rust の予約語なので `where_` です。 **等しいかどうかは `where_`、それ以外は `where_op`** に分かれています。
 Rust には引数の数による使い分けが無いためです。
 
 ```rust
@@ -123,7 +122,7 @@ Rust には引数の数による使い分けが無いためです。
 DB::table("posts").where_op("views", ">", 100)
 ```
 
-`where_in` に空の一覧を渡すと、**必ず 0 件**になります（`1 = 0` を置きます）。
+`where_in` に空の一覧を渡すと、 **必ず 0 件**になります（`1 = 0` を置きます）。
 
 ### 並べる・絞る・束ねる
 
@@ -138,17 +137,17 @@ DB::table("posts")
     .await?;
 ```
 
-| 書き方 | 意味 |
-|---|---|
-| `select(&["id", "title"])` / `add_select("body")` | 取る列 |
-| `distinct()` | 重なりを捨てる |
-| `order_by(col)` / `order_by_desc(col)` | 並べる |
-| `latest()` / `oldest()` | `created_at` の降順 / 昇順 |
-| `latest_by(col)` / `oldest_by(col)` | 列を指定して並べる |
-| `limit(n)` / `offset(n)` / `take(n)` / `skip(n)` | 件数 |
-| `for_page(page, per_page)` | ページから件数を決める |
-| `join` / `left_join` | 結合 |
-| `group_by` / `having_op` / `having_raw` | 束ねて絞る |
+| 書き方                                            | 意味                       |
+|---------------------------------------------------|----------------------------|
+| `select(&["id", "title"])` / `add_select("body")` | 取る列                     |
+| `distinct()`                                      | 重なりを捨てる             |
+| `order_by(col)` / `order_by_desc(col)`            | 並べる                     |
+| `latest()` / `oldest()`                           | `created_at` の降順 / 昇順 |
+| `latest_by(col)` / `oldest_by(col)`               | 列を指定して並べる         |
+| `limit(n)` / `offset(n)` / `take(n)` / `skip(n)`  | 件数                       |
+| `for_page(page, per_page)`                        | ページから件数を決める     |
+| `join` / `left_join`                              | 結合                       |
+| `group_by` / `having_op` / `having_raw`           | 束ねて絞る                 |
 
 **並びが一意になるようにしてください。** 同じ値の行が複数あると、
 ページの境目で同じ行が2回出ることがあります（`latest()` に `order_by_desc("id")` を足すなど）。
@@ -240,14 +239,14 @@ pub async fn index(req: Request) -> Result<Response> {
 }
 ```
 
-ページ番号は**引数で渡します。** `req.page()` が `?page=` を読みます（無ければ 1）。
+ページ番号は **引数で渡します。** `req.page()` が `?page=` を読みます（無ければ 1）。
 
-| 名前 | 意味 |
-|---|---|
-| `data` / `total` / `per_page` / `current_page` | 中身と件数 |
-| `last_page()` | 最後のページ番号 |
-| `has_more_pages()` | 次があるか |
-| `from()` / `to()` | 全体で何件目から何件目か |
+| 名前                                           | 意味                     |
+|------------------------------------------------|--------------------------|
+| `data` / `total` / `per_page` / `current_page` | 中身と件数               |
+| `last_page()`                                  | 最後のページ番号         |
+| `has_more_pages()`                             | 次があるか               |
+| `from()` / `to()`                              | 全体で何件目から何件目か |
 
 ## トランザクション
 
@@ -262,7 +261,7 @@ tx.commit().await?;
 
 - `tx.table(...)` で作ったクエリは、そのトランザクションの中で動きます。
 - **`commit()` を呼ばずに `tx` が落ちたら巻き戻します。** 明示するなら `tx.rollback().await?`。
-- `DB::table(...)` は**トランザクションの外**です。混ぜないでください。
+- `DB::table(...)` は **トランザクションの外**です。混ぜないでください。
 - **1本ずつ `await` してください。** 同時に2本投げるとエラーになります。
 
 ## SQL を直接書く
@@ -299,11 +298,11 @@ SQL が失敗したときは、文だけを添えて返します。
 
 ## 気をつけること
 
-| こと | 内容 |
-|---|---|
+| こと                         | 内容                                                                                  |
+|------------------------------|---------------------------------------------------------------------------------------|
 | 列名に外から来た値を入れない | 列名と表名は SQL にそのまま置きます。値（`where_` の第2引数）は必ずプレースホルダです |
-| `:memory:` は接続1本 | メモリ上のデータベースは接続ごとに別物になるため、1本に固定します |
-| 1プロセスで1つの接続プール | 既定の接続は最初の1回だけ作られ、以後は使い回します |
+| `:memory:` は接続1本         | メモリ上のデータベースは接続ごとに別物になるため、1本に固定します                     |
+| 1プロセスで1つの接続プール   | 既定の接続は最初の1回だけ作られ、以後は使い回します                                   |
 
 ## 関連
 

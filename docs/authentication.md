@@ -64,9 +64,9 @@ impl Authenticatable for User {
 
 ```rust
 // bootstrap/app.rs
-.with_middleware(|m| {
-    m.append(StartSession::from_env())
-        .alias("auth", Authenticate::new())
+.with_middleware( | m| {
+m.append(StartSession::from_env())
+.alias("auth", Authenticate::new())
 })
 ```
 
@@ -74,22 +74,22 @@ impl Authenticatable for User {
 
 ```rust
 let mut user = User {
-    id: 0,
-    name: "アリス".to_string(),
-    email: "alice@example.com".to_string(),
-    password: Hash::make("ひみつの言葉"),   // ここで変換する
-    is_admin: false,
-    created_at: String::new(),
-    updated_at: String::new(),
+id: 0,
+name: "アリス".to_string(),
+email: "alice@example.com".to_string(),
+password: Hash::make("ひみつの言葉"),   // ここで変換する
+is_admin: false,
+created_at: String::new(),
+updated_at: String::new(),
 };
 user.save().await?;
 ```
 
-| 関数 | すること |
-|---|---|
-| `Hash::make(平文)` | 保存する形に変える。**同じ平文でも毎回違う値**になります |
-| `Hash::check(平文, 保存した値)` | 合っているか |
-| `Hash::needs_rehash(保存した値)` | 回数の設定を上げた後、作り直すべきか |
+| 関数                             | すること                                                 |
+|----------------------------------|----------------------------------------------------------|
+| `Hash::make(平文)`               | 保存する形に変える。**同じ平文でも毎回違う値**になります |
+| `Hash::check(平文, 保存した値)`  | 合っているか                                             |
+| `Hash::needs_rehash(保存した値)` | 回数の設定を上げた後、作り直すべきか                     |
 
 方式は PBKDF2-HMAC-SHA256 です。保存されるのはこういう文字列です。
 
@@ -97,7 +97,7 @@ user.save().await?;
 $pbkdf2-sha256$i=120000$<塩>$<ハッシュ>
 ```
 
-方式と回数が入っているので、**あとから回数を上げても古いパスワードは照合できます。**
+方式と回数が入っているので、 **あとから回数を上げても古いパスワードは照合できます。**
 
 > **`Hash::make` と `Hash::check` は時間がかかります**（既定で 0.2 秒ほど）。
 > 非同期の処理の中で直接呼ぶと、その間ほかのリクエストを待たせます。
@@ -116,14 +116,13 @@ pub fn config() -> HashConfig {
 }
 ```
 
-| 場面 | 回数 | 1 回あたり |
-|---|---|---|
-| 本番（リリースビルド） | 120,000（既定） | 約 0.23 秒 |
-| 開発（デバッグビルド） | 同じ | 約 3.6 秒 |
-| テスト | 1,000（自動で下がる） | 約 0.03 秒 |
+| 場面                   | 回数                  | 1 回あたり |
+|------------------------|-----------------------|------------|
+| 本番（リリースビルド） | 120,000（既定）       | 約 0.23 秒 |
+| 開発（デバッグビルド） | 同じ                  | 約 3.6 秒  |
+| テスト                 | 1,000（自動で下がる） | 約 0.03 秒 |
 
-テストのときは `#[bengara::test]` が自動で下げます。
-**`.env` に書いた値はテストでは見ません。** 開発用に下げた値でテストが走ると、
+テストのときは `#[bengara::test]` が自動で下げます。 **`.env` に書いた値はテストでは見ません。** 開発用に下げた値でテストが走ると、
 件数が増えたときに時間がかかるためです。テストで変えたいときは環境変数で渡します。
 
 ```sh
@@ -149,23 +148,23 @@ pub async fn login(req: Request) -> Result<Response> {
 }
 ```
 
-`attempt` の第1引数は**照合に使う列**です。メールアドレス以外でもログインさせられます。
+`attempt` の第1引数は **照合に使う列**です。メールアドレス以外でもログインさせられます。
 
-| メソッド | すること |
-|---|---|
-| `attempt::<U>(列, 値, パスワード)` | 1 件引いて照合し、合えばログイン。返るのは `bool` |
-| `login(&user)` | 照合せずにログイン（登録の直後など） |
-| `login_using_id(値)` | 主キーの値だけでログイン |
-| `logout()` | セッションの中身を捨て、ID を作り直す |
-| `check()` / `guest()` | ログインしているか / していないか |
-| `id()` | ログイン中の主キーの値（`Option<String>`） |
-| `user::<U>()` | ログイン中の利用者を DB から読む |
-| `user_or_fail::<U>()` | 同じ。いなければ 401 のエラー |
-| `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする |
+| メソッド                                    | すること                                          |
+|---------------------------------------------|---------------------------------------------------|
+| `attempt::<U>(列, 値, パスワード)`          | 1 件引いて照合し、合えばログイン。返るのは `bool` |
+| `login(&user)`                              | 照合せずにログイン（登録の直後など）              |
+| `login_using_id(値)`                        | 主キーの値だけでログイン                          |
+| `logout()`                                  | セッションの中身を捨て、ID を作り直す             |
+| `check()` / `guest()`                       | ログインしているか / していないか                 |
+| `id()`                                      | ログイン中の主キーの値（`Option<String>`）        |
+| `user::<U>()`                               | ログイン中の利用者を DB から読む                  |
+| `user_or_fail::<U>()`                       | 同じ。いなければ 401 のエラー                     |
+| `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする                        |
 
-- `attempt` と `login` は**セッション ID を作り直します**（他人のセッション ID を押し付ける攻撃への対策）。
+- `attempt` と `login` は **セッション ID を作り直します**（他人のセッション ID を押し付ける攻撃への対策）。
 - **`user()` は呼ぶたびに DB を引きます。** 何度も使うときは変数に入れてください。
-- 利用者が見つからないときも、`attempt` は**照合と同じだけ時間をかけます。**
+- 利用者が見つからないときも、`attempt` は **照合と同じだけ時間をかけます。**
   すぐ帰ると「このアドレスは登録されていない」ことが応答の速さから分かるためです。
 
 ## ログイン必須にする
@@ -180,14 +179,14 @@ pub async fn login(req: Request) -> Result<Response> {
 Route::get("/api/me", UserController::me).middleware("auth");
 
 // グループにまとめて掛ける
-Route::prefix("api/my").middleware("auth").group(|| {
-    Route::get("/articles", MyArticleController::index);
+Route::prefix("api/my").middleware("auth").group(| | {
+Route::get("/articles", MyArticleController::index);
 });
 ```
 
-| 書き方 | ログインしていないとき |
-|---|---|
-| `Authenticate::new()` | 401 |
+| 書き方                                | ログインしていないとき                       |
+|---------------------------------------|----------------------------------------------|
+| `Authenticate::new()`                 | 401                                          |
 | `Authenticate::redirect_to("/login")` | 302（JSON を期待しているリクエストには 401） |
 
 止めたときの行き先は、セッションの `bengara_auth_intended` に入ります。
@@ -213,7 +212,7 @@ pub async fn me(req: Request) -> Result<Response> {
 }
 ```
 
-`Auth::user()` のように**どこからでも読める形はありません。** `req` から取ります。
+`Auth::user()` のように **どこからでも読める形はありません。** `req` から取ります。
 ハンドラは内部で別のタスクとして動くため、どこからでも読める置き場所が作れないためです。
 
 ## パスワードの再設定
@@ -229,30 +228,30 @@ pub fn up(schema: &mut Schema) {
 
 ```rust
 // 1. リンクを作る
-let token = PasswordReset::create(&email).await?;
-let link = PasswordReset::link("/password/reset", &email, &token, 3600)?;
+let token = PasswordReset::create( & email).await?;
+let link = PasswordReset::link("/password/reset", & email, & token, 3600) ?;
 
 // 2. 受け取ったトークンを確かめる
-if !PasswordReset::verify(&email, &token).await? {
-    return abort_with(422, "リンクが正しくないか、期限が切れています");
+if ! PasswordReset::verify( & email, & token).await? {
+return abort_with(422, "リンクが正しくないか、期限が切れています");
 }
 
 // 3. パスワードを書き換えて、トークンを使い切る
-user.password = Hash::make(&new_password);
+user.password = Hash::make( & new_password);
 user.save().await?;
-PasswordReset::consume(&email).await?;
+PasswordReset::consume( & email).await?;
 ```
 
-| メソッド | すること |
-|---|---|
-| `create(email)` | トークンを作って表に入れ、**平文のトークン**を返す |
-| `verify(email, token)` | 合っているか。期限切れ（60 分）も偽 |
-| `consume(email)` | 使い終わったトークンを消す |
-| `sweep_expired()` | 期限切れをまとめて消す |
-| `link(パス, email, token, 秒)` | 署名付き・期限つきの URL を作る |
-| `define(&mut Schema)` | 表を作る定義 |
+| メソッド                       | すること                                           |
+|--------------------------------|----------------------------------------------------|
+| `create(email)`                | トークンを作って表に入れ、**平文のトークン**を返す |
+| `verify(email, token)`         | 合っているか。期限切れ（60 分）も偽                |
+| `consume(email)`               | 使い終わったトークンを消す                         |
+| `sweep_expired()`              | 期限切れをまとめて消す                             |
+| `link(パス, email, token, 秒)` | 署名付き・期限つきの URL を作る                    |
+| `define(&mut Schema)`          | 表を作る定義                                       |
 
-- 表に入るのは**トークンのハッシュ**です。表が漏れても、そのままでは使えません。
+- 表に入るのは **トークンのハッシュ**です。表が漏れても、そのままでは使えません。
 - 期限切れ・不一致・記録なしは、すべて同じ「偽」です。理由は区別しません。
 - **知らないメールアドレスを頼まれたときも、同じ応答を返してください。**
   応答が違うと、登録の有無が分かってしまいます。
@@ -266,8 +265,8 @@ bengara = { version = "0.1", features = ["sqlite", "encryption"] }
 ```
 
 ```rust
-let hidden = encrypt("ひみつ")?;     // 毎回違う文字列になる
-let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
+let hidden = encrypt("ひみつ") ?;     // 毎回違う文字列になる
+let plain = decrypt( & hidden) ?;       // 改ざんされていればエラー
 ```
 
 - 鍵は `APP_KEY` です。`cargo artisan key:generate` で作ってください。
@@ -276,13 +275,13 @@ let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 
 ## まだ無いもの
 
-| 項目 | 状況 |
-|---|---|
-| 「ログイン状態を覚える」Cookie（remember me） | 作っていません |
-| 複数の認証の仕組み（Laravel の guard） | セッション 1 本だけです |
-| API トークン | ありません |
-| Argon2 / bcrypt | PBKDF2 だけです |
-| メールの送信 | Phase 5 |
+| 項目                                          | 状況                    |
+|-----------------------------------------------|-------------------------|
+| 「ログイン状態を覚える」Cookie（remember me） | 作っていません          |
+| 複数の認証の仕組み（Laravel の guard）        | セッション 1 本だけです |
+| API トークン                                  | ありません              |
+| Argon2 / bcrypt                               | PBKDF2 だけです         |
+| メールの送信                                  | Phase 5                 |
 
 一覧は [backlog.md](backlog.md) にあります。
 

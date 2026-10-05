@@ -4,33 +4,33 @@ bengara を使う人のための資料です。フレームワークの紹介は
 
 ## 使い始める
 
-| ページ | 内容 |
-|---|---|
-| [getting-started.md](getting-started.md) | 導入手順。つまずきやすい点つき |
+| ページ                                           | 内容                                         |
+|--------------------------------------------------|----------------------------------------------|
+| [getting-started.md](getting-started.md)         | 導入手順。つまずきやすい点つき               |
 | [directory-structure.md](directory-structure.md) | ディレクトリ構成と、ファイルの自動検出の規則 |
-| [artisan.md](artisan.md) | `cargo artisan` の仕組みとコマンド |
+| [artisan.md](artisan.md)                         | `cargo artisan` の仕組みとコマンド           |
 
 ## 書く
 
-| ページ | 内容 |
-|---|---|
-| [routing.md](routing.md) | ルート定義、パス引数、名前付きルート、グループ、署名付き URL、404 と 405 |
-| [middleware.md](middleware.md) | リクエストの前後に挟む処理、回数の制限 |
-| [validation.md](validation.md) | 入力の検査 |
-| [session.md](session.md) | セッション、Cookie、CSRF |
-| [authentication.md](authentication.md) | ログイン、パスワード、再設定、暗号化 |
-| [authorization.md](authorization.md) | 誰に何を許すか（ポリシー） |
-| [database.md](database.md) | 接続、クエリビルダ、ページ分け、トランザクション |
-| [migrations.md](migrations.md) | 表を作る。`migrate` 系のコマンド |
-| [models.md](models.md) | `#[derive(Model)]`、リレーション、シーダー、ファクトリ |
-| [requests-and-responses.md](requests-and-responses.md) | Request / Response / リダイレクト / エラー / 静的ファイル |
-| [configuration.md](configuration.md) | `config/*.rs` と `.env` |
-| [testing.md](testing.md) | `#[bengara::test]` でのテスト |
+| ページ                                                 | 内容                                                                     |
+|--------------------------------------------------------|--------------------------------------------------------------------------|
+| [routing.md](routing.md)                               | ルート定義、パス引数、名前付きルート、グループ、署名付き URL、404 と 405 |
+| [middleware.md](middleware.md)                         | リクエストの前後に挟む処理、回数の制限                                   |
+| [validation.md](validation.md)                         | 入力の検査                                                               |
+| [session.md](session.md)                               | セッション、Cookie、CSRF                                                 |
+| [authentication.md](authentication.md)                 | ログイン、パスワード、再設定、暗号化                                     |
+| [authorization.md](authorization.md)                   | 誰に何を許すか（ポリシー）                                               |
+| [database.md](database.md)                             | 接続、クエリビルダ、ページ分け、トランザクション                         |
+| [migrations.md](migrations.md)                         | 表を作る。`migrate` 系のコマンド                                         |
+| [models.md](models.md)                                 | `#[derive(Model)]`、リレーション、シーダー、ファクトリ                   |
+| [requests-and-responses.md](requests-and-responses.md) | Request / Response / リダイレクト / エラー / 静的ファイル                |
+| [configuration.md](configuration.md)                   | `config/*.rs` と `.env`                                                  |
+| [testing.md](testing.md)                               | `#[bengara::test]` でのテスト                                            |
 
 ## 知っておく
 
-| ページ | 内容 |
-|---|---|
+| ページ                                           | 内容             |
+|--------------------------------------------------|------------------|
 | [laravel-differences.md](laravel-differences.md) | Laravel と違う点 |
-| [backlog.md](backlog.md) | まだ無いもの |
-| [decisions.md](decisions.md) | 設計判断の記録 |
+| [backlog.md](backlog.md)                         | まだ無いもの     |
+| [decisions.md](decisions.md)                     | 設計判断の記録   |

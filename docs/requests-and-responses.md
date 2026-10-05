@@ -17,13 +17,13 @@ impl PostController {
 
 ## Request
 
-| 分類 | メソッド |
-|---|---|
-| 基本 | `method()` `path()` `query_string()` `full_path()` `route_name()` |
-| パス引数 | `param(name)` `param_as::<T>(name)` `params()` |
-| クエリ | `query(key)` `query_all()` |
-| ヘッダ | `header(name)` `headers()` |
-| 本文 | `body()` `body_text()` `json::<T>()` |
+| 分類     | メソッド                                                          |
+|----------|-------------------------------------------------------------------|
+| 基本     | `method()` `path()` `query_string()` `full_path()` `route_name()` |
+| パス引数 | `param(name)` `param_as::<T>(name)` `params()`                    |
+| クエリ   | `query(key)` `query_all()`                                        |
+| ヘッダ   | `header(name)` `headers()`                                        |
+| 本文     | `body()` `body_text()` `json::<T>()`                              |
 
 - `header(name)` は大文字小文字を区別しません。
 - `query` / `query_all` は `%xx` と `+` を元に戻します。
@@ -88,12 +88,12 @@ Response::text("ok")
     .with_body("changed")
 ```
 
-| メソッド | 中身 |
-|---|---|
-| `with_status(code)` | ステータスを変える |
-| `with_header(name, value)` | ヘッダーを**置き換える**。同じ名前があれば消してから入れる |
-| `with_added_header(name, value)` | ヘッダーを**足す**。`set-cookie` のように何本も送るとき |
-| `with_body(body)` | 本文を差し替える |
+| メソッド                         | 中身                                                       |
+|----------------------------------|------------------------------------------------------------|
+| `with_status(code)`              | ステータスを変える                                         |
+| `with_header(name, value)`       | ヘッダーを**置き換える**。同じ名前があれば消してから入れる |
+| `with_added_header(name, value)` | ヘッダーを**足す**。`set-cookie` のように何本も送るとき    |
+| `with_body(body)`                | 本文を差し替える                                           |
 
 名前の大文字小文字は区別しません（内部で小文字にそろえます）。
 
@@ -124,12 +124,12 @@ return abort_with(404, "記事が見つかりません");
 
 ## エラー
 
-| 種類 | 中身 |
-|---|---|
-| `Error::Http { status, message }` | ステータスを指定したエラー |
-| `Error::Message` | 文字列のエラー |
-| `Error::Io` | `std::io::Error` から変換 |
-| `Error::Json` | `serde_json::Error` から変換 |
+| 種類                              | 中身                         |
+|-----------------------------------|------------------------------|
+| `Error::Http { status, message }` | ステータスを指定したエラー   |
+| `Error::Message`                  | 文字列のエラー               |
+| `Error::Io`                       | `std::io::Error` から変換    |
+| `Error::Json`                     | `serde_json::Error` から変換 |
 
 作り方は `Error::msg("...")` と `Error::http(404, "...")` です。
 `io::Error` と `serde_json::Error` からは `From` があるので `?` で変換されます。
@@ -143,10 +143,10 @@ return abort_with(404, "記事が見つかりません");
 
 ハンドラを書かなくても、bengara がこの 2 つを返します。
 
-| 状況 | 返すもの |
-|---|---|
-| ルートが無く、`public/` にもファイルが無い | 404 |
-| **パスは当たるが、メソッドが違う** | 405 と `allow` ヘッダー |
+| 状況                                       | 返すもの                |
+|--------------------------------------------|-------------------------|
+| ルートが無く、`public/` にもファイルが無い | 404                     |
+| **パスは当たるが、メソッドが違う**         | 405 と `allow` ヘッダー |
 
 `allow` には、そのパスで通るメソッドがアルファベット順に入ります（`allow: GET, POST`）。
 くわしくは [routing.md](routing.md) を見てください。
@@ -155,12 +155,12 @@ return abort_with(404, "記事が見つかりません");
 
 エラーの形は、リクエストを見て決めます（Laravel の `expectsJson()` と同じ考え方）。
 
-| 見るもの | JSON になる条件 |
-|---|---|
-| `Accept` | `application/json` か `+json` を含む |
-| `Accept` | `text/html` が無く `*/*` がある（`curl` の既定） |
-| `X-Requested-With` | `XMLHttpRequest` |
-| `Content-Type` | 自分が JSON を送ってきた |
+| 見るもの           | JSON になる条件                                  |
+|--------------------|--------------------------------------------------|
+| `Accept`           | `application/json` か `+json` を含む             |
+| `Accept`           | `text/html` が無く `*/*` がある（`curl` の既定） |
+| `X-Requested-With` | `XMLHttpRequest`                                 |
+| `Content-Type`     | 自分が JSON を送ってきた                         |
 
 ```json
 { "message": "そのページはありません" }
@@ -184,7 +184,7 @@ Application::configure()
     })
 ```
 
-- 登録した関数を**上から順に試し**、最初に `Some` を返したものを使います。
+- 登録した関数を **上から順に試し**、最初に `Some` を返したものを使います。
 - どれも返さなければ、bengara の既定の形になります。
 - `render` は何回でも呼べます。
 

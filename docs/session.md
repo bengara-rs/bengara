@@ -10,9 +10,9 @@
 cargo artisan key:generate
 ```
 
-`.env` に書き込まれます。**この鍵を変えると、いまのセッションと署名付き URL は全部無効になります。**
+`.env` に書き込まれます。 **この鍵を変えると、いまのセッションと署名付き URL は全部無効になります。**
 
-`bootstrap/app.rs` に登録します。**順番が大事です。**
+`bootstrap/app.rs` に登録します。 **順番が大事です。**
 
 ```rust
 Application::configure()
@@ -26,13 +26,13 @@ Application::configure()
 
 ## 置き場所
 
-中身は**サーバー側**に置き、ブラウザには ID だけを署名つきの Cookie で渡します。
+中身は **サーバー側**に置き、ブラウザには ID だけを署名つきの Cookie で渡します。
 中身がブラウザに出ないので、Cookie の 4 KB という上限にも縛られません。
 
-| `SESSION_DRIVER` | 置き場所 |
-|---|---|
-| `file`（既定） | `storage/framework/sessions/` |
-| `memory` | プロセスのメモリ。**テストと手元の確認用** |
+| `SESSION_DRIVER` | 置き場所                                   |
+|------------------|--------------------------------------------|
+| `file`（既定）   | `storage/framework/sessions/`              |
+| `memory`         | プロセスのメモリ。**テストと手元の確認用** |
 
 `SESSION_LIFETIME` は分です（既定 120）。
 
@@ -55,20 +55,20 @@ pub async fn store(req: Request) -> Result<Response> {
 }
 ```
 
-| メソッド | 中身 |
-|---|---|
-| `get(key)` | 読む。無ければ `None` |
-| `get_or(key, default)` | 読む。無ければ既定値 |
-| `put(key, value)` | 入れる。次のリクエストでも読める |
-| `flash(key, value)` | 入れる。**次のリクエストまで**だけ残る |
-| `has(key)` | あるか |
-| `forget(key)` | 消す |
-| `pull(key)` | 読んでから消す |
-| `all()` | 全部の組 |
-| `old(key)` | 検査に落ちたときの入力 |
-| `flush()` | 中身を全部消す |
-| `regenerate()` | ID を作り直す |
-| `invalidate()` | 中身を消して ID も作り直す |
+| メソッド               | 中身                                   |
+|------------------------|----------------------------------------|
+| `get(key)`             | 読む。無ければ `None`                  |
+| `get_or(key, default)` | 読む。無ければ既定値                   |
+| `put(key, value)`      | 入れる。次のリクエストでも読める       |
+| `flash(key, value)`    | 入れる。**次のリクエストまで**だけ残る |
+| `has(key)`             | あるか                                 |
+| `forget(key)`          | 消す                                   |
+| `pull(key)`            | 読んでから消す                         |
+| `all()`                | 全部の組                               |
+| `old(key)`             | 検査に落ちたときの入力                 |
+| `flush()`              | 中身を全部消す                         |
+| `regenerate()`         | ID を作り直す                          |
+| `invalidate()`         | 中身を消して ID も作り直す             |
 
 ### flash の寿命
 
@@ -95,12 +95,12 @@ req.session().put("user_id", id);
 
 ## Cookie の既定
 
-| 属性 | 既定 | 意味 |
-|---|---|---|
-| `HttpOnly` | 付く | JavaScript から読めない |
-| `SameSite` | `Lax` | 他のサイトからの書き込みでは送らない |
-| `Secure` | `APP_ENV=production` なら強制 | HTTPS のときだけ送る |
-| `Path` | `/` | |
+| 属性       | 既定                          | 意味                                 |
+|------------|-------------------------------|--------------------------------------|
+| `HttpOnly` | 付く                          | JavaScript から読めない              |
+| `SameSite` | `Lax`                         | 他のサイトからの書き込みでは送らない |
+| `Secure`   | `APP_ENV=production` なら強制 | HTTPS のときだけ送る                 |
+| `Path`     | `/`                           |                                      |
 
 変えたいときは `SessionConfig` を渡します。
 
@@ -147,8 +147,7 @@ pub async fn token(req: Request) -> Result<Response> {
 VerifyCsrfToken::new().except("/api/*").except("/webhook")
 ```
 
-末尾の `*` で前方一致になります。
-**外から呼ばれる受け口（webhook）は、別の方法で相手を確かめてください。**
+末尾の `*` で前方一致になります。 **外から呼ばれる受け口（webhook）は、別の方法で相手を確かめてください。**
 
 ## 自分で Cookie を扱う
 
@@ -167,7 +166,7 @@ Ok(response.with_cookie(&cookie))
 ## 気をつけること
 
 - **セッションに秘密を入れすぎない。** 中身はサーバー側にありますが、置き場所は平文のファイルです。
-- `req.session()` は `StartSession` を登録していないと**パニックします**。登録し忘れにすぐ気づくためです。
+- `req.session()` は `StartSession` を登録していないと **パニックします**。登録し忘れにすぐ気づくためです。
 - `VerifyCsrfToken` を `StartSession` より前に置くと 500 になります。
 
 ## まだ無いもの

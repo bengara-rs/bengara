@@ -35,19 +35,19 @@ let app = try_config::<AppConfig>();      // Option 相当。無ければ取れ�
 
 ```rust
 if config::<AppConfig>().is_local() {
-    // 手元の開発環境のときだけ
+// 手元の開発環境のときだけ
 }
 ```
 
-| 関数 | true になる条件 |
-|---|---|
+| 関数              | true になる条件                  |
+|-------------------|----------------------------------|
 | `is_production()` | `APP_ENV` が `production` のとき |
-| `is_local()` | `APP_ENV` が `local` のとき |
+| `is_local()`      | `APP_ENV` が `local` のとき      |
 
-比較するのは**この 2 つの文字列だけ**です。`staging` のような他の値を使うときは、
+比較するのは **この 2 つの文字列だけ**です。`staging` のような他の値を使うときは、
 `config::<AppConfig>().env` を自分で比べてください。
 
-## env() の型
+## env () の型
 
 ```rust
 let port: u16 = env("APP_PORT", 8000);
@@ -56,13 +56,13 @@ let name: String = env("APP_NAME", "myapp");
 let dir: std::path::PathBuf = env("CACHE_DIR", "storage/cache");
 ```
 
-| 対応する型 |
-|---|
-| `String` |
-| `bool` |
-| `std::path::PathBuf` |
+| 対応する型                                          |
+|-----------------------------------------------------|
+| `String`                                            |
+| `bool`                                              |
+| `std::path::PathBuf`                                |
 | 整数（`i8`〜`i128` `isize` / `u8`〜`u128` `usize`） |
-| 浮動小数（`f32` `f64`） |
+| 浮動小数（`f32` `f64`）                             |
 
 変換できない値が入っていた場合は、警告を出して既定値を使います。止まりません。
 
@@ -92,23 +92,23 @@ APP_PORT=8000
 
 ## APP_* の一覧
 
-| 名前 | 既定 | 用途 |
-|---|---|---|
-| `APP_NAME` | `init` 時のパッケージ名 | アプリ名。`AppConfig.name` |
-| `APP_ENV` | `production` | 環境名。`AppConfig.env` |
-| `APP_DEBUG` | `false` | エラーページの詳細表示、ログの既定の細かさ |
-| `APP_URL` | `http://localhost:8000` | アプリの URL。`AppConfig.url` と `url()` の土台 |
-| `APP_KEY` | （なし） | セッションと署名付き URL の署名に使う鍵。`cargo artisan key:generate` で作る |
-| `SESSION_DRIVER` | `file` | セッションの置き場所（`file` / `memory`） |
-| `SESSION_LIFETIME` | `120` | セッションが消えるまでの分 |
-| `DB_CONNECTION` | `sqlite` | 既定で使う接続の名前 |
-| `DB_DATABASE` | `database/database.sqlite` | SQLite のファイル。相対パスはプロジェクト直下から |
-| `DB_TEST_DATABASE` | `:memory:` | テストで使うデータベース |
-| `HASH_ITERATIONS` | `120000` | パスワードの変換の繰り返し回数（[authentication.md](authentication.md)） |
-| `APP_HOST` | `127.0.0.1` | サーバーが待ち受けるホスト |
-| `APP_PORT` | `8000` | サーバーが待ち受けるポート |
-| `APP_BASE_PATH` | （なし） | プロジェクトのルート。`serve` が起動時に渡します |
-| `RUST_LOG` | （なし） | ログの細かさ。無ければ `APP_DEBUG` から決まります |
+| 名前               | 既定                       | 用途                                                                         |
+|--------------------|----------------------------|------------------------------------------------------------------------------|
+| `APP_NAME`         | `init` 時のパッケージ名    | アプリ名。`AppConfig.name`                                                   |
+| `APP_ENV`          | `production`               | 環境名。`AppConfig.env`                                                      |
+| `APP_DEBUG`        | `false`                    | エラーページの詳細表示、ログの既定の細かさ                                   |
+| `APP_URL`          | `http://localhost:8000`    | アプリの URL。`AppConfig.url` と `url()` の土台                              |
+| `APP_KEY`          | （なし）                   | セッションと署名付き URL の署名に使う鍵。`cargo artisan key:generate` で作る |
+| `SESSION_DRIVER`   | `file`                     | セッションの置き場所（`file` / `memory`）                                    |
+| `SESSION_LIFETIME` | `120`                      | セッションが消えるまでの分                                                   |
+| `DB_CONNECTION`    | `sqlite`                   | 既定で使う接続の名前                                                         |
+| `DB_DATABASE`      | `database/database.sqlite` | SQLite のファイル。相対パスはプロジェクト直下から                            |
+| `DB_TEST_DATABASE` | `:memory:`                 | テストで使うデータベース                                                     |
+| `HASH_ITERATIONS`  | `120000`                   | パスワードの変換の繰り返し回数（[authentication.md](authentication.md)）     |
+| `APP_HOST`         | `127.0.0.1`                | サーバーが待ち受けるホスト                                                   |
+| `APP_PORT`         | `8000`                     | サーバーが待ち受けるポート                                                   |
+| `APP_BASE_PATH`    | （なし）                   | プロジェクトのルート。`serve` が起動時に渡します                             |
+| `RUST_LOG`         | （なし）                   | ログの細かさ。無ければ `APP_DEBUG` から決まります                            |
 
 `APP_NAME` `APP_ENV` `APP_DEBUG` `APP_URL` は `config/app.rs` が読んでいるだけです。読み方を変えるのは自由です。
 `APP_HOST` `APP_PORT` `APP_BASE_PATH` `RUST_LOG` `SESSION_*` `DB_TEST_DATABASE` は
@@ -122,13 +122,13 @@ APP_PORT=8000
 
 bengara は使わない機能をバイナリに入れないようにしています。今あるフラグは 3 つです。
 
-| フラグ | 既定 | 中身 |
-|---|---|---|
-| `log-filter` | 入っている | `RUST_LOG=myapp=debug` のような細かい絞り込みを使えるようにします |
-| `sqlite` | **入っていない** | SQLite につながるようにします（[database.md](database.md)） |
-| `encryption` | **入っていない** | `encrypt` / `decrypt` が使えます（+14 クレート） |
+| フラグ       | 既定             | 中身                                                              |
+|--------------|------------------|-------------------------------------------------------------------|
+| `log-filter` | 入っている       | `RUST_LOG=myapp=debug` のような細かい絞り込みを使えるようにします |
+| `sqlite`     | **入っていない** | SQLite につながるようにします（[database.md](database.md)）       |
+| `encryption` | **入っていない** | `encrypt` / `decrypt` が使えます（+14 クレート）                  |
 
-認証（`Hash` / `Auth` / `authorize` / `PasswordReset`）は**フラグが要りません。**
+認証（`Hash` / `Auth` / `authorize` / `PasswordReset`）は **フラグが要りません。**
 依存クレートを増やさずに作っているためです（[authentication.md](authentication.md)）。
 
 `log-filter` は、依存クレートを減らしたいときに外せます。外すと 3 つ減り
@@ -140,7 +140,7 @@ bengara は使わない機能をバイナリに入れないようにしていま
 bengara = { version = "0.1", default-features = false }
 ```
 
-`sqlite` を入れると**依存クレートが大きく増えます**（依存の木が 59 → 133）。
+`sqlite` を入れると **依存クレートが大きく増えます**（依存の木が 59 → 133）。
 データベースを使わないアプリには入れないでください。
 `cargo run -- init` で作ったプロジェクトには最初から入っています。
 
@@ -173,19 +173,19 @@ pub fn config() -> MailConfig {
 ```
 
 ```rust
-let mail = config::<crate::config::mail::MailConfig>();
+let mail = config::< crate::config::mail::MailConfig>();
 ```
 
 型ごとに 1 つだけ保管されます。同じ型を 2 つのファイルから返さないでください。
 
 ## パス
 
-| 関数 | 返すもの |
-|---|---|
-| `base_path()` | プロジェクトのルート（`APP_BASE_PATH` → `CARGO_MANIFEST_DIR` → カレント の順で決定） |
-| `app_path(rel)` | ルートからの相対パスを絶対パスにする |
-| `public_path(rel)` | `public/` 以下のパス |
-| `storage_path(rel)` | `storage/` 以下のパス |
+| 関数                | 返すもの                                                                             |
+|---------------------|--------------------------------------------------------------------------------------|
+| `base_path()`       | プロジェクトのルート（`APP_BASE_PATH` → `CARGO_MANIFEST_DIR` → カレント の順で決定） |
+| `app_path(rel)`     | ルートからの相対パスを絶対パスにする                                                 |
+| `public_path(rel)`  | `public/` 以下のパス                                                                 |
+| `storage_path(rel)` | `storage/` 以下のパス                                                                |
 
 `app_path()` は **Laravel と意味が違います**。Laravel は `app/` を指しますが、bengara は
 基準ディレクトリからの相対パスです（[laravel-differences.md](laravel-differences.md)）。
