@@ -86,8 +86,9 @@ jobs:
         with:
           repository: bengara-rs/bengara-sandbox
           path: sandbox
-          # 非公開のリポジトリなら、読み取り権限のあるトークンを渡す。
-          # token: ${{ secrets.SANDBOX_TOKEN }}
+          # bengara-sandbox が非公開なら、読み取り権限のある SANDBOX_TOKEN を登録する。
+          # 公開なら登録不要で、既定のトークンで取得できる。
+          token: ${{ secrets.SANDBOX_TOKEN || github.token }}
       - uses: actions/checkout@v4
         with:
           # 変更中の bengara を、サブモジュールの位置に置く。

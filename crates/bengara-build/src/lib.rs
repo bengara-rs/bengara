@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn 連続する大文字で余計なアンダースコアを入れない() {
+    fn 連続する大文字は1文字ずつ区切る() {
         assert_eq!(to_module_name("API").unwrap(), "a_p_i");
     }
 

@@ -14,7 +14,8 @@ authors.workspace = true
 [features]
 default = ["log-filter"]
 # RUST_LOG による細かい絞り込み（`RUST_LOG=myapp=debug` のような書き方）。
-# 外すと依存クレートが5つ減り、RUST_LOG は trace/debug/info/warn/error の1語だけになる。
+# 外すと依存クレートが3つ減り（matchers / regex-automata / regex-syntax）、
+# RUST_LOG は trace/debug/info/warn/error の1語だけになる。
 log-filter = ["tracing-subscriber/env-filter"]
 
 [dependencies]

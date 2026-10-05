@@ -62,8 +62,21 @@ impl Response {
         self
     }
 
-    /// ヘッダーを足す。
+    /// ヘッダーを**置き換える**。同じ名前がすでにあれば、消してから入れます。
+    ///
+    /// Laravel の `header()` と同じ既定です。同じ名前を何本も送りたいときは
+    /// `with_added_header` を使ってください。
     pub fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
+        let name = name.to_ascii_lowercase();
+        self.headers.retain(|(existing, _)| existing != &name);
+        self.headers.push((name, value.into()));
+        self
+    }
+
+    /// ヘッダーを**足す**。同じ名前がすでにあっても消しません。
+    ///
+    /// `set-cookie` のように、同じ名前を何本も送る必要があるときに使います。
+    pub fn with_added_header(mut self, name: &str, value: impl Into<String>) -> Self {
         self.headers.push((name.to_ascii_lowercase(), value.into()));
         self
     }
@@ -251,9 +264,46 @@ pub fn escape_html(input: &str) -> String {
     out
 }
 
+/// ハンドラやミドルウェアの戻り値を、必ずレスポンスにする。
+///
+/// エラーはログに残してから、ステータス付きのレスポンスに変えます。
+pub(crate) fn render(result: crate::error::Result<Response>, debug: bool) -> Response {
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            if error.status() >= 500 {
+                tracing::error!("{error}");
+            } else {
+                tracing::debug!("{error}");
+            }
+            error_response(&error, debug)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_headerは置き換えwith_added_headerは足す() {
+        let r = Response::text("x")
+            .with_header("x-a", "1")
+            .with_header("X-A", "2");
+        assert_eq!(r.header("x-a"), Some("2"));
+        assert_eq!(r.headers().iter().filter(|(k, _)| k == "x-a").count(), 1);
+
+        let r = Response::text("x")
+            .with_added_header("set-cookie", "a=1")
+            .with_added_header("set-cookie", "b=2");
+        assert_eq!(
+            r.headers()
+                .iter()
+                .filter(|(k, _)| k == "set-cookie")
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn テキストのレスポンス() {

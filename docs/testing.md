@@ -52,13 +52,13 @@ async fn 無いページは404になる() {
 |---|
 | `get(uri)` |
 | `post(uri, body)` |
-| `post_json(uri, body)` |
-| `send(method, uri, body, headers)` |
+| `post_json(uri, body)` — `body` は `&serde_json::Value` |
+| `send(method, uri, body, headers)` — `body: Vec<u8>`、`headers: &[(&str, &str)]` |
 
 ```rust
 #[bengara::test]
 async fn JSONを受け取れる() {
-    let res = client.post_json("/api/posts", r#"{"title":"hi"}"#).await;
+    let res = client.post_json("/api/posts", &bengara::serde_json::json!({ "title": "hi" })).await;
     res.assert_status(201);
 }
 ```

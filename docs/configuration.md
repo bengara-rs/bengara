@@ -29,6 +29,24 @@ let app = try_config::<AppConfig>();      // Option 相当。無ければ取れ�
 
 型をキーにして取り出します。`config("app.name")` のような文字列キーは用意していません（[backlog.md](backlog.md)）。
 
+### 今の環境を調べる
+
+`AppConfig` には、`env` を見るだけの短い関数が 2 つあります。
+
+```rust
+if config::<AppConfig>().is_local() {
+    // 手元の開発環境のときだけ
+}
+```
+
+| 関数 | true になる条件 |
+|---|---|
+| `is_production()` | `APP_ENV` が `production` のとき |
+| `is_local()` | `APP_ENV` が `local` のとき |
+
+比較するのは**この 2 つの文字列だけ**です。`staging` のような他の値を使うときは、
+`config::<AppConfig>().env` を自分で比べてください。
+
 ## env() の型
 
 ```rust
@@ -92,7 +110,7 @@ bengara は使わない機能をバイナリに入れないようにしていま
 |---|---|---|
 | `log-filter` | 入っている | `RUST_LOG=myapp=debug` のような細かい絞り込みを使えるようにします |
 
-依存クレートを減らしたいときは外せます。外すと 5 つ減り、`RUST_LOG` は
+依存クレートを減らしたいときは外せます。外すと 3 つ減り（`matchers` / `regex-automata` / `regex-syntax`）、`RUST_LOG` は
 `trace` / `debug` / `info` / `warn` / `error` の 1 語だけになります。
 
 ```toml
@@ -137,6 +155,9 @@ let mail = config::<crate::config::mail::MailConfig>();
 | `app_path(rel)` | ルートからの相対パスを絶対パスにする |
 | `public_path(rel)` | `public/` 以下のパス |
 | `storage_path(rel)` | `storage/` 以下のパス |
+
+`app_path()` は **Laravel と意味が違います**。Laravel は `app/` を指しますが、bengara は
+基準ディレクトリからの相対パスです（[laravel-differences.md](laravel-differences.md)）。
 
 ## 関連
 

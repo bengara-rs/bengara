@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::config_registry::app_config;
 use crate::error::Error;
+use crate::http::middleware::{Middlewares, Next};
 use crate::http::response::error_response;
 use crate::http::routing::{Matched, RouteDef, Routes};
 use crate::http::{Request, Response};
@@ -55,14 +56,14 @@ impl Application {
             Matched::Found { def, params } => {
                 req.set_params(params);
                 req.set_route_name(def.name.clone());
-                let future = def.handler.call(req);
+                let debug = self.inner.debug;
+                let future = match &def.stack {
+                    Some(stack) => Next::new(stack.clone(), def.handler.clone(), debug).run(req),
+                    None => def.handler.call(req),
+                };
                 // ハンドラのパニックを1リクエストに閉じ込める。
                 match tokio::spawn(future).await {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(error)) => {
-                        self.log_error(&error);
-                        error_response(&error, self.inner.debug)
-                    }
+                    Ok(result) => crate::http::response::render(result, debug),
                     Err(join_error) => {
                         let error = Error::msg(panic_message(&join_error));
                         tracing::error!("ハンドラがパニックしました: {error}");
@@ -107,14 +108,6 @@ impl Application {
             self.inner.debug,
         )
     }
-
-    fn log_error(&self, error: &Error) {
-        if error.status() >= 500 {
-            tracing::error!("{error}");
-        } else {
-            tracing::debug!("{error}");
-        }
-    }
 }
 
 fn panic_message(join_error: &tokio::task::JoinError) -> String {
@@ -128,9 +121,20 @@ fn panic_message(join_error: &tokio::task::JoinError) -> String {
 #[derive(Default)]
 pub struct ApplicationBuilder {
     routing: Routing,
+    middleware: Middlewares,
 }
 
 impl ApplicationBuilder {
+    /// ミドルウェアを登録する。
+    ///
+    /// ```ignore
+    /// .with_middleware(|m| m.append(AddPoweredBy::handle).alias("admin", EnsureAdmin::handle))
+    /// ```
+    pub fn with_middleware(mut self, configure: impl FnOnce(Middlewares) -> Middlewares) -> Self {
+        self.middleware = configure(std::mem::take(&mut self.middleware));
+        self
+    }
+
     /// ルートを決める。
     pub fn with_routing(mut self, configure: impl FnOnce(Routing) -> Routing) -> Self {
         self.routing = configure(std::mem::take(&mut self.routing));
@@ -141,8 +145,11 @@ impl ApplicationBuilder {
     ///
     /// # パニック
     ///
-    /// 同じメソッドとパスのルートが2本あるときは、ここでパニックします。
-    /// 起動時に気づけるようにするためです。
+    /// 次のときに、ここでパニックします。起動時に気づけるようにするためです。
+    ///
+    /// - 同じメソッドとパスのルートが2本ある
+    /// - ルート名が重なっている
+    /// - 登録していないミドルウェアの名前が使われている
     pub fn create(self) -> Application {
         let mut defs = self.routing.defs;
         if let Some(path) = self.routing.health {
@@ -155,6 +162,17 @@ impl ApplicationBuilder {
                 }));
             }
         }
+        // 名前を実体に置き換え、ルートごとに1本の並びにして固定する。
+        // ここで済ませておけば、リクエスト処理中は読むだけで済む。
+        if !self.middleware.is_empty() {
+            for def in &mut defs {
+                let stack = self.middleware.stack_for(&def.middleware);
+                if !stack.is_empty() {
+                    def.stack = Some(stack);
+                }
+            }
+        }
+
         Application {
             inner: Arc::new(Inner {
                 routes: Routes::build(defs),

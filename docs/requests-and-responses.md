@@ -88,6 +88,15 @@ Response::text("ok")
     .with_body("changed")
 ```
 
+| メソッド | 中身 |
+|---|---|
+| `with_status(code)` | ステータスを変える |
+| `with_header(name, value)` | ヘッダーを**置き換える**。同じ名前があれば消してから入れる |
+| `with_added_header(name, value)` | ヘッダーを**足す**。`set-cookie` のように何本も送るとき |
+| `with_body(body)` | 本文を差し替える |
+
+名前の大文字小文字は区別しません（内部で小文字にそろえます）。
+
 ### 読む
 
 `status()` `header(name)` `headers()` `body()` `body_text()`
@@ -129,6 +138,18 @@ return abort_with(404, "記事が見つかりません");
 
 - `Error::Http` → そのステータス
 - それ以外 → 500
+
+## 404 と 405
+
+ハンドラを書かなくても、bengara がこの 2 つを返します。
+
+| 状況 | 返すもの |
+|---|---|
+| ルートが無く、`public/` にもファイルが無い | 404 |
+| **パスは当たるが、メソッドが違う** | 405 と `allow` ヘッダー |
+
+`allow` には、そのパスで通るメソッドがアルファベット順に入ります（`allow: GET, POST`）。
+くわしくは [routing.md](routing.md) を見てください。
 
 ## エラーページ
 

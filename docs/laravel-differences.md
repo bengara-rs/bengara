@@ -48,8 +48,8 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | `/posts/{post}` | `/posts/{post}`（同じ）。末尾の全取りは `/files/{*path}` |
 | `route('posts.show', $post)` | `route_with("posts.show", &[("post", "12")])` — **`Result<String>` を返す**ので `?` が必要 |
 | 可変長引数が使える | Rust に可変長引数が無いので、引数はスライスで渡す |
-| `Route::group` / `prefix` | まだ無い |
-| ミドルウェア | まだ無い |
+| `Route::group` / `prefix` | `Route::prefix("admin").group(|| { ... })`。`name` の点は自分で書く |
+| `Route::middleware(...)` | `Route::get(...).middleware("admin")` と後ろに付ける（[middleware.md](middleware.md)） |
 | ルートの重複は実行時に後勝ちなど | **起動時にパニックする**（メソッド＋パスの重複、ルート名の重複） |
 
 ## コントローラ
@@ -76,6 +76,17 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | 必要になってから読む（遅延ロード） | **遅延ロードは無い。** ルートと設定は起動時にすべて組み立てて固定する |
 | サービスコンテナ・サービスプロバイダ | 無い。設定は型をキーにした保管だけ |
 | ファサード | 無い。`use bengara::prelude::*;` の自由関数を使う |
+
+## パスを返す関数
+
+| Laravel | bengara |
+|---|---|
+| `app_path()` は `app/` を指す | **`app_path(rel)` は基準ディレクトリからの相対パス**。`app/` は指さない。`app_path("app/Models")` と書く |
+| `base_path()` はプロジェクトのルート | `base_path()`（同じ） |
+| `public_path()` / `storage_path()` | 同じ意味 |
+
+名前は Laravel に合わせましたが、`app_path()` だけは指す場所が違います。
+Laravel から移してきたコードは、ここで取り違えやすいので注意してください。
 
 ## テスト
 

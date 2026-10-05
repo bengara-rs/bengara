@@ -103,6 +103,24 @@ redirect().route_with("posts.show", &[("post", "12")])
 
 `health` のパスが `routes/*.rs` にもある場合は、警告を出して `health` 側を飛ばします（パニックはしません）。
 
+## 当たらなかったとき
+
+| 状況 | 返すもの |
+|---|---|
+| パスもメソッドも当たらない | `public/` に同じ名前のファイルがあればそれを返す。無ければ **404** |
+| **パスは当たるが、メソッドが違う** | **405**。どのメソッドなら通るかを `allow` ヘッダーに入れる |
+
+```
+$ curl -i -X DELETE http://127.0.0.1:8000/
+HTTP/1.1 405 Method Not Allowed
+allow: GET
+```
+
+`allow` の中身はメソッド名をアルファベット順に並べ、`, ` でつなぎます。
+`GET` のルートは `HEAD` にも応答するので、`HEAD` で 405 になることはありません。
+
+静的ファイルを探すのは `GET` と `HEAD` のときだけです。
+
 ## 一覧を見る
 
 ```sh
@@ -121,7 +139,89 @@ GET   /up
 - ルートは起動時に組み立てて固定します。
 - 照合は matchit（radix trie）で行います。リクエスト処理中にロックは取りません。
 
+## ミドルウェア
+
+```rust
+Route::get("/admin", AdminController::index)
+    .middleware("admin")
+    .name("admin.index");
+```
+
+名前は `bootstrap/app.rs` で登録します。くわしくは [middleware.md](middleware.md)。
+
+## グループ
+
+同じ設定を何本ものルートにまとめて付けられます。
+
+```rust
+Route::prefix("admin")
+    .middleware("admin")
+    .name("admin.")
+    .group(|| {
+        Route::get("/", AdminController::index).name("index");   // /admin        admin.index
+        Route::get("/users", AdminController::users).name("users"); // /admin/users  admin.users
+    });
+```
+
+| 付けるもの | 書き方 | 畳み方 |
+|---|---|---|
+| パスの頭 | `Route::prefix("admin")` | 外側から順につなぐ |
+| ルート名の頭 | `Route::name("admin.")` | 外側から順につなぐ。**点は自分で書く** |
+| ミドルウェア | `Route::middleware("admin")` | 外側が先、内側が後 |
+
+3 つは好きな順でつなげられます。どれか 1 つだけでも使えます。
+
+```rust
+Route::middleware("auth").group(|| {
+    Route::post("/posts", PostController::store);
+});
+```
+
+### 入れ子にできる
+
+外側の設定は内側へ引き継がれます。
+
+```rust
+Route::prefix("admin").middleware("auth").name("admin.").group(|| {
+    Route::prefix("posts").name("posts.").group(|| {
+        Route::get("/{post}", PostController::show).name("show");
+        // → GET /admin/posts/{post}   名前 admin.posts.show   ミドルウェア auth
+    });
+});
+```
+
+### 畳むのは登録のときだけ
+
+グループは**ルートを登録する瞬間に畳まれます**。
+畳んだ後のルートだけが残るので、リクエストを処理する速さは、グループを使わないときと同じです。
+
+`cargo artisan route:list` にも畳んだ結果が出ます。
+
+```
+METHOD  URI                   NAME               MIDDLEWARE
+GET     /team                 team.index         admin
+GET     /team/members/{name}  team.members.show  admin
+```
+
+### 細かい決まり
+
+| 書いたもの | どうなるか |
+|---|---|
+| `prefix("")` / `prefix("/")` | 何も足さない |
+| `prefix("/admin/")` | 前後の `/` は落ちて `/admin` になる |
+| `name("admin")`（点なし） | `adminindex` になる。**点は自分で書く** |
+| グループの中でパニック | 積んだ設定は必ず降ろす。後続のルートに漏れない |
+
+### `Route::name` と `.name` の違い
+
+| 書き方 | 意味 |
+|---|---|
+| `Route::name("admin.")` | **グループを作る。** 中のルート名の頭に付く |
+| `Route::get(...).name("index")` | **1 本に名前を付ける** |
+
+Laravel と同じ使い分けです。
+
 ## まだ無いもの
 
-ルートのグループ・プレフィックス、ミドルウェアはまだありません。
+サブドメインでの振り分け（`domain()`）と `Route::resource()` はありません。
 [backlog.md](backlog.md) を参照してください。

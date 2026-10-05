@@ -138,14 +138,38 @@ fn print_routes(app: &Application) {
         .max()
         .unwrap_or(4)
         .max(4);
-    println!("{:<method_width$}  {:<path_width$}  NAME", "METHOD", "URI");
-    for route in routes {
+    let name_width = routes
+        .iter()
+        .map(|r| r.name.as_deref().unwrap_or("").len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    // ミドルウェアが1本も無いなら、列ごと出さない。
+    let any_middleware = routes.iter().any(|r| !r.middleware.is_empty());
+    if any_middleware {
         println!(
-            "{:<method_width$}  {:<path_width$}  {}",
-            route.method,
-            route.path,
-            route.name.as_deref().unwrap_or("")
+            "{:<method_width$}  {:<path_width$}  {:<name_width$}  MIDDLEWARE",
+            "METHOD", "URI", "NAME"
         );
+    } else {
+        println!("{:<method_width$}  {:<path_width$}  NAME", "METHOD", "URI");
+    }
+    for route in routes {
+        let name = route.name.as_deref().unwrap_or("");
+        if any_middleware {
+            println!(
+                "{:<method_width$}  {:<path_width$}  {:<name_width$}  {}",
+                route.method,
+                route.path,
+                name,
+                route.middleware.join(", ")
+            );
+        } else {
+            println!(
+                "{:<method_width$}  {:<path_width$}  {}",
+                route.method, route.path, name
+            );
+        }
     }
     println!("\n{} 本", routes.len());
 }

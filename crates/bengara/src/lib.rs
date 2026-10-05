@@ -38,8 +38,9 @@ pub use config_registry::{config, try_config, AppConfig, Registry};
 pub use env_vars::{env, FromEnv};
 pub use error::{Error, Result};
 pub use http::{
-    abort, abort_with, escape_html, html, json, redirect, route, route_with, text, Handler,
-    Redirect, Registered, Request, Response, Route,
+    abort, abort_with, escape_html, html, json, redirect, route, route_with, text, BoxFuture,
+    Handler, Middleware, Middlewares, Next, Redirect, Registered, Request, Response, Route,
+    RouteGroup,
 };
 pub use paths::{app_path, base_path, public_path, storage_path};
 
@@ -123,7 +124,8 @@ macro_rules! app {
 pub mod prelude {
     pub use crate::{
         abort, abort_with, app_path, base_path, config, env, escape_html, html, json, public_path,
-        redirect, route, route_with, storage_path, text, try_config, AppConfig, Application, Error,
-        Redirect, Registered, Request, Response, Result, Route, Routing,
+        redirect, route, route_with, storage_path, text, try_config, AppConfig, Application,
+        BoxFuture, Error, Middleware, Middlewares, Next, Redirect, Registered, Request, Response,
+        Result, Route, RouteGroup, Routing,
     };
 }

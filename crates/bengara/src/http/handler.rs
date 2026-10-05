@@ -14,8 +14,11 @@ use std::pin::Pin;
 use crate::error::Result;
 use crate::http::{Request, Response};
 
-/// ハンドラの戻り値。
-pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = Result<Response>> + Send>>;
+/// ハンドラとミドルウェアの戻り値。
+///
+/// `Middleware` トレイトを自分で実装するときに使います。
+/// 普通は `async fn` を書くだけなので、この名前を出すことはありません。
+pub type BoxFuture = Pin<Box<dyn Future<Output = Result<Response>> + Send>>;
 
 /// ルートに登録できる関数。
 ///

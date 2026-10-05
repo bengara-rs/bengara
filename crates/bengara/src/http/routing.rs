@@ -9,13 +9,17 @@ use std::sync::{Arc, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::http::handler::{Erased, ErasedHandler, Handler};
+use crate::http::middleware::Middleware;
 
 /// 1本のルート。
 pub(crate) struct RouteDef {
     pub(crate) method: &'static str,
     pub(crate) path: String,
     pub(crate) name: Option<String>,
+    pub(crate) middleware: Vec<String>,
     pub(crate) handler: Arc<dyn ErasedHandler>,
+    /// 起動時に組み立てた並び。`create()` で入ります。
+    pub(crate) stack: Option<Arc<[Arc<dyn Middleware>]>>,
 }
 
 thread_local! {
@@ -80,17 +84,47 @@ macro_rules! route_method {
             H: Handler<Args>,
             Args: 'static,
         {
+            let group = folded();
             push(RouteDef {
                 method: $method,
-                path: normalize(path),
+                path: normalize(&format!("{}{}", group.prefix, normalize(path))),
                 name: None,
+                middleware: group.middleware,
                 handler: Arc::new(Erased::new(handler)),
+                stack: None,
             })
         }
     };
 }
 
 impl Route {
+    /// パスの頭をそろえるグループを作り始める。
+    ///
+    /// ```ignore
+    /// Route::prefix("admin").group(|| { ... });
+    /// ```
+    pub fn prefix(prefix: &str) -> RouteGroup {
+        RouteGroup::default().prefix(prefix)
+    }
+
+    /// ミドルウェアをまとめて付けるグループを作り始める。
+    ///
+    /// ```ignore
+    /// Route::middleware("auth").group(|| { ... });
+    /// ```
+    pub fn middleware(name: &str) -> RouteGroup {
+        RouteGroup::default().middleware(name)
+    }
+
+    /// ルート名の頭をそろえるグループを作り始める。点は自分で書きます。
+    ///
+    /// ```ignore
+    /// Route::name("admin.").group(|| { ... });
+    /// ```
+    pub fn name(name: &str) -> RouteGroup {
+        RouteGroup::default().name(name)
+    }
+
     route_method!(
         get,
         "GET",
@@ -102,22 +136,131 @@ impl Route {
     route_method!(delete, "DELETE", "DELETE のルートを登録する。");
 }
 
-/// 登録したルートに名前を付けるための戻り値。
+/// 登録したルートに名前やミドルウェアを足すための戻り値。
+///
+/// ```ignore
+/// Route::get("/admin", AdminController::index)
+///     .middleware("admin")
+///     .name("admin.index");
+/// ```
 pub struct Registered {
     index: Option<usize>,
 }
 
 impl Registered {
     /// ルートに名前を付ける。`route("home")` で URL を引けるようになります。
-    pub fn name(self, name: &str) {
-        let Some(index) = self.index else { return };
+    ///
+    /// グループの中なら、外側の `name(...)` が頭に付きます。
+    pub fn name(self, name: &str) -> Self {
+        let full = format!("{}{name}", folded().name);
+        self.edit(move |def| def.name = Some(full))
+    }
+
+    /// ルートにミドルウェアを付ける。名前は `bootstrap/app.rs` の `alias` で登録したものです。
+    ///
+    /// 何回でも呼べます。書いた順に通ります。
+    pub fn middleware(self, name: &str) -> Self {
+        self.edit(|def| def.middleware.push(name.to_string()))
+    }
+
+    fn edit(self, change: impl FnOnce(&mut RouteDef)) -> Self {
+        let Some(index) = self.index else { return self };
         COLLECTING.with(|c| {
             if let Some(list) = c.borrow_mut().as_mut() {
                 if let Some(def) = list.get_mut(index) {
-                    def.name = Some(name.to_string());
+                    change(def);
                 }
             }
         });
+        self
+    }
+}
+
+thread_local! {
+    /// `group()` の中にいる間だけ積まれる、外側の設定。
+    static GROUPS: RefCell<Vec<GroupConfig>> = const { RefCell::new(Vec::new()) };
+}
+
+/// グループ1段ぶんの設定。
+#[derive(Default, Clone)]
+struct GroupConfig {
+    prefix: String,
+    name: String,
+    middleware: Vec<String>,
+}
+
+/// 積まれているグループを1つに畳む。
+fn folded() -> GroupConfig {
+    GROUPS.with(|g| {
+        let mut out = GroupConfig::default();
+        for level in g.borrow().iter() {
+            out.prefix.push_str(&level.prefix);
+            out.name.push_str(&level.name);
+            out.middleware.extend(level.middleware.iter().cloned());
+        }
+        out
+    })
+}
+
+/// ルートをまとめて設定するためのグループ。
+///
+/// ```ignore
+/// Route::prefix("admin").middleware("auth").name("admin.").group(|| {
+///     Route::get("/users", AdminController::users).name("users");
+/// });
+/// ```
+#[derive(Default)]
+pub struct RouteGroup {
+    config: GroupConfig,
+}
+
+impl RouteGroup {
+    /// パスの頭に足す文字列を決める。
+    pub fn prefix(mut self, prefix: &str) -> Self {
+        self.config.prefix.push_str(&prefix_segment(prefix));
+        self
+    }
+
+    /// 中のルート全部に付けるミドルウェアを足す。
+    pub fn middleware(mut self, name: &str) -> Self {
+        self.config.middleware.push(name.to_string());
+        self
+    }
+
+    /// ルート名の頭に足す文字列を決める。
+    ///
+    /// 点は自分で書きます（`name("admin.")`）。Laravel と同じです。
+    pub fn name(mut self, name: &str) -> Self {
+        self.config.name.push_str(name);
+        self
+    }
+
+    /// グループを閉じる。中で登録したルートに、ここまでの設定が付きます。
+    ///
+    /// 入れ子にできます。外側の設定は内側へ引き継がれます。
+    pub fn group(self, define: impl FnOnce()) {
+        GROUPS.with(|g| g.borrow_mut().push(self.config));
+        // 中でパニックしても必ず降ろす。
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                GROUPS.with(|g| {
+                    g.borrow_mut().pop();
+                });
+            }
+        }
+        let _guard = Guard;
+        define();
+    }
+}
+
+/// プレフィックスを `/admin` の形にする。空なら何も足さない。
+fn prefix_segment(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
     }
 }
 
@@ -345,6 +488,113 @@ mod tests {
         assert_eq!(routes.names().get("home").map(String::as_str), Some("/"));
     }
 
+    #[test]
+    fn グループでパスと名前とミドルウェアが畳まれる() {
+        let defs = collect(|| {
+            Route::prefix("admin")
+                .middleware("auth")
+                .name("admin.")
+                .group(|| {
+                    Route::get("/", ok).name("index");
+                    Route::get("/users", ok).name("users");
+                });
+        });
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].path, "/admin");
+        assert_eq!(defs[0].name.as_deref(), Some("admin.index"));
+        assert_eq!(defs[0].middleware, vec!["auth".to_string()]);
+        assert_eq!(defs[1].path, "/admin/users");
+        assert_eq!(defs[1].name.as_deref(), Some("admin.users"));
+    }
+
+    #[test]
+    fn 入れ子のグループは外側を引き継ぐ() {
+        let defs = collect(|| {
+            Route::prefix("admin")
+                .middleware("auth")
+                .name("admin.")
+                .group(|| {
+                    Route::prefix("posts")
+                        .middleware("can")
+                        .name("posts.")
+                        .group(|| {
+                            Route::get("/{post}", ok).name("show");
+                        });
+                });
+        });
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].path, "/admin/posts/{post}");
+        assert_eq!(defs[0].name.as_deref(), Some("admin.posts.show"));
+        // 外側が先、内側が後。
+        assert_eq!(
+            defs[0].middleware,
+            vec!["auth".to_string(), "can".to_string()]
+        );
+    }
+
+    #[test]
+    fn グループを抜けたら元に戻る() {
+        let defs = collect(|| {
+            Route::prefix("admin").middleware("auth").group(|| {
+                Route::get("/inside", ok);
+            });
+            Route::get("/outside", ok).name("outside");
+        });
+        assert_eq!(defs[0].path, "/admin/inside");
+        assert_eq!(defs[1].path, "/outside");
+        assert!(defs[1].middleware.is_empty());
+        assert_eq!(defs[1].name.as_deref(), Some("outside"));
+    }
+
+    #[test]
+    fn 空のプレフィックスは何も足さない() {
+        let defs = collect(|| {
+            Route::prefix("").group(|| {
+                Route::get("/users", ok);
+            });
+            Route::prefix("/").group(|| {
+                Route::get("/posts", ok);
+            });
+        });
+        assert_eq!(defs[0].path, "/users");
+        assert_eq!(defs[1].path, "/posts");
+    }
+
+    #[test]
+    fn プレフィックスの余分なスラッシュは落ちる() {
+        let defs = collect(|| {
+            Route::prefix("/admin/").group(|| {
+                Route::get("users", ok);
+            });
+        });
+        assert_eq!(defs[0].path, "/admin/users");
+    }
+
+    #[test]
+    fn グループの中でパニックしても積んだ設定は降りる() {
+        let caught = std::panic::catch_unwind(|| {
+            collect(|| {
+                Route::prefix("boom").group(|| panic!("わざと"));
+            });
+        });
+        assert!(caught.is_err());
+        // 次の収集に前のグループが残っていないこと。
+        let defs = collect(|| {
+            Route::get("/after", ok);
+        });
+        assert_eq!(defs[0].path, "/after");
+    }
+
+    #[test]
+    fn ミドルウェアだけのグループも書ける() {
+        let defs = collect(|| {
+            Route::middleware("auth").group(|| {
+                Route::post("/posts", ok);
+            });
+        });
+        assert_eq!(defs[0].path, "/posts");
+        assert_eq!(defs[0].middleware, vec!["auth".to_string()]);
+    }
     #[test]
     fn パス引数はパーセントデコードされる() {
         let defs = collect(|| {
