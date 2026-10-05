@@ -81,6 +81,11 @@ jobs:
           cargo run -- migrate
           cargo run -- migrate:status
           cargo run -- db:seed
+          # 周辺機能のコマンドも、雛形のまま動くこと。
+          cargo run -- cache:clear
+          cargo run -- schedule:list
+          cargo run -- schedule:run
+          cargo run -- lang:list
 
   # アプリ側（bengara-sandbox）が壊れていないことを確かめる。
   # フレームワークだけを変えたときの巻き込み事故を防ぐため。

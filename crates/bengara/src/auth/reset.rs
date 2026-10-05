@@ -1,7 +1,7 @@
 //! パスワードの再設定（トークンの作成・照合・片付け）。
 //!
 //! 表の名前と列は Laravel と同じ `password_resets` です。
-//! **メールの送信は Phase 5 です。** ここで作るのはトークンとリンクまでです。
+//! **メールは本当には送れません。** ここで作るのはトークンとリンクまでです。
 
 use crate::database::{Value, DB};
 use crate::error::Result;

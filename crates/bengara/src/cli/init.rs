@@ -11,8 +11,11 @@ use crate::error::{Error, Result};
 
 /// 作るディレクトリ。空のままになるものには `.gitkeep` を置きます。
 const DIRECTORIES: &[&str] = &[
+    "app/Console/Commands",
     "app/Http/Controllers",
     "app/Http/Middleware",
+    "app/Jobs",
+    "app/Listeners",
     "app/Models",
     "app/Policies",
     "bootstrap",
@@ -21,8 +24,10 @@ const DIRECTORIES: &[&str] = &[
     "database/migrations",
     "database/seeders",
     "public",
+    "resources/lang",
     "resources/views",
     "routes",
+    "storage/app",
     "storage/framework",
     "storage/logs",
     "tests/Feature",
@@ -31,7 +36,10 @@ const DIRECTORIES: &[&str] = &[
 
 /// `.gitkeep` を置くディレクトリ（今はまだ中身が無いもの）。
 const KEEP: &[&str] = &[
+    "app/Console/Commands",
     "app/Http/Middleware",
+    "app/Jobs",
+    "app/Listeners",
     "app/Models",
     "app/Policies",
     "database/factories",
@@ -114,6 +122,13 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     write_if_missing(root, "routes/web.rs", stub("routes_web"), &mut report)?;
     write_if_missing(
         root,
+        "routes/console.rs",
+        stub("routes_console"),
+        &mut report,
+    )?;
+    write_if_missing(root, "resources/lang/ja.toml", stub("lang_ja"), &mut report)?;
+    write_if_missing(
+        root,
         "app/Http/Controllers/HomeController.rs",
         stub("controller_home"),
         &mut report,
@@ -158,6 +173,8 @@ fn stub(name: &str) -> &'static str {
         "config_database" => include_str!("stubs/config_database.stub"),
         "seeder_database" => include_str!("stubs/seeder_database.stub"),
         "routes_web" => include_str!("stubs/routes_web.stub"),
+        "routes_console" => include_str!("stubs/routes_console.stub"),
+        "lang_ja" => include_str!("stubs/lang_ja.stub"),
         "controller_home" => include_str!("stubs/controller_home.stub"),
         "test_home" => include_str!("stubs/test_home.stub"),
         other => unreachable!("雛形 {other} はありません"),
@@ -334,6 +351,13 @@ fn is_replaceable_main(text: &str) -> bool {
 fn update_manifest(manifest: &mut CargoToml, name: &str) {
     let requirement = version_requirement();
 
+    // bengara が動く Rust の下限。利用者の手元で古い版を使って失敗しないように書く。
+    if !manifest.has_key("package", "rust-version") {
+        manifest.add_line(
+            "package",
+            &format!("rust-version = \"{}\"", env!("CARGO_PKG_RUST_VERSION")),
+        );
+    }
     if !manifest.has_key("package", "default-run") {
         manifest.add_line("package", &format!("default-run = \"{name}\""));
     }
@@ -407,6 +431,8 @@ mod tests {
             "config_database",
             "seeder_database",
             "routes_web",
+            "routes_console",
+            "lang_ja",
             "controller_home",
             "test_home",
         ] {

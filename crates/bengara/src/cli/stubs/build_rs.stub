@@ -1,2 +1,4 @@
 // Laravel と同じ名前のファイルを自動検出して、モジュール宣言を生成する
-fn main() { bengara_build::discover() }
+fn main() {
+    bengara_build::discover()
+}

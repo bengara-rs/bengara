@@ -94,7 +94,7 @@ async fn execute(
         }
         "migrate:fresh" => {
             guard_destructive(options)?;
-            report("消した表", migrator.drop_all_tables().await?);
+            report("消した", migrator.drop_all_tables().await?);
             report("実行した", migrator.run(migrations).await?);
             if options.seed {
                 report(
@@ -113,7 +113,7 @@ async fn execute(
         }
         "db:wipe" => {
             guard_destructive(options)?;
-            report("消した表", migrator.drop_all_tables().await?);
+            report("消した", migrator.drop_all_tables().await?);
         }
         other => {
             return Err(Error::msg(format!(

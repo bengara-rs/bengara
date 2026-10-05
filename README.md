@@ -13,7 +13,8 @@ bengara は、Laravel と同じディレクトリ構成・同じ書き味で Web
 - **Cargo だけで完結** — `cargo artisan ...` で開発用コマンドが使えます。グローバルなツールのインストールは不要です。
 - **環境に依存しない** — ランタイムも言語処理系も要りません。ビルドした実行ファイルを置くだけです。
 - **いま書けるもの** — ルーティング、ミドルウェア、入力の検査、セッションと CSRF、
-  データベース（SQLite）、マイグレーション、モデル、認証と認可、テスト。
+  データベース（SQLite）、マイグレーション、モデル、認証と認可、キャッシュ、ファイルの置き場所、
+  キュー、定期処理、イベント、メール（ログのみ）、多言語、自分のコマンド、テスト。
 
 ## 5分で動かす
 
@@ -43,8 +44,11 @@ myapp/
 ├── main.rs                      bengara::app!();
 ├── artisan.rs                   fn main() { bengara::artisan() }
 ├── app/
+│   ├── Console/Commands/        自分のコマンド
 │   ├── Http/Controllers/HomeController.rs
 │   ├── Http/Middleware/         ミドルウェア
+│   ├── Jobs/                    キューのジョブ
+│   ├── Listeners/               イベントを聞く側
 │   ├── Models/                  モデル
 │   └── Policies/                誰に何を許すか
 ├── bootstrap/app.rs             アプリの組み立て
@@ -55,8 +59,12 @@ myapp/
 │   ├── seeders/DatabaseSeeder.rs 初期データ
 │   └── factories/               テスト用のデータを作る関数
 ├── public/robots.txt            静的ファイル
-├── resources/views/             （まだ使いません）
-├── routes/web.rs                ルート定義
+├── resources/
+│   ├── lang/ja.toml             言語ごとの文字
+│   └── views/                   （まだ使いません）
+├── routes/
+│   ├── web.rs                   ルート定義
+│   └── console.rs               定期処理
 ├── storage/                     実行時の書き込み先
 └── tests/
     ├── Feature/HomeTest.rs
@@ -149,15 +157,23 @@ async fn トップページが表示される() {
 | `session:gc`                                                                                              | 期限切れのセッションを消す                                   |
 | `migrate` / `migrate:status` / `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` | マイグレーション                                             |
 | `db:seed` / `db:wipe`                                                                                     | 初期データ / 表を全部消す                                    |
+| `cache:clear` / `cache:prune`                                                                             | キャッシュを消す                                             |
+| `queue:work` / `queue:failed` / `queue:retry` / `queue:flush`                                             | キューのジョブ                                               |
+| `schedule:run` / `schedule:list`                                                                          | 定期処理                                                     |
+| `lang:list`                                                                                               | 読み込まれている言語の一覧                                   |
 | `init`                                                                                                    | Laravel と同じ構成のファイルを作る                           |
 | `--version` / `--help`                                                                                    | 版・ヘルプ                                                   |
+
+`app/Console/Commands/*.rs` に置いたものも、同じ一覧に並びます。
 
 `make:*` コマンドはありません（意図的な判断です。[docs/decisions.md](docs/decisions.md) を参照）。
 
 ## まだ無いもの
 
-テンプレート（ビュー）、キャッシュ、キュー、メールはまだありません。
+テンプレート（ビュー）はまだありません。
+**メールは本当には送れません**（ログに書き出すだけ。SMTP は未実装）。
 データベースは **SQLite だけ**です（MySQL と PostgreSQL は未実装）。
+キャッシュとキューは Redis に対応していません（ファイルと DB です）。
 パスワードの変換は PBKDF2 です（Argon2 と bcrypt は未実装）。
 一覧は [docs/backlog.md](docs/backlog.md) にまとめてあります。
 

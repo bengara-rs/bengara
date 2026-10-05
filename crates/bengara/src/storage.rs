@@ -1,0 +1,384 @@
+//! ファイルの置き場所。Laravel の `Storage` に当たります。
+//!
+//! ```ignore
+//! Storage::put("notes/a.txt", "本文").await?;
+//! let body = Storage::get("notes/a.txt").await?;
+//! Storage::disk("public").put("avatars/1.png", bytes).await?;
+//! ```
+//!
+//! | 名前 | 実際の場所 |
+//! |---|---|
+//! | `local`（既定） | `storage/app/` |
+//! | `public` | `storage/app/public/` |
+
+use std::path::{Path, PathBuf};
+
+use crate::error::{Error, Result};
+
+/// 既定の置き場所の名前。
+const DEFAULT_DISK: &str = "local";
+
+/// 置き場所の設定。`config/storage.rs` が返します。
+///
+/// ```ignore
+/// pub fn config() -> StorageConfig {
+///     StorageConfig {
+///         default: env("STORAGE_DISK", "local"),
+///         disks: vec![
+///             DiskConfig::new("local", "app"),
+///             DiskConfig::new("public", "app/public"),
+///         ],
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    /// 既定で使う置き場所の名前。
+    pub default: String,
+    /// 置き場所の一覧。
+    pub disks: Vec<DiskConfig>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            default: crate::env("STORAGE_DISK", DEFAULT_DISK),
+            disks: vec![
+                DiskConfig::new("local", "app"),
+                DiskConfig::new("public", "app/public"),
+            ],
+        }
+    }
+}
+
+/// 置き場所1つぶんの設定。
+#[derive(Debug, Clone)]
+pub struct DiskConfig {
+    /// 名前（`Storage::disk("public")` で指す名前）。
+    pub name: String,
+    /// `storage/` からの相対パス。
+    pub root: String,
+}
+
+impl DiskConfig {
+    /// 名前と場所を決めて作る。
+    pub fn new(name: impl Into<String>, root: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            root: root.into(),
+        }
+    }
+}
+
+fn config() -> StorageConfig {
+    crate::try_config::<StorageConfig>()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// ファイルの読み書き。`Storage::disk("名前")` で置き場所を選べます。
+pub struct Storage {
+    root: PathBuf,
+}
+
+impl Storage {
+    /// 既定の置き場所。
+    pub fn default_disk() -> Result<Self> {
+        let config = config();
+        Self::named(&config.default)
+    }
+
+    /// 名前で置き場所を選ぶ。
+    ///
+    /// # パニック
+    ///
+    /// 知らない名前のときはパニックします。設定の書き間違いに
+    /// すぐ気づけるようにするためです。読み書きの前に分かります。
+    pub fn disk(name: &str) -> Self {
+        Self::named(name).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn named(name: &str) -> Result<Self> {
+        let config = config();
+        let disk = config
+            .disks
+            .iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "`{name}` という置き場所は設定にありません（ある置き場所: {}）",
+                    config
+                        .disks
+                        .iter()
+                        .map(|d| d.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+        Ok(Self {
+            root: crate::paths::storage_path(&disk.root),
+        })
+    }
+
+    /// 文字列を書く。途中のディレクトリは作ります。
+    pub async fn put(path: &str, contents: impl Into<String>) -> Result<()> {
+        Self::default_disk()?
+            .write(path, contents.into().into_bytes())
+            .await
+    }
+
+    /// バイト列を書く。
+    pub async fn put_bytes(path: &str, contents: Vec<u8>) -> Result<()> {
+        Self::default_disk()?.write(path, contents).await
+    }
+
+    /// 文字列として読む。無ければ `None`。
+    pub async fn get(path: &str) -> Result<Option<String>> {
+        Self::default_disk()?.read(path).await
+    }
+
+    /// バイト列として読む。
+    pub async fn get_bytes(path: &str) -> Result<Option<Vec<u8>>> {
+        Self::default_disk()?.read_bytes(path).await
+    }
+
+    /// あるか。
+    pub async fn exists(path: &str) -> Result<bool> {
+        Self::default_disk()?.has(path).await
+    }
+
+    /// 無いか。
+    pub async fn missing(path: &str) -> Result<bool> {
+        Ok(!Self::exists(path).await?)
+    }
+
+    /// 消す。
+    pub async fn delete(path: &str) -> Result<()> {
+        Self::default_disk()?.remove(path).await
+    }
+
+    // ---- 置き場所を指定したとき ----
+
+    /// 文字列を書く。
+    pub async fn write(&self, path: &str, contents: Vec<u8>) -> Result<()> {
+        let full = self.absolute(path)?;
+        crate::support::blocking(move || {
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&full, contents).map_err(Error::Io)
+        })
+        .await?
+    }
+
+    /// 文字列として読む。
+    pub async fn read(&self, path: &str) -> Result<Option<String>> {
+        let Some(bytes) = self.read_bytes(path).await? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| Error::msg(format!("`{path}` は文字列として読めません")))
+    }
+
+    /// バイト列として読む。
+    pub async fn read_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        let full = self.absolute(path)?;
+        crate::support::blocking(move || match std::fs::read(&full) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        })
+        .await?
+    }
+
+    /// あるか。
+    pub async fn has(&self, path: &str) -> Result<bool> {
+        let full = self.absolute(path)?;
+        crate::support::blocking(move || full.is_file()).await
+    }
+
+    /// 消す。無くてもエラーにはしません。
+    pub async fn remove(&self, path: &str) -> Result<()> {
+        let full = self.absolute(path)?;
+        crate::support::blocking(move || match std::fs::remove_file(&full) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        })
+        .await?
+    }
+
+    /// バイト数。無ければ `None`。
+    pub async fn size(&self, path: &str) -> Result<Option<u64>> {
+        let full = self.absolute(path)?;
+        crate::support::blocking(move || match std::fs::metadata(&full) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        })
+        .await?
+    }
+
+    /// その下にあるファイルの一覧（置き場所からの相対パス）。
+    pub async fn files(&self, prefix: &str) -> Result<Vec<String>> {
+        let base = self.root.clone();
+        let full = self.absolute(prefix)?;
+        crate::support::blocking(move || {
+            let mut out = Vec::new();
+            collect_files(&full, &base, &mut out)?;
+            out.sort();
+            Ok(out)
+        })
+        .await?
+    }
+
+    /// 実際の絶対パス。
+    pub fn path(&self, path: &str) -> Result<PathBuf> {
+        self.absolute(path)
+    }
+
+    /// 置き場所の中の絶対パスにする。
+    ///
+    /// `..` や絶対パスは**断ります**。置き場所の外を触らせないためです。
+    fn absolute(&self, path: &str) -> Result<PathBuf> {
+        let trimmed = path.trim_start_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return Ok(self.root.clone());
+        }
+        for part in trimmed.split(['/', '\\']) {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            if part == ".." || part.contains(':') {
+                return Err(Error::msg(format!("`{path}` は置き場所の外を指しています")));
+            }
+        }
+        Ok(self.root.join(trimmed.replace('\\', "/")))
+    }
+}
+
+/// ディレクトリの中のファイルを集める（再帰）。
+fn collect_files(dir: &Path, base: &Path, out: &mut Vec<String>) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, base, out)?;
+            continue;
+        }
+        if let Ok(relative) = path.strip_prefix(base) {
+            out.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// テストごとに別のディレクトリを使う（並行して走るため）。
+    fn disk(name: &str) -> Storage {
+        Storage {
+            root: std::env::temp_dir()
+                .join(format!("bengara-storage-{}-{name}", std::process::id())),
+        }
+    }
+
+    #[test]
+    fn 既定の設定は2つの置き場所を持つ() {
+        let config = StorageConfig::default();
+        assert_eq!(config.default, "local");
+        assert_eq!(config.disks.len(), 2);
+        assert_eq!(config.disks[0].root, "app");
+        assert_eq!(config.disks[1].root, "app/public");
+    }
+
+    #[test]
+    fn 置き場所の外は指せない() {
+        let disk = disk("paths");
+        for bad in [
+            "../secret",
+            "a/../../b",
+            "C:/windows/system32",
+            "a/..",
+            "..",
+        ] {
+            assert!(disk.absolute(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn 普通のパスは置き場所の下になる() {
+        let disk = disk("paths2");
+        let full = disk.absolute("notes/a.txt").unwrap();
+        assert!(full.starts_with(&disk.root));
+        assert!(full.ends_with("notes/a.txt"));
+
+        // 先頭の / は落とす。
+        assert_eq!(disk.absolute("/notes/a.txt").unwrap(), full);
+        // 空のパスは置き場所そのもの。
+        assert_eq!(disk.absolute("").unwrap(), disk.root);
+    }
+
+    #[tokio::test]
+    async fn 書いて読んで消せる() {
+        let disk = disk("rw");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        disk.write("notes/a.txt", "本文".as_bytes().to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            disk.read("notes/a.txt").await.unwrap().as_deref(),
+            Some("本文")
+        );
+        assert!(disk.has("notes/a.txt").await.unwrap());
+        assert_eq!(disk.size("notes/a.txt").await.unwrap(), Some(6));
+
+        assert_eq!(disk.read("none.txt").await.unwrap(), None);
+        assert!(!disk.has("none.txt").await.unwrap());
+        assert_eq!(disk.size("none.txt").await.unwrap(), None);
+
+        disk.write("notes/b.txt", b"2".to_vec()).await.unwrap();
+        assert_eq!(
+            disk.files("notes").await.unwrap(),
+            vec!["notes/a.txt".to_string(), "notes/b.txt".to_string()]
+        );
+
+        disk.remove("notes/a.txt").await.unwrap();
+        assert!(!disk.has("notes/a.txt").await.unwrap());
+        // 無いものを消してもエラーにしない。
+        disk.remove("notes/a.txt").await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[tokio::test]
+    async fn バイト列も扱える() {
+        let disk = disk("bytes");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        disk.write("bin/a.dat", vec![0, 1, 2, 255]).await.unwrap();
+        assert_eq!(
+            disk.read_bytes("bin/a.dat").await.unwrap(),
+            Some(vec![0, 1, 2, 255])
+        );
+        // 文字列として読もうとすると分かるエラーになる。
+        assert!(disk.read("bin/a.dat").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[tokio::test]
+    async fn 無いディレクトリの一覧は空() {
+        let disk = disk("empty");
+        let _ = std::fs::remove_dir_all(&disk.root);
+        assert!(disk.files("none").await.unwrap().is_empty());
+    }
+}

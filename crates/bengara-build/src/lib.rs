@@ -15,6 +15,8 @@
 //! 名前空間は再エクスポートだけで組み立てます。入れ子のモジュールの中に
 //! `#[path]` を書くと rust-analyzer がパスを解決できないためです。
 
+mod toml;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -116,6 +118,14 @@ struct Generator {
     has_migrations: bool,
     /// `database/seeders/` が見つかったか。
     has_seeders: bool,
+    /// `app/Jobs/` が見つかったか。
+    has_jobs: bool,
+    /// `app/Console/Commands/` が見つかったか。
+    has_commands: bool,
+    /// `routes/console.rs` が見つかったか。
+    has_console: bool,
+    /// `resources/lang/*.toml` から読んだ文字（言語ごと）。
+    lang: Vec<(String, Vec<(String, String)>)>,
     /// 生成コードに埋め込むエラー（`compile_error!` にする）。
     errors: Vec<String>,
 }
@@ -134,6 +144,44 @@ impl Generator {
                 self.tree.push_str("#[cfg(test)]\n");
             }
             self.emit_dir(&dir, target.name, target, 0);
+        }
+        self.read_lang(root);
+    }
+
+    /// `resources/lang/*.toml` を読んで、文字の表を作る。
+    ///
+    /// **ビルド時に読み込みます。** 実行時にファイルを読まないので、本番に配る必要はありません。
+    fn read_lang(&mut self, root: &Path) {
+        let dir = root.join("resources/lang");
+        println!("cargo:rerun-if-changed={}", dir.display());
+        if !dir.is_dir() {
+            return;
+        }
+        let Some(entries) = self.read_dir_sorted(&dir) else {
+            return;
+        };
+
+        for path in entries {
+            if path.extension().is_none_or(|e| e != "toml") {
+                continue;
+            }
+            // 中身が変わったら作り直す。
+            println!("cargo:rerun-if-changed={}", path.display());
+            let Some(locale) = file_stem(&path) else {
+                continue;
+            };
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.errors
+                        .push(format!("{} を読めませんでした: {e}", path.display()));
+                    continue;
+                }
+            };
+            match toml::parse(&text) {
+                Ok(pairs) => self.lang.push((locale, pairs)),
+                Err(reason) => self.errors.push(format!("{} の {reason}", path.display())),
+            }
         }
     }
 
@@ -162,11 +210,20 @@ impl Generator {
         // `database/migrations/` と `database/seeders/` の中身。
         // どちらも (ファイル名, 平らなモジュール名) で覚える。
         let in_database = target.name == "database" && depth == 1;
-        let in_migrations = in_database && dir_name == "migrations";
-        let in_seeders = in_database && dir_name == "seeders";
-        let in_factories = in_database && dir_name == "factories";
+        let in_migrations = in_database && dir_name.eq_ignore_ascii_case("migrations");
+        let in_seeders = in_database && dir_name.eq_ignore_ascii_case("seeders");
+        let in_factories = in_database && dir_name.eq_ignore_ascii_case("factories");
+        // `app/Jobs/` と `app/Console/Commands/` も、関数を置く場所として扱う。
+        let in_jobs = target.name == "app" && depth == 1 && dir_name.eq_ignore_ascii_case("jobs");
+        let in_listeners =
+            target.name == "app" && depth == 1 && dir_name.eq_ignore_ascii_case("listeners");
+        let in_commands =
+            target.name == "app" && depth == 2 && dir_name.eq_ignore_ascii_case("commands");
+        let function_dir = in_seeders || in_factories || in_jobs || in_commands || in_listeners;
         let mut migrations: Vec<(String, String)> = Vec::new();
         let mut seeders: Vec<(String, String)> = Vec::new();
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        let mut commands: Vec<(String, String)> = Vec::new();
 
         for path in entries {
             let Some(stem) = file_stem(&path) else {
@@ -208,7 +265,7 @@ impl Generator {
 
             // PSR-4 と同じ約束。先頭が大文字のファイルは、同じ名前の型を公開する。
             // ただし seeders と factories は「関数を置く場所」なので、型は探さない。
-            if target.reexport && starts_upper(&stem) && !in_seeders && !in_factories {
+            if target.reexport && starts_upper(&stem) && !function_dir {
                 let _ = writeln!(self.tree, "pub use crate::{flat}::{stem};");
             }
             // database/migrations/ の、日付で始まるファイルはマイグレーション。
@@ -218,6 +275,18 @@ impl Generator {
             // database/seeders/ の、大文字で始まるファイルはシーダー。
             if in_seeders && starts_upper(&stem) {
                 seeders.push((stem.clone(), flat.clone()));
+            }
+            // app/Jobs/ の、大文字で始まるファイルはジョブ。
+            if in_jobs && starts_upper(&stem) {
+                jobs.push((stem.clone(), flat.clone()));
+            }
+            // app/Console/Commands/ の、大文字で始まるファイルは自作コマンド。
+            if in_commands && starts_upper(&stem) {
+                commands.push((stem.clone(), flat.clone()));
+            }
+            // routes/console.rs があれば、定期処理の登録を呼ぶ。
+            if target.name == "routes" && depth == 0 && stem == "console" {
+                self.has_console = true;
             }
             // config/ の直下にある小文字のファイルは、設定として自動登録する。
             if target.name == "config" && depth == 0 && !starts_upper(&stem) {
@@ -260,6 +329,43 @@ impl Generator {
                 "pub const SEEDERS: &[::bengara::Seeder] = &[{list}];"
             );
             self.has_seeders = true;
+        }
+        // ジョブの一覧。
+        if in_jobs {
+            let list = jobs
+                .iter()
+                .map(|(stem, flat)| {
+                    format!(
+                        "::bengara::Job {{ name: {stem:?}, \
+                         handle: |__payload| ::std::boxed::Box::pin(\
+                         crate::{flat}::handle(__payload)) }}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(self.tree, "pub const JOBS: &[::bengara::Job] = &[{list}];");
+            self.has_jobs = true;
+        }
+        // 自作コマンドの一覧。ファイル名を小文字とハイフンにした名前で呼べる。
+        if in_commands {
+            let list = commands
+                .iter()
+                .map(|(stem, flat)| {
+                    let name = to_command_name(stem);
+                    format!(
+                        "::bengara::Command {{ name: {name:?}, \
+                         description: crate::{flat}::DESCRIPTION, \
+                         handle: |__args| ::std::boxed::Box::pin(async move {{ \
+                         crate::{flat}::handle(&__args).await }}) }}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                self.tree,
+                "pub const COMMANDS: &[::bengara::Command] = &[{list}];"
+            );
+            self.has_commands = true;
         }
         self.stack.pop();
         self.tree.push_str("}\n");
@@ -341,6 +447,37 @@ impl Generator {
         }
     }
 
+    /// 言語の表を Rust の定数として書き出す。
+    ///
+    /// ```ignore
+    /// static __BENGARA_LANG_JA: &[(&str, &str)] = &[("messages.welcome", "ようこそ")];
+    /// static __BENGARA_LANG: ::bengara::LangTable = &[("ja", __BENGARA_LANG_JA)];
+    /// ```
+    fn lang_code(&self) -> String {
+        let mut code = String::new();
+        let mut locales = Vec::new();
+
+        for (index, (locale, pairs)) in self.lang.iter().enumerate() {
+            let name = format!("__BENGARA_LANG_{index}");
+            let entries = pairs
+                .iter()
+                .map(|(key, value)| format!("({key:?}, {value:?})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                code,
+                "#[doc(hidden)] static {name}: &[(&str, &str)] = &[{entries}];"
+            );
+            locales.push(format!("({locale:?}, {name})"));
+        }
+        let _ = writeln!(
+            code,
+            "#[doc(hidden)] static __BENGARA_LANG: ::bengara::LangTable = &[{}];",
+            locales.join(", ")
+        );
+        code
+    }
+
     fn finish(mut self) -> String {
         let mut code = String::from("// @generated by bengara-build. 手で編集しないでください。\n");
         code.push_str(&self.flat);
@@ -365,10 +502,29 @@ impl Generator {
         } else {
             "|| &[]"
         };
+        // ジョブ・自作コマンド・定期処理。無ければ何もしない形にする。
+        let jobs = if self.has_jobs {
+            "|| crate::app::jobs::JOBS"
+        } else {
+            "|| &[]"
+        };
+        let commands = if self.has_commands {
+            "|| crate::app::console::commands::COMMANDS"
+        } else {
+            "|| &[]"
+        };
+        let schedule = if self.has_console {
+            "|__schedule| crate::routes::console::schedule(__schedule)"
+        } else {
+            "|_| {}"
+        };
+        // 言語の表。ビルド時に読んだ中身をそのまま埋め込む。
+        let lang = self.lang_code();
 
         let _ = write!(
             code,
-            "#[doc(hidden)]\n\
+            "{lang}\
+             #[doc(hidden)]\n\
              pub fn __bengara_hooks() -> ::bengara::Hooks {{\n\
              \x20   ::bengara::Hooks {{\n\
              \x20       configs: |__registry| {{\n\
@@ -376,6 +532,10 @@ impl Generator {
              \x20       }},\n\
              \x20       migrations: {migrations},\n\
              \x20       seeders: {seeders},\n\
+             \x20       jobs: {jobs},\n\
+             \x20       commands: {commands},\n\
+             \x20       lang: || __BENGARA_LANG,\n\
+             \x20       schedule: {schedule},\n\
              \x20   }}\n\
              }}\n"
         );
@@ -446,6 +606,24 @@ fn skip_dir(name: &str) -> bool {
 
 fn starts_upper(stem: &str) -> bool {
     stem.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// ファイル名をコマンド名にする。`SendReport` → `send-report`。
+fn to_command_name(stem: &str) -> String {
+    let mut out = String::with_capacity(stem.len() + 2);
+    for (i, c) in stem.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 && !out.ends_with('-') {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else if c == '_' {
+            out.push('-');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn starts_digit(stem: &str) -> bool {

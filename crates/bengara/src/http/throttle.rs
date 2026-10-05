@@ -97,9 +97,15 @@ impl Throttle {
 
 /// 誰を数えるかを決める。
 ///
-/// いまはログインの仕組みが無いので、`X-Forwarded-For` の先頭か接続元のアドレスを使います。
-/// どちらも無ければ、パスごとにまとめて数えます。
+/// ログインしていれば**その人ごと**に数えます。していなければ、
+/// `X-Forwarded-For` の先頭か `X-Real-IP` を使います。どちらも無ければパスごとにまとめます。
+///
+/// ログイン中の人ごとに数えると、同じ回線にいる別の人（会社や学校のネットワーク）が
+/// 巻き込まれません。
 fn key_for(req: &Request) -> String {
+    if let Some(id) = req.auth().id() {
+        return format!("user:{id}|{}", req.path());
+    }
     let who = req
         .header("x-forwarded-for")
         .and_then(|v| v.split(',').next())

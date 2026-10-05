@@ -1,0 +1,8 @@
+# 日本語の文字。ビルド時に読み込まれ、バイナリに入ります。
+#
+# 使い方: __("messages.welcome") / __with("messages.greeting", &[("name", "アリス")])
+# 言語を増やすときは en.toml のように名前を付けたファイルを隣に置きます。
+
+[messages]
+welcome = "ようこそ"
+greeting = "こんにちは、:name さん"

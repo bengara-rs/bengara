@@ -1,0 +1,15 @@
+//! 定期処理。Laravel の routes/console.php に当たります。
+//!
+//! `cargo artisan schedule:run` で、動かすべきものだけが動きます。
+//! **1分ごとに外から呼んでください**（cron やタスクスケジューラ）。
+//!
+//! 一覧は `cargo artisan schedule:list` で見られます。
+
+use bengara::prelude::*;
+
+pub fn schedule(s: &mut Schedule) {
+    // 毎分動く例。スケジューラが動いていることの確認になります。
+    s.job("生存の記録", Every::Minute, || async {
+        Cache::put("schedule.alive", now(), 600).await
+    });
+}

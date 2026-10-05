@@ -109,11 +109,21 @@ APP_PORT=8000
 | `APP_PORT`         | `8000`                     | サーバーが待ち受けるポート                                                   |
 | `APP_BASE_PATH`    | （なし）                   | プロジェクトのルート。`serve` が起動時に渡します                             |
 | `RUST_LOG`         | （なし）                   | ログの細かさ。無ければ `APP_DEBUG` から決まります                            |
+| `CACHE_DRIVER`     | `file`                     | キャッシュの置き場所（`file` / `memory`）（[cache.md](cache.md)）            |
+| `STORAGE_DISK`     | `local`                    | 既定のファイル置き場（[storage.md](storage.md)）                             |
+| `MAIL_DRIVER`      | `log`                      | メールの送り先（`log` / `array`）（[mail.md](mail.md)）                      |
+| `MAIL_FROM`        | `noreply@example.com`      | 差出人                                                                       |
+| `MAIL_FROM_NAME`   | `bengara`                  | 差出人の名前                                                                 |
+| `APP_LOCALE`       | `ja`                       | 画面の言語（[localization.md](localization.md)）                             |
+| `APP_FALLBACK_LOCALE` | `ja`                    | 鍵が無いときに見る言語                                                       |
 
 `APP_NAME` `APP_ENV` `APP_DEBUG` `APP_URL` は `config/app.rs` が読んでいるだけです。読み方を変えるのは自由です。
 `APP_HOST` `APP_PORT` `APP_BASE_PATH` `RUST_LOG` `SESSION_*` `DB_TEST_DATABASE` は
 フレームワークが直接読みます。
 `DB_CONNECTION` と `DB_DATABASE` は `config/database.rs` が読んでいるだけです（[database.md](database.md)）。
+`CACHE_DRIVER` `STORAGE_DISK` `MAIL_*` `APP_LOCALE` `APP_FALLBACK_LOCALE` は、
+対応する `config/*.rs` が無ければフレームワークが直接読みます。
+`config/cache.rs`・`config/filesystems.rs`・`config/mail.rs` を置けば、そちらが優先します。
 
 **`APP_KEY` が空のままだと、セッションと署名付き URL を使うリクエストが 500 になります。**
 `cargo artisan key:generate` で作ってください（[session.md](session.md)）。
@@ -141,7 +151,9 @@ bengara = { version = "0.1", default-features = false }
 ```
 
 `sqlite` を入れると **依存クレートが大きく増えます**（依存の木が 59 → 133）。
-データベースを使わないアプリには入れないでください。
+データベースを使わないアプリには入れないでください。 **キューも `sqlite` が要ります**
+（[queue.md](queue.md)）。キャッシュ・ファイル・メール・多言語・イベント・定期処理は
+フラグなしで使えます。
 `cargo run -- init` で作ったプロジェクトには最初から入っています。
 
 ```toml
@@ -194,3 +206,4 @@ let mail = config::< crate::config::mail::MailConfig>();
 
 - [getting-started.md](getting-started.md)
 - [directory-structure.md](directory-structure.md)
+- [cache.md](cache.md) / [storage.md](storage.md) / [mail.md](mail.md) / [localization.md](localization.md) — 周辺機能の設定

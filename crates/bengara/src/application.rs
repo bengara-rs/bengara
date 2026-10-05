@@ -201,6 +201,7 @@ pub struct ApplicationBuilder {
     routing: Routing,
     middleware: Middlewares,
     exceptions: Exceptions,
+    events: crate::events::Events,
 }
 
 impl ApplicationBuilder {
@@ -223,6 +224,24 @@ impl ApplicationBuilder {
     /// ルートを決める。
     pub fn with_routing(mut self, configure: impl FnOnce(Routing) -> Routing) -> Self {
         self.routing = configure(std::mem::take(&mut self.routing));
+        self
+    }
+
+    /// 出来事（イベント）に対して、聞く側を登録する。
+    ///
+    /// ```ignore
+    /// .with_events(|e| {
+    ///     e.listen("user.registered", SendWelcome::handle)
+    ///         .listen("user.registered", NotifyAdmin::handle)
+    /// })
+    /// ```
+    ///
+    /// 起動時に固定されます。実行中には増えません。
+    pub fn with_events(
+        mut self,
+        configure: impl FnOnce(crate::events::Events) -> crate::events::Events,
+    ) -> Self {
+        self.events = configure(std::mem::take(&mut self.events));
         self
     }
 
@@ -257,6 +276,9 @@ impl ApplicationBuilder {
                 }
             }
         }
+
+        // 聞く側を固定する。以後は読むだけ。
+        crate::events::install(self.events);
 
         Application {
             inner: Arc::new(Inner {

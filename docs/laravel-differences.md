@@ -192,6 +192,28 @@ Laravel から移してきたコードは、ここで取り違えやすいので
 | トレイトを使う宣言が必要        | `#[bengara::test]` が道具を注入する。`use` は不要 |
 | HTTP サーバーを立てる構成もある | ソケットを開かない                                |
 
+## 周辺の機能
+
+| Laravel                                   | bengara                                                      |
+|-------------------------------------------|--------------------------------------------------------------|
+| `Cache::remember('k', 60, fn() => ...)`   | `Cache::remember("k", 60, \|\| async { ... }).await?`         |
+| `Cache::tags([...])`                      | ありません。鍵に頭を付けます                                 |
+| `Storage::disk('s3')`                     | `storage/` の下だけ。S3 はありません                          |
+| `Storage::url($path)` / `storage:link`    | ありません。配信する画面を自分で書きます                      |
+| ジョブのクラス＋`SendWelcome::dispatch()` | `app/Jobs/SendWelcome.rs` の関数＋`Queue::push("SendWelcome", &payload)` |
+| `$job->handle()` に型つきの引数           | `handle(payload: String)` の 1 つだけ。中身は自分で読みます   |
+| `Redis` のキュー・キャッシュ              | ありません。キューは DB、キャッシュはファイル                 |
+| `->everyMinute()` / `->cron('0 3 * * 1')` | `Every::Minute` などの列挙。cron の式は読みません             |
+| `schedule:work`                           | ありません。cron から `schedule:run` を 1 分ごとに呼びます     |
+| イベントクラス＋`EventServiceProvider`    | 名前は文字列。登録は `bootstrap/app.rs` の `with_events`      |
+| `Mail::to(...)->send(new WelcomeMail)`    | `Mail::to(..).subject(..).text(..).send().await?`             |
+| SMTP での送信                             | **ありません。** `log` と `array` だけです                     |
+| `Notification`                            | 作りません。`Mail` を直接使います                             |
+| `__('messages.welcome')`                  | 同じ名前（`__`）。`:name` の差し替えは `__with`                |
+| 言語ファイルは PHP の配列                 | `resources/lang/*.toml`。**ビルド時に読みます**               |
+| `trans_choice`（複数形）                  | ありません。鍵を分けます                                      |
+| `make:command` ＋ `$signature`            | `app/Console/Commands/*.rs` に `DESCRIPTION` と `handle`      |
+
 ## PHP 固有の機能は作りません
 
 PHP の言語や実行の形に強く結びついた機能は、bengara では作りません。

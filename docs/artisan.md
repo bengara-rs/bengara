@@ -55,6 +55,31 @@
 
 どれにも `--database=接続の名前` を付けられます。
 
+周辺機能のコマンド。
+
+| コマンド          | 動き                                                   | 詳しくは                                   |
+|-------------------|--------------------------------------------------------|--------------------------------------------|
+| `cache:clear`     | キャッシュを全部消す                                   | [cache.md](cache.md)                       |
+| `cache:prune`     | 期限切れのキャッシュだけ消す                           | [cache.md](cache.md)                       |
+| `queue:work`      | ジョブを処理する（`--once` / `--tries=` / `--sleep=` / `--queue=`） | [queue.md](queue.md)           |
+| `queue:failed`    | 諦めたジョブの一覧                                     | [queue.md](queue.md)                       |
+| `queue:retry`     | 諦めたジョブをキューへ戻す（`--id=1` で 1 件）          | [queue.md](queue.md)                       |
+| `queue:flush`     | 諦めたジョブの記録を捨てる                             | [queue.md](queue.md)                       |
+| `schedule:run`    | いま動かすべき定期処理を動かす                         | [scheduling.md](scheduling.md)             |
+| `schedule:list`   | 定期処理の一覧                                         | [scheduling.md](scheduling.md)             |
+| `lang:list`       | 読み込まれている言語の一覧                             | [localization.md](localization.md)         |
+
+`queue:*` は `features = ["sqlite"]` のときだけ動きます。
+
+## 自分のコマンド
+
+`app/Console/Commands/*.rs` に置いたものが、同じ一覧に並びます。
+書き方は [console-commands.md](console-commands.md) にあります。
+
+```sh
+cargo artisan greet アリス
+```
+
 ホストとポートの既定は `.env` の `APP_HOST`（既定 `127.0.0.1`）と `APP_PORT`（既定 `8000`）です。
 
 `init` 前の `main.rs`（`fn main() { bengara::run() }`）は `init` と `--version` だけを受け付けます。
@@ -97,7 +122,10 @@ Ctrl+C で `artisan` が止まるとき、まれに本体が残ることがあ�
 
 本体は Ctrl+C と（Unix では）SIGTERM を受けたら、処理中のリクエストを終えてから止まります。
 
+`queue:work` も同じで、 **いま動かしている 1 件を終わらせてから**止まります。
+
 ## 関連
 
 - [getting-started.md](getting-started.md)
 - [routing.md](routing.md)
+- [console-commands.md](console-commands.md) — 自分のコマンドを足す

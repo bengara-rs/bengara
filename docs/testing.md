@@ -27,6 +27,8 @@ async fn 無いページは404になる() {
 - `bootstrap/app.rs` の `app()` でアプリを組み立てる
 - tokio ランタイムを用意する
 - テスト用の道具を関数の中に入れる
+- パスワードの変換の回数を 1,000 に下げる
+- メールの送り先を `array` にする（**本当には送りません**）
 
 **ソケットは開きません。** ポートの衝突を気にせず並行して実行できます。
 
@@ -202,6 +204,67 @@ async fn 他人の記事は直せない() {
 （本番の既定は 120,000 回）。`.env` に書いた値は見ません。
 変えたいときは `HASH_ITERATIONS=20000 cargo test` のように環境変数で渡します。
 
+## 周辺機能のテスト
+
+### メール
+
+送り先が `array` になっているので、`Mail::sent()` で中身を確かめます。
+
+```rust
+#[bengara::test]
+async fn お知らせを送る() {
+    Mail::clear_sent();
+    // ... 送る処理 ...
+    assert_eq!(Mail::sent()[0].subject, "ようこそ");
+}
+```
+
+**溜まったメールはテストの間ずっと残ります。** 数を確かめる前に `clear_sent()` を呼んでください。
+
+### キャッシュとファイル
+
+**自動では消えません。** テストは並んで走るので、 **鍵とパスを重ねないでください。**
+
+```rust
+#[bengara::test]
+async fn 数える() {
+    Cache::forget("test.count").await.unwrap();      // 前の残りを消す
+    assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
+    Cache::forget("test.count").await.unwrap();      // 片付ける
+}
+```
+
+`.env` に `CACHE_DRIVER=memory` と書くと、ファイルに残らなくなります。
+
+### キュー
+
+worker は動きません。 **入ったことだけを確かめます。**
+
+```rust
+#[bengara::test]
+async fn ジョブが積まれる() {
+    let _db = refresh_database().await;
+    client.post("/api/register", "name=x&email=a@example.com&password=password123").await;
+    assert_eq!(Queue::size().await.unwrap(), 1);
+}
+```
+
+処理の中身は `handle` をそのまま呼んで確かめます。
+
+```rust
+crate::app::jobs::send_welcome::handle(r#"{"user_id":1}"#.to_string()).await.unwrap();
+```
+
+### 定期処理
+
+`routes/console.rs` の関数を自分で呼ぶと、登録された内容を確かめられます。
+
+```rust
+let mut schedule = Schedule::new();
+crate::routes::console::schedule(&mut schedule);
+assert_eq!(schedule.len(), 3);
+```
+
 ## ユニットテスト
 
 `tests/Unit/` のファイルも同じように自動検出されます。
@@ -214,3 +277,4 @@ async fn 他人の記事は直せない() {
 - [database.md](database.md) — 接続とクエリ
 - [models.md](models.md) — モデルとシーダー
 - [authentication.md](authentication.md) — ログイン
+- [cache.md](cache.md) / [queue.md](queue.md) / [mail.md](mail.md) — 周辺機能

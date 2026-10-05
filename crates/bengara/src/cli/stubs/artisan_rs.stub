@@ -1,1 +1,3 @@
-fn main() { bengara::artisan() }
+fn main() {
+    bengara::artisan()
+}

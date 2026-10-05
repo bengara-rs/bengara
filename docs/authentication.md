@@ -281,7 +281,7 @@ let plain = decrypt( & hidden) ?;       // 改ざんされていればエラー
 | 複数の認証の仕組み（Laravel の guard）        | セッション 1 本だけです |
 | API トークン                                  | ありません              |
 | Argon2 / bcrypt                               | PBKDF2 だけです         |
-| メールの送信                                  | Phase 5                 |
+| メールの送信                                  | **SMTP がありません**。`log` か `array` だけです（[mail.md](mail.md)） |
 
 一覧は [backlog.md](backlog.md) にあります。
 

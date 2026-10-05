@@ -21,7 +21,10 @@ myapp/
 ├── main.rs                      bengara::app!();
 ├── artisan.rs                   fn main() { bengara::artisan() }
 ├── build.rs                     fn main() { bengara_build::discover() }
+├── app/Console/Commands/        自分のコマンド
 ├── app/Http/Controllers/        コントローラ
+├── app/Jobs/                    キューのジョブ
+├── app/Listeners/               イベントを聞く側
 ├── app/Models/                  モデル
 ├── app/Policies/                誰に何を許すか
 ├── bootstrap/app.rs             アプリの組み立て
@@ -31,8 +34,10 @@ myapp/
 ├── database/seeders/            初期データ
 ├── database/factories/          テスト用のデータを作る関数
 ├── public/                      静的ファイル
+├── resources/lang/              言語ごとの文字（*.toml）
 ├── resources/views/             （まだ使いません）
 ├── routes/web.rs                ルート定義
+├── routes/console.rs            定期処理
 ├── storage/                     実行時の書き込み先
 └── tests/Feature/ tests/Unit/   テスト
 ```
@@ -80,11 +85,36 @@ myapp/
   関数を置く場所として扱います。
 - 詳しくは [migrations.md](migrations.md) と [models.md](models.md) にあります。
 
+### `app/Jobs/` `app/Listeners/` `app/Console/Commands/` の約束
+
+| 場所                           | 書くもの                                                          |
+|--------------------------------|-------------------------------------------------------------------|
+| `app/Jobs/`                    | `pub async fn handle(payload: String) -> Result<()>`              |
+| `app/Listeners/`               | 同じ形                                                            |
+| `app/Console/Commands/`        | `pub const DESCRIPTION: &str` と `pub async fn handle(args: &[String]) -> Result<()>` |
+
+- この 3 つでは、 **大文字始まりのファイルに同名の型は要りません。** 関数を置く場所として扱います。
+- `app/Jobs/` と `app/Console/Commands/` は、名前順の一覧が自動で作られて本体に渡ります。
+  ジョブの名前はファイル名そのまま、コマンドの名前はファイル名を `-` 区切りにしたものです。
+- **`app/Listeners/` は自動では登録しません。** `bootstrap/app.rs` の `with_events` に書きます
+  （[events.md](events.md)）。
+
+### `resources/lang/` の約束
+
+`resources/lang/<言語>.toml` を **ビルド時に読み込んで**バイナリに入れます。
+中身を書き換えると `cargo build` が走り直します。詳しくは
+[localization.md](localization.md) にあります。
+
+### `routes/console.rs` の約束
+
+`pub fn schedule(s: &mut Schedule)` を書きます。無ければ定期処理はありません。
+詳しくは [scheduling.md](scheduling.md) にあります。
+
 ### 取り込まれないもの
 
 - 隠しファイル（`.` で始まるもの）
 - `mod.rs` / `main.rs` / `lib.rs`
-- `.rs` 以外のファイル
+- `.rs` 以外のファイル（例外は `resources/lang/*.toml`）
 - `target/`
 
 ## テストの名前

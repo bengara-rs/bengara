@@ -21,6 +21,8 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     let mut registry = Registry::new();
     (hooks.configs)(&mut registry);
     config_registry::install(registry);
+    // 言語の表を固定する。以後は読むだけ。
+    crate::lang::install((hooks.lang)());
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(error) = dispatch(&args, hooks, factory) {
@@ -52,18 +54,24 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
         name if crate::database::commands::is_command(name) => {
             crate::database::commands::run(name, rest, (hooks.migrations)(), (hooks.seeders)())
         }
+        // 周辺のコマンド（cache:clear / queue:work / schedule:run など）。
+        name if crate::commands::is_command(name) => crate::commands::run(name, rest, hooks),
+        // アプリが `app/Console/Commands/` に置いた自作コマンド。
+        name if crate::console::find((hooks.commands)(), name).is_some() => {
+            crate::commands::run_custom(name, rest, hooks)
+        }
         "init" => crate::cli::init_here(),
         "--version" | "-V" | "version" => {
             println!("bengara {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         "--help" | "-h" | "help" | "list" => {
-            print_help();
+            print_help(hooks);
             Ok(())
         }
         other => {
             eprintln!("`{other}` というコマンドはありません。");
-            print_help();
+            print_help(hooks);
             std::process::exit(1);
         }
     }
@@ -249,12 +257,15 @@ fn print_routes(app: &Application) {
     println!("\n{} 本", routes.len());
 }
 
-fn print_help() {
-    let database = crate::database::commands::COMMANDS
-        .iter()
-        .map(|(name, description)| format!("  {name:<20} {description}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+fn print_help(hooks: Hooks) {
+    let describe = |list: &[(&str, &str)]| {
+        list.iter()
+            .map(|(name, description)| format!("  {name:<20} {description}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let database = describe(crate::database::commands::COMMANDS);
+    let extras = describe(crate::commands::COMMANDS);
     println!(
         "\
 本体のコマンド
@@ -273,11 +284,16 @@ fn print_help() {
 {database}
   どれにも --database=<接続の名前> を付けられます。
 
+周辺機能のコマンド
+{extras}
+
 開発用のコマンド（init と、serve の自動再ビルド）は artisan 側です。
 
   cargo artisan list
 "
     );
+    // アプリが app/Console/Commands/ に置いたものも出す。
+    crate::console::print_list((hooks.commands)());
 }
 
 /// ログの出力を用意する。
@@ -336,6 +352,8 @@ fn parse_level(raw: &str) -> Option<tracing::Level> {
 
 /// テストから使う初期化。`#[bengara::test]` が1回だけ呼びます。
 pub(crate) fn boot_for_tests(hooks: Hooks) {
+    // メールはテストでは送らず、溜めるだけにする（`.env` を読む前に決める）。
+    crate::mail::install_test_mailer();
     // パスワードのハッシュの回数を下げるのは **`.env` を読む前**に決める。
     // `.env` の値まで尊重すると、開発用に下げた値（や上げた値）でテストが走り、
     // 1 件ごとに数秒かかってしまう。環境変数で明示したときだけ従う。
@@ -349,6 +367,8 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
         (hooks.configs)(&mut registry);
         config_registry::install(registry);
     }
+    // 言語の表を固定する。
+    crate::lang::install((hooks.lang)());
     // マイグレーションの一覧を、あとで `refresh_database()` から使えるようにしておく。
     let _ = TEST_HOOKS.set(hooks);
 }
