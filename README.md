@@ -13,7 +13,7 @@ bengara は、Laravel と同じディレクトリ構成・同じ書き味で Web
 - **Cargo だけで完結** — `cargo artisan ...` で開発用コマンドが使えます。グローバルなツールのインストールは不要です。
 - **環境に依存しない** — ランタイムも言語処理系も要りません。ビルドした実行ファイルを置くだけです。
 - **いま書けるもの** — ルーティング、ミドルウェア、入力の検査、セッションと CSRF、
-  データベース（SQLite）、マイグレーション、モデル、テスト。
+  データベース（SQLite）、マイグレーション、モデル、認証と認可、テスト。
 
 ## 5分で動かす
 
@@ -45,7 +45,8 @@ myapp/
 ├── app/
 │   ├── Http/Controllers/HomeController.rs
 │   ├── Http/Middleware/         ミドルウェア
-│   └── Models/                  モデル
+│   ├── Models/                  モデル
+│   └── Policies/                誰に何を許すか
 ├── bootstrap/app.rs             アプリの組み立て
 ├── config/app.rs                設定
 ├── config/database.rs           データベースの設定
@@ -155,8 +156,9 @@ async fn トップページが表示される() {
 
 ## まだ無いもの
 
-テンプレート（ビュー）、認証、キャッシュ、キュー、メールはまだありません。
+テンプレート（ビュー）、キャッシュ、キュー、メールはまだありません。
 データベースは **SQLite だけ**です（MySQL と PostgreSQL は未実装）。
+パスワードの変換は PBKDF2 です（Argon2 と bcrypt は未実装）。
 一覧は [docs/backlog.md](docs/backlog.md) にまとめてあります。
 
 ## 必要なもの

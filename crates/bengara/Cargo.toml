@@ -26,6 +26,11 @@ sqlite = ["database", "sqlx/sqlite"]
 # ドライバ共通の土台。単体では指定しません。
 database = ["sqlx"]
 
+# 暗号化（encrypt / decrypt）。既定では入りません。
+# 署名（SHA-256 / HMAC）は自前なのでフラグは要りませんが、
+# 暗号は実績のあるクレートに任せます（決定記録 #050）。
+encryption = ["chacha20poly1305"]
+
 [dependencies]
 bengara-macros = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -38,6 +43,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 getrandom = { version = "0.4.3", features = ["std"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
+], optional = true }
+chacha20poly1305 = { version = "0.10", default-features = false, features = [
+    "alloc",
 ], optional = true }
 
 [dev-dependencies]

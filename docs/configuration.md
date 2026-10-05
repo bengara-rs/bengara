@@ -104,6 +104,7 @@ APP_PORT=8000
 | `DB_CONNECTION` | `sqlite` | 既定で使う接続の名前 |
 | `DB_DATABASE` | `database/database.sqlite` | SQLite のファイル。相対パスはプロジェクト直下から |
 | `DB_TEST_DATABASE` | `:memory:` | テストで使うデータベース |
+| `HASH_ITERATIONS` | `120000` | パスワードの変換の繰り返し回数（[authentication.md](authentication.md)） |
 | `APP_HOST` | `127.0.0.1` | サーバーが待ち受けるホスト |
 | `APP_PORT` | `8000` | サーバーが待ち受けるポート |
 | `APP_BASE_PATH` | （なし） | プロジェクトのルート。`serve` が起動時に渡します |
@@ -119,12 +120,16 @@ APP_PORT=8000
 
 ## 機能フラグ
 
-bengara は使わない機能をバイナリに入れないようにしています。今あるフラグは 2 つです。
+bengara は使わない機能をバイナリに入れないようにしています。今あるフラグは 3 つです。
 
 | フラグ | 既定 | 中身 |
 |---|---|---|
 | `log-filter` | 入っている | `RUST_LOG=myapp=debug` のような細かい絞り込みを使えるようにします |
 | `sqlite` | **入っていない** | SQLite につながるようにします（[database.md](database.md)） |
+| `encryption` | **入っていない** | `encrypt` / `decrypt` が使えます（+14 クレート） |
+
+認証（`Hash` / `Auth` / `authorize` / `PasswordReset`）は**フラグが要りません。**
+依存クレートを増やさずに作っているためです（[authentication.md](authentication.md)）。
 
 `log-filter` は、依存クレートを減らしたいときに外せます。外すと 3 つ減り
 （`matchers` / `regex-automata` / `regex-syntax`）、`RUST_LOG` は

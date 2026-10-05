@@ -18,6 +18,8 @@ bengara を使う人のための資料です。フレームワークの紹介は
 | [middleware.md](middleware.md) | リクエストの前後に挟む処理、回数の制限 |
 | [validation.md](validation.md) | 入力の検査 |
 | [session.md](session.md) | セッション、Cookie、CSRF |
+| [authentication.md](authentication.md) | ログイン、パスワード、再設定、暗号化 |
+| [authorization.md](authorization.md) | 誰に何を許すか（ポリシー） |
 | [database.md](database.md) | 接続、クエリビルダ、ページ分け、トランザクション |
 | [migrations.md](migrations.md) | 表を作る。`migrate` 系のコマンド |
 | [models.md](models.md) | `#[derive(Model)]`、リレーション、シーダー、ファクトリ |

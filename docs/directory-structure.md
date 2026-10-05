@@ -23,6 +23,7 @@ myapp/
 ├── build.rs                     fn main() { bengara_build::discover() }
 ├── app/Http/Controllers/        コントローラ
 ├── app/Models/                  モデル
+├── app/Policies/                誰に何を許すか
 ├── bootstrap/app.rs             アプリの組み立て
 ├── config/app.rs                設定
 ├── config/database.rs           データベースの設定

@@ -78,6 +78,37 @@ impl Request {
         self.session.as_ref()
     }
 
+    /// ログインの状態を扱う入口。
+    ///
+    /// ```ignore
+    /// let user = req.auth().user_or_fail::<User>().await?;
+    /// ```
+    pub fn auth(&self) -> crate::auth::Auth<'_> {
+        crate::auth::Auth::new(self.session.as_ref())
+    }
+
+    /// パス引数の値でモデルを1件読む。見つからなければ 404。
+    ///
+    /// ```ignore
+    /// // Route::get("/posts/{post}", ...)
+    /// let post = req.model::<Post>("post").await?;
+    /// ```
+    ///
+    /// Laravel のルートモデルバインディング（引数に型を書くと勝手に読む仕組み）は
+    /// ありません。**この1行で同じことをします**（決定記録 #051）。
+    pub async fn model<T: crate::database::Model>(&self, param: &str) -> Result<T> {
+        let value = self.param(param).ok_or_else(|| {
+            Error::msg(format!(
+                "パス引数 `{{{param}}}` がありません。ルートの書き方を確かめてください"
+            ))
+        })?;
+        T::query()
+            .where_(T::PRIMARY_KEY, value)
+            .first()
+            .await?
+            .ok_or_else(|| Error::http(404, format!("{} が見つかりません", T::TABLE)))
+    }
+
     /// CSRF のトークン。フォームの `_token` に入れて返してもらいます。
     ///
     /// # パニック

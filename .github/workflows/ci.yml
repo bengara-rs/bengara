@@ -27,8 +27,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # データベースを入れた状態でも通ることを確かめる。
-      - run: cargo clippy --workspace --all-targets --features sqlite -- -D warnings
-      - run: cargo test --workspace --features sqlite
+      - run: cargo clippy --workspace --all-targets --features "sqlite encryption" -- -D warnings
+      - run: cargo test --workspace --features "sqlite encryption"
       # 機能フラグを外しても通ることを確かめる。
       - run: cargo clippy -p bengara --no-default-features --all-targets -- -D warnings
 
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --features sqlite
+      - run: cargo test --workspace --features "sqlite encryption"
 
   # 利用者の手順をそのまま再現する。
   # cargo new → init → build → test が通ること。

@@ -143,6 +143,26 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | `php artisan migrate` | `cargo artisan migrate`（本番は `./myapp migrate`） |
 | `RefreshDatabase` トレイト | `let _db = refresh_database().await;` |
 
+## 認証と認可
+
+| Laravel | bengara |
+|---|---|
+| `Hash::make($password)` | `Hash::make(password)`（中身は PBKDF2-HMAC-SHA256。bcrypt ではない） |
+| `Auth::attempt(['email' => .., 'password' => ..])` | `req.auth().attempt::<User>("email", email, password).await?` |
+| `Auth::user()` | `req.auth().user::<User>().await?`（**どこからでも読める形は無い**） |
+| `Auth::id()` / `Auth::check()` | `req.auth().id()` / `req.auth().check()` |
+| `Auth::logout()` | `req.auth().logout()?` |
+| `auth` ミドルウェア | `Authenticate::new()` を `alias("auth", ..)` で登録 |
+| `class User extends Authenticatable` | `#[derive(Model)]` ＋ `impl Authenticatable`（`password_hash()` の 1 つだけ） |
+| remember me の Cookie | **無い** |
+| 複数の guard | **無い。** セッション 1 本 |
+| `Gate::allows('update', $post)` | `PostPolicy::update(&user, &post)`（ただの関数） |
+| `$this->authorize('update', $post)` | `authorize(PostPolicy::update(&user, &post))?` |
+| ポリシーの自動対応づけ | **無い。** 呼ぶ側で関数を指定する |
+| `encrypt()` / `decrypt()` | 同名。ただし機能フラグ `encryption` が要る。中身は ChaCha20-Poly1305 |
+| `Password::sendResetLink()` | `PasswordReset::create()` ＋ `link()`。**メールの送信はまだ無い** |
+| `Hash::check` が自動で再ハッシュ | `Hash::needs_rehash()` を自分で見る |
+
 ## 読み込みのしかた
 
 | Laravel | bengara |

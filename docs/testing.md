@@ -175,6 +175,33 @@ cargo test
 
 `Cargo.toml` に `features = ["sqlite"]` が書かれていれば、そのまま動きます。
 
+## ログインが要るテスト
+
+`client` は Cookie を覚えるので、ログインしてから続けて送れます。
+別の人として送りたいときは `client.fresh()` で作り直します。
+
+```rust
+#[bengara::test]
+async fn 他人の記事は直せない() {
+    let _db = refresh_database().await;
+
+    let alice = client.fresh();
+    alice
+        .send("POST", "/api/login", b"email=alice@example.com&password=password123".to_vec(), &[FORM])
+        .await
+        .assert_ok();
+
+    let bob = client.fresh();   // 別の人
+    bob.send("PUT", "/api/my/articles/1", b"title=x".to_vec(), &[FORM])
+        .await
+        .assert_status(403);
+}
+```
+
+パスワードの変換は時間がかかるので、**テストでは回数が自動で 1,000 回に下がります**
+（本番の既定は 120,000 回）。`.env` に書いた値は見ません。
+変えたいときは `HASH_ITERATIONS=20000 cargo test` のように環境変数で渡します。
+
 ## ユニットテスト
 
 `tests/Unit/` のファイルも同じように自動検出されます。
@@ -186,3 +213,4 @@ cargo test
 - [requests-and-responses.md](requests-and-responses.md)
 - [database.md](database.md) — 接続とクエリ
 - [models.md](models.md) — モデルとシーダー
+- [authentication.md](authentication.md) — ログイン

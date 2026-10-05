@@ -14,6 +14,7 @@ const DIRECTORIES: &[&str] = &[
     "app/Http/Controllers",
     "app/Http/Middleware",
     "app/Models",
+    "app/Policies",
     "bootstrap",
     "config",
     "database/factories",
@@ -32,6 +33,7 @@ const DIRECTORIES: &[&str] = &[
 const KEEP: &[&str] = &[
     "app/Http/Middleware",
     "app/Models",
+    "app/Policies",
     "database/factories",
     "database/migrations",
     "resources/views",

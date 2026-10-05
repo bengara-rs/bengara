@@ -336,6 +336,11 @@ fn parse_level(raw: &str) -> Option<tracing::Level> {
 
 /// テストから使う初期化。`#[bengara::test]` が1回だけ呼びます。
 pub(crate) fn boot_for_tests(hooks: Hooks) {
+    // パスワードのハッシュの回数を下げるのは **`.env` を読む前**に決める。
+    // `.env` の値まで尊重すると、開発用に下げた値（や上げた値）でテストが走り、
+    // 1 件ごとに数秒かかってしまう。環境変数で明示したときだけ従う。
+    crate::auth::install_test_iterations();
+
     let base = paths::base_path().to_path_buf();
     env_vars::load_dotenv(&base);
     init_tracing();

@@ -111,6 +111,30 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Digest {
     sha256(&outer)
 }
 
+/// PBKDF2-HMAC-SHA256（RFC 8018）。パスワードを総当たりしにくい形に変えます。
+///
+/// `iterations` 回 HMAC を繰り返します。回数が多いほど、1回の照合に時間がかかり、
+/// 総当たりが割に合わなくなります。
+///
+/// 出力は 32 バイト（SHA-256 の1ブロックぶん）に固定しています。
+/// それより長い鍵が要る使い方は、いまありません。
+pub(crate) fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> Digest {
+    // ブロック番号は 1 つだけ（出力が 32 バイトのため）。
+    let mut block = Vec::with_capacity(salt.len() + 4);
+    block.extend_from_slice(salt);
+    block.extend_from_slice(&1u32.to_be_bytes());
+
+    let mut u = hmac_sha256(password, &block);
+    let mut out = u;
+    for _ in 1..iterations.max(1) {
+        u = hmac_sha256(password, &u);
+        for (slot, value) in out.iter_mut().zip(u.iter()) {
+            *slot ^= value;
+        }
+    }
+    out
+}
+
 /// バイト列を16進の小文字にする。
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -268,11 +292,61 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
     }
 
+    /// 広く使われている PBKDF2-HMAC-SHA256 のテストベクタ
+    /// （RFC 8018 の手順に対する、SHA-256 版の既知の答え）。
+    #[test]
+    fn pbkdf2が公式のテストベクタと一致する() {
+        assert_eq!(
+            to_hex(&pbkdf2_sha256(b"password", b"salt", 1)),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        );
+        assert_eq!(
+            to_hex(&pbkdf2_sha256(b"password", b"salt", 2)),
+            "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+        );
+        assert_eq!(
+            to_hex(&pbkdf2_sha256(b"password", b"salt", 4096)),
+            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+    }
+
+    #[test]
+    fn pbkdf2は塩と回数で変わる() {
+        let a = pbkdf2_sha256(b"same", b"salt-a", 10);
+        let b = pbkdf2_sha256(b"same", b"salt-b", 10);
+        let c = pbkdf2_sha256(b"same", b"salt-a", 11);
+        assert_ne!(a, b, "塩が違えば結果も違う");
+        assert_ne!(a, c, "回数が違えば結果も違う");
+        // 0 回は 1 回として扱う（0 除算のような壊れ方をしないこと）。
+        assert_eq!(pbkdf2_sha256(b"x", b"y", 0), pbkdf2_sha256(b"x", b"y", 1));
+    }
+
     #[test]
     fn 乱数は毎回変わる() {
         let a = random_token();
         let b = random_token();
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// 回数を決めるための計測。`cargo test -- --ignored --nocapture` で見る。
+    #[test]
+    #[ignore]
+    fn pbkdf2の速さを測る() {
+        for iterations in [10_000u32, 50_000, 120_000, 600_000] {
+            let started = Instant::now();
+            let _ = pbkdf2_sha256(
+                b"correct horse battery staple",
+                b"0123456789abcdef",
+                iterations,
+            );
+            println!("{iterations:>7} 回: {:?}", started.elapsed());
+        }
     }
 }

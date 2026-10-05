@@ -22,6 +22,7 @@
 //! ```
 
 mod application;
+pub mod auth;
 mod cli;
 mod config_registry;
 pub mod database;
@@ -38,6 +39,10 @@ pub mod validation;
 pub mod testing;
 
 pub use application::{Application, ApplicationBuilder, Exceptions, Routing};
+pub use auth::{
+    authorize, authorize_with, decrypt, encrypt, Auth, Authenticatable, Authenticate, Hash,
+    HashConfig, PasswordReset,
+};
 pub use config_registry::{config, try_config, AppConfig, Registry};
 pub use database::{
     now, Affected, Blueprint, ConnectionConfig, DatabaseConfig, Driver, Migration, Model,
@@ -161,4 +166,10 @@ pub mod prelude {
         ModelQuery, Paginator, QueryBuilder, Row, Schema, Seeder, Transaction, Value, DB,
     };
     pub use bengara_macros::Model;
+
+    // 認証と認可。
+    pub use crate::auth::{
+        authorize, authorize_with, decrypt, encrypt, Auth, Authenticatable, Authenticate, Hash,
+        HashConfig, PasswordReset,
+    };
 }
