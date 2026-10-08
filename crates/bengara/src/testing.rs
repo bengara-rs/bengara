@@ -18,6 +18,9 @@ use crate::application::Application;
 use crate::http::{Request, Response};
 use crate::{kernel_impl, Hooks};
 
+/// フォームで送るときの `content-type`。`post` / `put` / `patch` で同じものを使う。
+const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+
 /// テストから送るときの接続元のアドレス。
 ///
 /// ソケットを開かないので本物の接続元はありません。`127.0.0.1` を入れておくと、
@@ -71,11 +74,31 @@ impl TestClient {
 
     /// POST を送る（`application/x-www-form-urlencoded`）。
     pub async fn post(&self, uri: &str, body: &str) -> TestResponse {
+        self.form("POST", uri, body).await
+    }
+
+    /// PUT を送る（`application/x-www-form-urlencoded`）。
+    pub async fn put(&self, uri: &str, body: &str) -> TestResponse {
+        self.form("PUT", uri, body).await
+    }
+
+    /// PATCH を送る（`application/x-www-form-urlencoded`）。
+    pub async fn patch(&self, uri: &str, body: &str) -> TestResponse {
+        self.form("PATCH", uri, body).await
+    }
+
+    /// DELETE を送る。本文は付けません。
+    pub async fn delete(&self, uri: &str) -> TestResponse {
+        self.send("DELETE", uri, Vec::new(), &[]).await
+    }
+
+    /// フォームの本文を付けて送る。`post` / `put` / `patch` の中身。
+    async fn form(&self, method: &str, uri: &str, body: &str) -> TestResponse {
         self.send(
-            "POST",
+            method,
             uri,
             body.as_bytes().to_vec(),
-            &[("content-type", "application/x-www-form-urlencoded")],
+            &[("content-type", FORM_CONTENT_TYPE)],
         )
         .await
     }
@@ -106,7 +129,7 @@ impl TestClient {
             uri,
             body.as_bytes().to_vec(),
             &[
-                ("content-type", "application/x-www-form-urlencoded"),
+                ("content-type", FORM_CONTENT_TYPE),
                 ("x-csrf-token", &token),
             ],
         )
@@ -341,7 +364,15 @@ thread_local! {
 ///
 /// `std::sync::Mutex` は再入できないので、気づかないと**何も言わずに永久に止まります**。
 /// 分かるメッセージでパニックさせます。
-#[track_caller]
+///
+/// 立っているかを見るだけです。**旗を立てるのは札を作る直前**にします。
+/// ここで立ててしまうと、途中（錠の取得やマイグレーション）で失敗したときに
+/// 旗が立ったまま残り、同じスレッドで走る後のテストが全部この文で落ちて、
+/// 本当の原因が埋もれるためです。
+//
+// `#[track_caller]` は付けません。呼び元が `async fn` なので効かず、
+// 付いていると効いているように見えて紛らわしいためです。
+// パニックの場所はこのファイル（`testing.rs`）になります。
 fn check_reentrant(held: &'static std::thread::LocalKey<std::cell::Cell<bool>>, what: &str) {
     if held.get() {
         panic!(
@@ -350,7 +381,6 @@ fn check_reentrant(held: &'static std::thread::LocalKey<std::cell::Cell<bool>>, 
              先に取った札（`let _db = ...`）を使い回してください。"
         );
     }
-    held.set(true);
 }
 
 /// テスト用のデータベースを空から作り直す。
@@ -400,6 +430,8 @@ pub async fn refresh_database() -> DatabaseGuard {
         .await
         .unwrap_or_else(|e| panic!("テスト用のマイグレーションに失敗しました: {e}"));
 
+    // ここまで来てから旗を立てる。札（`DatabaseGuard`）の `Drop` が下ろす。
+    HOLDS_DATABASE.set(true);
     DatabaseGuard { _guard: guard }
 }
 
@@ -473,6 +505,8 @@ impl Drop for ExclusiveGuard {
 pub async fn exclusive() -> ExclusiveGuard {
     check_reentrant(&HOLDS_EXCLUSIVE, "exclusive()");
     let guard = EXCLUSIVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 錠を取れてから旗を立てる。札（`ExclusiveGuard`）の `Drop` が下ろす。
+    HOLDS_EXCLUSIVE.set(true);
     ExclusiveGuard { _guard: guard }
 }
 
@@ -503,10 +537,11 @@ mod tests {
 
     #[test]
     fn 札を二重に取ると分かる文でパニックする() {
-        // 1 回目は通る。
+        // 旗が下りている間は何度でも通る（旗を立てるのは呼び元の役目）。
         check_reentrant(&DUMMY, "refresh_database()");
+        DUMMY.set(true);
 
-        // 2 回目は、黙って止まるのではなくパニックする。
+        // 旗が立っていると、黙って止まるのではなくパニックする。
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             check_reentrant(&DUMMY, "refresh_database()")
         }));
@@ -521,7 +556,66 @@ mod tests {
         DUMMY.set(false);
         // 手放したあとはまた取れる。
         check_reentrant(&DUMMY, "refresh_database()");
-        DUMMY.set(false);
+    }
+
+    #[test]
+    fn 旗を立てるのは呼び元なので失敗しても残らない() {
+        // `check_reentrant` 自体は旗に触らない。錠やマイグレーションが途中で
+        // 失敗しても、旗が立ったまま残らないことを確かめる。
+        check_reentrant(&DUMMY, "refresh_database()");
+        assert!(!DUMMY.get());
+    }
+
+    /// メソッドと content-type と本文をそのまま返すだけのアプリ。
+    fn echo_app() -> Application {
+        use crate::http::Route;
+
+        async fn echo(req: Request) -> crate::Result<Response> {
+            Ok(Response::text(format!(
+                "{} {} {}",
+                req.method(),
+                req.header("content-type").unwrap_or("-"),
+                req.body_text()
+            )))
+        }
+
+        Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::put("/echo", echo);
+                    Route::patch("/echo", echo);
+                    Route::delete("/echo", echo);
+                })
+            })
+            .create()
+    }
+
+    #[tokio::test]
+    async fn putとpatchはフォームの本文で送る() {
+        let client = TestClient::new(echo_app());
+
+        client
+            .put("/echo", "title=x")
+            .await
+            .assert_ok()
+            .assert_see("PUT")
+            .assert_see(FORM_CONTENT_TYPE)
+            .assert_see("title=x");
+
+        client
+            .patch("/echo", "title=y")
+            .await
+            .assert_ok()
+            .assert_see("PATCH")
+            .assert_see(FORM_CONTENT_TYPE)
+            .assert_see("title=y");
+    }
+
+    #[tokio::test]
+    async fn deleteは本文もcontent_typeも付けない() {
+        let client = TestClient::new(echo_app());
+        let body = client.delete("/echo").await.assert_ok().body();
+        assert_eq!(body, "DELETE - ");
     }
 
     #[tokio::test]

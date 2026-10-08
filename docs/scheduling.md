@@ -2,6 +2,16 @@
 
 決まった間隔で動かしたい処理を書く場所です。
 
+> **自動では動きません。** `cargo artisan schedule:run` を **1 分ごとに外から呼ぶ前提**です。
+> cron やタスクスケジューラに登録してください。常駐する仕組みはありません。
+> Laravel と同じ形です。
+
+```text
+* * * * * cd /path/to/app && ./myapp schedule:run >> /dev/null 2>&1
+```
+
+Windows ならタスクスケジューラで、1 分おきに `myapp.exe schedule:run` を登録します。
+
 ## 書く
 
 `routes/console.rs` に書きます。`init` が雛形を作ります。
@@ -48,15 +58,7 @@ cargo artisan schedule:run
 2 件動かしました。
 ```
 
-**1 分ごとに外から呼んでください。** Laravel と同じ形です。
-
-```text
-* * * * * cd /path/to/app && ./myapp schedule:run >> /dev/null 2>&1
-```
-
-Windows ならタスクスケジューラで、1 分おきに `myapp.exe schedule:run` を登録します。
-
-## 一覧を見る
+一覧だけ見たいときは `schedule:list` です。
 
 ```sh
 cargo artisan schedule:list
@@ -70,6 +72,22 @@ cargo artisan schedule:list
 
 3 件
 ```
+
+### 二重に走らない
+
+**タスクごとに錠ファイルを取ります。** 前の `schedule:run` が終わる前に次が始まっても、
+同じタスクが 2 回走ることはありません。2 台が同じ `storage/` を共有しているときも同じです。
+
+| 決まり           | 内容                                                       |
+|------------------|------------------------------------------------------------|
+| 錠の置き場所     | `storage/framework/schedule/+locks/`                       |
+| 錠を握る長さ     | 「前回の時刻を読む → 判定する → 書く」の間だけ             |
+| 錠が取れないとき | `名前 は飛ばします（錠を取れませんでした）` と出て動かない |
+| ほかのタスク     | 1 つ飛ばしても、残りは動かす                               |
+
+処理そのものは錠を手放してから動かします。長い処理の間ずっと握ると、古い錠と
+見なされて外されてしまうためです。動かすと決める前に時刻を書くので、
+同じ時刻に動かすのは 1 つだけになります。
 
 ## 間隔の数え方
 
@@ -95,14 +113,14 @@ cargo artisan schedule:list
 `schedule:run` は本体のバイナリなので、アプリの中身を全部使えます。
 
 ```rust
-s.job("古い記事を消す", Every::Day, | | async {
-DB::table("posts").where_op("created_at", "<", "2020-01-01 00:00:00").delete().await?;
-Ok(())
+s.job("古い記事を消す", Every::Day, || async {
+    DB::table("posts").where_op("created_at", "<", "2020-01-01 00:00:00").delete().await?;
+    Ok(())
 });
 
-s.job("お知らせを積む", Every::Hour, | | async {
-Queue::push_raw("SendReport", "{}").await?;
-Ok(())
+s.job("お知らせを積む", Every::Hour, || async {
+    Queue::push_raw("SendReport", "{}").await?;
+    Ok(())
 });
 ```
 

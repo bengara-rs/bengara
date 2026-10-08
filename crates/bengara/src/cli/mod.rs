@@ -106,6 +106,9 @@ fn spawn_app(root: &Path, args: &[String], quiet: bool) -> Result<ExitStatus> {
     let cargo = cargo_command();
     let manifest = root.join("Cargo.toml");
     std::process::Command::new(&cargo)
+        // `serve` と同じく、プロジェクトのルートで動かす。`--manifest-path` だけだと
+        // 呼び出し元のカレントディレクトリが本体に渡ってしまう。
+        .current_dir(root)
         .arg("run")
         .arg("-q")
         .arg("--manifest-path")

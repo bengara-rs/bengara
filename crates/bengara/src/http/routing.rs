@@ -15,7 +15,8 @@ use crate::http::middleware::Middleware;
 pub(crate) struct RouteDef {
     pub(crate) method: &'static str,
     pub(crate) path: String,
-    pub(crate) name: Option<String>,
+    /// ルート名。`Arc<str>` なのは、`Request` へ渡すときに確保しないためです。
+    pub(crate) name: Option<Arc<str>>,
     pub(crate) middleware: Vec<String>,
     pub(crate) handler: Arc<dyn ErasedHandler>,
     /// 起動時に組み立てた並び。`create()` で入ります。
@@ -153,7 +154,7 @@ impl Registered {
     /// グループの中なら、外側の `name(...)` が頭に付きます。
     pub fn name(self, name: &str) -> Self {
         let full = format!("{}{name}", folded().name);
-        self.edit(move |def| def.name = Some(full))
+        self.edit(move |def| def.name = Some(full.into()))
     }
 
     /// ルートにミドルウェアを付ける。名前は `bootstrap/app.rs` の `alias` で登録したものです。
@@ -317,7 +318,7 @@ impl Routes {
                 );
             }
             if let Some(name) = &def.name {
-                if let Some(existing) = names.insert(name.clone(), def.path.clone()) {
+                if let Some(existing) = names.insert(name.to_string(), def.path.clone()) {
                     panic!(
                         "ルート名 `{name}` が2回使われています（{existing} と {}）",
                         def.path
@@ -365,7 +366,7 @@ impl Routes {
         let params = matched
             .params
             .iter()
-            .map(|(k, v)| (k.to_string(), super::request::percent_decode_strict(v)))
+            .map(|(k, v)| (k.to_string(), super::percent::decode_strict(v)))
             .collect();
         Some(Matched::Found {
             def: &self.defs[*matched.value],
@@ -450,24 +451,15 @@ fn fill(pattern: &str, params: &[(&str, &str)]) -> Result<String> {
 ///
 /// 照合は符号化されたパスで行うので、組み立てる側もそろえないと形が変わります。
 /// そろえないと `("name", "a/b")` が `/hello/a/b` になり、別のルートになってしまいます。
-/// 逃がす文字は `http/url.rs` の `encode()` と同じ規則です。
+/// 逃がす文字の規則は `http/percent.rs` にあり、`http/url.rs` の署名の組み立てと
+/// **同じ関数**を使います（以前は同じ規則を2か所に書いていました）。
 fn encode_segment(value: &str, keep_slash: bool) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        let c = *byte;
-        let keep = c.is_ascii_alphanumeric()
-            || matches!(c, b'-' | b'_' | b'.' | b'~')
-            || (keep_slash && c == b'/');
-        if keep {
-            out.push(c as char);
-        } else {
-            out.push('%');
-            out.push(HEX[(c >> 4) as usize] as char);
-            out.push(HEX[(c & 0x0f) as usize] as char);
-        }
-    }
-    out
+    let keep = if keep_slash {
+        super::percent::unreserved_or_slash
+    } else {
+        super::percent::unreserved
+    };
+    super::percent::encode(value, keep)
 }
 
 #[cfg(test)]

@@ -77,10 +77,26 @@ impl CargoToml {
 
     /// 節の中にキーがあるか。
     ///
-    /// `[dependencies] bengara = {...}` と `[dependencies.bengara]` のどちらの形でも
-    /// 見つけます。見落とすと `init` が同じキーを2回書いて、Cargo が落ちます。
+    /// 次のどの形でも見つけます。見落とすと `init` が同じキーを2回書いて、Cargo が落ちます。
+    ///
+    /// | 形 | 例 |
+    /// |---|---|
+    /// | そのまま | `bengara = "0.1"` |
+    /// | 引用符つき | `"bengara" = "0.1"` |
+    /// | ドット付き（workspace 継承） | `bengara.workspace = true` |
+    /// | 節の形 | `[dependencies.bengara]` |
     pub(crate) fn has_key(&self, section: &str, key: &str) -> bool {
-        self.value_in(section, key).is_some() || self.has_section(&format!("{section}.{key}"))
+        if self.has_section(&format!("{section}.{key}")) {
+            return true;
+        }
+        let Some(range) = self.section_range(section) else {
+            return false;
+        };
+        // `rust-version.workspace = true` のような、キーの後ろにドットが続く形も見る。
+        let dotted = format!("{key}.");
+        self.lines[range]
+            .iter()
+            .any(|line| key_of(line).is_some_and(|k| k == key || k.starts_with(&dotted)))
     }
 
     /// `path = "main.rs"` のような行があるか。
@@ -154,13 +170,15 @@ impl CargoToml {
 }
 
 /// `key = value` の `key`。コメント行と空行は `None`。
+///
+/// `"bengara" = "0.1"` のような引用符つきのキーは、引用符を外して返します。
 fn key_of(line: &str) -> Option<String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
     let (key, _) = line.split_once('=')?;
-    Some(key.trim().to_string())
+    Some(unquote(key.trim()).to_string())
 }
 
 /// `key = value` の `value`。行末のコメントと引用符を外します。
@@ -252,6 +270,26 @@ mod tests {
         let d = doc(
             "[package]\nname = \"myapp\"\n\n[dependencies.bengara]\nversion = \"0.1\"\nfeatures = [\"sqlite\"]\n",
         );
+        assert!(d.has_key("dependencies", "bengara"));
+        assert!(!d.has_key("dependencies", "serde"));
+    }
+
+    #[test]
+    fn workspace継承のキーも見つける() {
+        // 見落とすと init が rust-version を2回書き、cargo が動かなくなる。
+        let d = doc("[package]\nname = \"myapp\"\nrust-version.workspace = true\n");
+        assert!(d.has_key("package", "rust-version"));
+        assert!(!d.has_key("package", "default-run"));
+
+        let d = doc("[dependencies]\nbengara.workspace = true\n");
+        assert!(d.has_key("dependencies", "bengara"));
+        // 前方一致だけで判断しない（`bengara-build` は別のキー）。
+        assert!(!d.has_key("dependencies", "bengara-build"));
+    }
+
+    #[test]
+    fn 引用符つきのキーも見つける() {
+        let d = doc("[dependencies]\n\"bengara\" = \"0.1\"\n");
         assert!(d.has_key("dependencies", "bengara"));
         assert!(!d.has_key("dependencies", "serde"));
     }

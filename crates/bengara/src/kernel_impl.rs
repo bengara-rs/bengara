@@ -254,21 +254,25 @@ fn print_routes(app: &Application) {
         println!("ルートは1本も登録されていません。routes/web.rs を確かめてください。");
         return;
     }
+    // 桁は**端末での幅**でそろえる。文字数で数えると、日本語のルート名で崩れます
+    // （`about` や `schedule:list` と同じ数え方にそろえてあります）。
+    use crate::support::text;
+
     let method_width = routes
         .iter()
-        .map(|r| r.method.len())
+        .map(|r| text::width(r.method))
         .max()
         .unwrap_or(6)
         .max(6);
     let path_width = routes
         .iter()
-        .map(|r| r.path.len())
+        .map(|r| text::width(&r.path))
         .max()
         .unwrap_or(4)
         .max(4);
     let name_width = routes
         .iter()
-        .map(|r| r.name.as_deref().unwrap_or("").len())
+        .map(|r| text::width(r.name.as_deref().unwrap_or("")))
         .max()
         .unwrap_or(4)
         .max(4);
@@ -276,26 +280,34 @@ fn print_routes(app: &Application) {
     let any_middleware = routes.iter().any(|r| !r.middleware.is_empty());
     if any_middleware {
         println!(
-            "{:<method_width$}  {:<path_width$}  {:<name_width$}  MIDDLEWARE",
-            "METHOD", "URI", "NAME"
+            "{}  {}  {}  MIDDLEWARE",
+            text::pad("METHOD", method_width),
+            text::pad("URI", path_width),
+            text::pad("NAME", name_width)
         );
     } else {
-        println!("{:<method_width$}  {:<path_width$}  NAME", "METHOD", "URI");
+        println!(
+            "{}  {}  NAME",
+            text::pad("METHOD", method_width),
+            text::pad("URI", path_width)
+        );
     }
     for route in routes {
         let name = route.name.as_deref().unwrap_or("");
         if any_middleware {
             println!(
-                "{:<method_width$}  {:<path_width$}  {:<name_width$}  {}",
-                route.method,
-                route.path,
-                name,
+                "{}  {}  {}  {}",
+                text::pad(route.method, method_width),
+                text::pad(&route.path, path_width),
+                text::pad(name, name_width),
                 route.middleware.join(", ")
             );
         } else {
             println!(
-                "{:<method_width$}  {:<path_width$}  {}",
-                route.method, route.path, name
+                "{}  {}  {}",
+                text::pad(route.method, method_width),
+                text::pad(&route.path, path_width),
+                name
             );
         }
     }

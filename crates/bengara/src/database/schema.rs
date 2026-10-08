@@ -15,11 +15,28 @@
 use super::grammar::{self, Driver};
 use super::value::Value;
 
-/// 列の種類。ドライバごとの型名はここから決めます。
+/// 列の種類。
+///
+/// 自動採番の主キー（`Id`）だけを分けてあります。`Id` は型名1つで
+/// `primary key` まで全部を書くので、ほかの型と同じ道を通れません。
+/// 分けておくと、[`type_sql`] に `Id` の腕が要らなくなります。
 #[derive(Debug, Clone, PartialEq)]
 enum ColumnType {
     /// 自動採番の主キー。
     Id,
+    /// それ以外の型。
+    Plain(PlainType),
+}
+
+impl From<PlainType> for ColumnType {
+    fn from(kind: PlainType) -> Self {
+        ColumnType::Plain(kind)
+    }
+}
+
+/// `Id` を除いた列の種類。ドライバごとの型名はここから決めます。
+#[derive(Debug, Clone, PartialEq)]
+enum PlainType {
     Integer,
     BigInteger,
     /// 長さ付きの文字列。
@@ -107,10 +124,10 @@ impl Blueprint {
         }
     }
 
-    fn push(&mut self, name: &str, kind: ColumnType) -> ColumnDefinition<'_> {
+    fn push(&mut self, name: &str, kind: impl Into<ColumnType>) -> ColumnDefinition<'_> {
         self.columns.push(Column {
             name: name.to_string(),
-            kind,
+            kind: kind.into(),
             nullable: false,
             default: None,
             unique: false,
@@ -136,87 +153,87 @@ impl Blueprint {
 
     /// 整数。
     pub fn integer(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Integer)
+        self.push(name, PlainType::Integer)
     }
 
     /// 大きい整数。
     pub fn big_integer(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::BigInteger)
+        self.push(name, PlainType::BigInteger)
     }
 
     /// ほかの表を指す整数の列（`post_id` など）。
     pub fn foreign_id(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::BigInteger)
+        self.push(name, PlainType::BigInteger)
     }
 
     /// 文字列（255 文字）。
     pub fn string(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Str(255))
+        self.push(name, PlainType::Str(255))
     }
 
     /// 長さを決めた文字列。
     pub fn string_with(&mut self, name: &str, length: u32) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Str(length.max(1)))
+        self.push(name, PlainType::Str(length.max(1)))
     }
 
     /// 長い文字列。
     pub fn text(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Text)
+        self.push(name, PlainType::Text)
     }
 
     /// 真偽。
     pub fn boolean(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Boolean)
+        self.push(name, PlainType::Boolean)
     }
 
     /// 小数。
     pub fn float(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Float)
+        self.push(name, PlainType::Float)
     }
 
     /// 倍精度の小数。
     pub fn double(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Double)
+        self.push(name, PlainType::Double)
     }
 
     /// 桁を決めた数値。
     pub fn decimal(&mut self, name: &str, total: u8, places: u8) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Decimal(total, places))
+        self.push(name, PlainType::Decimal(total, places))
     }
 
     /// 日付。
     pub fn date(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Date)
+        self.push(name, PlainType::Date)
     }
 
     /// 日付と時刻。
     pub fn date_time(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::DateTime)
+        self.push(name, PlainType::DateTime)
     }
 
     /// 日付と時刻（Laravel の `timestamp`）。
     pub fn timestamp(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::DateTime)
+        self.push(name, PlainType::DateTime)
     }
 
     /// JSON。SQLite では文字列として入ります。
     pub fn json(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Json)
+        self.push(name, PlainType::Json)
     }
 
     /// バイト列。
     pub fn binary(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Binary)
+        self.push(name, PlainType::Binary)
     }
 
     /// UUID。
     pub fn uuid(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Uuid)
+        self.push(name, PlainType::Uuid)
     }
 
     /// SQL の型名をそのまま書く。
     pub fn raw_column(&mut self, name: &str, type_sql: &str) -> ColumnDefinition<'_> {
-        self.push(name, ColumnType::Raw(type_sql.to_string()))
+        self.push(name, PlainType::Raw(type_sql.to_string()))
     }
 
     /// `created_at` と `updated_at` を足す（どちらも null 可）。
@@ -380,31 +397,35 @@ impl Blueprint {
         let mut sql = grammar::quote(driver, &column.name);
         sql.push(' ');
 
-        if column.kind == ColumnType::Id {
-            // 自動採番の主キーは型名1つで全部書くので、ほかの指定を置く場所がない。
-            // 黙って捨てると気づけないので警告を出す。
-            // ここは同期の組み立てで `Result` を返せず、エラーにするとパニックしか
-            // 残らないため、警告にしてあります（`index()` は別の文になるので効きます）。
-            if column.nullable || column.default.is_some() || column.unique {
-                tracing::warn!(
-                    "{}.{} は自動採番の主キーなので、nullable / default / unique は無視します",
-                    self.table,
-                    column.name
-                );
+        // 自動採番の主キーだけは、型名1つで `primary key` まで全部書く。
+        // `auto_increment_sql` を呼ぶのはここだけです。
+        let plain = match &column.kind {
+            ColumnType::Id => {
+                // ほかの指定を置く場所がない。黙って捨てると気づけないので警告を出す。
+                // ここは同期の組み立てで `Result` を返せず、エラーにするとパニックしか
+                // 残らないため、警告にしてあります（`index()` は別の文になるので効きます）。
+                if column.nullable || column.default.is_some() || column.unique {
+                    tracing::warn!(
+                        "{}.{} は自動採番の主キーなので、nullable / default / unique は無視します",
+                        self.table,
+                        column.name
+                    );
+                }
+                if self.mode == Mode::Alter {
+                    tracing::warn!(
+                        "{}.{} に id() を使っています。alter table add column では \
+                         自動採番の主キーを足せないので、この SQL は流れません",
+                        self.table,
+                        column.name
+                    );
+                }
+                sql.push_str(auto_increment_sql(driver));
+                return sql;
             }
-            if self.mode == Mode::Alter {
-                tracing::warn!(
-                    "{}.{} に id() を使っています。alter table add column では \
-                     自動採番の主キーを足せないので、この SQL は流れません",
-                    self.table,
-                    column.name
-                );
-            }
-            sql.push_str(auto_increment_sql(driver));
-            return sql;
-        }
+            ColumnType::Plain(plain) => plain,
+        };
 
-        sql.push_str(&type_sql(driver, &column.kind));
+        sql.push_str(&type_sql(driver, plain));
         if column.primary {
             sql.push_str(" primary key");
         }
@@ -426,6 +447,20 @@ impl Blueprint {
 
     fn foreign_sql(&self, foreign: &ForeignKey) -> String {
         let driver = self.driver;
+        if foreign.on.is_empty() {
+            // 指す先の表が決まっていないので、流せない SQL になる。
+            // ここは同期の組み立てで `Result` を返せないため、警告にしてあります
+            // （`column_sql` が id() の矛盾を知らせるのと同じ方針）。
+            //
+            // 組み立てからは外しません。外すと、外部キーだけが黙って消えた表ができます。
+            // `references "" (...)` のまま流して、実行のときに失敗させます。
+            tracing::warn!(
+                "{}.{} の foreign() に .on(表名) がありません。\
+                 指す先が決まらないので、この文は実行のときに失敗します",
+                self.table,
+                foreign.column
+            );
+        }
         let mut sql = format!(
             "foreign key ({}) references {} ({})",
             grammar::quote(driver, &foreign.column),
@@ -649,32 +684,31 @@ fn auto_increment_sql(driver: Driver) -> &'static str {
 }
 
 /// 列の型名。
-fn type_sql(driver: Driver, kind: &ColumnType) -> String {
+fn type_sql(driver: Driver, kind: &PlainType) -> String {
     match (driver, kind) {
-        (_, ColumnType::Raw(sql)) => sql.clone(),
-        (_, ColumnType::Id) => auto_increment_sql(driver).to_string(),
-        (_, ColumnType::Integer) => "integer".into(),
-        (Driver::Sqlite, ColumnType::BigInteger) => "integer".into(),
-        (_, ColumnType::BigInteger) => "bigint".into(),
-        (_, ColumnType::Str(length)) => format!("varchar({length})"),
-        (_, ColumnType::Text) => "text".into(),
-        (Driver::Sqlite, ColumnType::Boolean) => "boolean".into(),
-        (Driver::MySql, ColumnType::Boolean) => "tinyint(1)".into(),
-        (Driver::Postgres, ColumnType::Boolean) => "boolean".into(),
-        (Driver::Sqlite, ColumnType::Float) => "real".into(),
-        (Driver::Sqlite, ColumnType::Double) => "real".into(),
-        (_, ColumnType::Float) => "float".into(),
-        (_, ColumnType::Double) => "double precision".into(),
-        (_, ColumnType::Decimal(total, places)) => format!("numeric({total}, {places})"),
-        (_, ColumnType::Date) => "date".into(),
-        (Driver::Postgres, ColumnType::DateTime) => "timestamp".into(),
-        (_, ColumnType::DateTime) => "datetime".into(),
-        (Driver::Sqlite, ColumnType::Json) => "text".into(),
-        (_, ColumnType::Json) => "json".into(),
-        (Driver::Sqlite, ColumnType::Binary) => "blob".into(),
-        (Driver::MySql, ColumnType::Binary) => "blob".into(),
-        (Driver::Postgres, ColumnType::Binary) => "bytea".into(),
-        (_, ColumnType::Uuid) => "varchar(36)".into(),
+        (_, PlainType::Raw(sql)) => sql.clone(),
+        (_, PlainType::Integer) => "integer".into(),
+        (Driver::Sqlite, PlainType::BigInteger) => "integer".into(),
+        (_, PlainType::BigInteger) => "bigint".into(),
+        (_, PlainType::Str(length)) => format!("varchar({length})"),
+        (_, PlainType::Text) => "text".into(),
+        (Driver::Sqlite, PlainType::Boolean) => "boolean".into(),
+        (Driver::MySql, PlainType::Boolean) => "tinyint(1)".into(),
+        (Driver::Postgres, PlainType::Boolean) => "boolean".into(),
+        (Driver::Sqlite, PlainType::Float) => "real".into(),
+        (Driver::Sqlite, PlainType::Double) => "real".into(),
+        (_, PlainType::Float) => "float".into(),
+        (_, PlainType::Double) => "double precision".into(),
+        (_, PlainType::Decimal(total, places)) => format!("numeric({total}, {places})"),
+        (_, PlainType::Date) => "date".into(),
+        (Driver::Postgres, PlainType::DateTime) => "timestamp".into(),
+        (_, PlainType::DateTime) => "datetime".into(),
+        (Driver::Sqlite, PlainType::Json) => "text".into(),
+        (_, PlainType::Json) => "json".into(),
+        (Driver::Sqlite, PlainType::Binary) => "blob".into(),
+        (Driver::MySql, PlainType::Binary) => "blob".into(),
+        (Driver::Postgres, PlainType::Binary) => "bytea".into(),
+        (_, PlainType::Uuid) => "varchar(36)".into(),
     }
 }
 
@@ -770,6 +804,38 @@ mod tests {
         });
         assert!(schema.to_sql()[0]
             .contains("foreign key (\"post_id\") references \"posts\" (\"id\") on delete cascade"));
+    }
+
+    #[test]
+    fn on_を書き忘れた外部キーは指す先が空になる() {
+        // 流せない SQL になるので、組み立てのときに警告を出している。
+        // 警告そのものは tracing に出るので、ここでは形だけを確かめる。
+        let mut schema = sqlite();
+        schema.create("comments", |t| {
+            t.id();
+            t.foreign_id("post_id");
+            t.foreign("post_id");
+        });
+        assert!(schema.to_sql()[0].contains("references \"\" (\"id\")"));
+    }
+
+    #[test]
+    fn 自動採番の主キーは型名1つで全部書く() {
+        // `type_sql` には Id の腕が無い。書くのは `column_sql` の1箇所だけ。
+        let mut schema = sqlite();
+        schema.create("posts", |t| {
+            t.id();
+            t.increments("other");
+        });
+        let sql = &schema.to_sql()[0];
+        assert!(
+            sql.contains("\"id\" integer primary key autoincrement not null"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("\"other\" integer primary key autoincrement not null"),
+            "{sql}"
+        );
     }
 
     #[test]

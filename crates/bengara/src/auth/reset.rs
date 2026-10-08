@@ -33,23 +33,34 @@ impl PasswordReset {
     ///
     /// 表に入れるのはハッシュです。表が漏れても、そのままでは使えません。
     /// 同じメールアドレスのトークンが残っていたら上書きします（1 アドレス 1 本）。
+    ///
+    /// **消すのと入れるのを 1 つのトランザクションで囲みます。** 別の文にすると、
+    /// 同じアドレスで同時に 2 本来たときに主キー違反で 500 になります。
+    /// 登録済みのアドレスだけが 500 になりえるので、
+    /// 「登録の有無を漏らさない」という配慮が崩れます。
     pub async fn create(email: &str) -> Result<String> {
         let token = crypto::random_token();
         let hashed = crypto::to_hex(&crypto::sha256(token.as_bytes()));
 
         // 入れ替えなので、先に消してから入れる。
-        DB::table(TABLE).where_("email", email).delete().await?;
-        DB::table(TABLE)
+        let tx = DB::begin().await?;
+        tx.table(TABLE).where_("email", email).delete().await?;
+        tx.table(TABLE)
             .insert(&[
                 ("email", Value::Text(email.to_string())),
                 ("token", Value::Text(hashed)),
                 ("created_at", Value::Text(crate::database::now())),
             ])
             .await?;
+        tx.commit().await?;
         Ok(token)
     }
 
     /// 照合して、合っていれば**その場で消す**。1 回しか使えません。
+    ///
+    /// **パスワードの再設定は、必ずこれを通してください。** 再設定の正しい入口は
+    /// これだけです。[`verify`](Self::verify) で真を見てから書き換えると、
+    /// 同じリンクを 2 回使えます。
     ///
     /// `verify` と `consume` を分けて呼ぶと、その間に別のリクエストが入れば
     /// 同じトークンを 2 回使えます。ここでは**条件つきの `delete` 1 文**にして、
@@ -79,14 +90,17 @@ impl PasswordReset {
         Ok(removed > 0)
     }
 
-    /// トークンが合っているか。期限切れ・不一致・記録なしは、すべて偽。
+    /// **照合だけです。再設定には使わないでください。**
     ///
+    /// トークンは消しません。ここで真を見てからパスワードを書き換えるまでの間に
+    /// 別のリクエストが入れば、**同じトークンが 2 回使えます。**
+    /// 再設定の正しい入口は [`consume_if_valid`](Self::consume_if_valid) だけです。
+    ///
+    /// 使い道は「リンクを開いた時点で入力欄を出してよいか」の下調べです。
+    /// 送信を受け取る側では、必ず `consume_if_valid` で判定し直してください。
+    ///
+    /// 期限切れ・不一致・記録なしは、すべて偽。
     /// **理由は区別しません。** どれなのかが分かると、総当たりの手がかりになります。
-    ///
-    /// **照合だけです。トークンは消しません。** 1 回限りにするには
-    /// [`consume_if_valid`](Self::consume_if_valid) を使ってください。
-    /// ここで真を見てから `consume` を呼ぶまでの間に別のリクエストが入れば、
-    /// 同じトークンが 2 回使えます。
     pub async fn verify(email: &str, token: &str) -> Result<bool> {
         let Some(row) = DB::table(TABLE).where_("email", email).first().await? else {
             // 記録が無いときも、合っているときと同じだけ計算してから帰る。
@@ -108,10 +122,13 @@ impl PasswordReset {
         ))
     }
 
-    /// 使い終わったトークンを消す。
+    /// 使い終わったトークンを消す。**照合はしません。**
     ///
-    /// 照合と消すのをまとめたいときは [`consume_if_valid`](Self::consume_if_valid) を
-    /// 使ってください。
+    /// 再設定の正しい入口は [`consume_if_valid`](Self::consume_if_valid) だけです。
+    /// `verify` と `consume` を並べる形にはしないでください
+    /// （その間に別のリクエストが入れば、同じトークンが 2 回使えます）。
+    ///
+    /// 使い道は「再設定をやめた」ときの片付けです。
     pub async fn consume(email: &str) -> Result<()> {
         DB::table(TABLE).where_("email", email).delete().await?;
         Ok(())
@@ -263,6 +280,25 @@ mod tests {
             assert!(PasswordReset::consume_if_valid(email, &token)
                 .await
                 .unwrap());
+        }
+
+        #[tokio::test]
+        async fn 同じアドレスで何度作っても一本だけ残る() {
+            let _db = setup().await;
+            let email = "twice@example.com";
+
+            // `delete` → `insert` をトランザクションで囲んでいるので、
+            // 主キー違反にならず、最後の 1 本だけが残る。
+            let first = PasswordReset::create(email).await.unwrap();
+            let second = PasswordReset::create(email).await.unwrap();
+            assert_ne!(first, second, "トークンは毎回変わる");
+
+            assert!(!PasswordReset::verify(email, &first).await.unwrap(), "古い");
+            assert!(PasswordReset::verify(email, &second).await.unwrap());
+
+            // 残っているのは 1 本だけ。
+            let rows = DB::table(TABLE).where_("email", email).get().await.unwrap();
+            assert_eq!(rows.len(), 1);
         }
 
         #[tokio::test]

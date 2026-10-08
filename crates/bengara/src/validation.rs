@@ -122,9 +122,8 @@ impl ValidationErrors {
 impl std::fmt::Display for ValidationErrors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.first() {
-            Some(first) if self.errors.len() == 1 && self.get_first_count() == 1 => {
-                write!(f, "{first}")
-            }
+            // 1 件だけなら、そのまま出す。
+            Some(first) if self.total() == 1 => write!(f, "{first}"),
             Some(first) => write!(f, "{first}（ほか {} 件）", self.total() - 1),
             None => write!(f, "入力に誤りがあります。"),
         }
@@ -132,10 +131,6 @@ impl std::fmt::Display for ValidationErrors {
 }
 
 impl ValidationErrors {
-    fn get_first_count(&self) -> usize {
-        self.errors.values().next().map(Vec::len).unwrap_or(0)
-    }
-
     /// 理由の総数（項目ごとではなく1件ずつ数える）。
     pub fn total(&self) -> usize {
         self.errors.values().map(Vec::len).sum()
@@ -167,8 +162,12 @@ enum Rule {
     Different(String),
     StartsWith(String),
     EndsWith(String),
-    Regexless(String),
 }
+
+/// 使える規則の名前。知らない規則を断るときの案内に出します。
+const RULE_NAMES: &str = "required, nullable, integer (int), numeric, boolean (bool), email, \
+                          url, alpha, alpha_num, alpha_dash, min, max, size, between, in, \
+                          confirmed, same, different, starts_with, ends_with";
 
 impl Rule {
     /// `max:255` のような1語を規則にする。
@@ -234,7 +233,14 @@ impl Rule {
             "different" => Rule::Different(text("different")?),
             "starts_with" => Rule::StartsWith(text("starts_with")?),
             "ends_with" => Rule::EndsWith(text("ends_with")?),
-            other => Rule::Regexless(other.to_string()),
+            // 知らない規則は**書き間違い**です。利用者に見せる 422 にはしません。
+            // `min`（引数忘れ）と同じ扱いで、作った人へ 500 で知らせます。
+            // 422 にすると、内部の規則名がそのまま画面に出ます。
+            other => {
+                return Err(Error::msg(format!(
+                    "規則 `{other}` は bengara にありません。使えるのは {RULE_NAMES} です"
+                )))
+            }
         })
     }
 }
@@ -328,7 +334,9 @@ fn check(
             }
         }
         Rule::Numeric => {
-            if value.parse::<f64>().is_err() {
+            // **有限の数として読めるか**で見る。`is_err()` だけだと
+            // `inf` / `NaN` / `1e400` が通り、`max:1000` も素通りします。
+            if !value.parse::<f64>().is_ok_and(f64::is_finite) {
                 errors.add(field, format!("{field} は数値で入力してください。"));
             }
         }
@@ -487,17 +495,22 @@ fn check(
                 errors.add(field, format!("{field} は {suffix} で終えてください。"));
             }
         }
-
-        // 知らない規則は、黙って通さずに作った人へ知らせる。
-        Rule::Regexless(name) => {
-            errors.add(field, format!("規則 `{name}` は bengara にありません。"));
-        }
     }
 }
 
+/// `min` / `max` / `between` が何と比べるか。
 enum Measure {
+    /// 値そのもの。
     Number(f64),
+    /// 文字数。
     Length(usize),
+    /// どちらでも測れない。**何も言いません。**
+    ///
+    /// `integer` / `numeric` が付いているのに数値として読めない場合です。
+    /// 文字数へ逃がすと、`("n", "integer|min:5")` に `abc` を送ったときに
+    /// 「整数で入力してください」と「3 文字以上で入力してください」の 2 件が出ます。
+    /// 後者は意図と食い違うので、数値の規則だけに言わせます。
+    Invalid,
 }
 
 /// 値で測るか、文字数で測るかを決める。
@@ -505,18 +518,19 @@ enum Measure {
 /// `numeric` か `integer` が付いているときだけ値で測ります（Laravel と同じ）。
 /// 付いていない項目を値で測ると、`password=9` が `min:8` を通り、
 /// `password=12345678` が `max:72` で落ちます。
+///
+/// 数値の規則が付いているのに読めない値のときは [`Measure::Invalid`] です。
+/// **文字数へ逃がしません。**
 fn measure(value: &str, rules: &[Rule]) -> Measure {
     let by_value = rules
         .iter()
         .any(|rule| matches!(rule, Rule::Numeric | Rule::Integer));
-    let number = if by_value {
-        value.parse::<f64>().ok().filter(|n| n.is_finite())
-    } else {
-        None
-    };
-    match number {
+    if !by_value {
+        return Measure::Length(value.chars().count());
+    }
+    match value.parse::<f64>().ok().filter(|n| n.is_finite()) {
         Some(n) => Measure::Number(n),
-        None => Measure::Length(value.chars().count()),
+        None => Measure::Invalid,
     }
 }
 
@@ -732,10 +746,49 @@ mod tests {
 
     #[test]
     fn 複数の理由がまとまる() {
-        let e = errors_of(&input(&[("n", "abc")]), &[("n", "integer|min:5")]);
-        assert_eq!(e.get("n").len(), 2, "整数でない、かつ短い");
+        let i = input(&[("e", "これはメールではない"), ("e_x", "")]);
+        let e = errors_of(&i, &[("e", "email|starts_with:zz")]);
+        assert_eq!(
+            e.get("e").len(),
+            2,
+            "メールの形でない、かつ zz で始まらない"
+        );
         assert_eq!(e.len(), 1, "項目は1つ");
         assert_eq!(e.total(), 2);
+    }
+
+    #[test]
+    fn 数値として読めなければ長さの規則は何も言わない() {
+        // 以前は「整数で入力してください」と「5 文字以上で入力してください」の
+        // 2 件が出ていた。後者は文字数の話で、`integer|min:5` の意図と食い違う。
+        let e = errors_of(&input(&[("n", "abc")]), &[("n", "integer|min:5")]);
+        assert_eq!(e.get("n").len(), 1, "{:?}", e.get("n"));
+        assert!(e.get("n")[0].contains("整数で入力してください"));
+
+        // `max` と `between` も同じ。
+        let e = errors_of(
+            &input(&[("n", "abc")]),
+            &[("n", "numeric|max:5|between:1,3")],
+        );
+        assert_eq!(e.get("n").len(), 1, "{:?}", e.get("n"));
+        assert!(e.get("n")[0].contains("数値で入力してください"));
+    }
+
+    #[test]
+    fn numericは無限とnanを通さない() {
+        // `parse::<f64>()` は `inf` / `NaN` / `1e400` を読めてしまう。
+        // 通すと、そのあと文字数比較に落ちて `max:1000` まで素通りしていた。
+        for bad in ["inf", "-inf", "infinity", "NaN", "nan", "1e400", "-1e400"] {
+            let e = errors_of(&input(&[("n", bad)]), &[("n", "numeric|min:0|max:1000")]);
+            assert!(!e.is_empty(), "`{bad}` は弾くはず");
+            assert!(
+                e.get("n")[0].contains("数値で入力してください"),
+                "`{bad}`: {:?}",
+                e.get("n")
+            );
+        }
+        // 普通の数は通る。
+        assert!(errors_of(&input(&[("n", "1e3")]), &[("n", "numeric|max:1000")]).is_empty());
     }
 
     #[test]
@@ -746,9 +799,20 @@ mod tests {
     }
 
     #[test]
-    fn 知らない規則は黙って通さない() {
-        let e = errors_of(&input(&[("s", "x")]), &[("s", "unknown_rule")]);
-        assert!(e.get("s")[0].contains("bengara にありません"));
+    fn 知らない規則は開発者向けのエラーになる() {
+        // 書き間違いなので、利用者向けの 422 にはしない（`min` の引数忘れと同じ扱い）。
+        let i = input(&[("s", "x")]);
+        let error = validate(&i, &[("s", "requiredd")]).unwrap_err();
+        assert!(
+            !matches!(error, Error::Validation(_)),
+            "422 にはしない: {error}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("`requiredd` は bengara にありません"),
+            "{text}"
+        );
+        assert!(text.contains("starts_with"), "使える規則を並べる: {text}");
     }
 
     #[test]
@@ -797,5 +861,12 @@ mod tests {
         assert_eq!(e.to_string(), "A が駄目です。");
         e.add("b", "B も駄目です。");
         assert_eq!(e.to_string(), "A が駄目です。（ほか 1 件）");
+
+        // 同じ項目に 2 件でも「ほか 1 件」になる（総数で数える）。
+        let mut e = ValidationErrors::default();
+        e.add("a", "1 つめ。");
+        e.add("a", "2 つめ。");
+        assert_eq!(e.len(), 1, "項目は 1 つ");
+        assert_eq!(e.to_string(), "1 つめ。（ほか 1 件）");
     }
 }

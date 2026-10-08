@@ -219,7 +219,16 @@ macro_rules! from_value_int {
 
 // `#[derive(Model)]` が主キーに許す整数は、ここに実装があるものと同じにそろえます。
 // そろっていないと、主キーの型を変えたときに読みにくいエラーが出ます。
-from_value_int!(i8, i16, i32, isize, u8, u16, usize);
+from_value_int!(i8, i16, i32, isize, u8, u16, u32, usize);
+
+/// `FromValue` を実装している整数の型の名前。
+///
+/// `bengara-macros` の `INTEGER_TYPES` と同じ並びにそろえます。
+/// 片方にしか無い型を主キーにすると、コンパイルエラーになるためです。
+#[cfg(test)]
+const INTEGER_TYPES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize",
+];
 
 impl FromValue for u64 {
     fn from_value(value: &Value) -> Result<Self> {
@@ -246,6 +255,17 @@ impl FromValue for f64 {
                 .map_err(|_| Error::msg(format!("`{v}` を小数として読めません"))),
             other => mismatch(other, "小数"),
         }
+    }
+}
+
+impl FromValue for f32 {
+    fn from_value(value: &Value) -> Result<Self> {
+        // `From<f32> for Value` が `f64` に広げるので、読み戻しも `f64` 経由にする。
+        let v = f64::from_value(value)?;
+        if v.is_finite() && (v < f32::MIN as f64 || v > f32::MAX as f64) {
+            return Err(Error::msg(format!("{v} は f32 に収まりません")));
+        }
+        Ok(v as f32)
     }
 }
 
@@ -455,7 +475,43 @@ mod tests {
         assert_eq!(isize::from_value(&Value::Int(7)).unwrap(), 7isize);
         assert_eq!(u8::from_value(&Value::Int(7)).unwrap(), 7u8);
         assert_eq!(u16::from_value(&Value::Int(7)).unwrap(), 7u16);
+        assert_eq!(u32::from_value(&Value::Int(7)).unwrap(), 7u32);
         assert_eq!(usize::from_value(&Value::Int(7)).unwrap(), 7usize);
+    }
+
+    #[test]
+    fn 整数の型の一覧はマクロ側とそろっている() {
+        // `bengara-macros` の `INTEGER_TYPES` と同じ並び。
+        // 片方にしか無い型を主キーにすると、コンパイルエラーになる。
+        assert_eq!(
+            INTEGER_TYPES,
+            &["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize"]
+        );
+        // 一覧に挙げた型には、ここに実装がある（無ければコンパイルできない）。
+        assert_eq!(i8::from_value(&Value::Int(1)).unwrap(), 1i8);
+        assert_eq!(i16::from_value(&Value::Int(1)).unwrap(), 1i16);
+        assert_eq!(i32::from_value(&Value::Int(1)).unwrap(), 1i32);
+        assert_eq!(i64::from_value(&Value::Int(1)).unwrap(), 1i64);
+        assert_eq!(isize::from_value(&Value::Int(1)).unwrap(), 1isize);
+        assert_eq!(u8::from_value(&Value::Int(1)).unwrap(), 1u8);
+        assert_eq!(u16::from_value(&Value::Int(1)).unwrap(), 1u16);
+        assert_eq!(u32::from_value(&Value::Int(1)).unwrap(), 1u32);
+        assert_eq!(u64::from_value(&Value::Int(1)).unwrap(), 1u64);
+        assert_eq!(usize::from_value(&Value::Int(1)).unwrap(), 1usize);
+    }
+
+    #[test]
+    fn f32も読める() {
+        // `From<f32> for Value` があるので、読み戻しもできるようにそろえる。
+        assert_eq!(f32::from_value(&Value::from(1.5f32)).unwrap(), 1.5f32);
+        assert_eq!(f32::from_value(&Value::Int(3)).unwrap(), 3.0f32);
+        assert_eq!(f32::from_value(&Value::Text("2.5".into())).unwrap(), 2.5f32);
+
+        // 入らない値は型の名前を添えて断る。
+        let error = f32::from_value(&Value::Float(1e40))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("f32"), "{error}");
     }
 
     #[test]

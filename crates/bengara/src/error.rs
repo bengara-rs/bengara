@@ -138,14 +138,25 @@ pub(crate) fn reason_phrase(status: u16) -> &'static str {
         308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
+        402 => "Payment Required",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        415 => "Unsupported Media Type",
         419 => "Page Expired",
         422 => "Unprocessable Content",
+        428 => "Precondition Required",
         429 => "Too Many Requests",
+        451 => "Unavailable For Legal Reasons",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Unknown",
     }
 }
@@ -154,6 +165,29 @@ pub(crate) fn reason_phrase(status: u16) -> &'static str {
 mod tests {
     use super::*;
     use std::error::Error as _;
+
+    #[test]
+    fn よく使うステータスには説明文がある() {
+        // `abort(409)` などが「HTTP 409 Unknown」にならないことを確かめる。
+        for status in [
+            200, 201, 204, 301, 302, 303, 304, 307, 308, 400, 401, 402, 403, 404, 405, 406, 408,
+            409, 410, 415, 419, 422, 428, 429, 451, 500, 501, 502, 503, 504,
+        ] {
+            assert_ne!(reason_phrase(status), "Unknown", "{status}");
+        }
+        assert_eq!(reason_phrase(409), "Conflict");
+        assert_eq!(reason_phrase(504), "Gateway Timeout");
+        // 知らないものは Unknown のまま。
+        assert_eq!(reason_phrase(599), "Unknown");
+    }
+
+    #[test]
+    fn メッセージの無いhttpエラーは説明文を出す() {
+        let error = Error::http(409, "");
+        assert_eq!(error.status(), 409);
+        assert_eq!(error.public_message(), "Conflict");
+        assert_eq!(error.to_string(), "HTTP 409 Conflict");
+    }
 
     #[test]
     fn 包んだエラーは原因をたどれる() {

@@ -12,6 +12,9 @@
 //! | 3 | 実行ファイルの隣 | する |
 //! | 4 | カレントディレクトリ | する |
 //!
+//! 1 は目印（`.env` / `storage/`）を確かめませんが、**その場所があるかは確かめます**。
+//! 打ち間違いを通すと、無い場所の下に `storage/` を作り始めてしまうためです。
+//!
 //! 2 だけ目印を確かめません。`init` は `.env` も `storage/` も無い状態で動くためです。
 //! この変数は子プロセスに引き継がれるので、`cargo run` から起動した子プロセスも
 //! cargo のプロジェクトを基準にします。別の場所を見せたいときは `APP_BASE_PATH` を使ってください。
@@ -171,6 +174,11 @@ pub(crate) fn guard() -> Result<()> {
     if let Some(reason) = &resolved.bad_explicit {
         return Err(Error::msg(reason.clone()));
     }
+    // 絶対パスでも、その場所が無ければ断る。打ち間違いをそのまま採用すると、
+    // 無い場所の下に storage/ を作り始めて原因が分からなくなる。
+    if resolved.source == Source::Explicit && !resolved.path.is_dir() {
+        return Err(Error::msg(explicit_missing_message(&resolved.path)));
+    }
     if resolved.source != Source::Unknown {
         return Ok(());
     }
@@ -192,6 +200,18 @@ pub(crate) fn guard() -> Result<()> {
          \x20 1. 実行ファイルの隣に .env を置き、cargo artisan storage:init を実行する\n\
          \x20 2. 環境変数 APP_BASE_PATH に絶対パスを指定する"
     )))
+}
+
+/// `APP_BASE_PATH` の場所が無いときのエラー文。
+fn explicit_missing_message(path: &Path) -> String {
+    format!(
+        "APP_BASE_PATH の場所がありません（いまの値: {}）。\n\
+         直し方（どれか）:\n\
+         \x20 1. 打ち間違いが無いか確かめる\n\
+         \x20 2. そのディレクトリを作る\n\
+         \x20 3. APP_BASE_PATH を外し、実行ファイルの隣を基準にする",
+        path.display()
+    )
 }
 
 /// `storage/` の場所を確かめる。
@@ -292,6 +312,20 @@ mod tests {
         // このテストでは APP_STORAGE_PATH を指定していない。
         assert_eq!(storage_root(), app_path("storage"));
         assert_eq!(storage_path("logs"), app_path("storage").join("logs"));
+    }
+
+    #[test]
+    fn 無いapp_base_pathは直し方を添えて断る() {
+        // 実際の環境変数は触らずに、エラー文だけを確かめる（resolve は1回しか走らない）。
+        let missing = std::env::temp_dir().join("bengara_paths_absent");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(!missing.is_dir());
+
+        let text = explicit_missing_message(&missing);
+        assert!(text.contains("APP_BASE_PATH"), "{text}");
+        assert!(text.contains("場所がありません"), "{text}");
+        assert!(text.contains("直し方"), "{text}");
+        assert!(text.contains(&missing.display().to_string()), "{text}");
     }
 
     #[test]

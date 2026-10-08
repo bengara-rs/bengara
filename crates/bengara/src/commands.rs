@@ -138,15 +138,52 @@ fn build_schedule(hooks: Hooks) -> crate::schedule::Schedule {
 /// Ctrl+C を受け取ったら真になる札。
 ///
 /// `queue:work` は、いま処理中のジョブを終えてから止まります。
+///
+/// **2 回目以降も受け取ります。** 1 回待って終わると、2 回目が握り潰されて
+/// しまい、ジョブが固まったときに `kill` が必要になります。
+/// 2 回目は待たずに落とします（終了コードは 130。Ctrl+C の慣わしです）。
 fn stop_signal() -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let handle = stop.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            handle.store(true, Ordering::Relaxed);
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                // 合図を見張れなくなった。待ち続けても意味がない。
+                return;
+            }
+            if handle.swap(true, Ordering::Relaxed) {
+                eprintln!("\n強制終了します。");
+                std::process::exit(130);
+            }
+            println!(
+                "\n停止の合図を受けました。いまのジョブを終えてから止まります\
+                 （もう一度 Ctrl+C を押すと強制終了します）。"
+            );
         }
     });
     stop
+}
+
+/// `queue:failed` の表の桁幅（ジョブ名、失敗した時刻）。
+///
+/// **文字数ではなく端末での幅で数えます。** `{job:<20}` は文字数で詰めるので、
+/// ジョブ名に日本語が入ると表が崩れます（`schedule::print_list` と同じ考え方）。
+fn failed_widths(rows: &[(i64, String, String, String)]) -> (usize, usize) {
+    use crate::support::text;
+
+    let job = rows
+        .iter()
+        .map(|(_, job, _, _)| text::width(job))
+        .max()
+        .unwrap_or(0)
+        .max(text::width("ジョブ"));
+    let time = rows
+        .iter()
+        .map(|(_, _, failed_at, _)| text::width(failed_at))
+        .max()
+        .unwrap_or(0)
+        .max(text::width("失敗した時刻"));
+    (job, time)
 }
 
 async fn print_failed() -> Result<()> {
@@ -155,10 +192,21 @@ async fn print_failed() -> Result<()> {
         println!("諦めたジョブはありません。");
         return Ok(());
     }
-    println!("ID   ジョブ               失敗した時刻          理由");
+    use crate::support::text;
+    let (job_width, time_width) = failed_widths(&rows);
+
+    println!(
+        "ID   {}  {}  理由",
+        text::pad("ジョブ", job_width),
+        text::pad("失敗した時刻", time_width)
+    );
     for (id, job, failed_at, error) in &rows {
         let error = error.lines().next().unwrap_or("");
-        println!("{id:<4} {job:<20} {failed_at:<20} {error}");
+        println!(
+            "{id:<4} {}  {}  {error}",
+            text::pad(job, job_width),
+            text::pad(failed_at, time_width)
+        );
     }
     println!("\n{} 件", rows.len());
     Ok(())
@@ -331,6 +379,39 @@ mod tests {
 
         // 旗を取らないコマンドは、旗が無ければ通る。
         assert!(Options::parse("cache:prune", &[]).is_ok());
+    }
+
+    #[test]
+    fn 諦めたジョブの表は文字の幅でそろえる() {
+        use crate::support::text;
+
+        let rows = vec![
+            (
+                1i64,
+                "日報の送信".to_string(),
+                "2024-01-01 00:00:00".to_string(),
+                "理由".to_string(),
+            ),
+            (
+                2i64,
+                "SendWelcome".to_string(),
+                "2024-01-02 00:00:00".to_string(),
+                "理由".to_string(),
+            ),
+        ];
+        let (job, time) = failed_widths(&rows);
+
+        // `日報の送信` は 10 文字分。`SendWelcome` は 11 文字分。
+        assert_eq!(job, 11);
+        assert_eq!(time, 19);
+        // そろえた後の幅が同じになる（`{job:<20}` だとここがずれる）。
+        assert_eq!(text::width(&text::pad(&rows[0].1, job)), job);
+        assert_eq!(text::width(&text::pad(&rows[1].1, job)), job);
+
+        // 1 件も無いときは見出しの幅になる。
+        let (job, time) = failed_widths(&[]);
+        assert_eq!(job, text::width("ジョブ"));
+        assert_eq!(time, text::width("失敗した時刻"));
     }
 
     #[test]

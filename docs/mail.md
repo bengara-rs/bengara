@@ -1,12 +1,18 @@
 # メール
 
-文面を組み立てて送ります。
+文面を組み立てて送る仕組みです。
 
-> **SMTP はまだありません。** いま送れるのは「ログに書き出す」と「メモリに溜める」の
-> 2 つだけです。TLS を自前で書けないためです。差し替えられる形（`Mailer`）は
-> 用意してあるので、決まれば足せます。
+> **本当のメールは送れません。** SMTP はありません。TLS を自前で書けないためです。
+> できるのは次の 2 つだけです。
+>
+> | `MAIL_DRIVER` | 何をするか                             |
+> |---------------|----------------------------------------|
+> | `log`（既定） | `storage/logs/mail.log` に書き出す     |
+> | `array`       | プロセスのメモリに溜める。**テスト用** |
+>
+> 送り先の差し替え口（`Mailer`）は用意してあります（下の「送り先を自分で作る」）。
 
-## 送り先
+## 設定
 
 `.env` に書きます。下は「自分のアプリ名を入れた」例です。
 
@@ -27,12 +33,7 @@ MAIL_FROM_NAME=myapp
 **`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名にしたいときは、上の例のように
 `.env` へ書いてください。
 
-| `MAIL_DRIVER` | 何をするか                             |
-|---------------|----------------------------------------|
-| `log`（既定） | `storage/logs/mail.log` に書き出す     |
-| `array`       | プロセスのメモリに溜める。**テスト用** |
-
-`config/mail.rs` を置けば `.env` より優先します。無くても動きます。
+`config/mail.rs` を置くと `.env` より優先します。無くても動きます。
 
 ```rust
 // config/mail.rs
@@ -54,10 +55,10 @@ pub fn config() -> MailConfig {
 use bengara::prelude::*;
 
 Mail::to("alice@example.com")
-.subject("ようこそ")
-.text("登録ありがとうございます。")
-.send()
-.await?;
+    .subject("ようこそ")
+    .text("登録ありがとうございます。")
+    .send()
+    .await?;
 ```
 
 | 組み立て                 | 内容                       |
@@ -74,18 +75,14 @@ Mail::to("alice@example.com")
 
 `text` と `html` の両方を書いても構いません。`log` はどちらも書き出します。
 
-## ログに出たもの
+送る前に中身を見られます。
 
+```rust
+let mail = Mail::to("alice@example.com").subject("ようこそ").text("本文");
+let message: &Message = mail.message();
+assert_eq!(message.to, ["alice@example.com"]);
+mail.send().await?;
 ```
----- 2026-10-05 10:20:01 ----
-From: myapp <noreply@example.com>
-To: alice@example.com
-Subject: ようこそ
-
-アリス さん、登録ありがとうございます。
-```
-
-`storage/logs/mail.log` に追記されます。 **自動では消えません。** 大きくなったら消してください。
 
 ## 断るもの
 
@@ -99,14 +96,18 @@ Subject: ようこそ
 **アドレスの形は確かめません。** 入力から受け取るなら `email` の検査規則を通してください
 （[validation.md](validation.md)）。
 
-## 送る前に中身を見る
+## ログに出たもの
 
-```rust
-let mail = Mail::to("alice@example.com").subject("ようこそ").text("本文");
-let message: & Message = mail.message();
-assert_eq!(message.to, ["alice@example.com"]);
-mail.send().await?;
 ```
+---- 2026-10-05 10:20:01 ----
+From: myapp <noreply@example.com>
+To: alice@example.com
+Subject: ようこそ
+
+アリス さん、登録ありがとうございます。
+```
+
+`storage/logs/mail.log` に追記されます。 **自動では消えません。** 大きくなったら消してください。
 
 ## キューから送る
 
@@ -115,7 +116,7 @@ mail.send().await?;
 
 ```rust
 // 画面の中
-Queue::push("SendWelcome", & Payload { user_id: user.id }).await?;
+Queue::push("SendWelcome", &Payload { user_id: user.id }).await?;
 ```
 
 ```rust
@@ -131,7 +132,7 @@ pub async fn handle(payload: String) -> Result<()> {
 
 ## テスト
 
-`#[bengara::test]` は自動で `array` にします。 **テストでは本当には送りません。**
+`#[bengara::test]` は自動で `array` にします。溜まったメールを数えて確かめます。
 
 ```rust
 #[bengara::test]
@@ -154,13 +155,13 @@ async fn お知らせを送る() {
 | `Mail::sent()`       | `Vec<Message>` |
 | `Mail::clear_sent()` | –              |
 
-溜まったメールは **テストの間ずっと残ります。** 数を確かめる前に `clear_sent()` を呼んでください。
+気をつけることが 3 つあります。
 
-溜まる場所はプロセス共通です。テストは並んで走るので、 **`Mail::sent()` で数を確かめるテストは
-`bengara::testing::exclusive()` で札を取ってください**（[testing.md](testing.md)）。
-
-`MAIL_DRIVER` を **本物の環境変数**で渡したときは、そちらを使います
-（`.env` の値はテストに効きません）。
+- 溜まったメールは **テストの間ずっと残ります。** 数を確かめる前に `clear_sent()` を呼んでください。
+- 溜まる場所はプロセス共通です。テストは並んで走るので、 **`Mail::sent()` で数を確かめるテストは
+  `bengara::testing::exclusive()` で札を取ってください**（[testing.md](testing.md)）。
+- `MAIL_DRIVER` を **本物の環境変数**で渡したときは、そちらを使います
+  （`.env` の値はテストに効きません）。
 
 ```sh
 MAIL_DRIVER=log cargo test

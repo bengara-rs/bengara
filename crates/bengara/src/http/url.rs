@@ -123,13 +123,14 @@ fn build_signed(path: &str, params: &[(&str, &str)], expires: Option<u64>) -> Re
 pub fn has_valid_signature(req: &super::Request) -> Result<bool> {
     let key = crate::config_registry::app_config().derived_key(SIGNING_LABEL)?;
 
+    // クエリは `Request` が1回だけ解析したものを借りる（呼ぶたびに解析し直さない）。
     let mut pairs = Vec::new();
     let mut given = None;
-    for (k, v) in req.query_all() {
+    for (k, v) in req.query_pairs() {
         if k == SIGNATURE {
-            given = Some(v);
+            given = Some(v.clone());
         } else {
-            pairs.push((k, v));
+            pairs.push((k.clone(), v.clone()));
         }
     }
     let Some(given) = given else {
@@ -190,18 +191,11 @@ fn canonical_query(pairs: &[(String, String)]) -> String {
 }
 
 /// クエリに入れられない文字を `%xx` にする。
+///
+/// 規則は `http/percent.rs` に置いてあり、ルートの組み立て（`routing.rs`）と
+/// **同じ関数**を使います。片方だけ直すと署名が合わなくなるためです。
 fn encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.as_bytes() {
-        let c = *byte;
-        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~') {
-            out.push(c as char);
-        } else {
-            out.push('%');
-            out.push_str(&crypto::to_hex(&[c]).to_uppercase());
-        }
-    }
-    out
+    super::percent::encode(input, super::percent::unreserved)
 }
 
 fn now() -> u64 {

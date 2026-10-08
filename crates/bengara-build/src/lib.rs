@@ -74,6 +74,19 @@ const MAX_EMBED_FILE: u64 = 8 * 1024 * 1024;
 /// `public/` の合計がこれを超えるときは警告を出す（32 MiB）。
 const MAX_EMBED_TOTAL: u64 = 32 * 1024 * 1024;
 
+/// マイグレーションの置き場所（**モジュール名**で書きます）。
+const MIGRATIONS_DIR: &[&str] = &["database", "migrations"];
+/// シーダーの置き場所。
+const SEEDERS_DIR: &[&str] = &["database", "seeders"];
+/// ファクトリの置き場所。
+const FACTORIES_DIR: &[&str] = &["database", "factories"];
+/// ジョブの置き場所。
+const JOBS_DIR: &[&str] = &["app", "jobs"];
+/// 聞く側（リスナ）の置き場所。
+const LISTENERS_DIR: &[&str] = &["app", "listeners"];
+/// 自作コマンドの置き場所。
+const COMMANDS_DIR: &[&str] = &["app", "console", "commands"];
+
 /// `build.rs` から呼ぶ入口。
 ///
 /// ```ignore
@@ -89,12 +102,22 @@ pub fn discover() {
         return;
     };
 
-    let mut gen = Generator::default();
-    gen.run(&root);
+    let mut generator = Generator::default();
+    generator.run(&root);
 
-    let code = gen.finish();
-    let out_path = out_dir.join(OUT_FILE);
-    if let Err(e) = fs::write(&out_path, code) {
+    let code = generator.finish();
+    write_if_changed(&out_dir.join(OUT_FILE), &code);
+}
+
+/// 中身が変わったときだけ書く。
+///
+/// 無条件に書くと更新時刻だけが進みます。`main.rs` の `include!` を通じて
+/// アプリのクレートが丸ごと再コンパイルされるので、1バイトも変わっていないなら触りません。
+fn write_if_changed(out_path: &Path, code: &str) {
+    if fs::read_to_string(out_path).is_ok_and(|old| old == code) {
+        return;
+    }
+    if let Err(e) = fs::write(out_path, code) {
         // ここで失敗すると compile_error! も届けられないので、警告だけ出して続ける。
         warn(&format!(
             "{} を書き出せませんでした: {e}",
@@ -108,6 +131,42 @@ fn warn(message: &str) {
     println!("cargo:warning=bengara-build: {message}");
 }
 
+/// バイト数を MiB の文字にする。小数1桁。
+///
+/// 切り捨てで出すと、8.9 MiB のファイルを「8 MiB あります」と言ってしまうためです。
+fn mib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// ディレクトリの中の1件。`DirEntry` から取れる分を先に持っておきます。
+///
+/// 後から `is_dir()` や `metadata()` を呼び直すと、そのたびに OS に聞きに行きます。
+struct Entry {
+    path: PathBuf,
+    is_dir: bool,
+    /// ファイルの大きさ。ディレクトリのときと、取れなかったときは 0。
+    len: u64,
+}
+
+/// 一覧に入れる1件（マイグレーション・シーダー・ジョブ・コマンド）。
+struct Item {
+    /// 一覧に出る名前（ファイル名そのまま）。
+    name: String,
+    /// クレート直下に置いたときのモジュール名。
+    flat: String,
+    /// 元のファイル。名前がぶつかったときに知らせるために持ちます。
+    path: PathBuf,
+}
+
+/// 一覧の定数を書き出したか。`finish()` が参照するかどうかの判断に使います。
+#[derive(Default)]
+struct Emitted {
+    migrations: bool,
+    seeders: bool,
+    jobs: bool,
+    commands: bool,
+}
+
 #[derive(Default)]
 struct Generator {
     /// クレート直下に平らに並べる `#[path]` 付きのモジュール宣言。
@@ -116,21 +175,25 @@ struct Generator {
     tree: String,
     /// 今たどっているディレクトリのモジュール名（平らな名前を作るのに使う）。
     stack: Vec<String>,
-    /// すでに使った平らな名前。重なったときに連番を足すため。
-    taken_flat: BTreeMap<String, usize>,
+    /// すでに使った平らな名前と、最初にその名前になったファイル。
+    taken_flat: BTreeMap<String, PathBuf>,
     /// `config/` 直下で見つかった設定モジュール（登録順）。
     configs: Vec<String>,
-    /// `database/migrations/` が見つかったか。
-    has_migrations: bool,
-    /// `database/seeders/` が見つかったか。
-    has_seeders: bool,
-    /// `app/Jobs/` が見つかったか。
-    has_jobs: bool,
-    /// `app/Console/Commands/` が見つかったか。
-    has_commands: bool,
     /// `routes/console.rs` が見つかったか。
     has_console: bool,
-    /// `resources/lang/*.toml` から読んだ文字（言語ごと）。
+    /// プロジェクトのルートを見張ると宣言したか（同じ指定は1回だけ出す）。
+    watched_root: bool,
+    /// `database/migrations/` の下で集めたマイグレーション（入れ子も含む）。
+    migrations: Vec<Item>,
+    /// `database/seeders/` の下で集めたシーダー。
+    seeders: Vec<Item>,
+    /// `app/Jobs/` の下で集めたジョブ。
+    jobs: Vec<Item>,
+    /// `app/Console/Commands/` の下で集めた自作コマンド。
+    commands: Vec<Item>,
+    /// 一覧の定数を書いたか。
+    emitted: Emitted,
+    /// `resources/lang/` から読んだ文字（言語ごと）。
     lang: Vec<(String, Vec<(String, String)>)>,
     /// `public/` の中のファイル（配信するときの鍵と、実ファイルのパス）。
     ///
@@ -144,10 +207,7 @@ impl Generator {
     fn run(&mut self, root: &Path) {
         for target in TARGETS {
             let dir = root.join(target.name);
-            // ディレクトリ自体の変化（ファイルの追加・削除）を監視する。
-            // ファイルの内容の変化は、取り込んだソースとして rustc 側で追跡される。
-            println!("cargo:rerun-if-changed={}", dir.display());
-            if !dir.is_dir() {
+            if !self.watch(root, &dir) {
                 continue;
             }
             if target.test_only {
@@ -159,52 +219,74 @@ impl Generator {
         self.read_public(root);
     }
 
+    /// `dir` の変化を見張る。無いときはプロジェクトのルートを1回だけ見張る。
+    ///
+    /// 無いディレクトリを `cargo:rerun-if-changed` に出すと、cargo は
+    /// 「常に古い」と見なしてビルドスクリプトを毎回走らせます。かといって
+    /// 何も出さないと、後からそのディレクトリを作っても気づけません。
+    /// そこでルート自身を見張り、ディレクトリが生えたら走り直すようにします。
+    ///
+    /// 戻り値は「そのディレクトリがあったか」です。
+    fn watch(&mut self, root: &Path, dir: &Path) -> bool {
+        if dir.is_dir() {
+            self.watch_existing(dir);
+            return true;
+        }
+        if !self.watched_root {
+            self.watched_root = true;
+            println!("cargo:rerun-if-changed={}", root.display());
+        }
+        false
+    }
+
+    /// あると分かっているディレクトリを見張る。
+    ///
+    /// ディレクトリ自体の変化（ファイルの追加・削除）を見ます。取り込んだ `.rs` の
+    /// 中身の変化は、`#[path]` で取り込んだソースとして rustc 側が追跡します。
+    fn watch_existing(&mut self, dir: &Path) {
+        println!("cargo:rerun-if-changed={}", dir.display());
+    }
+
     /// `public/` の中身を、バイナリに埋め込む一覧にする。
     ///
     /// **リリースビルドのときだけ**集めます。デバッグビルドではディスクから読むので、
     /// ファイルを直したらすぐ反映されます。
     fn read_public(&mut self, root: &Path) {
         let dir = root.join("public");
-        println!("cargo:rerun-if-changed={}", dir.display());
-
+        // 見張りはデバッグビルドでも出す。release に切り替えたときに集め直せるようにする。
+        if !self.watch(root, &dir) {
+            return;
+        }
         // PROFILE は cargo がビルドスクリプトに渡す（"debug" か "release"）。
         if env::var("PROFILE").as_deref() != Ok("release") {
             return;
         }
-        if !dir.is_dir() {
-            return;
-        }
-        self.collect_public(&dir, "");
 
         // 大きくなりすぎたら気づけるようにする。止めはしない。
         let mut total: u64 = 0;
-        for (key, path) in &self.public {
-            let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            total += size;
-            if size > MAX_EMBED_FILE {
-                warn(&format!(
-                    "public/{key} は {} MiB あります。バイナリに埋め込みます",
-                    size / 1024 / 1024
-                ));
-            }
-        }
+        self.collect_public(&dir, "", &mut total);
         if total > MAX_EMBED_TOTAL {
             warn(&format!(
                 "public/ の合計が {} MiB あります。バイナリがその分大きくなります",
-                total / 1024 / 1024
+                mib(total)
             ));
         }
     }
 
     /// `public/` を下までたどる。`prefix` は配信するときの鍵の頭（`/` 区切り）。
-    fn collect_public(&mut self, dir: &Path, prefix: &str) {
+    ///
+    /// ファイルごとの `cargo:rerun-if-changed` は出しません。中身は生成コードの
+    /// `include_bytes!` で取り込むので、rustc 側が追跡します（`public/` の指定とも重複します）。
+    fn collect_public(&mut self, dir: &Path, prefix: &str, total: &mut u64) {
         let Some(entries) = self.read_dir_sorted(dir) else {
             return;
         };
-        for path in entries {
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                self.errors
-                    .push(format!("{} の名前が UTF-8 ではありません", path.display()));
+        for entry in entries {
+            let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) else {
+                self.errors.push(format!(
+                    "{} の名前が UTF-8 ではありません",
+                    entry.path.display()
+                ));
                 continue;
             };
             // 隠しファイルは配信しない。
@@ -217,12 +299,19 @@ impl Generator {
             } else {
                 format!("{prefix}/{name}")
             };
-            if path.is_dir() {
-                self.collect_public(&path, &key);
-            } else {
-                println!("cargo:rerun-if-changed={}", path.display());
-                self.public.push((key, path));
+            if entry.is_dir {
+                self.watch_existing(&entry.path);
+                self.collect_public(&entry.path, &key, total);
+                continue;
             }
+            *total += entry.len;
+            if entry.len > MAX_EMBED_FILE {
+                warn(&format!(
+                    "public/{key} は {} MiB あります。バイナリに埋め込みます",
+                    mib(entry.len)
+                ));
+            }
+            self.public.push((key, entry.path));
         }
     }
 
@@ -247,54 +336,128 @@ impl Generator {
         )
     }
 
-    /// `resources/lang/*.toml` を読んで、文字の表を作る。
+    /// `resources/lang/` を読んで、文字の表を作る。
+    ///
+    /// 読む形は2つです。どちらも使えます。
+    ///
+    /// | 置き方 | `[x] y = ".."` の鍵 |
+    /// |---|---|
+    /// | `resources/lang/ja.toml` | `x.y` |
+    /// | `resources/lang/ja/messages.toml` | `messages.x.y` |
+    ///
+    /// 下が Laravel 本来の置き方です。ファイル名が鍵の頭に付きます。
+    /// 同じ言語で両方を置いてもよく、1つの表にまとまります。
     ///
     /// **ビルド時に読み込みます。** 実行時にファイルを読まないので、本番に配る必要はありません。
     fn read_lang(&mut self, root: &Path) {
         let dir = root.join("resources/lang");
-        println!("cargo:rerun-if-changed={}", dir.display());
-        if !dir.is_dir() {
+        if !self.watch(root, &dir) {
             return;
         }
         let Some(entries) = self.read_dir_sorted(&dir) else {
             return;
         };
 
-        for path in entries {
-            if path.extension().is_none_or(|e| e != "toml") {
+        // 言語ごとにまとめる。3つめの要素は、鍵が重なったときに知らせるための元のファイル。
+        let mut table: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+
+        for entry in entries {
+            let Some(stem) = file_stem(&entry.path) else {
+                continue;
+            };
+            if stem.starts_with('.') {
                 continue;
             }
-            // 中身が変わったら作り直す。
-            println!("cargo:rerun-if-changed={}", path.display());
-            let Some(locale) = file_stem(&path) else {
+            let locale = stem.to_string();
+            if entry.is_dir {
+                self.read_lang_dir(&entry.path, &locale, &mut table);
+                continue;
+            }
+            if !is_toml(&entry.path) {
+                continue;
+            }
+            let origin = entry.path.display().to_string();
+            let pairs = self.read_toml(&entry.path);
+            let into = table.entry(locale).or_default();
+            for (key, value) in pairs {
+                into.push((key, value, origin.clone()));
+            }
+        }
+
+        for (locale, mut pairs) in table {
+            // 鍵の昇順（`str` の辞書順）に並べる。実行時はこの並びを前提に引きます。
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            // 同じ鍵が2回あったら教える。黙って先に書いた方が勝つと、直し方が
+            // 分からないためです。`ja.toml` と `ja/` を混ぜたときにも起こります。
+            for pair in pairs.windows(2) {
+                if pair[0].0 == pair[1].0 {
+                    self.errors.push(format!(
+                        "`{locale}` に鍵 `{}` が2回書かれています: {} と {}",
+                        pair[0].0, pair[0].2, pair[1].2
+                    ));
+                }
+            }
+            let pairs = pairs.into_iter().map(|(k, v, _)| (k, v)).collect();
+            self.lang.push((locale, pairs));
+        }
+    }
+
+    /// `resources/lang/<言語>/*.toml` を読む。鍵の頭にファイル名が付きます。
+    fn read_lang_dir(
+        &mut self,
+        dir: &Path,
+        locale: &str,
+        table: &mut BTreeMap<String, Vec<(String, String, String)>>,
+    ) {
+        self.watch_existing(dir);
+        let Some(entries) = self.read_dir_sorted(dir) else {
+            return;
+        };
+        for entry in entries {
+            if entry.is_dir {
+                // ここより下は読みません（Laravel も1階層だけ）。黙って無視しないで知らせます。
+                warn(&format!(
+                    "{} は読みません。言語ファイルは resources/lang/{locale}/ の直下に置いてください",
+                    entry.path.display()
+                ));
+                continue;
+            }
+            if !is_toml(&entry.path) {
+                continue;
+            }
+            let Some(group) = file_stem(&entry.path) else {
                 continue;
             };
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(e) => {
-                    self.errors
-                        .push(format!("{} を読めませんでした: {e}", path.display()));
-                    continue;
-                }
-            };
-            match toml::parse(&text) {
-                Ok(mut pairs) => {
-                    // 鍵の昇順（`str` の辞書順）に並べる。実行時はこの並びを前提に引きます。
-                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                    // 同じ鍵が2回書かれていたら教える。本来の TOML はエラーだし、
-                    // 黙って先に書いた方が勝つと、直し方が分からないため。
-                    for pair in pairs.windows(2) {
-                        if pair[0].0 == pair[1].0 {
-                            self.errors.push(format!(
-                                "{} に鍵 `{}` が2回書かれています",
-                                path.display(),
-                                pair[0].0
-                            ));
-                        }
-                    }
-                    self.lang.push((locale, pairs));
-                }
-                Err(reason) => self.errors.push(format!("{} の {reason}", path.display())),
+            if group.starts_with('.') {
+                continue;
+            }
+            let group = group.to_string();
+            let origin = entry.path.display().to_string();
+            let pairs = self.read_toml(&entry.path);
+            let into = table.entry(locale.to_string()).or_default();
+            for (key, value) in pairs {
+                into.push((format!("{group}.{key}"), value, origin.clone()));
+            }
+        }
+    }
+
+    /// 1つの TOML を読む。読めないときはエラーを記録して空を返す。
+    fn read_toml(&mut self, path: &Path) -> Vec<(String, String)> {
+        // 中身が変わったら作り直す。ビルド時に読むので rustc は追跡しません。
+        println!("cargo:rerun-if-changed={}", path.display());
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) => {
+                self.errors
+                    .push(format!("{} を読めませんでした: {e}", path.display()));
+                return Vec::new();
+            }
+        };
+        match toml::parse(&text) {
+            Ok(pairs) => pairs,
+            Err(reason) => {
+                self.errors.push(format!("{} の {reason}", path.display()));
+                Vec::new()
             }
         }
     }
@@ -308,6 +471,11 @@ impl Generator {
         };
         let _ = writeln!(self.tree, "#[allow(unused_imports)] pub mod {module} {{");
         self.stack.push(module);
+        // 入れ子のディレクトリも見張る。親だけ見張っても、下にファイルを足したときに
+        // 親の更新時刻は動かないので気づけません（いちばん上は `run` が見張っています）。
+        if depth > 0 {
+            self.watch_existing(dir);
+        }
 
         let entries = match self.read_dir_sorted(dir) {
             Some(entries) => entries,
@@ -321,40 +489,33 @@ impl Generator {
         // 同じディレクトリの中でモジュール名がぶつかっていないかを調べる。
         // 例: `User.rs` と `user.rs` はどちらも `user` になる。
         let mut taken: BTreeMap<String, String> = BTreeMap::new();
-        // `database/migrations/` と `database/seeders/` の中身。
-        // どちらも (ファイル名, 平らなモジュール名) で覚える。
-        //
-        // 置き場所は、深さだけでなく**親の名前まで**確かめます。`finish()` が
-        // `crate::database::migrations::MIGRATIONS` のような決まったパスを参照するので、
-        // `app/Foo/Commands/` のような別の場所で立ってしまうと解決できなくなります。
-        let in_database =
-            target.name == "database" && depth == 1 && parents_are(dir, &["database"]);
-        let in_migrations = in_database && dir_name.eq_ignore_ascii_case("migrations");
-        let in_seeders = in_database && dir_name.eq_ignore_ascii_case("seeders");
-        let in_factories = in_database && dir_name.eq_ignore_ascii_case("factories");
-        // `app/Jobs/` と `app/Console/Commands/` も、関数を置く場所として扱う。
-        let in_app = target.name == "app" && depth == 1 && parents_are(dir, &["app"]);
-        let in_jobs = in_app && dir_name.eq_ignore_ascii_case("jobs");
-        let in_listeners = in_app && dir_name.eq_ignore_ascii_case("listeners");
-        let in_commands = target.name == "app"
-            && depth == 2
-            && dir_name.eq_ignore_ascii_case("commands")
-            && parents_are(dir, &["console", "app"]);
-        let function_dir = in_seeders || in_factories || in_jobs || in_commands || in_listeners;
-        let mut migrations: Vec<(String, String)> = Vec::new();
-        let mut seeders: Vec<(String, String)> = Vec::new();
-        let mut jobs: Vec<(String, String)> = Vec::new();
-        let mut commands: Vec<(String, String)> = Vec::new();
 
-        for path in entries {
+        // 置き場所は**モジュール名の並び**で確かめます。`finish()` が
+        // `crate::app::jobs::JOBS` のような決まったパスを参照するので、
+        // 生のディレクトリ名で判定すると、`app/JOBS/`（モジュール名は `j_o_b_s`）
+        // のときに解決できない生成コードになります。
+        //
+        // 「置き場所の**下にあるか**」で見ます。`app/Jobs/Mail/SendWelcome.rs` の
+        // ように入れ子にしても一覧に入ります。集めたものは親に持ち上げて1つの定数にします。
+        let in_migrations = under(&self.stack, MIGRATIONS_DIR);
+        let in_seeders = under(&self.stack, SEEDERS_DIR);
+        let in_factories = under(&self.stack, FACTORIES_DIR);
+        let in_jobs = under(&self.stack, JOBS_DIR);
+        let in_listeners = under(&self.stack, LISTENERS_DIR);
+        let in_commands = under(&self.stack, COMMANDS_DIR);
+        let function_dir = in_seeders || in_factories || in_jobs || in_commands || in_listeners;
+
+        for entry in entries {
+            let path = entry.path;
             let Some(stem) = file_stem(&path) else {
                 continue;
             };
 
-            if path.is_dir() {
-                if skip_dir(&stem) {
+            if entry.is_dir {
+                if skip_dir(stem) {
                     continue;
                 }
+                let stem = stem.to_string();
                 if let Some(module) = self.module_name(&stem, &path) {
                     self.check_duplicate(&mut taken, &module, &stem, dir);
                 }
@@ -365,7 +526,7 @@ impl Generator {
             if !is_rust_file(&path) {
                 continue;
             }
-            if skip_file(&stem) {
+            if skip_file(stem) {
                 // `mod.rs` は Rust の癖で意味を持つ名前なので取り込みません。
                 // 黙って無視すると、置いた人には何も伝わらないので知らせます。
                 if stem == "mod" {
@@ -377,13 +538,13 @@ impl Generator {
                 }
                 continue;
             }
-            let Some(module) = self.module_name(&stem, &path) else {
+            let Some(module) = self.module_name(stem, &path) else {
                 continue;
             };
-            self.check_duplicate(&mut taken, &module, &stem, dir);
+            self.check_duplicate(&mut taken, &module, stem, dir);
 
             // 平らな名前は、パスをつないで作る。テストの出力などで読めるようにするため。
-            let flat = self.flat_name(&module);
+            let flat = self.flat_name(&module, &path);
             let cfg = if target.test_only {
                 "#[cfg(test)] "
             } else {
@@ -401,10 +562,10 @@ impl Generator {
 
             // PSR-4 と同じ約束。先頭が大文字のファイルは、同じ名前の型を公開する。
             // ただし seeders と factories は「関数を置く場所」なので、型は探さない。
-            if target.reexport && starts_upper(&stem) && !function_dir {
+            if target.reexport && starts_upper(stem) && !function_dir {
                 // ファイル名をそのまま型の名前として書くので、識別子に使えるか確かめる。
                 // `My-Model.rs` はモジュール名にはできるが、型の名前にはできない。
-                if is_ident(&stem) {
+                if is_ident(stem) {
                     let _ = writeln!(self.tree, "pub use crate::{flat}::{stem};");
                 } else {
                     self.errors.push(format!(
@@ -416,8 +577,12 @@ impl Generator {
             }
             // database/migrations/ の、日付で始まるファイルはマイグレーション。
             if in_migrations {
-                if starts_digit(&stem) {
-                    migrations.push((stem.clone(), flat.clone()));
+                if starts_digit(stem) {
+                    self.migrations.push(Item {
+                        name: stem.to_string(),
+                        flat: flat.clone(),
+                        path: path.clone(),
+                    });
                 } else {
                     warn(&format!(
                         "{} は日付で始まらないので、マイグレーションの一覧に入りません",
@@ -427,106 +592,129 @@ impl Generator {
             }
             // database/seeders/ の、大文字で始まるファイルはシーダー。
             if in_seeders {
-                collect_upper(&path, &stem, "シーダー", &mut seeders, &flat);
+                collect_upper(&path, stem, "シーダー", &mut self.seeders, &flat);
             }
             // app/Jobs/ の、大文字で始まるファイルはジョブ。
             if in_jobs {
-                collect_upper(&path, &stem, "ジョブ", &mut jobs, &flat);
+                collect_upper(&path, stem, "ジョブ", &mut self.jobs, &flat);
             }
             // app/Console/Commands/ の、大文字で始まるファイルは自作コマンド。
             if in_commands {
-                collect_upper(&path, &stem, "コマンド", &mut commands, &flat);
+                collect_upper(&path, stem, "コマンド", &mut self.commands, &flat);
             }
             // routes/console.rs があれば、定期処理の登録を呼ぶ。
             if target.name == "routes" && depth == 0 && stem == "console" {
                 self.has_console = true;
             }
             // config/ の直下にある小文字のファイルは、設定として自動登録する。
-            if target.name == "config" && depth == 0 && !starts_upper(&stem) {
+            if target.name == "config" && depth == 0 && !starts_upper(stem) {
                 self.configs.push(module.clone());
             }
         }
 
-        // マイグレーションの一覧。名前順に並ぶ（読み込みの時点で並べてある）。
-        if in_migrations {
-            let list = migrations
-                .iter()
-                .map(|(stem, flat)| {
-                    format!(
-                        "::bengara::Migration {{ name: {stem:?}, \
-                         up: crate::{flat}::up, down: crate::{flat}::down }}"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(
-                self.tree,
-                "pub const MIGRATIONS: &[::bengara::Migration] = &[{list}];"
-            );
-            self.has_migrations = true;
-        }
-        // シーダーの一覧。
-        if in_seeders {
-            let list = seeders
-                .iter()
-                .map(|(stem, flat)| {
-                    format!(
-                        "::bengara::Seeder {{ name: {stem:?}, \
-                         run: || ::std::boxed::Box::pin(crate::{flat}::run()) }}"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(
-                self.tree,
-                "pub const SEEDERS: &[::bengara::Seeder] = &[{list}];"
-            );
-            self.has_seeders = true;
-        }
-        // ジョブの一覧。
-        if in_jobs {
-            let list = jobs
-                .iter()
-                .map(|(stem, flat)| {
-                    format!(
-                        "::bengara::Job {{ name: {stem:?}, \
-                         handle: |__payload| ::std::boxed::Box::pin(\
-                         crate::{flat}::handle(__payload)) }}"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(self.tree, "pub const JOBS: &[::bengara::Job] = &[{list}];");
-            self.has_jobs = true;
-        }
-        // 自作コマンドの一覧。ファイル名を小文字とハイフンにした名前で呼べる。
-        if in_commands {
-            let list = commands
-                .iter()
-                .map(|(stem, flat)| {
-                    let name = to_command_name(stem);
-                    format!(
-                        "::bengara::Command {{ name: {name:?}, \
-                         description: crate::{flat}::DESCRIPTION, \
-                         handle: |__args| ::std::boxed::Box::pin(async move {{ \
-                         crate::{flat}::handle(&__args).await }}) }}"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(
-                self.tree,
-                "pub const COMMANDS: &[::bengara::Command] = &[{list}];"
-            );
-            self.has_commands = true;
-        }
+        // 一覧の定数は、置き場所そのもの（`database/migrations` など）に1つだけ書く。
+        // 入れ子で集めたものは、ここまで持ち上がってきています。
+        self.emit_lists();
+
         self.stack.pop();
         self.tree.push_str("}\n");
     }
 
+    /// 集めた一覧を、置き場所そのもののディレクトリで定数にする。
+    fn emit_lists(&mut self) {
+        if is_exactly(&self.stack, MIGRATIONS_DIR) {
+            let items = std::mem::take(&mut self.migrations);
+            let list = self.join_items(items, "マイグレーション", |item| {
+                let (name, flat) = (&item.name, &item.flat);
+                format!(
+                    "::bengara::Migration {{ name: {name:?}, \
+                     up: crate::{flat}::up, down: crate::{flat}::down }}"
+                )
+            });
+            let _ = writeln!(
+                self.tree,
+                "pub const MIGRATIONS: &[::bengara::Migration] = &[{list}];"
+            );
+            self.emitted.migrations = true;
+        }
+        if is_exactly(&self.stack, SEEDERS_DIR) {
+            let items = std::mem::take(&mut self.seeders);
+            let list = self.join_items(items, "シーダー", |item| {
+                let (name, flat) = (&item.name, &item.flat);
+                format!(
+                    "::bengara::Seeder {{ name: {name:?}, \
+                     run: || ::std::boxed::Box::pin(crate::{flat}::run()) }}"
+                )
+            });
+            let _ = writeln!(
+                self.tree,
+                "pub const SEEDERS: &[::bengara::Seeder] = &[{list}];"
+            );
+            self.emitted.seeders = true;
+        }
+        if is_exactly(&self.stack, JOBS_DIR) {
+            let items = std::mem::take(&mut self.jobs);
+            let list = self.join_items(items, "ジョブ", |item| {
+                let (name, flat) = (&item.name, &item.flat);
+                format!(
+                    "::bengara::Job {{ name: {name:?}, \
+                     handle: |__payload| ::std::boxed::Box::pin(\
+                     crate::{flat}::handle(__payload)) }}"
+                )
+            });
+            let _ = writeln!(self.tree, "pub const JOBS: &[::bengara::Job] = &[{list}];");
+            self.emitted.jobs = true;
+        }
+        if is_exactly(&self.stack, COMMANDS_DIR) {
+            let items = std::mem::take(&mut self.commands);
+            // ファイル名を小文字とハイフンにした名前で呼べる。
+            let list = self.join_items(items, "コマンド", |item| {
+                let flat = &item.flat;
+                let name = to_command_name(&item.name);
+                format!(
+                    "::bengara::Command {{ name: {name:?}, \
+                     description: crate::{flat}::DESCRIPTION, \
+                     handle: |__args| ::std::boxed::Box::pin(async move {{ \
+                     crate::{flat}::handle(&__args).await }}) }}"
+                )
+            });
+            let _ = writeln!(
+                self.tree,
+                "pub const COMMANDS: &[::bengara::Command] = &[{list}];"
+            );
+            self.emitted.commands = true;
+        }
+    }
+
+    /// 一覧を名前順に並べ、名前の重なりを調べてから、生成コードの並びにする。
+    ///
+    /// 入れ子のディレクトリに置いても1つの一覧にまとめるので、名前が全体で
+    /// 重なっていないかをここで確かめます。
+    fn join_items(
+        &mut self,
+        mut items: Vec<Item>,
+        kind: &str,
+        render: impl Fn(&Item) -> String,
+    ) -> String {
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        for pair in items.windows(2) {
+            if pair[0].name == pair[1].name {
+                self.errors.push(format!(
+                    "{kind}の名前 `{}` が2つあります: {} と {}。\
+                     入れ子のディレクトリに置いても1つの一覧にまとまるので、\
+                     名前は全体で重ならないようにしてください",
+                    pair[0].name,
+                    pair[0].path.display(),
+                    pair[1].path.display()
+                ));
+            }
+        }
+        items.iter().map(render).collect::<Vec<_>>().join(", ")
+    }
+
     /// クレート直下に置くときの名前。`tests/Feature/HomeTest.rs` なら
     /// `__bengara_tests_feature_home_test` になります。
-    fn flat_name(&mut self, module: &str) -> String {
+    fn flat_name(&mut self, module: &str, path: &Path) -> String {
         let mut name = String::from("__bengara");
         for segment in &self.stack {
             name.push('_');
@@ -535,25 +723,34 @@ impl Generator {
         name.push('_');
         name.push_str(module);
 
-        // 万一ぶつかったら連番を足す。黙って変えると、エラーの文に出た名前から
-        // どのファイルか分からなくなるので、1行知らせる。
-        let count = self.taken_flat.entry(name.clone()).or_insert(0);
-        *count += 1;
-        if *count == 1 {
-            name
-        } else {
-            let unique = format!("{name}_{count}");
-            warn(&format!(
-                "平らなモジュール名 `{name}` が重なったので `{unique}` にしました。\
-                 `app/Http/user.rs` と `app/HttpUser.rs` のように、\
-                 つなげると同じ名前になるファイルがあります"
-            ));
-            unique
+        if !self.taken_flat.contains_key(&name) {
+            self.taken_flat.insert(name.clone(), path.to_path_buf());
+            return name;
         }
+
+        // 万一ぶつかったら、空いている名前が見つかるまで番号を上げる。
+        // 作った名前も登録する。登録しないと、素でその名前になるファイルと
+        // 二重定義になり、利用者が書いていない名前でエラーが出ます。
+        let mut number = 2;
+        let mut unique = format!("{name}_{number}");
+        while self.taken_flat.contains_key(&unique) {
+            number += 1;
+            unique = format!("{name}_{number}");
+        }
+        // 黙って変えると、エラーの文に出た名前からどのファイルか分からなくなるので、
+        // 元の2つのファイルを添えて1行知らせる。
+        let first = self.taken_flat[&name].display().to_string();
+        warn(&format!(
+            "平らなモジュール名 `{name}` が重なったので `{unique}` にしました。\
+             つなげると同じ名前になるファイルがあります: {first} と {}",
+            path.display()
+        ));
+        self.taken_flat.insert(unique.clone(), path.to_path_buf());
+        unique
     }
 
     /// ディレクトリの中身を名前順に並べて返す。読めなければエラーを記録する。
-    fn read_dir_sorted(&mut self, dir: &Path) -> Option<Vec<PathBuf>> {
+    fn read_dir_sorted(&mut self, dir: &Path) -> Option<Vec<Entry>> {
         let read = match fs::read_dir(dir) {
             Ok(read) => read,
             Err(e) => {
@@ -564,16 +761,32 @@ impl Generator {
         };
         let mut entries = Vec::new();
         for entry in read {
-            match entry {
-                Ok(entry) => entries.push(entry.path()),
+            let entry = match entry {
+                Ok(entry) => entry,
                 Err(e) => {
                     self.errors
                         .push(format!("{} の一覧取得に失敗しました: {e}", dir.display()));
                     return None;
                 }
-            }
+            };
+            // 種類と大きさは `DirEntry` から取る。あとで `is_dir()` や
+            // `metadata()` を呼び直すと、そのたびに OS に聞きに行きます。
+            let is_dir = match entry.file_type() {
+                Ok(kind) => kind.is_dir(),
+                Err(_) => entry.path().is_dir(),
+            };
+            let len = if is_dir {
+                0
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            entries.push(Entry {
+                path: entry.path(),
+                is_dir,
+                len,
+            });
         }
-        entries.sort();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
         Some(entries)
     }
 
@@ -659,23 +872,23 @@ impl Generator {
             );
         }
         // マイグレーションとシーダーの一覧。無ければ空の一覧を渡す。
-        let migrations = if self.has_migrations {
+        let migrations = if self.emitted.migrations {
             "|| crate::database::migrations::MIGRATIONS"
         } else {
             "|| &[]"
         };
-        let seeders = if self.has_seeders {
+        let seeders = if self.emitted.seeders {
             "|| crate::database::seeders::SEEDERS"
         } else {
             "|| &[]"
         };
         // ジョブ・自作コマンド・定期処理。無ければ何もしない形にする。
-        let jobs = if self.has_jobs {
+        let jobs = if self.emitted.jobs {
             "|| crate::app::jobs::JOBS"
         } else {
             "|| &[]"
         };
-        let commands = if self.has_commands {
+        let commands = if self.emitted.commands {
             "|| crate::app::console::commands::COMMANDS"
         } else {
             "|| &[]"
@@ -710,12 +923,13 @@ impl Generator {
         );
 
         // 問題はビルドを止めずに、生成コードの中で知らせる。
+        // `const _` は名前がぶつからないので、何個でもそのまま並べられる。
         self.errors.sort();
         self.errors.dedup();
-        for (i, message) in self.errors.iter().enumerate() {
+        for message in &self.errors {
             let _ = writeln!(
                 code,
-                "const _: () = {{ compile_error!({:?}); }}; // {i}",
+                "const _: () = {{ compile_error!({:?}); }};",
                 format!("bengara-build: {message}")
             );
         }
@@ -755,12 +969,16 @@ fn to_module_name(stem: &str) -> Result<String, &'static str> {
     Ok(out)
 }
 
-fn file_stem(path: &Path) -> Option<String> {
-    Some(path.file_stem()?.to_str()?.to_string())
+fn file_stem(path: &Path) -> Option<&str> {
+    path.file_stem()?.to_str()
 }
 
 fn is_rust_file(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "rs")
+}
+
+fn is_toml(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "toml")
 }
 
 /// 取り込まないファイル。隠しファイルと、Rust の慣習で意味を持つ名前。
@@ -777,15 +995,13 @@ fn skip_dir(name: &str) -> bool {
 ///
 /// 黙って外すと `cargo artisan migrate` などが「何もしない」だけになり、
 /// 理由がどこにも出ないためです（取り込み自体はできているので、ビルドは止めません）。
-fn collect_upper(
-    path: &Path,
-    stem: &str,
-    kind: &str,
-    list: &mut Vec<(String, String)>,
-    flat: &str,
-) {
+fn collect_upper(path: &Path, stem: &str, kind: &str, list: &mut Vec<Item>, flat: &str) {
     if starts_upper(stem) {
-        list.push((stem.to_string(), flat.to_string()));
+        list.push(Item {
+            name: stem.to_string(),
+            flat: flat.to_string(),
+            path: path.to_path_buf(),
+        });
     } else {
         warn(&format!(
             "{} は大文字で始まらないので、{kind}の一覧に入りません",
@@ -794,22 +1010,17 @@ fn collect_upper(
     }
 }
 
-/// 上のディレクトリの名前が、与えた並び（下から上へ）と一致するか。
+/// いまたどっているモジュール名の並びが、置き場所の**下にあるか**。
 ///
-/// `app/Console/Commands` なら `parents_are(dir, &["console", "app"])` が真になります。
-/// 大文字と小文字は区別しません。
-fn parents_are(dir: &Path, names: &[&str]) -> bool {
-    let mut current = dir;
-    for name in names {
-        let Some(parent) = current.parent() else {
-            return false;
-        };
-        match parent.file_name().and_then(|n| n.to_str()) {
-            Some(found) if found.eq_ignore_ascii_case(name) => current = parent,
-            _ => return false,
-        }
-    }
-    true
+/// `["app", "jobs", "mail"]` は `["app", "jobs"]` の下にあります。
+/// 入れ子にしたジョブなども一覧に入れるために、これで判定します。
+fn under(stack: &[String], names: &[&str]) -> bool {
+    stack.len() >= names.len() && stack.iter().zip(names).all(|(a, b)| a == b)
+}
+
+/// いまたどっているモジュール名の並びが、置き場所**そのもの**か。
+fn is_exactly(stack: &[String], names: &[&str]) -> bool {
+    stack.len() == names.len() && under(stack, names)
 }
 
 /// Rust の識別子として使える名前か（型名の再エクスポートに使う）。
@@ -866,6 +1077,26 @@ fn is_keyword(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// テスト用の作業場所。テストごとに別の名前にする。
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "bengara_build_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn touch(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn stack_of(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
     #[test]
     fn 大文字始まりはスネークケースになる() {
         assert_eq!(to_module_name("HomeController").unwrap(), "home_controller");
@@ -898,19 +1129,30 @@ mod tests {
     }
 
     #[test]
-    fn 置き場所は親の名前まで確かめる() {
-        assert!(parents_are(
-            Path::new("app/Console/Commands"),
-            &["console", "app"]
+    fn 置き場所はモジュール名の並びで見る() {
+        // 置き場所そのもの。
+        assert!(is_exactly(
+            &stack_of(&["app", "console", "commands"]),
+            COMMANDS_DIR
         ));
-        // app/Foo/Commands/ は自作コマンドの置き場所ではない。
-        assert!(!parents_are(
-            Path::new("app/Foo/Commands"),
-            &["console", "app"]
-        ));
-        assert!(parents_are(Path::new("database/migrations"), &["database"]));
-        assert!(!parents_are(Path::new("tests/migrations"), &["database"]));
-        assert!(!parents_are(Path::new("migrations"), &["database"]));
+        // 下にあるものも一覧に入れる。
+        assert!(under(&stack_of(&["app", "jobs", "mail"]), JOBS_DIR));
+        assert!(!is_exactly(&stack_of(&["app", "jobs", "mail"]), JOBS_DIR));
+        // 別の場所は入らない。
+        assert!(!under(&stack_of(&["app", "foo", "commands"]), COMMANDS_DIR));
+        assert!(!under(&stack_of(&["tests", "migrations"]), MIGRATIONS_DIR));
+        assert!(!under(&stack_of(&["database"]), MIGRATIONS_DIR));
+    }
+
+    #[test]
+    fn 大文字だけのディレクトリ名は置き場所にならない() {
+        // `app/JOBS/` のモジュール名は `j_o_b_s`。生のディレクトリ名で判定すると
+        // ここが真になり、`crate::app::jobs::JOBS` を参照する壊れたコードができる。
+        assert_eq!(to_module_name("JOBS").unwrap(), "j_o_b_s");
+        assert!(!under(&stack_of(&["app", "j_o_b_s"]), JOBS_DIR));
+        // `app/Jobs/` は `jobs` になるので一致する。
+        assert_eq!(to_module_name("Jobs").unwrap(), "jobs");
+        assert!(under(&stack_of(&["app", "jobs"]), JOBS_DIR));
     }
 
     #[test]
@@ -939,15 +1181,10 @@ mod tests {
 
     #[test]
     fn 鍵は昇順に並び重複は知らせる() {
-        let root = env::temp_dir().join(format!(
-            "bengara_build_lang_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let root = temp_root("lang");
         let dir = root.join("resources/lang");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("ja.toml"), "[m]\nb = \"2\"\na = \"1\"\n").unwrap();
-        fs::write(dir.join("en.toml"), "[m]\na = \"1\"\na = \"2\"\n").unwrap();
+        touch(&dir.join("ja.toml"), "[m]\nb = \"2\"\na = \"1\"\n");
+        touch(&dir.join("en.toml"), "[m]\na = \"1\"\na = \"2\"\n");
 
         let mut generator = Generator::default();
         generator.read_lang(&root);
@@ -965,6 +1202,158 @@ mod tests {
             .any(|e| e.contains("m.a") && e.contains("2回")));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 言語は入れ子のディレクトリも読む() {
+        let root = temp_root("lang_dir");
+        let dir = root.join("resources/lang");
+        // Laravel 本来の置き方。鍵の頭にファイル名が付く。
+        touch(&dir.join("ja/messages.toml"), "[x]\ny = \"値\"\n");
+        touch(&dir.join("ja/validation.toml"), "required = \"必須です\"\n");
+        // 直下の ja.toml もこれまでどおり読める。1つの表にまとまる。
+        touch(&dir.join("ja.toml"), "[top]\nz = \"直下\"\n");
+
+        let mut generator = Generator::default();
+        generator.read_lang(&root);
+
+        assert_eq!(generator.lang.len(), 1, "言語は ja だけ");
+        let keys: Vec<&str> = generator.lang[0]
+            .1
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["messages.x.y", "top.z", "validation.required"],
+            "鍵の昇順で並ぶ"
+        );
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 入れ子のシーダーとマイグレーションも一覧に入る() {
+        let root = temp_root("nested");
+        touch(&root.join("database/seeders/UserSeeder.rs"), "");
+        touch(&root.join("database/seeders/Demo/AdminSeeder.rs"), "");
+        touch(&root.join("database/migrations/2026_01_01_000000_a.rs"), "");
+        touch(
+            &root.join("database/migrations/2027/2027_01_01_000000_b.rs"),
+            "",
+        );
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+        let code = generator.finish();
+
+        // 一覧は1つだけ。入れ子で集めたものが親に持ち上がっている。
+        assert_eq!(code.matches("pub const SEEDERS").count(), 1);
+        assert_eq!(code.matches("pub const MIGRATIONS").count(), 1);
+
+        let seeders = code
+            .lines()
+            .find(|l| l.contains("pub const SEEDERS"))
+            .unwrap();
+        // 名前順に並ぶ。
+        assert!(
+            seeders.find("\"AdminSeeder\"").unwrap() < seeders.find("\"UserSeeder\"").unwrap(),
+            "{seeders}"
+        );
+        assert!(seeders.contains("crate::__bengara_database_seeders_demo_admin_seeder::run()"));
+
+        let migrations = code
+            .lines()
+            .find(|l| l.contains("pub const MIGRATIONS"))
+            .unwrap();
+        assert!(migrations.contains("\"2026_01_01_000000_a\""));
+        assert!(migrations.contains("\"2027_01_01_000000_b\""));
+
+        // 空の一覧ではなく、生成した定数を参照している。
+        assert!(code.contains("seeders: || crate::database::seeders::SEEDERS"));
+        assert!(code.contains("migrations: || crate::database::migrations::MIGRATIONS"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 入れ子で一覧の名前がぶつかったら知らせる() {
+        let root = temp_root("dup_seeder");
+        touch(&root.join("database/seeders/UserSeeder.rs"), "");
+        touch(&root.join("database/seeders/Demo/UserSeeder.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(
+            generator
+                .errors
+                .iter()
+                .any(|e| e.contains("シーダー") && e.contains("UserSeeder")),
+            "{:?}",
+            generator.errors
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 平らな名前は連番も登録する() {
+        let mut generator = Generator::default();
+        generator.stack.push("app".to_string());
+
+        let first = generator.flat_name("foo_bar", Path::new("app/foo_bar.rs"));
+        assert_eq!(first, "__bengara_app_foo_bar");
+        // つなげると同じ名前になる2つめは連番になる。
+        let second = generator.flat_name("foo_bar", Path::new("app/FooBar.rs"));
+        assert_eq!(second, "__bengara_app_foo_bar_2");
+        // 連番も登録されているので、素で `foo_bar_2` になるファイルは別の名前になる。
+        // 登録していないと、ここで `__bengara_app_foo_bar_2` と二重定義になる。
+        let third = generator.flat_name("foo_bar_2", Path::new("app/foo_bar_2.rs"));
+        assert_eq!(third, "__bengara_app_foo_bar_2_2");
+        assert_eq!(generator.taken_flat.len(), 3);
+    }
+
+    #[test]
+    fn 中身が同じなら書き直さない() {
+        let root = temp_root("write");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(OUT_FILE);
+
+        write_if_changed(&path, "a");
+        let first = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // 同じ中身なら触らない（更新時刻が進まない）。
+        write_if_changed(&path, "a");
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), first);
+
+        // 違う中身なら書く。
+        write_if_changed(&path, "b");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "b");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 大きさは小数1桁で出す() {
+        // 切り捨てると 8.9 MiB が「8 MiB」になってしまう。
+        assert_eq!(mib(8 * 1024 * 1024 + 900 * 1024), "8.9");
+        assert_eq!(mib(0), "0.0");
+        assert_eq!(mib(1024 * 1024), "1.0");
+    }
+
+    #[test]
+    fn 置き場所が無いときはルートを1回だけ見張る() {
+        let root = temp_root("missing");
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        // 無いだけならエラーにしない。生成コードも壊れない。
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        assert!(generator.watched_root);
+        let code = generator.finish();
+        assert!(code.contains("migrations: || &[]"));
     }
 
     #[test]

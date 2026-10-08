@@ -43,6 +43,8 @@ pub struct Throttle {
     buckets: Mutex<Buckets>,
     /// 鍵を作れなかったときの警告を、1回だけ出すための目印。
     warned: AtomicBool,
+    /// 件数の天井で鍵を落としたことを、1回だけ知らせるための目印。
+    evicted: AtomicBool,
 }
 
 /// 数え方の中身と、最後に掃除した時刻。
@@ -69,6 +71,7 @@ impl Throttle {
                 last_swept: Instant::now(),
             }),
             warned: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
         }
     }
 
@@ -103,10 +106,17 @@ impl Throttle {
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         self.sweep(&mut buckets, now);
 
-        let bucket = buckets.map.entry(key.to_string()).or_insert(Bucket {
-            count: 0,
-            resets_at: now + self.window,
-        });
+        // 既にある鍵のときは `String` を作らない（`entry` は毎回 `to_string` が要る）。
+        if !buckets.map.contains_key(key) {
+            buckets.map.insert(
+                key.to_string(),
+                Bucket {
+                    count: 0,
+                    resets_at: now + self.window,
+                },
+            );
+        }
+        let bucket = buckets.map.get_mut(key).expect("直前に無ければ入れている");
         if bucket.resets_at <= now {
             bucket.count = 0;
             bucket.resets_at = now + self.window;
@@ -133,16 +143,27 @@ impl Throttle {
         if buckets.map.len() <= MAX_BUCKETS {
             return;
         }
-        // 掃除しても天井を超えるなら、期限の古い順に落として件数を抑える。
-        // 際限なく増えて落ちるより、数え直しが早まるほうがましです。
-        let mut keys: Vec<(Instant, String)> = buckets
+        // 掃除しても天井を超えるなら、件数を抑えるために鍵を落とす。
+        //
+        // **残すのは制限に近い鍵（`count` の多いもの）です。** 以前は期限の新しい順に
+        // 残していたので、鍵を大量に作った相手の分が守られ、先に上限へ達していた
+        // `/login` の鍵が落ちて数え直しになっていました（攻撃者に有利）。
+        let mut keys: Vec<(u32, Instant, String)> = buckets
             .map
             .iter()
-            .map(|(key, bucket)| (bucket.resets_at, key.clone()))
+            .map(|(key, bucket)| (bucket.count, bucket.resets_at, key.clone()))
             .collect();
-        keys.sort_unstable_by_key(|(resets_at, _)| std::cmp::Reverse(*resets_at));
-        for (_, key) in keys.into_iter().skip(MAX_BUCKETS) {
+        // 多い順。同じなら期限の遠いほうを残す。
+        keys.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        let dropped = keys.len().saturating_sub(MAX_BUCKETS);
+        for (_, _, key) in keys.into_iter().skip(MAX_BUCKETS) {
             buckets.map.remove(&key);
+        }
+        if dropped > 0 && !self.evicted.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "数え方の置き場所が {MAX_BUCKETS} 件を超えたので、{dropped} 件を落としました。\
+                 回数を数える鍵が増えすぎています"
+            );
         }
     }
 
@@ -224,8 +245,9 @@ fn key_for(req: &Request) -> Option<String> {
 }
 
 fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
+    let target = target_of(req);
     if let Some(id) = req.auth().id() {
-        return Some(format!("user:{id}|{}", req.path()));
+        return Some(format!("user:{id}|{target}"));
     }
     // 接続元が分からなければ鍵を作らない。`"unknown"` のような1つの鍵にまとめると、
     // 誰か1人が使い切るだけで全員を締め出せてしまいます。
@@ -235,7 +257,19 @@ fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
     } else {
         peer.to_string()
     };
-    Some(format!("{who}|{}", req.path()))
+    Some(format!("{who}|{target}"))
+}
+
+/// 何に対する回数かを表す文字列。
+///
+/// **ルート名があればそちらを使います。** 生のパスを使うと、`/api/items/{id}` の
+/// ようなパス引数つきのルートで、1つの相手が `/api/items/1`…`/api/items/20000` と
+/// 叩くだけで鍵を好きなだけ増やせます。ルート名は起動時に一意だと確かめてあるので、
+/// パス引数の数だけ鍵が増えることがありません。
+///
+/// 名前を付けていないルートと、ルートに当たらなかったときはパスを使います。
+fn target_of(req: &Request) -> &str {
+    req.route_name().unwrap_or_else(|| req.path())
 }
 
 /// 前段のプロキシが伝えてきた、元の相手。
@@ -361,6 +395,53 @@ mod tests {
         assert_eq!(
             key_for_with(&req, &Trusted::None),
             Some("203.0.113.9|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 名前が付いていればルート名で数える() {
+        // パス引数つきのルートで、パスごとに鍵が増えないようにする。
+        let addr: std::net::SocketAddr = "203.0.113.9:12345".parse().expect("アドレスの形");
+        let mut first = Request::new("GET", "/api/items/1").with_remote_addr(addr);
+        first.set_route_name(Some("items.show".into()));
+        let mut second = Request::new("GET", "/api/items/99").with_remote_addr(addr);
+        second.set_route_name(Some("items.show".into()));
+
+        assert_eq!(
+            key_for_with(&first, &Trusted::None),
+            key_for_with(&second, &Trusted::None),
+            "同じルートなら、パスが違っても同じ鍵になる"
+        );
+        assert_eq!(
+            key_for_with(&first, &Trusted::None),
+            Some("203.0.113.9|items.show".to_string())
+        );
+    }
+
+    #[test]
+    fn 制限に近い鍵を残して落とす() {
+        let throttle = Throttle::new(10, Duration::from_secs(60));
+        let base = Instant::now() + Duration::from_secs(60);
+        // まず1回掃除を走らせ、基準の時刻をそろえる。
+        let _ = throttle.hit("first", base);
+
+        let filling = base + Duration::from_secs(30);
+        // 1件だけ上限に近づけ、残りは1回ずつにする。
+        for _ in 0..9 {
+            let _ = throttle.hit("close-to-limit", filling);
+        }
+        for i in 0..(MAX_BUCKETS + 100) {
+            let _ = throttle.hit(&format!("key-{i}"), filling);
+        }
+
+        let sweeping = base + Duration::from_secs(60);
+        let _ = throttle.hit("trigger", sweeping);
+
+        let buckets = throttle.buckets.lock().unwrap();
+        assert!(buckets.map.len() <= MAX_BUCKETS + 1, "天井を守っている");
+        assert!(
+            buckets.map.contains_key("close-to-limit"),
+            "制限に近い鍵は残す（落とすと数え直しになる）"
         );
     }
 

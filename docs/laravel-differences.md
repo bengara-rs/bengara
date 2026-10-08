@@ -1,7 +1,7 @@
 # Laravel と違う点
 
 bengara は Laravel の構成と書き味に寄せています。ただし同じではありません。
-ここでは **今あるものの範囲**での違いを挙げます。
+このページは対応表です。 **今あるものの範囲**での違いを挙げます。
 まだ無い機能は [backlog.md](backlog.md) にまとめてあります。
 
 表の「同じ」は、Laravel から移してきたときに考え直さなくていいところです。
@@ -24,10 +24,10 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 |--------------------------------------|---------------------------------------------------------------|
 | `php artisan ...`                    | `cargo artisan ...`                                           |
 | `route:list`                         | 同じ                                                          |
-| `make:controller` などの生成コマンド | **ありません。** 基本的なコードは AI で生成できます           |
+| `make:controller` などの生成コマンド | **ありません。** 基本的なコードは AI で生成できます            |
 | `serve` はビルド不要                 | ビルドしてから起動します。変更があれば作り直します            |
-| `serve` が見張る対象は広い           | `.rs` と `resources/lang/*.toml` だけです                     |
-| コマンドの旗は共通で緩い             | **旗はコマンドごとに分かれています。** 知らない旗はエラーです |
+| `serve` が見張る対象は広い           | `.rs` と `resources/lang/` の `.toml` だけです                |
+| コマンドの旗は共通で緩い             | **旗はコマンドごとに分かれています。** 知らない旗はエラーです  |
 
 ## 設定
 
@@ -61,18 +61,18 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 
 ## コントローラとレスポンス
 
+受け付けるハンドラの形は `async fn f() -> Result<Response>` と
+`async fn f(req: Request) -> Result<Response>` の 2 つだけです。
+
 | Laravel                        | bengara                                                                                  |
 |--------------------------------|------------------------------------------------------------------------------------------|
-| 引数の型からコンテナが注入する | **自動解決はありません。** 受け付ける形は 2 つだけです（下記）                           |
+| 引数の型からコンテナが注入する | **自動解決はありません。** 受け付ける形は上の 2 つだけです                               |
 | `Request` から何でも取れる     | メソッドは決まった一覧だけです（[requests-and-responses.md](requests-and-responses.md)） |
 | `view("welcome")`              | **テンプレートはありません。** `html(...)` か JSON を返します                            |
 | `response()->json($data)`      | `json(&data)` — `Result<Response>`                                                       |
 | `redirect('/login')`           | `redirect().to("/login")` — `Result<Response>`                                           |
 | `abort(403)`                   | `return abort(403);` と書きます                                                          |
 | 例外を投げる                   | `Err` を返します。`Error::Http` ならそのステータスです                                   |
-
-受け付ける形は `async fn f() -> Result<Response>` と
-`async fn f(req: Request) -> Result<Response>` の 2 つだけです。
 
 ## 入力とバリデーション
 
@@ -101,6 +101,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `X-CSRF-TOKEN` ヘッダー                   | 同じ                                                       |
 | 失敗すると 419                            | 同じ                                                       |
 | `VerifyCsrfToken::$except`                | `VerifyCsrfToken::new().except("/api/posts")`              |
+| （Laravel には無い）                      | `except_route("api.*")` でルート名で外せます。**勧める形** |
 
 **`except` に `/api/*` のようなまとめ書きをしないでください。**
 セッションは全ルートに掛かるので、`/api/*` も Cookie で認証されます。
@@ -114,10 +115,8 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `bootstrap/app.php` の `withExceptions` | `with_exceptions(\|e\| e.render(...))`                    |
 | `throttle:60,1`                         | `Throttle::from_spec("60,1")?` を `alias` に登録します    |
 | 制限はキャッシュで共有される            | **プロセスごとに数えます**（2 プロセスなら上限は約 2 倍） |
+| 数えるのは接続元のアドレス              | 同じ。`X-Forwarded-For` と `X-Real-IP` は下の行の相手だけ |
 | `TrustProxies` ミドルウェア             | 環境変数 `TRUSTED_PROXIES`。範囲指定（CIDR）は書けません  |
-
-回数の制限は、つないできた相手のアドレスで数えます。
-`X-Forwarded-For` と `X-Real-IP` は、`TRUSTED_PROXIES` に載っている相手からのものだけ見ます。
 
 ## データベース
 
@@ -127,7 +126,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `->where('views', '>', 100)`                       | `.where_op("views", ">", 100)`（引数の数では分けられません） |
 | `->where(function ($q) {...})`                     | `.where_group(\|q\| ...)`                                    |
 | `->orderBy()` に式を書ける                         | **列名は英数字と `_` `.` だけ。** 式は `order_by_raw` です   |
-| `->limit(1)->update([...])` が効く                 | **エラーになります**（下記）                                 |
+| `->limit(1)->update([...])` が効く                 | **エラーになります。** 黙って全件に当てないためです          |
 | `->groupBy()` ＋ `->count()`                       | **グループの数**を返します                                   |
 | `->groupBy()` ＋ `->sum()` など                    | **併用できません**（エラー）                                 |
 | `->paginate(15)` が `?page=` を見る                | `.paginate(15, req.page())`（**引数で渡します**）            |
@@ -137,28 +136,26 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | MySQL / PostgreSQL / SQLite / SQL Server           | **SQLite だけ**（機能フラグ `sqlite`）                       |
 | 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作ります |
 
-`update` と `delete` に `join` / `limit` / `offset` を付けるとエラーになります。
-黙って全件に当てないためです。
+エラーになるのは `update` と `delete` に `join` / `limit` / `offset` を付けたときです。
 
 ## モデルとマイグレーション
 
-| Laravel                                    | bengara                                                  |
-|--------------------------------------------|----------------------------------------------------------|
-| `class Post extends Model`                 | `#[derive(Model)]` ＋ `#[model(table = "posts")]`        |
-| 表の名前はクラス名から推測                 | **書きます。** 推測しません                              |
-| `$keyType = 'string'`（文字列の主キー）    | **`#[derive(Model)]` では使えません**（下記）            |
-| `$post->comments` で自動的に読む           | `post.comments().get().await?`（遅延ロードはありません） |
-| `with('comments')` でまとめ読み            | `where_in` で 2 回に分けます                             |
-| `Post::create([...])`                      | 構造体を作って `post.save().await?`                      |
-| `DB::transaction` の中で `$model->save()`  | `post.save_using(&tx).await?` を使います                 |
-| `$casts` で型を変える                      | 構造体の宣言がそのまま型です                             |
-| `Post::factory()->count(3)->create()`      | `database/factories/` のただの関数                       |
-| `up()` / `down()` は `Schema::create(...)` | 同じ。ただし**同期の関数**です                           |
-| `$table->string('title')->change()`        | **ありません**（SQLite が苦手なため）                    |
-| `php artisan migrate`                      | `cargo artisan migrate`（本番は `./myapp migrate`）      |
+| Laravel                                    | bengara                                                           |
+|--------------------------------------------|-------------------------------------------------------------------|
+| `class Post extends Model`                 | `#[derive(Model)]` ＋ `#[model(table = "posts")]`                 |
+| 表の名前はクラス名から推測                 | **書きます。** 推測しません                                       |
+| `$keyType = 'string'`（文字列の主キー）    | **使えません**（コンパイルエラー）。`Model` を手で実装します      |
+| `$post->comments` で自動的に読む           | `post.comments().get().await?`（遅延ロードはありません）          |
+| `with('comments')` でまとめ読み            | `where_in` で 2 回に分けます                                      |
+| `Post::create([...])`                      | 構造体を作って `post.save().await?`                               |
+| `DB::transaction` の中で `$model->save()`  | `post.save_using(&tx).await?` を使います                          |
+| `$casts` で型を変える                      | 構造体の宣言がそのまま型です                                      |
+| `Post::factory()->count(3)->create()`      | `database/factories/` のただの関数                                |
+| `up()` / `down()` は `Schema::create(...)` | 同じ。ただし**同期の関数**です                                    |
+| `$table->string('title')->change()`        | **ありません**（SQLite が苦手なため）                             |
+| `php artisan migrate`                      | `cargo artisan migrate`（本番は `./myapp migrate`）               |
 
 `#[derive(Model)]` が扱えるのは **自動採番の整数の主キー**だけです。
-それ以外はコンパイルエラーになります。文字列の主キーを使うなら `Model` を手で実装します。
 
 ## 認証と認可
 
@@ -217,13 +214,10 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | SMTP での送信                             | **ありません。** `log` と `array` だけです                               |
 | `Notification`                            | 作りません。`Mail` を直接使います                                        |
 | `__('messages.welcome')`                  | 同じ名前（`__`）。`:name` の差し替えは `__with`                          |
-| `App::setLocale()`                        | `Lang::set`（プロセス全体）と `Lang::with`（その 1 本だけ）              |
-| 言語ファイルは PHP の配列                 | `resources/lang/*.toml`。**ビルド時に読みます**                          |
+| `App::setLocale()`                        | `Lang::set`（プロセス全体）。リクエストごとに変えるなら `Lang::with`     |
+| 言語ファイルは PHP の配列                 | `resources/lang/<言語>.toml` か `<言語>/<群>.toml`。**ビルド時に読む**   |
 | `trans_choice`（複数形）                  | ありません。鍵を分けます                                                 |
 | `make:command` ＋ `$signature`            | `app/Console/Commands/*.rs` に `DESCRIPTION` と `handle`                 |
-
-リクエストごとに言語を変えるときは `Lang::with` を使ってください。
-`Lang::set` はプロセス全体に効きます。
 
 ## パスを返す関数
 
@@ -233,8 +227,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `base_path()` はプロジェクトのルート | 同じ                                                                    |
 | `public_path()` / `storage_path()`   | 同じ意味                                                                |
 
-名前は Laravel に合わせましたが、`app_path()` だけは指す場所が違います。
-Laravel から移したコードでは取り違えやすいところです。
+`app_path()` は名前だけ合わせてあります。指す場所が違うので、移したコードでは取り違えやすいところです。
 
 ## 本番で動かす
 
@@ -262,7 +255,7 @@ Rust では原理的に作れないものがあるためです。
 | Blade のテンプレート文法                           | 作りません。Rust のエンジンは当面入れません   |
 | 実行時に型や名前を調べる仕組み                     | ありません。Rust に無いためです               |
 | サービスコンテナによる依存の自動解決               | ありません。ハンドラの引数は 2 つの形だけです |
-| マジックメソッド（`__get` / `__call`）の遅延ロード | ありません。読み込みはいつも明示します        |
+| マジックメソッド（`__get` / `__call`）の遅延ロード | ありません。読み込みはいつも明示します         |
 | `eval` 相当・実行時のコード生成                    | ありません                                    |
 | 緩い型比較（`==` の暗黙の変換）                    | ありません。Rust の型を使います               |
 

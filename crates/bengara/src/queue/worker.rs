@@ -1,6 +1,7 @@
 //! ジョブを取り出して動かす側（`queue:work`）。
 //!
-//! - **同じジョブを2つのワーカーが同時に取らない**ように、取り出しはトランザクションの中で行います。
+//! - **同じジョブを2つのワーカーが同時に取らない**ように、取り出しは 2 文の
+//!   比較交換（select → 条件付き update）で行います。
 //! - 失敗したら回数を数え、待ち時間を伸ばして戻します。上限を超えたら `failed_jobs` へ移します。
 //! - 停止の合図（Ctrl+C）を受けたら、**いま処理中のジョブを終えてから**止まります。
 //! - ワーカーが強制終了しても、`retry_after` 秒たてば別のワーカーが取り直します
@@ -10,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{Job, DEFAULT_QUEUE, FAILED_TABLE, TABLE};
-use crate::database::{Value, DB};
-use crate::error::{Error, Result};
+use crate::database::{QueryBuilder, Value, DB};
+use crate::error::Result;
 use crate::support::time;
 
 /// `queue:work` に渡せる指定。
@@ -75,15 +76,48 @@ pub(crate) fn next_attempts(reserved_at: Option<&str>, attempts: u32) -> u32 {
     }
 }
 
-/// 取り直してよいか。`reserve` の `where` と同じ判定です。
+/// 取り直してよい行だけに絞る条件。
+///
+/// **`reserve` の 2 つの文が同じものを使います。** 片方だけ直すと、
+/// 候補の選び方と更新の条件がずれて、同じジョブを 2 つのワーカーが取ります。
 ///
 /// 時刻は `YYYY-MM-DD HH:MM:SS` なので、文字の大小が時刻の前後と一致します。
-#[cfg(test)]
-pub(crate) fn is_reclaimable(reserved_at: Option<&str>, cutoff: &str) -> bool {
-    match reserved_at {
-        None => true,
-        Some(at) => at <= cutoff,
-    }
+fn reclaimable(query: QueryBuilder, cutoff: &str) -> QueryBuilder {
+    let cutoff = cutoff.to_string();
+    query.where_group(move |q| {
+        q.where_null("reserved_at")
+            .or_where_op("reserved_at", "<=", cutoff)
+    })
+}
+
+/// いま取れるジョブだけに絞る条件（`reserve` の 1 文目）。
+fn reservable(query: QueryBuilder, queue: &str, now: &str, cutoff: &str) -> QueryBuilder {
+    reclaimable(
+        query
+            .where_("queue", queue)
+            .where_op("available_at", "<=", now.to_string()),
+        cutoff,
+    )
+}
+
+/// **自分が予約したままの行**だけに絞る条件。
+///
+/// `id` だけで絞ると、`retry_after` で取り直された後の行を触ってしまいます。
+/// 成功したときは別のワーカーが動かしている行を消し、失敗したときは
+/// 予約を外して 3 つ目のワーカーに取らせてしまいました。
+fn mine(query: QueryBuilder, reserved: &Reserved) -> QueryBuilder {
+    query
+        .where_("id", reserved.id)
+        .where_("reserved_at", reserved.reserved_at.clone())
+}
+
+/// 自分の予約ではなくなっていたことを知らせる。
+fn warn_not_mine(id: i64) {
+    tracing::warn!(
+        "ジョブ #{id} は自分の予約ではなくなっていたので、何もしません（\
+         処理に retry_after より長くかかって、別のワーカーが取り直しました。\
+         --retry-after を長くしてください）"
+    );
 }
 
 /// 取り出した 1 件。
@@ -93,6 +127,10 @@ struct Reserved {
     payload: String,
     attempts: u32,
     queue: String,
+    /// 予約したときに書いた `reserved_at`。
+    ///
+    /// `finish` と `fail` の `where` に入れて、**自分の予約のままか**を確かめます。
+    reserved_at: String,
 }
 
 /// 取り出しの結果。
@@ -110,8 +148,17 @@ enum Reservation {
 
 /// 1 件取り出して、処理中の目印を付ける。
 ///
-/// **トランザクションの中で選んで更新します。** 2 つのワーカーが同じジョブを
-/// 取らないようにするためです。
+/// **トランザクションを使いません。2 文の比較交換（compare-and-set）です。**
+///
+/// 1. `select` で候補を 1 件取る。
+/// 2. `update ... where id = ? and (reserved_at is null or reserved_at <= cutoff)`
+///    を投げ、0 件なら負けたと見なす（[`Reservation::Lost`]）。
+///
+/// 2 つのワーカーが同じ行を見ても、更新が通るのは 1 つだけです。
+///
+/// トランザクションの中で読んでから書くと、WAL では読み取りのスナップショットを
+/// 持ったまま書き込みへ昇格します。これは `SQLITE_BUSY_SNAPSHOT` になり、
+/// `busy_timeout` の再試行対象ではないので、ワーカーが丸ごと終了しました。
 ///
 /// 目印（`reserved_at`）が `retry_after` 秒より古いものも取り直します。
 /// ワーカーが強制終了・電源断で死ぬと目印が残ったままになるためです。
@@ -120,16 +167,8 @@ async fn reserve(queue: &str, retry_after: i64) -> Result<Reservation> {
     let now_secs = time::now_seconds();
     let now = time::format_timestamp(now_secs);
     let cutoff = reclaim_cutoff(now_secs, retry_after);
-    let tx = DB::begin().await?;
 
-    let row = tx
-        .table(TABLE)
-        .where_("queue", queue)
-        .where_op("available_at", "<=", now.clone())
-        .where_group(|q| {
-            q.where_null("reserved_at")
-                .or_where_op("reserved_at", "<=", cutoff.clone())
-        })
+    let row = reservable(DB::table(TABLE), queue, &now, &cutoff)
         .order_by("id")
         .limit(1)
         .get()
@@ -138,7 +177,6 @@ async fn reserve(queue: &str, retry_after: i64) -> Result<Reservation> {
         .next();
 
     let Some(row) = row else {
-        tx.commit().await?;
         return Ok(Reservation::Empty);
     };
 
@@ -150,19 +188,12 @@ async fn reserve(queue: &str, retry_after: i64) -> Result<Reservation> {
         row.get::<i64>("attempts")?.max(0) as u32,
     );
 
-    let affected = tx
-        .table(TABLE)
-        .where_("id", id)
-        .where_group(|q| {
-            q.where_null("reserved_at")
-                .or_where_op("reserved_at", "<=", cutoff.clone())
-        })
+    let affected = reclaimable(DB::table(TABLE).where_("id", id), &cutoff)
         .update(&[
-            ("reserved_at", Value::Text(now)),
+            ("reserved_at", Value::Text(now.clone())),
             ("attempts", Value::Int(attempts as i64)),
         ])
         .await?;
-    tx.commit().await?;
 
     if affected == 0 {
         // ほかのワーカーが先に取った。待たずに取り直す。
@@ -181,22 +212,42 @@ async fn reserve(queue: &str, retry_after: i64) -> Result<Reservation> {
         payload: row.get("payload")?,
         attempts,
         queue: row.get("queue")?,
+        reserved_at: now,
     }))
 }
 
 /// 成功したので消す。
-async fn finish(id: i64) -> Result<()> {
-    DB::table(TABLE).where_("id", id).delete().await?;
+///
+/// **自分が予約したままの行だけ**を消します。`id` だけで消すと、
+/// `retry_after` で取り直した別のワーカーが動かしている行を消してしまい、
+/// そのワーカーの失敗が `failed_jobs` にも残りません。
+async fn finish(reserved: &Reserved) -> Result<()> {
+    let affected = mine(DB::table(TABLE), reserved).delete().await?;
+    if affected == 0 {
+        warn_not_mine(reserved.id);
+    }
     Ok(())
 }
 
 /// 失敗したので戻す。上限を超えていたら諦める。
+///
+/// こちらも**自分が予約したままの行だけ**を触ります。`reserved_at` を
+/// 戻すだけだと、まだ動いている別のワーカーがいるのに 3 つ目のワーカーが
+/// 同じジョブを取れてしまいます。
 async fn fail(reserved: &Reserved, tries: u32, error: &str) -> Result<bool> {
     let attempts = reserved.attempts + 1;
     if attempts >= tries {
         // 入れるのと消すのを 1 つのトランザクションにする。
         // 分けると、間でプロセスが死んだときに両方の表に残って再実行されます。
         let tx = DB::begin().await?;
+        // **先に消します。** 0 件なら自分の予約ではないので、
+        // `failed_jobs` にも入れません（別のワーカーの結果を踏まない）。
+        let affected = mine(tx.table(TABLE), reserved).delete().await?;
+        if affected == 0 {
+            tx.commit().await?;
+            warn_not_mine(reserved.id);
+            return Ok(true);
+        }
         tx.table(FAILED_TABLE)
             .insert(&[
                 ("queue", Value::Text(reserved.queue.clone())),
@@ -206,20 +257,21 @@ async fn fail(reserved: &Reserved, tries: u32, error: &str) -> Result<bool> {
                 ("failed_at", Value::Text(crate::database::now())),
             ])
             .await?;
-        tx.table(TABLE).where_("id", reserved.id).delete().await?;
         tx.commit().await?;
         return Ok(true);
     }
 
     let next = time::format_timestamp(time::now_seconds() + backoff_secs(attempts));
-    DB::table(TABLE)
-        .where_("id", reserved.id)
+    let affected = mine(DB::table(TABLE), reserved)
         .update(&[
             ("attempts", Value::Int(attempts as i64)),
             ("available_at", Value::Text(next)),
             ("reserved_at", Value::Null),
         ])
         .await?;
+    if affected == 0 {
+        warn_not_mine(reserved.id);
+    }
     Ok(false)
 }
 
@@ -281,7 +333,7 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
         let started = std::time::Instant::now();
         match run_one(jobs, &reserved).await {
             Ok(()) => {
-                finish(reserved.id).await?;
+                finish(&reserved).await?;
                 processed += 1;
                 println!(
                     "  {} #{} 成功（{} ms）",
@@ -372,8 +424,7 @@ pub(crate) async fn failed_list() -> Result<Vec<(i64, String, String, String)>> 
                 row.get::<String>("error")?,
             ))
         })
-        .collect::<Result<Vec<_>>>()
-        .map_err(|e: Error| e)
+        .collect()
 }
 
 #[cfg(test)]
@@ -401,28 +452,88 @@ mod tests {
         assert_eq!(options.retry_after, 90);
     }
 
-    #[test]
-    fn 期限を過ぎた予約は取り直す() {
-        let now = time::now_seconds();
-        let cutoff = reclaim_cutoff(now, 90);
-
-        // 100 秒前に予約されたまま（ワーカーが死んだ）。
-        let dead = time::format_timestamp(now - 100);
-        assert!(is_reclaimable(Some(&dead), &cutoff));
-        // まだ予約されていないものも取れる。
-        assert!(is_reclaimable(None, &cutoff));
+    /// `reserve` の 1 文目を組み立てて SQL と値を見る。
+    ///
+    /// **Rust 側に判定を写しません。** 本番で走るのは SQL なので、写しを
+    /// 持つと 2 つがずれても気づけません。投げる文そのものを押さえます。
+    fn reserve_sql(now: &str, cutoff: &str) -> (String, Vec<Value>) {
+        reservable(DB::table(TABLE), "default", now, cutoff)
+            .order_by("id")
+            .limit(1)
+            .to_sql()
     }
 
     #[test]
-    fn 期限内の予約は取らない() {
+    fn 取り直しの条件はsqlに出る() {
+        let now = time::format_timestamp(1_700_000_000);
+        let cutoff = reclaim_cutoff(1_700_000_000, 90);
+        let (sql, bindings) = reserve_sql(&now, &cutoff);
+
+        // 予約が無いもの、または境目**以前**に予約されたもの。`<` では
+        // ちょうど境目のものを取り直せません。
+        assert!(sql.contains("\"reserved_at\" is null"), "{sql}");
+        assert!(sql.contains("or \"reserved_at\" <= ?"), "{sql}");
+        assert!(!sql.contains("\"reserved_at\" < ?"), "{sql}");
+        // 括弧でくくられていること（`or` が外に出ると全件が当たる）。
+        assert!(sql.contains("and (\"reserved_at\" is null"), "{sql}");
+        // 1 件ずつ、古いものから。
+        assert!(sql.contains("order by \"id\" asc limit 1"), "{sql}");
+
+        // 渡す値は キュー → いまの時刻 → 境目 の順。
+        assert_eq!(
+            bindings,
+            vec![
+                Value::Text("default".to_string()),
+                Value::Text(now),
+                Value::Text(cutoff),
+            ]
+        );
+    }
+
+    #[test]
+    fn 更新も同じ条件で絞る() {
+        // 2 文目（update）の `where` は 1 文目と同じものを使う。
+        let cutoff = reclaim_cutoff(1_700_000_000, 90);
+        let (sql, bindings) = reclaimable(DB::table(TABLE).where_("id", 7), &cutoff).to_sql();
+
+        assert!(sql.contains("\"id\" = ?"), "{sql}");
+        assert!(sql.contains("and (\"reserved_at\" is null"), "{sql}");
+        assert!(sql.contains("or \"reserved_at\" <= ?"), "{sql}");
+        assert_eq!(bindings, vec![Value::Int(7), Value::Text(cutoff)]);
+    }
+
+    #[test]
+    fn 自分の予約だけを触る条件() {
+        // `finish` と `fail` は id だけで絞りません。
+        let reserved = Reserved {
+            id: 7,
+            job: "SendWelcome".into(),
+            payload: "{}".into(),
+            attempts: 1,
+            queue: "default".into(),
+            reserved_at: "2024-01-01 00:00:00".into(),
+        };
+        let (sql, bindings) = mine(DB::table(TABLE), &reserved).to_sql();
+
+        assert!(sql.contains("\"id\" = ?"), "{sql}");
+        assert!(sql.contains("and \"reserved_at\" = ?"), "{sql}");
+        assert_eq!(
+            bindings,
+            vec![
+                Value::Int(7),
+                Value::Text("2024-01-01 00:00:00".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn 境目の時刻は予約より前になる() {
         let now = time::now_seconds();
         let cutoff = reclaim_cutoff(now, 90);
-
-        // 10 秒前に予約されたばかり（まだ処理中）。
-        let working = time::format_timestamp(now - 10);
-        assert!(!is_reclaimable(Some(&working), &cutoff));
-        // ちょうど境目は取り直す側に入れる。
-        assert!(is_reclaimable(Some(&cutoff), &cutoff));
+        // 100 秒前に予約されたまま（ワーカーが死んだ）＝境目より前なので取り直す。
+        assert!(time::format_timestamp(now - 100) < cutoff);
+        // 10 秒前に予約されたばかり（まだ処理中）＝境目より後なので取らない。
+        assert!(time::format_timestamp(now - 10) > cutoff);
     }
 
     #[test]

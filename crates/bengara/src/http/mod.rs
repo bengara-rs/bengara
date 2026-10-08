@@ -3,6 +3,7 @@
 pub(crate) mod cookie;
 pub(crate) mod handler;
 pub(crate) mod middleware;
+pub(crate) mod percent;
 pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod routing;

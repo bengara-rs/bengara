@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
+use crate::support::crypto;
 
 type Data = BTreeMap<String, String>;
 
@@ -66,6 +67,23 @@ fn warn_not_implemented(method: &str) {
     );
 }
 
+/// セッション ID として通す形か。
+///
+/// ID は自分で作った16進の文字列ですが、外から来た値でもあるので念のため確かめます。
+/// `..` や `/` が混じったファイル名を作らせないためです。
+///
+/// 通すのは**英数字とハイフンだけ**です。ここで**ドットを通さない**ことが、
+/// `write` の一時ファイル（`<ID>.<乱数>.tmp`）がセッションのファイル名と
+/// ぶつからない根拠になっています。この条件を緩めるときは `write` も見直してください。
+///
+/// `destroy_matching` と `sweep` も、ディレクトリの中のファイルを触るかどうかを
+/// **この判定で**決めます。書きかけの一時ファイルを消すと `rename` が失敗します。
+fn is_session_id(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// `storage/framework/sessions/` にファイルとして置く。既定の置き場所です。
 ///
 /// 1つのセッションが1つのファイルになります。
@@ -93,18 +111,8 @@ impl FileStore {
     }
 
     /// ID からファイルの場所を決める。
-    ///
-    /// ID は自分で作った16進の文字列ですが、外から来た値でもあるので念のため確かめます。
-    /// `..` や `/` が混じったファイル名を作らせないためです。
-    ///
-    /// 通すのは**英数字とハイフンだけ**です。ここで**ドットを通さない**ことが、
-    /// `write` の一時ファイル（`<ID>.tmp`）がセッションのファイル名と
-    /// ぶつからない根拠になっています。この条件を緩めるときは `write` も見直してください。
     fn path_of(&self, id: &str) -> Result<PathBuf> {
-        if id.is_empty()
-            || id.len() > 128
-            || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
+        if !is_session_id(id) {
             return Err(Error::msg("セッション ID の形が正しくありません"));
         }
         Ok(self.dir.join(id))
@@ -143,8 +151,8 @@ impl FileStore {
         let mut removed = 0;
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // 書きかけの `<ID>.tmp` などは触らない（消すと rename が失敗する）。
-            if self.path_of(&name).is_err() {
+            // 書きかけの一時ファイルなどは触らない（消すと rename が失敗する）。
+            if !is_session_id(&name) {
                 continue;
             }
             if keep == Some(name.as_str()) {
@@ -210,10 +218,26 @@ impl SessionStore for FileStore {
 
         // 書いている途中のファイルを読まれないように、別名で書いてから置き換える。
         // 一時ファイルも本体と同じ権限で作る（途中だけ読めるのでは意味がない）。
-        // `path_of` が ID にドットを通さないので、この名前はぶつからない。
-        let temp = path.with_extension("tmp");
+        //
+        // 名前に**乱数を混ぜます。** ID だけで決めると、同じ Cookie の2本が同時に
+        // 書き込んだときに同じ一時ファイルを `truncate` で開き、混ざった JSON が
+        // 本体に置き換わります。次の `read` が失敗してファイルを消すので、
+        // 利用者は突然ログアウトされ、次の POST が 419 になります。
+        //
+        // `is_session_id` がドットを通さないので、この名前は本体とぶつからず、
+        // `destroy_matching` と `sweep` も触りません。
+        let temp = self
+            .dir
+            .join(format!("{id}.{}.tmp", crypto::random_token()));
         write_private(&temp, body.as_bytes())?;
-        std::fs::rename(&temp, &path)?;
+        if let Err(e) = std::fs::rename(&temp, &path) {
+            // 置き換えられなかった一時ファイルを残さない。
+            // 残すとディスクを食い、`sweep` も触らないので永遠に消えません。
+            if let Err(cleanup) = std::fs::remove_file(&temp) {
+                tracing::warn!("一時ファイルを片付けられませんでした: {cleanup}");
+            }
+            return Err(Error::Io(e));
+        }
         Ok(())
     }
 
@@ -379,6 +403,13 @@ pub(crate) fn sweep(dir: &Path) -> Result<usize> {
     };
     let mut removed = 0;
     for entry in entries.flatten() {
+        // 名前がセッション ID の形でないファイルは触らない。
+        // 書きかけの一時ファイル（`<ID>.<乱数>.tmp`）は、まだ JSON として読めないので
+        // 「読めない＝捨てる」の判定に当たり、`rename` の直前に消してしまいます。
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_session_id(&name) {
+            continue;
+        }
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -628,6 +659,80 @@ mod tests {
         store.write("def", &with_user("7")).unwrap();
         let mode = std::fs::metadata(&other).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "0{:o}", mode & 0o777);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn セッションidの形だけを通す() {
+        assert!(is_session_id("abc123"));
+        assert!(is_session_id("a-b"));
+        assert!(!is_session_id(""));
+        assert!(
+            !is_session_id("a.b"),
+            "ドットは通さない（一時ファイルの根拠）"
+        );
+        assert!(!is_session_id("a/b"));
+        assert!(!is_session_id(".."));
+        assert!(!is_session_id(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn 掃除は一時ファイルを触らない() {
+        let dir = temp_dir("sweep-tmp");
+        FileStore::new(&dir, 0)
+            .write("old", &data(&[("a", "1")]))
+            .unwrap();
+        // 書きかけの一時ファイルを置いておく。JSON としては読めない。
+        let temp = dir.join("abc.0123456789abcdef.tmp");
+        std::fs::write(&temp, "{\"expires_at\":").unwrap();
+
+        let removed = sweep(&dir).unwrap();
+        assert_eq!(removed, 1, "期限切れの本体だけ消す");
+        assert!(!dir.join("old").exists());
+        assert!(
+            temp.exists(),
+            "書きかけは触らない（消すと rename が失敗する）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 同時に書き込んでも中身が混ざらない() {
+        // 一時ファイル名が ID だけで決まっていたころは、同じ ID の2本が
+        // 同じ `<ID>.tmp` を `truncate` で開き、混ざった JSON が本体になった。
+        let dir = temp_dir("concurrent");
+        let store = std::sync::Arc::new(FileStore::new(&dir, 60));
+
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        // Windows では、同じ本体への `rename` が同時に走ると
+                        // 「別のプロセスが使用中」で失敗することがあります。
+                        // ここで確かめたいのは**中身が混ざらないこと**なので、
+                        // 失敗そのものは見ません。
+                        let _ = store.write("abc", &data(&[("n", "値")]));
+                    }
+                    n
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("スレッドが落ちていない");
+        }
+
+        // 本体は読める（混ざった JSON になっていれば `read` が消して `None`）。
+        assert_eq!(store.read("abc").unwrap(), Some(data(&[("n", "値")])));
+        // 一時ファイルも残っていない。
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["abc".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

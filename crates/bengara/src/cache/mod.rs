@@ -94,9 +94,17 @@ where
 /// Linux では別のファイルになります。開発と本番で挙動が変わるのを避けるため、
 /// **大文字を含む鍵はハッシュ側に回します**（鍵の見た目は読めなくなりますが、
 /// どの OS でも必ず別の置き場所になります）。
+///
+/// ハッシュ側には `~` を付けます。接頭辞が無いと、64 文字の小文字 16 進は
+/// そのまま素通しするので、**別の鍵の SHA-256 を計算してその 16 進を鍵として
+/// 渡せば、狙って同じファイルを指せました**（衝突を探す必要もありません）。
+/// `~` は素通し側では `:` の置換先としてしか出ないので、`:` で始まる鍵も
+/// ハッシュ側に回して、`~` で始まる名前はハッシュだけにしています。
 pub(crate) fn normalize_key(key: &str) -> String {
     let safe = !key.is_empty()
         && key.len() <= 150
+        // `:` 始まりは `~` 始まりになるので、ハッシュとぶつからないよう避ける。
+        && !key.starts_with(':')
         && key.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b':')
         });
@@ -104,7 +112,7 @@ pub(crate) fn normalize_key(key: &str) -> String {
         // `:` は Windows のファイル名に使えないので、置き場所側で避ける。
         key.replace(':', "~")
     } else {
-        crypto::to_hex(&crypto::sha256(key.as_bytes()))
+        format!("~{}", crypto::to_hex(&crypto::sha256(key.as_bytes())))
     }
 }
 
@@ -261,11 +269,29 @@ mod tests {
     #[test]
     fn 使えない文字の鍵はハッシュにする() {
         let hashed = normalize_key("日本語の鍵");
-        assert_eq!(hashed.len(), 64, "SHA-256 の16進");
-        assert!(hashed.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(hashed.len(), 65, "`~` と SHA-256 の16進");
+        let hex = hashed.strip_prefix('~').expect("`~` で始まる");
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
         // 同じ鍵なら同じ結果になる。
         assert_eq!(hashed, normalize_key("日本語の鍵"));
         assert_ne!(hashed, normalize_key("別の鍵"));
+    }
+
+    #[test]
+    fn ハッシュの16進を鍵にしても同じ置き場所にならない() {
+        // 接頭辞が無かったときは、別の鍵の SHA-256 の16進をそのまま鍵として
+        // 渡せば、狙って同じファイルを指せた。
+        let target = normalize_key("日本語の鍵");
+        let hex = target.trim_start_matches('~');
+        assert_ne!(normalize_key(hex), target);
+        // 16進の鍵は素通しされる（ハッシュ側の名前にはならない）。
+        assert_eq!(normalize_key(hex), hex);
+
+        // `:` 始まりの鍵も、`~` 始まりのハッシュとぶつからない。
+        let colon = normalize_key(&format!(":{hex}"));
+        assert_ne!(colon, target);
+        assert_eq!(colon.len(), 65, "ハッシュ側に回る");
+        assert_ne!(colon, format!("~{hex}"));
     }
 
     #[test]
@@ -273,7 +299,7 @@ mod tests {
         // NTFS / APFS は大文字小文字を区別しないので、大文字を含む鍵はハッシュにする。
         let upper = normalize_key("User:1");
         let lower = normalize_key("user:1");
-        assert_eq!(upper.len(), 64, "ハッシュにする");
+        assert_eq!(upper.len(), 65, "ハッシュにする");
         assert_eq!(lower, "user~1", "小文字はそのまま");
         assert_ne!(upper, lower);
         // 大文字小文字を無視してもぶつからない。
@@ -282,8 +308,24 @@ mod tests {
 
     #[test]
     fn 空と長すぎる鍵もハッシュにする() {
-        assert_eq!(normalize_key("").len(), 64);
-        assert_eq!(normalize_key(&"a".repeat(200)).len(), 64);
+        assert_eq!(normalize_key("").len(), 65);
+        assert_eq!(normalize_key(&"a".repeat(200)).len(), 65);
+    }
+
+    #[test]
+    fn 正規化した鍵は一時ファイルの印を含まない() {
+        // `cache/store.rs` の `TEMP_MARK` と `LOCK_DIR` は `+` を使っています。
+        // 素通し側にもハッシュ側にも `+` が出ないことを押さえます。
+        for key in [
+            "a.+tmp.1",
+            "+locks",
+            "locks",
+            "report.2024.12",
+            "日本語の鍵",
+            "User:1",
+        ] {
+            assert!(!normalize_key(key).contains('+'), "{key}");
+        }
     }
 
     #[test]

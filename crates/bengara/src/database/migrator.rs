@@ -111,6 +111,11 @@ fn lock_error(held: Option<(String, String)>, detail: &str) -> Error {
 pub(crate) struct Migrator {
     backend: Arc<dyn Backend>,
     source: Source,
+    /// 札の表を作ったという印。
+    ///
+    /// 1つのコマンドで `lock` / `lock_holder` / `unlock` と2〜3回通るので、
+    /// 作るのは最初の1回だけにします。
+    lock_table_ready: std::sync::OnceLock<()>,
 }
 
 impl Migrator {
@@ -122,7 +127,11 @@ impl Migrator {
             Some(name) if super::test_backend().is_none() => Source::Named(name.to_string()),
             _ => Source::Default,
         };
-        Ok(Self { backend, source })
+        Ok(Self {
+            backend,
+            source,
+            lock_table_ready: std::sync::OnceLock::new(),
+        })
     }
 
     fn driver(&self) -> Driver {
@@ -143,8 +152,11 @@ impl Migrator {
         Ok(())
     }
 
-    /// 札を置く表が無ければ作る。
+    /// 札を置く表が無ければ作る。この接続では1回だけ流します。
     async fn ensure_lock_table(&self) -> Result<()> {
+        if self.lock_table_ready.get().is_some() {
+            return Ok(());
+        }
         let mut schema = Schema::new(self.driver());
         schema.create_if_not_exists(LOCK_TABLE, |t| {
             // 1行しか入らないように、主キーを固定の値にする。
@@ -155,6 +167,8 @@ impl Migrator {
         for sql in schema.into_statements() {
             self.source.execute(&sql, &[]).await?;
         }
+        // 流せたときだけ印を付ける。失敗したら次も作りに行く。
+        let _ = self.lock_table_ready.set(());
         Ok(())
     }
 

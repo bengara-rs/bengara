@@ -1,6 +1,6 @@
 //! セッションを読み書きするミドルウェアと、CSRF の確認。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{Session, SessionStore};
 use crate::error::{Error, Result};
@@ -41,8 +41,11 @@ impl SessionConfig {
     /// `APP_ENV=production` のときは `Secure` を強制します。
     /// HTTP で動かしている本番があると Cookie が送られなくなりますが、
     /// 平文で送ってしまうよりは気づけるほうがよいと考えました。
-    fn resolved(&self) -> Self {
-        let mut out = self.clone();
+    ///
+    /// **組み立てるときに 1 回だけ呼びます。** `APP_ENV` は起動後に変わりません。
+    /// リクエストごとに呼ぶと、毎回クローンが走ります。
+    fn resolved(self) -> Self {
+        let mut out = self;
         if crate::config_registry::app_config().is_production() {
             out.secure = true;
         }
@@ -64,10 +67,12 @@ pub struct StartSession {
 
 impl StartSession {
     /// 置き場所を指定して作る。
+    ///
+    /// 設定はここで実際に使う形にそろえます（`APP_ENV=production` なら `Secure`）。
     pub fn new(store: impl SessionStore, config: SessionConfig) -> Self {
         Self {
             store: Arc::new(store),
-            config,
+            config: config.resolved(),
         }
     }
 
@@ -106,7 +111,7 @@ impl StartSession {
 
     /// 設定を差し替える。
     pub fn with_config(mut self, config: SessionConfig) -> Self {
-        self.config = config;
+        self.config = config.resolved();
         self
     }
 }
@@ -114,15 +119,14 @@ impl StartSession {
 impl Middleware for StartSession {
     fn handle(&self, mut req: Request, next: Next) -> BoxFuture {
         let store = self.store.clone();
-        let config = self.config.resolved();
+        // 設定は組み立てたときにそろえてある。ここではクローンだけ。
+        let config = self.config.clone();
 
         Box::pin(async move {
             let key = signing_key()?;
 
             // 1. Cookie から ID を読む。署名が合わないものは無かったことにする。
-            let incoming = req
-                .cookie(&config.cookie)
-                .and_then(|raw| unsign(&raw, &key));
+            let incoming = req.cookie(&config.cookie).and_then(|raw| unsign(&raw, key));
 
             let had_cookie = incoming.is_some();
 
@@ -158,21 +162,40 @@ impl Middleware for StartSession {
             let response = next.run(req).await?;
 
             // 4. 要るときだけ保存する。
-            let (id_after, data) = session.take_for_save();
+            //
+            // 中身のクローン（`snapshot_for_save`）は、保存が要ると決まってから行う。
+            // 読むだけのリクエストでクローンしても捨てるだけです。
+            let id_after = session.id();
+            // ID を作り直したかどうかは「古いファイルを消すか」の判定に使う。
+            // `regenerate()` が `dirty` を立てるので、保存の判定には足しません。
             let id_changed = id_before != id_after;
-            let saved = session.should_save() || id_changed;
+            let saved = session.should_save();
 
             if saved {
+                let data = session.snapshot_for_save();
                 if id_changed {
                     // 古いほうは残さない。
+                    // 消せなくても応答は返す（新しいほうは正しく保存できている）。
+                    // 古い ID の Cookie はもう誰も持っていないので、致命的ではない。
                     let store = store.clone();
                     let old = id_before.clone();
-                    let _ = tokio::task::spawn_blocking(move || store.destroy(&old)).await;
+                    match tokio::task::spawn_blocking(move || store.destroy(&old)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::error!("作り直す前のセッションを消せませんでした: {e}")
+                        }
+                        Err(_) => tracing::error!("作り直す前のセッションの削除が中断されました"),
+                    }
                 }
                 if session.was_flushed() && data.is_empty() {
+                    // ログアウトの経路。**消せなければ 500 にする。**
+                    // 握り潰すと 200 を返しながら中身が残り、盗まれた Cookie が
+                    // 期限まで使えてしまいます。
                     let store = store.clone();
                     let id = id_after.clone();
-                    let _ = tokio::task::spawn_blocking(move || store.destroy(&id)).await;
+                    tokio::task::spawn_blocking(move || store.destroy(&id))
+                        .await
+                        .map_err(|_| Error::msg("セッションの削除が中断されました"))??;
                 } else {
                     let store = store.clone();
                     let id = id_after.clone();
@@ -187,7 +210,7 @@ impl Middleware for StartSession {
             // 保存したときと、もともと有効な Cookie を持っていたとき（期限を延ばす）だけです。
             // 何も起きなかった人に配ると、置き場所に無い ID の Cookie を持たせることになります。
             if saved || had_cookie {
-                let cookie = Cookie::new(&config.cookie, sign(&id_after, &key))
+                let cookie = Cookie::new(&config.cookie, sign(&id_after, key))
                     .with_path(&config.path)
                     .with_max_age(config.lifetime_secs as i64)
                     .with_secure(config.secure)
@@ -206,8 +229,17 @@ impl Middleware for StartSession {
 const SIGNING_LABEL: &str = "bengara:session";
 
 /// 署名の鍵。`APP_KEY` から用途ごとに作ります。
-fn signing_key() -> Result<Vec<u8>> {
-    crate::config_registry::app_config().derived_key(SIGNING_LABEL)
+///
+/// **一度作ったら使い回します。** `APP_KEY` は起動後に変わらないので、
+/// リクエストごとに HMAC-SHA256 を計算し直す意味がありません。
+/// 鍵が設定されていないときの案内だけは、毎回その場で作ります（まれなので）。
+fn signing_key() -> Result<&'static [u8]> {
+    static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+    if let Some(found) = KEY.get() {
+        return Ok(found.as_slice());
+    }
+    let derived = crate::config_registry::app_config().derived_key(SIGNING_LABEL)?;
+    Ok(KEY.get_or_init(|| derived).as_slice())
 }
 
 /// `値|署名` の形にする。
@@ -238,8 +270,23 @@ fn unsign(raw: &str, key: &[u8]) -> Option<String> {
 /// ```ignore
 /// .with_middleware(|m| m.append(StartSession::file()).append(VerifyCsrfToken::new()))
 /// ```
+///
+/// # 確認を外す
+///
+/// | 外し方 | 見るもの |
+/// |---|---|
+/// | [`except_route`](Self::except_route) | ルートの名前。**こちらを勧めます** |
+/// | [`except`](Self::except) | パス |
+///
+/// ```ignore
+/// VerifyCsrfToken::new().except_route("api.*")
+/// ```
+///
+/// ルート名で外すと、`routes/` でパスを変えてもずれません。
+/// パスを書き写す形は、ルート表との二重管理になります。
 pub struct VerifyCsrfToken {
     except: Vec<String>,
+    except_routes: Vec<String>,
 }
 
 impl Default for VerifyCsrfToken {
@@ -251,7 +298,10 @@ impl Default for VerifyCsrfToken {
 impl VerifyCsrfToken {
     /// 全部のパスで確かめる。
     pub fn new() -> Self {
-        Self { except: Vec::new() }
+        Self {
+            except: Vec::new(),
+            except_routes: Vec::new(),
+        }
     }
 
     /// 確かめないパスを足す。末尾の `*` で前方一致にできます。
@@ -259,6 +309,10 @@ impl VerifyCsrfToken {
     /// ```ignore
     /// VerifyCsrfToken::new().except("/api/*")
     /// ```
+    ///
+    /// **ルート名で外せる [`except_route`](Self::except_route) のほうが、
+    /// パスを変えてもずれません。** パスを書き写す形は、ルート表を直したときに
+    /// 外しすぎ・外し漏れが静かに起きます。
     ///
     /// `*` は**区切り（`/`）も含めた残り全部**に当たります。
     /// つまり `/api/*` は `/api/`・`/api/posts`・`/api/posts/1` に当たり、
@@ -282,14 +336,47 @@ impl VerifyCsrfToken {
         self
     }
 
-    fn is_excepted(&self, path: &str) -> bool {
-        self.except
-            .iter()
-            .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => path.starts_with(prefix),
-                None => path == pattern,
-            })
+    /// 確かめない**ルート**を名前で足す。末尾の `*` で前方一致にできます。
+    ///
+    /// ```ignore
+    /// VerifyCsrfToken::new().except_route("articles.*")
+    /// ```
+    ///
+    /// `articles.*` は `articles.index`・`articles.store`・`articles.destroy` に
+    /// 当たります。前方一致の規則は [`except`](Self::except) と同じです。
+    ///
+    /// **こちらを勧めます。** パスを書き写さないので、`routes/` でパスを変えても
+    /// ずれません。
+    ///
+    /// **名前を付けていないルートは外せません。** ルート名が無いリクエストは、
+    /// どの `except_route` にも当たりません（パスで外すなら
+    /// [`except`](Self::except) を使ってください）。
+    pub fn except_route(mut self, pattern: &str) -> Self {
+        self.except_routes.push(pattern.to_string());
+        self
     }
+
+    fn is_excepted(&self, path: &str) -> bool {
+        matches_any(&self.except, path)
+    }
+
+    /// ルート名で外す対象か。名前が無ければ当たりません。
+    fn is_excepted_route(&self, name: Option<&str>) -> bool {
+        match name {
+            Some(name) => matches_any(&self.except_routes, name),
+            None => false,
+        }
+    }
+}
+
+/// 一覧のどれかに当たるか。末尾の `*` は前方一致です。
+fn matches_any(patterns: &[String], value: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| match pattern.strip_suffix('*') {
+            Some(prefix) => value.starts_with(prefix),
+            None => value == pattern,
+        })
 }
 
 /// セッションの中でトークンを入れておく場所。
@@ -298,7 +385,8 @@ pub(crate) const CSRF_KEY: &str = "__csrf_token";
 impl Middleware for VerifyCsrfToken {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
         let safe = matches!(req.method(), "GET" | "HEAD" | "OPTIONS");
-        let excepted = self.is_excepted(req.path());
+        // パスでもルート名でも外せる。どちらかに当たれば確かめない。
+        let excepted = self.is_excepted(req.path()) || self.is_excepted_route(req.route_name());
         // ルートが無いなら守る対象も無い。確かめずに通して 404 / 405 を返させる。
         // 共通のミドルウェアはルートに当たらなかったリクエストにも掛かるので、
         // ここで見分けないと、無いページへの POST が 404 ではなく 419 になります。
@@ -312,8 +400,14 @@ impl Middleware for VerifyCsrfToken {
                 ));
             };
 
+            // 守る対象のルートが無いなら、トークンを渡す相手もいない。
+            // ここで `ensure_token` を呼ぶと、Cookie 無しの `GET /no-such-page` ごとに
+            // セッションのファイルが1つ増えます（`put` で保存が要る状態になるため）。
+            if no_route {
+                return next.run(req).await;
+            }
             // 読むだけの操作は確かめない。トークンだけ用意しておく。
-            if safe || excepted || no_route {
+            if safe || excepted {
                 ensure_token(session);
                 return next.run(req).await;
             }
@@ -443,6 +537,61 @@ mod tests {
     }
 
     #[test]
+    fn ルート名で確認を外せる() {
+        let mw = VerifyCsrfToken::new()
+            .except_route("articles.*")
+            .except_route("webhook");
+
+        // 前方一致。
+        assert!(mw.is_excepted_route(Some("articles.index")));
+        assert!(mw.is_excepted_route(Some("articles.store")));
+        assert!(
+            mw.is_excepted_route(Some("articles.")),
+            "区切りだけでも当たる"
+        );
+        // 完全一致。
+        assert!(mw.is_excepted_route(Some("webhook")));
+        assert!(!mw.is_excepted_route(Some("webhooks")));
+        assert!(
+            !mw.is_excepted_route(Some("articles")),
+            "`.` が無ければ外れる"
+        );
+        assert!(!mw.is_excepted_route(Some("posts.index")));
+
+        // 名前を付けていないルートは外せない。
+        assert!(!mw.is_excepted_route(None));
+        // ルート名は見ても、パスは見ない。
+        assert!(!mw.is_excepted("/articles"));
+    }
+
+    #[test]
+    fn パスとルート名はどちらでも外せる() {
+        let mw = VerifyCsrfToken::new()
+            .except("/webhook/*")
+            .except_route("api.*");
+
+        // パスだけで当たる。
+        assert!(mw.is_excepted("/webhook/stripe"));
+        assert!(!mw.is_excepted_route(Some("webhook.stripe")));
+
+        // ルート名だけで当たる。
+        assert!(mw.is_excepted_route(Some("api.articles.store")));
+        assert!(!mw.is_excepted("/api/articles"));
+
+        // どちらにも当たらない。
+        assert!(!mw.is_excepted("/articles"));
+        assert!(!mw.is_excepted_route(Some("articles.store")));
+    }
+
+    #[test]
+    fn 何も外さなければ全部確かめる() {
+        let mw = VerifyCsrfToken::new();
+        assert!(!mw.is_excepted("/anything"));
+        assert!(!mw.is_excepted_route(Some("anything")));
+        assert!(!mw.is_excepted_route(None));
+    }
+
+    #[test]
     fn セッションの鍵は用途ごとに分かれている() {
         // `APP_KEY` の生バイトではなく、ラベルを混ぜた鍵を使う。
         assert_eq!(SIGNING_LABEL, "bengara:session");
@@ -461,8 +610,60 @@ mod tests {
 
     #[test]
     fn 本番ではsecureが強制される() {
-        // 既定（開発）は false のまま。
+        // 素の既定値（`resolved()` を通していない値）は false。
         let config = SessionConfig::default();
         assert!(!config.secure);
+
+        // `resolved()` を通すと、本番のときだけ true になる。
+        let is_production = crate::config_registry::app_config().is_production();
+        assert_eq!(config.resolved().secure, is_production);
+
+        // 自分で true にした値は、本番でなくても下げない。
+        let explicit = SessionConfig {
+            secure: true,
+            ..SessionConfig::default()
+        };
+        assert!(explicit.resolved().secure);
+    }
+
+    #[test]
+    fn 設定は組み立てたときにそろえる() {
+        // リクエストごとに `resolved()` を呼ばないので、ここでそろっていること。
+        // `secure` は `APP_ENV` で変わるため、環境に左右されない項目で確かめます
+        // （`resolved()` の中身そのものは `本番ではsecureが強制される` が見ます）。
+        let mw = StartSession::memory();
+        assert_eq!(mw.config.cookie, "bengara_session");
+        assert_eq!(mw.config.path, "/");
+        assert_eq!(mw.config.lifetime_secs, 7200);
+
+        // `with_config` でも同じようにそろえる。
+        let mw = StartSession::memory().with_config(SessionConfig {
+            cookie: "other".into(),
+            path: "/app".into(),
+            ..SessionConfig::default()
+        });
+        assert_eq!(mw.config.cookie, "other");
+        assert_eq!(mw.config.path, "/app");
+    }
+
+    #[test]
+    fn 署名の鍵は使い回す() {
+        // 2 回目は HMAC を計算し直さず、同じ値を指す。
+        match (signing_key(), signing_key()) {
+            (Ok(a), Ok(b)) => assert!(a.as_ptr() == b.as_ptr(), "同じ鍵を指す"),
+            // APP_KEY が無い環境。案内は毎回その場で作るので、どちらもエラー。
+            (Err(_), Err(_)) => {}
+            _ => panic!("鍵の判定が揺れた"),
+        }
+    }
+
+    #[test]
+    fn トークンを用意すると保存が要る状態になる() {
+        // だからこそ、ルートに当たらないリクエストでは `ensure_token` を呼ばない。
+        // 呼ぶと Cookie 無しの `GET /no-such-page` ごとにファイルが1つ増える。
+        let session = Session::empty();
+        assert!(!session.should_save(), "触る前は保存が要らない");
+        ensure_token(&session);
+        assert!(session.should_save(), "トークンを入れると保存が要る");
     }
 }

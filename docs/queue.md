@@ -1,8 +1,18 @@
 # キューとジョブ
 
 時間のかかる処理を後回しにして、画面はすぐ返す仕組みです。
+積んだ処理（ジョブ）は、別のプロセス（worker）が取り出して動かします。
 
 **`sqlite` の機能フラグが要ります。** ジョブは DB の `jobs` 表に入ります。
+
+使うまでの手順は 4 つです。
+
+| 手順            | すること                           |
+|-----------------|------------------------------------|
+| 1. 表を作る     | `Queue::define` のマイグレーション |
+| 2. ジョブを書く | `app/Jobs/` に `handle` を置く     |
+| 3. 積む         | `Queue::push` を呼ぶ               |
+| 4. 動かす       | `cargo artisan queue:work`         |
 
 ## 表を作る
 
@@ -79,10 +89,10 @@ pub async fn handle(payload: String) -> Result<()>
 ```rust
 use bengara::prelude::*;
 
-Queue::push("SendWelcome", & Payload { user_id: 1 }).await?;         // すぐ
-Queue::later("SendWelcome", & Payload { user_id: 1 }, 300).await?;    // 5 分後
-Queue::push_on("mail", "SendWelcome", & Payload { user_id: 1 }).await?; // 列を分ける
-Queue::push_raw("SendWelcome", r#"{"user_id":1}"#).await?;           // すでに JSON のとき
+Queue::push("SendWelcome", &Payload { user_id: 1 }).await?;             // すぐ
+Queue::later("SendWelcome", &Payload { user_id: 1 }, 300).await?;       // 5 分後
+Queue::push_on("mail", "SendWelcome", &Payload { user_id: 1 }).await?;  // 列を分ける
+Queue::push_raw("SendWelcome", r#"{"user_id":1}"#).await?;              // すでに JSON のとき
 ```
 
 返るのは入れた行の id です。
@@ -124,11 +134,18 @@ cargo artisan queue:work
 | `--retry-after=秒` | 90        | 処理中のまま残ったものを取り直す秒数 |
 
 **Ctrl+C は、いま動かしている 1 件を終わらせてから止まります。** 途中で切りません。
+1 回目を押すと、そう伝える案内が出ます。 **待ちたくないときは、もう一度 Ctrl+C を押すと
+強制終了します**（終了コードは 130）。
 
 ### 複数の worker
 
 **同じジョブを 2 つの worker が処理することはありません。**
-取り出しをトランザクションの中で行い、`reserved_at` を立てているためです。
+取り出しは `select` で候補を 1 件取り、続けて「まだ予約されていなければ」という条件を
+付けた `update` を投げます。この 2 文の比較交換で、更新が通るのは 1 つの worker だけです。
+
+トランザクションは使いません。読んでから書くと、SQLite の WAL では
+`SQLITE_BUSY_SNAPSHOT` になります。これは待ち時間を伸ばしても再試行されないので、
+worker が丸ごと落ちていました。
 
 ### 取り残しを拾う
 
@@ -146,6 +163,12 @@ worker が強制終了すると、予約の目印（`reserved_at`）が立った
 **`retry_after` は、ジョブ 1 本にかかる最長の時間より長くしてください。**
 短いと、まだ動いているジョブを別の worker が二重に処理します。
 
+処理を終えた worker は、`id` だけでなく自分が書いた `reserved_at` も条件に見ます。
+取り直されて自分の予約でなくなっていたときは、 **成功も失敗も記録せず、何もしません。**
+代わりに警告が出て、`--retry-after` を長くするよう案内します。
+これが無いと、成功したときに別の worker が動かしている行を消し、失敗したときに
+予約を外して 3 つ目の worker に取らせていました。
+
 ## 失敗したとき
 
 待ってから再挑戦します。待ち時間は倍々に増えます。
@@ -158,8 +181,8 @@ worker が強制終了すると、予約の目印（`reserved_at`）が立った
 | …          | …            |
 | 6 回目以降 | 320 秒       |
 
-`--tries` を超えたら `failed_jobs` 表に移します。 **移すのと元の行を消すのは 1 つのトランザクションで行います。**
-戻すときも同じです。
+`--tries` を超えたら `failed_jobs` 表に移します。
+**移すのと元の行を消すのは 1 つのトランザクションで行います。** 戻すときも同じです。
 途中で落ちても、ジョブが消えたり二重になったりしません。
 
 ```sh
@@ -207,8 +230,8 @@ async fn 登録するとジョブが積まれる() {
 
 ```rust
 crate::app::jobs::send_welcome::handle(r#"{"user_id":1}"#.to_string())
-.await
-.unwrap();
+    .await
+    .unwrap();
 assert_eq!(Mail::sent().len(), 1);
 ```
 

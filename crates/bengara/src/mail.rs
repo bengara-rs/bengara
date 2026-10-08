@@ -174,19 +174,24 @@ pub(crate) fn install_test_mailer() {
     install_mailer(Box::new(ArrayMailer));
 }
 
+/// 名前から送り先を作る。**知らない名前は `log`** にします。
+///
+/// `mailer()` から切り出してあります。`MAILER` は 1 回しか決まらないので、
+/// 中に書くと選び方をテストから確かめられません。
+fn make_mailer(driver: &str) -> Box<dyn Mailer> {
+    match driver {
+        "array" | "memory" => Box::new(ArrayMailer) as Box<dyn Mailer>,
+        "log" => Box::new(LogMailer),
+        other => {
+            tracing::warn!("MAIL_DRIVER `{other}` は知りません。log を使います");
+            Box::new(LogMailer)
+        }
+    }
+}
+
 fn mailer() -> &'static dyn Mailer {
     MAILER
-        .get_or_init(|| {
-            let config = config();
-            match config.driver.as_str() {
-                "array" | "memory" => Box::new(ArrayMailer) as Box<dyn Mailer>,
-                "log" => Box::new(LogMailer),
-                other => {
-                    tracing::warn!("MAIL_DRIVER `{other}` は知りません。log を使います");
-                    Box::new(LogMailer)
-                }
-            }
-        })
+        .get_or_init(|| make_mailer(&config().driver))
         .as_ref()
 }
 
@@ -282,15 +287,31 @@ impl Builder {
 
     /// 送る。
     pub async fn send(self) -> Result<()> {
-        let message = self.message;
-        if message.to.iter().all(|a| a.trim().is_empty()) {
-            return Err(Error::msg("メールの宛先がありません"));
-        }
-        if message.text.is_none() && message.html.is_none() {
-            return Err(Error::msg("メールの本文がありません"));
-        }
-        crate::support::blocking(move || mailer().send(&message)).await?
+        send_with(mailer(), self.message).await
     }
+}
+
+/// 送れる形になっているか。
+///
+/// 宛先が無いメールと本文が無いメールは、送り先に渡す前に断ります。
+/// 送り先によっては黙って捨てられ、送れたつもりになるためです。
+fn check(message: &Message) -> Result<()> {
+    if message.to.iter().all(|a| a.trim().is_empty()) {
+        return Err(Error::msg("メールの宛先がありません"));
+    }
+    if message.text.is_none() && message.html.is_none() {
+        return Err(Error::msg("メールの本文がありません"));
+    }
+    Ok(())
+}
+
+/// 送り先を指定して送る（[`Builder::send`] の本体）。
+///
+/// 送り先を引数で受け取ります。`install_mailer` は 1 回しか効かないので、
+/// `mailer()` 越しだと検査と送りをテストから確かめられません。
+pub(crate) async fn send_with(mailer: &'static dyn Mailer, message: Message) -> Result<()> {
+    check(&message)?;
+    crate::support::blocking(move || mailer.send(&message)).await?
 }
 
 #[cfg(test)]
@@ -339,6 +360,33 @@ mod tests {
         assert!(log.contains("本文"));
     }
 
+    /// テストで使う送り先。`install_mailer` を使わずに差し替えられます。
+    ///
+    /// `ArrayMailer` を使わないのは、溜め先（`SENT`）がプロセス全体で1つで、
+    /// 並行して走るほかのテストと取り合うためです。
+    struct SpyMailer;
+
+    static SPY: Mutex<Vec<Message>> = Mutex::new(Vec::new());
+    static SPY_MAILER: SpyMailer = SpyMailer;
+
+    impl Mailer for SpyMailer {
+        fn send(&self, message: &Message) -> Result<()> {
+            SPY.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(message.clone());
+            Ok(())
+        }
+    }
+
+    fn spied() -> Vec<Message> {
+        std::mem::take(&mut *SPY.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// `SENT` を見るテストを直列にする錠。
+    ///
+    /// `Mail::clear_sent` を呼ぶテストが並行して走ると、互いの中身を消します。
+    static SENT_LOCK: Mutex<()> = Mutex::new(());
+
     #[tokio::test]
     async fn 宛先と本文が無ければ断る() {
         let error = Mail::to("  ")
@@ -357,9 +405,93 @@ mod tests {
         assert!(error.to_string().contains("本文がありません"));
     }
 
+    #[test]
+    fn 検査は宛先と本文を見る() {
+        // 宛先が1つも無い（空白だけも無いものとして扱う）。
+        let message = Message {
+            to: vec!["  ".to_string(), String::new()],
+            text: Some("本文".into()),
+            ..Message::default()
+        };
+        assert!(check(&message)
+            .unwrap_err()
+            .to_string()
+            .contains("宛先がありません"));
+
+        // 本文が文字でも HTML でも無い。
+        let message = Message {
+            to: vec!["a@example.com".to_string()],
+            ..Message::default()
+        };
+        assert!(check(&message)
+            .unwrap_err()
+            .to_string()
+            .contains("本文がありません"));
+
+        // HTML だけでも本文はあるものとして通す。
+        let message = Message {
+            to: vec!["a@example.com".to_string()],
+            html: Some("<p>本文</p>".into()),
+            ..Message::default()
+        };
+        assert!(check(&message).is_ok());
+    }
+
+    #[tokio::test]
+    async fn 送り先を指定して送れる() {
+        let _ = spied();
+        let message = Mail::to("a@example.com")
+            .subject("件名")
+            .text("本文")
+            .message()
+            .clone();
+        send_with(&SPY_MAILER, message).await.unwrap();
+
+        let sent = spied();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].subject, "件名");
+        assert_eq!(sent[0].to, ["a@example.com"]);
+
+        // 検査に落ちたら送り先には渡さない。
+        let message = Message {
+            to: vec!["a@example.com".to_string()],
+            subject: "本文の無いメール".into(),
+            ..Message::default()
+        };
+        assert!(send_with(&SPY_MAILER, message).await.is_err());
+        assert!(spied().is_empty(), "送り先まで届かない");
+    }
+
+    #[test]
+    fn 送り先は名前で選ぶ() {
+        let _guard = SENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let message = Message {
+            to: vec!["a@example.com".to_string()],
+            subject: "件名".into(),
+            text: Some("本文".into()),
+            ..Message::default()
+        };
+
+        // `array` と `memory` は溜める送り先。
+        for driver in ["array", "memory"] {
+            Mail::clear_sent();
+            make_mailer(driver).send(&message).unwrap();
+            assert_eq!(Mail::sent().len(), 1, "{driver}");
+        }
+
+        // `log` と知らない名前は書き出す送り先。溜まりません。
+        for driver in ["log", "smtp", ""] {
+            Mail::clear_sent();
+            make_mailer(driver).send(&message).unwrap();
+            assert!(Mail::sent().is_empty(), "{driver}");
+        }
+        Mail::clear_sent();
+    }
+
     #[tokio::test]
     async fn 溜める送り先は一覧に出る() {
         // install は1回しか効かないので、送り先を直接使う。
+        let _guard = SENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         Mail::clear_sent();
         let mailer = ArrayMailer;
         let message = Mail::to("a@example.com")

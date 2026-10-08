@@ -363,7 +363,7 @@ fn pick_primary<'a>(fields: &[&'a Field], input: &DeriveInput) -> syn::Result<&'
         .ok_or_else(|| {
             syn::Error::new(
                 input.ident.span(),
-                "主キーが決まっていません。`id` という名前のフィールドを置くか、\
+                "主キーが決まっていません。列名が `id` の項目を置くか、\
                  `#[model(primary)]` を付けてください",
             )
         })

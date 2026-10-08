@@ -15,16 +15,15 @@ use crate::http::middleware::{Middleware, Next};
 use crate::http::Request;
 
 /// 戻り先をセッションに入れておく場所。
-const INTENDED_KEY: &str = "bengara_auth_intended";
+///
+/// 読む側は `Session::intended()` です。
+pub(crate) const INTENDED_KEY: &str = "bengara_auth_intended";
 
 /// 自分のサイトの中を指すパスか。
 ///
 /// ログイン後の戻り先として覚えてよいかを決めます。`//evil.example` は
 /// 「プロトコル相対 URL」で、転送先に使うと**外のサイト**へ飛ばせます。
 /// `Location: //evil.example` はブラウザが `https://evil.example` と読むためです。
-///
-/// いまは覚えるだけで誰も読んでいませんが、読む側（Laravel の `intended()`）を
-/// あとで足すときに、入れるところで止めておくほうが見落としません。
 fn is_internal_path(path: &str) -> bool {
     path.starts_with('/') && !path.starts_with("//")
 }
@@ -36,6 +35,21 @@ fn is_internal_path(path: &str) -> bool {
 /// | JSON を期待している | 401 |
 /// | 転送先を指定していない | 401 |
 /// | 転送先を指定している | 302 |
+///
+/// # ログイン後に元の画面へ返す
+///
+/// 転送するとき（上の表の 302 の行）だけ、**もとのパスをセッションに覚えます。**
+/// ログインを処理するハンドラで `req.session().intended()` を呼ぶと取り出せます。
+/// 覚えるのは自分のサイトの中を指すパスだけです。
+///
+/// ```ignore
+/// // ログインできたあとで
+/// let back = req.session().intended().unwrap_or_else(|| "/".to_string());
+/// redirect().to(back)
+/// ```
+///
+/// 401 を返すだけの経路（JSON を期待しているとき、転送先を決めていないとき）では
+/// **覚えません。** 使う相手がいないのに、401 のたびにセッションを書くことになります。
 pub struct Authenticate {
     redirect_to: Option<String>,
 }
@@ -71,12 +85,19 @@ impl Middleware for Authenticate {
         let options = next.render_options();
         let redirect_to = self.redirect_to.clone();
         Box::pin(async move {
+            // 転送するかどうかを先に決める。転送しないなら戻り先も覚えない。
+            let will_redirect = redirect_to.is_some() && !options.wants_json;
+
             // 戻り先を覚えておく（ログイン後に元の画面へ返せるように）。
             // **自分のサイトの中だけ**を覚えます。
-            if let Some(session) = req.try_session() {
-                let intended = req.full_path();
-                if is_internal_path(&intended) {
-                    session.put(INTENDED_KEY, intended);
+            // 401 を返すだけの経路で覚えても使い道が無く、401 のたびに
+            // セッションの書き込みが増えるだけなので、転送するときに限ります。
+            if will_redirect {
+                if let Some(session) = req.try_session() {
+                    let intended = req.full_path();
+                    if is_internal_path(&intended) {
+                        session.put(INTENDED_KEY, intended);
+                    }
                 }
             }
 

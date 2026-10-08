@@ -217,6 +217,22 @@ impl Session {
         self.flash(OLD_INPUT_KEY, json);
     }
 
+    /// ログイン前に見ようとしていたパスを取り出す。**読むと消えます。**
+    ///
+    /// `Authenticate` ミドルウェアが転送するときに覚えた値です。
+    /// ログインできたあとの転送先に使います。
+    ///
+    /// ```ignore
+    /// let back = req.session().intended().unwrap_or_else(|| "/".to_string());
+    /// redirect().to(back)
+    /// ```
+    ///
+    /// 覚えてあるのは自分のサイトの中を指すパスだけです（`Authenticate` が選びます）。
+    /// 覚えていなければ `None` を返すので、呼ぶ側で既定の行き先を決めてください。
+    pub fn intended(&self) -> Option<String> {
+        self.pull(crate::auth::INTENDED_KEY)
+    }
+
     /// 前のリクエストの入力を読む。
     pub fn old(&self, key: &str) -> Option<String> {
         let raw = self.get(OLD_INPUT_KEY)?;
@@ -244,16 +260,19 @@ impl Session {
         self.lock().flushed
     }
 
-    /// 保存する中身と ID を取り出す。
+    /// 保存する中身を写し取る。
     ///
     /// 今回入れた flash は「次回ぶん」として持ち越し、前回ぶんは捨てます。
-    pub(crate) fn take_for_save(&self) -> (String, Data) {
+    ///
+    /// **中身をクローンします。** 保存が要るとき（[`should_save`](Self::should_save) が
+    /// 真のとき）だけ呼んでください。
+    pub(crate) fn snapshot_for_save(&self) -> Data {
         let inner = self.lock();
         let mut data = inner.data.clone();
         for (k, v) in &inner.flash {
             data.insert(format!("{FLASH_PREFIX}{k}"), v.clone());
         }
-        (inner.id.clone(), data)
+        data
     }
 
     /// 読み込んだ中身を、本体ぶんと持ち越しぶんに分ける。
@@ -409,7 +428,7 @@ mod tests {
         let s = session();
         s.flash("status", "ok");
         s.put("keep", "always");
-        let (_, saved) = s.take_for_save();
+        let saved = s.snapshot_for_save();
         assert!(saved.contains_key("__flash:status"));
         assert_eq!(saved.get("keep").map(String::as_str), Some("always"));
 
@@ -420,7 +439,7 @@ mod tests {
         assert_eq!(s2.get("keep").as_deref(), Some("always"));
 
         // 2回目で何も足さずに保存すると、持ち越しは消える。
-        let (_, saved2) = s2.take_for_save();
+        let saved2 = s2.snapshot_for_save();
         assert!(!saved2.contains_key("__flash:status"), "3回目には残らない");
         assert!(!saved2.contains_key("status"));
         assert_eq!(saved2.get("keep").map(String::as_str), Some("always"));
@@ -446,6 +465,17 @@ mod tests {
         s.flash_input(&[("title".to_string(), "下書き".to_string())]);
         assert_eq!(s.old("title").as_deref(), Some("下書き"));
         assert!(s.old("missing").is_none());
+    }
+
+    #[test]
+    fn 戻り先は一度だけ取り出せる() {
+        let s = session();
+        assert!(s.intended().is_none(), "覚えていなければ None");
+
+        // `Authenticate` が入れる形。
+        s.put(crate::auth::INTENDED_KEY, "/profile?page=2");
+        assert_eq!(s.intended().as_deref(), Some("/profile?page=2"));
+        assert!(s.intended().is_none(), "読むと消える");
     }
 
     #[test]

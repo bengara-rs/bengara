@@ -183,6 +183,17 @@ macro_rules! app {
 /// ```ignore
 /// use bengara::prelude::*;
 /// ```
+///
+/// **よく使うものだけを入れています。ここに無いものは `bengara::` から直接使ってください。**
+/// 根（`bengara::`）の `pub use` と中身をそろえる気はありません。`*` で取り込む名前が
+/// 増えるほど、アプリ側の名前とぶつかりやすくなるためです。
+///
+/// 置き分けの基準は 2 つです。
+///
+/// - **根（`bengara::`）**：公開 API はすべて根から届きます。`bengara::SeederFuture` の
+///   ように再エクスポートしたものと、`bengara::session::Session` のようにモジュールごと
+///   公開したものがあります。
+/// - **prelude**：ルート・コントローラ・モデルを書くときに**毎回出てくるもの**だけ置きます。
 pub mod prelude {
     pub use crate::{
         abort, abort_with, app_path, base_path, config, env, escape_html, has_valid_signature,

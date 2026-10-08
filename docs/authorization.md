@@ -1,6 +1,6 @@
 # 認可（誰に何を許すか）
 
-「この記事を直してよいのは持ち主だけ」のような判定です。
+「この記事を直してよいのは持ち主だけ」のような判定のしかたです。
 ログインしているかどうかは [authentication.md](authentication.md) にあります。
 
 ## 考え方
@@ -9,11 +9,11 @@
 フレームワークが持っているのは、真偽値から 403 を作る `authorize` だけです。
 
 ```rust
-authorize(PostPolicy::update( & user, & post)) ?;
+authorize(PostPolicy::update(&user, &post))?;
 ```
 
 文字列で引く表（Laravel の `Gate::define`）はありません。
-関数呼び出しなので、 **名前を間違えればコンパイルで止まります。**
+関数呼び出しなので、**名前を間違えればコンパイルで止まります。**
 
 ## 書く
 
@@ -73,7 +73,8 @@ pub async fn update(req: Request) -> Result<Response> {
 }
 ```
 
-3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。 **止まる順番も、この並びのとおり**です（401 → 404 → 403）。
+3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。
+**止まる順番も、この並びのとおり**です（401 → 404 → 403）。
 
 | 関数                               | すること                                           |
 |------------------------------------|----------------------------------------------------|
@@ -83,9 +84,9 @@ pub async fn update(req: Request) -> Result<Response> {
 403 を HTML で返すか JSON で返すかは、リクエストの `Accept` で決まります
 （[requests-and-responses.md](requests-and-responses.md)）。
 
-## 分けて使う
+## 止めずに分岐する
 
-真偽値なので、止めずに分岐もできます。
+返るのは真偽値です。画面の出し分けにそのまま使えます。
 
 ```rust
 let can_edit = PostPolicy::update(&user, &post);

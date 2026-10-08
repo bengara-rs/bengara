@@ -159,50 +159,14 @@ pub(crate) fn parse_cookie_header(raw: &str) -> Vec<(String, String)> {
 /// Cookie に入れられない文字を `%xx` にする。
 ///
 /// 区切りに使う文字（`;` `,` 空白 `=`）と、制御文字・非 ASCII を逃がします。
+/// 規則は `http/percent.rs` に置いてあります。
 fn encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.as_bytes() {
-        let c = *byte;
-        let safe = c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                b'-' | b'_'
-                    | b'.'
-                    | b'~'
-                    | b'!'
-                    | b'#'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'/'
-                    | b':'
-                    | b'<'
-                    | b'>'
-                    | b'?'
-                    | b'@'
-                    | b'['
-                    | b']'
-                    | b'^'
-                    | b'`'
-                    | b'{'
-                    | b'|'
-                    | b'}'
-            );
-        if safe {
-            out.push(c as char);
-        } else {
-            out.push('%');
-            out.push_str(&crate::support::crypto::to_hex(&[c]).to_uppercase());
-        }
-    }
-    out
+    super::percent::encode(input, super::percent::cookie_safe)
 }
 
 /// `%xx` を元に戻す。壊れた並びはそのまま残します。
 fn decode(input: &str) -> String {
-    super::request::percent_decode_strict(input)
+    super::percent::decode_strict(input)
 }
 
 #[cfg(test)]

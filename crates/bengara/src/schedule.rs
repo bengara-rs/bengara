@@ -201,6 +201,37 @@ fn write_last_run(dir: &Path, task: &Task, now: i64) -> Result<()> {
     Ok(())
 }
 
+/// 錠ファイルを置くディレクトリの名前。
+///
+/// 前回の時刻を覚えるファイルは SHA-256 の16進なので、`+` を含む名前とは
+/// ぶつかりません。
+const LOCK_DIR: &str = "+locks";
+
+/// そのタスクを守る錠ファイルの場所。
+fn lock_path(dir: &Path, task: &Task) -> PathBuf {
+    dir.join(LOCK_DIR)
+        .join(format!("{}.lock", task.state_file()))
+}
+
+/// 錠を取って「読む → 判定 → 書く」を行う。動かすべきなら真を返す。
+///
+/// **排他が無いと、cron が重なったとき（前の `schedule:run` が終わる前に
+/// 次が始まる）や、2 台が同じ `storage/` を共有しているときに、
+/// 同じ処理が 2 回走ります。**
+///
+/// 錠を握るのはここだけです。**処理そのものは錠を手放してから動かします。**
+/// 長い処理の間ずっと握ると、古い錠と見なされて外されてしまいます。
+/// 先に時刻を書くので、動かすと決めたのは 1 つだけになります。
+fn claim(dir: &Path, task: &Task, now: i64) -> Result<bool> {
+    let _lock = crate::support::lock::FileLock::acquire(&lock_path(dir, task))?;
+    if !is_due(read_last_run(dir, task), task.every, now) {
+        return Ok(false);
+    }
+    // 先に時刻を書く。処理が失敗しても、次の1分でまた走らないようにするため。
+    write_last_run(dir, task, now)?;
+    Ok(true)
+}
+
 /// 動かすべきものを動かす。返るのは動かした名前です。
 pub(crate) async fn run_due(schedule: &Schedule) -> Result<Vec<String>> {
     let dir = state_dir();
@@ -214,14 +245,17 @@ async fn run_due_in(dir: &Path, schedule: &Schedule) -> Result<Vec<String>> {
     let mut done = Vec::new();
 
     for task in &schedule.tasks {
-        let last_run = read_last_run(dir, task);
-
-        if !is_due(last_run, task.every, now) {
-            continue;
+        match claim(dir, task, now) {
+            Ok(true) => {}
+            // まだ動かすときではない。
+            Ok(false) => continue,
+            // 錠が取れなかった。別のプロセスが見ているので任せる。
+            // 1 つ飛ばしても、ほかの処理は動かす。
+            Err(e) => {
+                eprintln!("  {} は飛ばします（錠を取れませんでした）: {e}", task.name);
+                continue;
+            }
         }
-
-        // 先に時刻を書く。処理が失敗しても、次の1分でまた走らないようにするため。
-        write_last_run(dir, task, now)?;
 
         let started = std::time::Instant::now();
         match (task.run)().await {
@@ -411,6 +445,42 @@ mod tests {
         assert!(read_last_run(&dir, &schedule.tasks()[0]).is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 錠を取れないタスクは動かさない() {
+        let dir = temp_dir("lock");
+        let mut schedule = Schedule::new();
+        schedule.job("重なった処理", Every::Hour, || async { Ok(()) });
+
+        // 別のプロセスが錠を持っている状態を作る。
+        let held = crate::support::lock::FileLock::acquire(&lock_path(&dir, &schedule.tasks()[0]))
+            .unwrap();
+
+        // 動かさない。時刻も書かない（次の 1 分で動けるように）。
+        assert!(run_due_in(&dir, &schedule).await.unwrap().is_empty());
+        assert!(read_last_run(&dir, &schedule.tasks()[0]).is_none());
+
+        // 錠が空けば動く。
+        drop(held);
+        assert_eq!(run_due_in(&dir, &schedule).await.unwrap().len(), 1);
+        // 錠は手放したら残らない。
+        assert!(!lock_path(&dir, &schedule.tasks()[0]).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 錠の置き場所は覚えるファイルとぶつからない() {
+        let mut schedule = Schedule::new();
+        schedule.job("毎日の集計", Every::Day, || async { Ok(()) });
+        let task = &schedule.tasks()[0];
+        let dir = PathBuf::from("どこか");
+
+        // 覚えるファイルは SHA-256 の16進なので、`+` を含む名前とは重ならない。
+        assert!(!task.state_file().contains('+'));
+        assert!(lock_path(&dir, task).starts_with(dir.join(LOCK_DIR)));
+        assert_ne!(lock_path(&dir, task), dir.join(task.state_file()));
     }
 
     #[test]

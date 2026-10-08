@@ -1,7 +1,7 @@
 //! リクエスト。
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::de::DeserializeOwned;
 
@@ -18,7 +18,11 @@ pub struct Request {
     headers: Vec<(String, String)>,
     params: Vec<(String, String)>,
     body: Vec<u8>,
-    route_name: Option<String>,
+    /// 当たったルートの名前。
+    ///
+    /// `Arc<str>` なのは、1リクエストごとに `String` を作らないためです
+    /// （ルートの一覧は起動時に固定され、名前はそこから借りるだけです）。
+    route_name: Option<Arc<str>>,
     /// ルートに当たったか。
     ///
     /// 共通のミドルウェアは 404 や 405 にも掛かるので、
@@ -34,6 +38,7 @@ pub struct Request {
     form_cache: OnceLock<Vec<(String, String)>>,
     input_cache: OnceLock<Vec<(String, String)>>,
     cookie_cache: OnceLock<Vec<(String, String)>>,
+    query_cache: OnceLock<Vec<(String, String)>>,
 }
 
 impl Request {
@@ -53,6 +58,7 @@ impl Request {
             form_cache: OnceLock::new(),
             input_cache: OnceLock::new(),
             cookie_cache: OnceLock::new(),
+            query_cache: OnceLock::new(),
         }
     }
 
@@ -81,13 +87,13 @@ impl Request {
         self.params = params;
     }
 
-    pub(crate) fn set_route_name(&mut self, name: Option<String>) {
+    pub(crate) fn set_route_name(&mut self, name: Option<Arc<str>>) {
         self.route_name = name;
     }
 
     /// ルートに当たったことを覚える。`Application` が照合の直後に呼びます。
-    pub(crate) fn set_matched(&mut self, matched: bool) {
-        self.matched = matched;
+    pub(crate) fn mark_matched(&mut self) {
+        self.matched = true;
     }
 
     /// ルートに当たったか。
@@ -216,17 +222,23 @@ impl Request {
 
     /// クエリの値（最初に見つかったもの）。`%xx` と `+` を元に戻します。
     pub fn query(&self, key: &str) -> Option<String> {
-        for (k, v) in parse_query(&self.query) {
-            if k == key {
-                return Some(v);
-            }
-        }
-        None
+        self.query_pairs()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
     }
 
     /// クエリの一覧。
     pub fn query_all(&self) -> Vec<(String, String)> {
-        parse_query(&self.query)
+        self.query_pairs().to_vec()
+    }
+
+    /// クエリを解析した結果。1リクエストに1回だけ解析します。
+    ///
+    /// `page()`・`input_pairs()`・`has_valid_signature()` が同じ道を通るので、
+    /// 呼ぶたびに解析すると組ごとの `String` が積み上がります。
+    pub(crate) fn query_pairs(&self) -> &[(String, String)] {
+        self.query_cache.get_or_init(|| parse_query(&self.query))
     }
 
     /// ページ番号（`?page=2`）。無い・読めない・0 のときは 1 になります。
@@ -329,12 +341,7 @@ impl Request {
 
     /// 本文が JSON か。
     fn is_json_body(&self) -> bool {
-        self.header("content-type")
-            .map(|ct| {
-                let kind = ct.split(';').next().unwrap_or("").trim();
-                kind.eq_ignore_ascii_case("application/json") || kind.ends_with("+json")
-            })
-            .unwrap_or(false)
+        self.header("content-type").is_some_and(json_content_type)
     }
 
     /// フォームの値（最初に見つかったもの）。
@@ -394,7 +401,7 @@ impl Request {
                     }
                 }
             }
-            out.extend(self.query_all());
+            out.extend_from_slice(self.query_pairs());
             out
         })
     }
@@ -436,9 +443,10 @@ impl Request {
     }
 }
 
-/// セッションに残してはいけない名前。
+/// セッションに残してはいけない語。
 ///
-/// 名前のどこかにこの語が入っていれば落とします（`new_password_confirmation` も落ちます）。
+/// 名前を `_` `-` `.` 空白と**大文字の境目**で区切り、1語ずつ突き合わせます。
+/// `api_key` や `private_key` は `key` の語で当たるので、一覧には1語ずつ入れます。
 const SENSITIVE: &[&str] = &[
     "password",
     "passwd",
@@ -447,15 +455,15 @@ const SENSITIVE: &[&str] = &[
     "secret",
     "token",
     "key",
-    "api_key",
     "apikey",
-    "private_key",
     "credential",
+    "credentials",
     "cvv",
     "card",
     "ssn",
     "otp",
     "pin",
+    "signature",
 ];
 
 /// 覚えておいてはいけない入力を落とす。
@@ -471,9 +479,58 @@ fn redact(pairs: &[(String, String)]) -> Vec<(String, String)> {
 }
 
 /// 残してはいけない名前か。
-fn is_sensitive(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    SENSITIVE.iter().any(|word| lower.contains(word))
+///
+/// **語の単位で突き合わせます。** 以前は部分一致だったので、`shipping_address`
+/// （`pin` を含む）・`opinion`・`passenger`・`keyword` のような普通の項目まで
+/// 黙って落ちていました。再表示したフォームで住所欄だけが空に戻る、という
+/// 原因の分かりにくい不具合になります。
+///
+/// アクセスログでクエリの値を伏せるときも、同じ判定を使います。
+pub(crate) fn is_sensitive(name: &str) -> bool {
+    for_each_word(name, |word| {
+        SENSITIVE
+            .iter()
+            .any(|known| word.eq_ignore_ascii_case(known))
+    })
+}
+
+/// 名前を語に区切って1語ずつ渡す。真を返した時点で止めて真を返します。
+///
+/// 区切りは `_` `-` `.` 空白と、大文字の直前です（`apiKey` は `api` と `Key`）。
+/// 区切りに使う文字はどれも1バイトなので、UTF-8 の途中で切ることはありません。
+/// 文字列を作らないので、1リクエストごとに呼んでも確保が増えません。
+fn for_each_word(name: &str, mut found: impl FnMut(&str) -> bool) -> bool {
+    let bytes = name.as_bytes();
+    let mut start = 0;
+    for index in 0..bytes.len() {
+        let byte = bytes[index];
+        let separator = matches!(byte, b'_' | b'-' | b'.' | b' ');
+        let upper = byte.is_ascii_uppercase() && index > start;
+        if !separator && !upper {
+            continue;
+        }
+        if index > start && found(&name[start..index]) {
+            return true;
+        }
+        start = if separator { index + 1 } else { index };
+    }
+    start < bytes.len() && found(&name[start..])
+}
+
+/// `Content-Type` が JSON か。
+///
+/// `application/json` と、`application/vnd.api+json` のような `+json` で終わる形を見ます。
+/// **大文字小文字は区別しません。** 以前は `+json` の判定だけ素の比較だったので、
+/// `application/vnd.api+JSON` の本文が読まれませんでした。
+pub(crate) fn json_content_type(value: &str) -> bool {
+    let kind = value.split(';').next().unwrap_or("").trim();
+    if kind.eq_ignore_ascii_case("application/json") {
+        return true;
+    }
+    matches!(
+        kind.rsplit_once('+'),
+        Some((head, suffix)) if !head.is_empty() && suffix.eq_ignore_ascii_case("json")
+    )
 }
 
 /// `a=1&b=2` を組に分ける。値は `%xx` と `+` を元に戻します。
@@ -487,59 +544,9 @@ pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        out.push((percent_decode(k), percent_decode(v)));
+        out.push((super::percent::decode(k), super::percent::decode(v)));
     }
     out
-}
-
-/// `%xx` と `+` を元に戻す。壊れた並びはそのまま残します。
-pub(crate) fn percent_decode(input: &str) -> String {
-    decode_percent(input, true)
-}
-
-/// `%xx` だけを元に戻す。`+` は空白にしません。
-///
-/// Cookie の値はフォームの書き方（`+` が空白）ではないので、こちらを使います。
-pub(crate) fn percent_decode_strict(input: &str) -> String {
-    decode_percent(input, false)
-}
-
-fn decode_percent(input: &str, plus_is_space: bool) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' if plus_is_space => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                (Some(h), Some(l)) => {
-                    out.push(h << 4 | l);
-                    i += 3;
-                }
-                _ => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            },
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -560,14 +567,6 @@ mod tests {
         assert_eq!(req.query("q").as_deref(), Some("hello world"));
         assert_eq!(req.query("page").as_deref(), Some("2"));
         assert_eq!(req.query("none"), None);
-    }
-
-    #[test]
-    fn パーセントエンコードを戻せる() {
-        assert_eq!(percent_decode("%E3%81%82"), "あ");
-        assert_eq!(percent_decode("a%2Fb"), "a/b");
-        assert_eq!(percent_decode("%zz"), "%zz");
-        assert_eq!(percent_decode("%4"), "%4");
     }
 
     #[test]
@@ -671,11 +670,32 @@ mod tests {
             "otp",
             "pin",
             "key",
+            // 署名付き URL の署名も、それ自体が認証情報なので残さない。
+            "signature",
+            "X-Signature",
         ];
         for name in banned {
             assert!(is_sensitive(name), "{name} は残してはいけない");
         }
-        for name in ["title", "email", "age", "body"] {
+        for name in [
+            "title",
+            "email",
+            "age",
+            "body",
+            // 以前は部分一致だったので、ここから下が黙って落ちていた。
+            "shipping_address",
+            "shippingAddress",
+            "opinion",
+            "topping",
+            "spinner",
+            "keyword",
+            "monkey",
+            "turkey",
+            "passenger",
+            "passport",
+            "discard",
+            "cardiac",
+        ] {
             assert!(!is_sensitive(name), "{name} は残してよい");
         }
 
@@ -686,5 +706,61 @@ mod tests {
         ];
         let kept = redact(&pairs);
         assert_eq!(kept, vec![("title".to_string(), "のこる".to_string())]);
+    }
+
+    #[test]
+    fn 名前を語に区切る() {
+        let collect = |name: &str| {
+            let mut out = Vec::new();
+            for_each_word(name, |word| {
+                out.push(word.to_string());
+                false
+            });
+            out
+        };
+        assert_eq!(
+            collect("password_confirmation"),
+            ["password", "confirmation"]
+        );
+        assert_eq!(collect("apiKey"), ["api", "Key"]);
+        assert_eq!(collect("_token"), ["token"]);
+        assert_eq!(collect("a.b-c d"), ["a", "b", "c", "d"]);
+        // 日本語の名前でも、UTF-8 の途中で切らない。
+        assert_eq!(collect("題名_副題"), ["題名", "副題"]);
+        assert_eq!(collect(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn content_typeのjsonは大文字小文字を区別しない() {
+        assert!(json_content_type("application/json"));
+        assert!(json_content_type("APPLICATION/JSON"));
+        assert!(json_content_type("application/json; charset=utf-8"));
+        assert!(json_content_type("application/vnd.api+json"));
+        // 以前は `+json` の判定だけ素の比較で、これが通らなかった。
+        assert!(json_content_type("application/vnd.api+JSON"));
+        assert!(!json_content_type("application/x-www-form-urlencoded"));
+        assert!(!json_content_type("+json"), "前が空なら形として認めない");
+        assert!(!json_content_type(""));
+    }
+
+    #[test]
+    fn jsonの本文は種類の大文字小文字を問わず読める() {
+        let req = Request::new("post", "/")
+            .with_headers(vec![(
+                "content-type".into(),
+                "application/vnd.api+JSON".into(),
+            )])
+            .with_body(r#"{"title":"あ"}"#.as_bytes().to_vec());
+        assert_eq!(req.input("title").as_deref(), Some("あ"));
+    }
+
+    #[test]
+    fn クエリは1回だけ解析する() {
+        let req = Request::new("get", "/search").with_query("q=hello+world&page=2");
+        let first = req.query_pairs().as_ptr();
+        assert_eq!(req.query("q").as_deref(), Some("hello world"));
+        assert_eq!(req.query_all().len(), 2);
+        assert_eq!(req.page(), 2);
+        assert_eq!(req.query_pairs().as_ptr(), first, "解析し直していない");
     }
 }

@@ -1,9 +1,15 @@
 # イベント
 
 「何かが起きた」と知らせて、別の場所で受け取る仕組みです。
+呼ぶ側は、誰が聞いているかを知りません。処理を足すときに、呼ぶ側のコードを触らずに済みます。
 
-呼ぶ側は、誰が聞いているかを知りません。処理を足したいときに、
-呼ぶ側のコードを触らずに済みます。
+使うまでの手順は 3 つです。
+
+| 手順            | すること                       |
+|-----------------|--------------------------------|
+| 1. 聞く側を書く | `app/Listeners/` に `handle`   |
+| 2. 登録する     | `bootstrap/app.rs` で `listen` |
+| 3. 知らせる     | `Event::dispatch` を呼ぶ       |
 
 ## 聞く側を書く
 
@@ -45,10 +51,10 @@ pub fn app() -> Application {
 `listen` は重ねて書けます。1 つのイベントに複数の聞く側を付けられます。
 
 ```rust
-.with_events( | e| {
-e.listen("user.registered", crate::app::listeners::notify_admin::handle)
-.listen("user.registered", crate::app::listeners::send_slack::handle)
-.listen("post.published", crate::app::listeners::clear_cache::handle)
+.with_events(|e| {
+    e.listen("user.registered", crate::app::listeners::notify_admin::handle)
+        .listen("user.registered", crate::app::listeners::send_slack::handle)
+        .listen("post.published", crate::app::listeners::clear_cache::handle)
 })
 ```
 
@@ -57,7 +63,7 @@ e.listen("user.registered", crate::app::listeners::notify_admin::handle)
 ## 知らせる
 
 ```rust
-Event::dispatch("user.registered", & Payload { user_id: user.id }).await?;
+Event::dispatch("user.registered", &Payload { user_id: user.id }).await?;
 ```
 
 | メソッド                           | 失敗したとき                     |
@@ -66,17 +72,15 @@ Event::dispatch("user.registered", & Payload { user_id: user.id }).await?;
 | `Event::try_dispatch(名前, &中身)` | ログに出すだけ。先へ進む         |
 | `Event::dispatch_raw(名前, 文字)`  | すでに JSON のとき               |
 
-聞く側は **書いた順に、1 つずつ**動きます。途中で失敗すると、そこで止まります
-（`dispatch` の場合）。
+聞く側は **書いた順に、1 つずつ**動きます。
+`dispatch` では、途中で失敗するとそこで止まります。
 
 ```rust
 // 聞く側が失敗しても、登録そのものは成功させたいとき
-Event::try_dispatch("user.registered", & payload).await?;
+Event::try_dispatch("user.registered", &payload).await?;
 ```
 
-## 誰も聞いていないとき
-
-何も起きません。エラーにもなりません。
+誰も聞いていないときは何も起きません。エラーにもなりません。
 
 ```rust
 if Event::has_listeners("user.registered") { /* ... */ }
@@ -112,19 +116,19 @@ pub struct Payload {
 聞く側では自分で読みます。
 
 ```rust
-let payload: Payload = bengara::serde_json::from_str( & payload) ?;
+let payload: Payload = bengara::serde_json::from_str(&payload)?;
 ```
 
 **型は効きません。** 知らせる側と聞く側で形を合わせてください。
 
 ## 何をどこでやるか
 
+聞く側はリクエストの中で動きます。 **ここで待つと、画面の応答が遅くなります。**
+
 | やること                                 | 置き場所               |
 |------------------------------------------|------------------------|
 | すぐ終わること（数を足す、印を置く）     | 聞く側で直接           |
 | 時間のかかること（メール、外部への通信） | 聞く側からキューに積む |
-
-聞く側はリクエストの中で動きます。 **ここで待つと、画面の応答が遅くなります。**
 
 ## 無いもの
 

@@ -2,6 +2,15 @@
 //!
 //! 何度実行しても壊れないようにしてあります。すでにあるファイルには触らず、
 //! 足りないものだけを作ります。
+//!
+//! ただし次の3つは例外です。`cargo new` や利用者がすでに持っていることが多く、
+//! そのまま残すと `init` の目的が果たせないからです。
+//!
+//! | ファイル | すでにあるとき |
+//! |---|---|
+//! | `.gitignore` | 雛形の行のうち、足りない行を足す |
+//! | `.cargo/config.toml` | `artisan` の別名が無ければ足す |
+//! | `build.rs` | `bengara_build::discover()` が無ければ警告を出す（書き換えない） |
 
 use std::path::{Path, PathBuf};
 
@@ -89,15 +98,11 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     }
 
     // 利用者が手で書くことになっている入口と、数行の設定ファイル。
-    write_if_missing(
-        root,
-        ".cargo/config.toml",
-        stub("cargo_config"),
-        &mut report,
-    )?;
-    write_if_missing(root, "build.rs", stub("build_rs"), &mut report)?;
+    // この3つは「すでにある」ことが多いので、そのまま残さず中身を確かめる。
+    merge_cargo_config(root, &mut report)?;
+    check_build_rs(root, &mut report)?;
+    merge_gitignore(root, &mut report)?;
     write_if_missing(root, "artisan.rs", stub("artisan_rs"), &mut report)?;
-    write_if_missing(root, ".gitignore", stub("gitignore"), &mut report)?;
     write_if_missing(
         root,
         "storage/.gitignore",
@@ -270,6 +275,131 @@ fn write_file(path: &PathBuf, contents: &str) -> Result<()> {
     }
     std::fs::write(path, contents)
         .map_err(|e| Error::msg(format!("{} を書けません: {e}", path.display())))
+}
+
+/// `.gitignore` に、雛形の行のうち足りないものを足す。
+///
+/// **そのまま残してはいけません。** `cargo new` は `/target` の1行だけの `.gitignore` を
+/// 必ず作ります。「ある」と見て残すと `/.env` が入らず、`key:generate` で作った
+/// `APP_KEY` 入りの `.env` が git に入ります。
+fn merge_gitignore(root: &Path, report: &mut Report) -> Result<()> {
+    let path = root.join(".gitignore");
+    let wanted = stub("gitignore");
+
+    let Ok(current) = std::fs::read_to_string(&path) else {
+        write_file(&path, wanted)?;
+        report.created.push(".gitignore".to_string());
+        println!(".env を git の管理から外しました。\n");
+        return Ok(());
+    };
+
+    let missing = missing_lines(&current, wanted);
+    if missing.is_empty() {
+        report.kept.push(".gitignore".to_string());
+        return Ok(());
+    }
+
+    // 1行足すだけで全行が差分になるのを避けるため、元の改行に合わせる。
+    let newline = if current.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut lines: Vec<String> = current.lines().map(str::to_string).collect();
+    lines.extend(missing.iter().cloned());
+    let mut text = lines.join(newline);
+    text.push_str(newline);
+    std::fs::write(&path, text)
+        .map_err(|e| Error::msg(format!("{} を書けません: {e}", path.display())))?;
+
+    report.updated.push(".gitignore".to_string());
+    // 鍵が git に入りかけていたので、気づけるように1行出す。
+    if missing.iter().any(|line| line == "/.env") {
+        println!(".env を git の管理から外しました。\n");
+    }
+    Ok(())
+}
+
+/// 雛形にあって既存のファイルに無い行。
+///
+/// コメント行と空行は足しません。無くても害が無く、足すと読みにくくなるためです。
+fn missing_lines(current: &str, wanted: &str) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for line in wanted.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let in_current = current.lines().any(|l| l.trim() == line);
+        if in_current || missing.iter().any(|l| l == line) {
+            continue;
+        }
+        missing.push(line.to_string());
+    }
+    missing
+}
+
+/// `.cargo/config.toml` に `artisan` の別名が無ければ足す。
+///
+/// リンカの指定などで自前の `.cargo/config.toml` を持っている人は多いです。
+/// そのまま残すと `cargo artisan` が「そんなサブコマンドは無い」で終わり、
+/// `init` が最後に案内する「次の一歩」がそのまま動きません。
+fn merge_cargo_config(root: &Path, report: &mut Report) -> Result<()> {
+    let relative = ".cargo/config.toml";
+    let path = root.join(relative);
+    if !path.exists() {
+        write_file(&path, stub("cargo_config"))?;
+        report.created.push(relative.to_string());
+        return Ok(());
+    }
+
+    // `CargoToml` は Cargo.toml 用の名前だが、中身は「行の並び」として扱う汎用の作り。
+    let mut config = CargoToml::load(&path)?;
+    if config.has_key("alias", "artisan") {
+        report.kept.push(relative.to_string());
+        return Ok(());
+    }
+    config.add_line("alias", artisan_alias_line());
+    if config.save(&path)? {
+        report.updated.push(relative.to_string());
+        println!("cargo artisan が使えるように、.cargo/config.toml に別名を足しました。\n");
+    }
+    Ok(())
+}
+
+/// 雛形から `artisan` の別名の行を取り出す。
+///
+/// 同じ行を2か所に書くと必ずずれるので、雛形を唯一の出どころにします。
+fn artisan_alias_line() -> &'static str {
+    stub("cargo_config")
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("artisan"))
+        .unwrap_or(r#"artisan = ["run", "-q", "--bin", "artisan", "--"]"#)
+}
+
+/// `build.rs` が `bengara_build::discover()` を呼んでいるか確かめる。
+///
+/// 呼んでいないと `bengara::app!()` が `bengara_app.rs` を読めず、原因の分からない
+/// エラーになります。自前の `build.rs` を壊さないよう、書き換えずに案内だけ出します。
+fn check_build_rs(root: &Path, report: &mut Report) -> Result<()> {
+    let path = root.join("build.rs");
+    let Ok(current) = std::fs::read_to_string(&path) else {
+        write_file(&path, stub("build_rs"))?;
+        report.created.push("build.rs".to_string());
+        return Ok(());
+    };
+
+    report.kept.push("build.rs".to_string());
+    if !current.contains("bengara_build::discover") {
+        println!(
+            "build.rs が bengara_build::discover() を呼んでいません。\n\
+             このままでは bengara::app!() が bengara_app.rs を読めません。\n\
+             fn main() の中に次の1行を足してください。\n\n  \
+             bengara_build::discover()\n"
+        );
+    }
+    Ok(())
 }
 
 /// プロジェクト直下の `main.rs` を `bengara::app!();` にする。
@@ -476,6 +606,41 @@ mod tests {
         );
         update_manifest(&mut manifest, "myapp");
         assert_eq!(manifest.count_lines("bengara = {"), 0);
+    }
+
+    #[test]
+    fn cargo_newのgitignoreに足りない行を足す() {
+        // cargo new は `/target` の1行だけを作る。ここで `/.env` が入らないと
+        // APP_KEY 入りの .env が git に入る。
+        let missing = missing_lines("/target\n", stub("gitignore"));
+        assert!(missing.iter().any(|l| l == "/.env"), "{missing:?}");
+        assert!(missing.iter().any(|l| l == "/storage/framework"));
+        assert!(missing.iter().any(|l| l == "/database/*.sqlite"));
+        // すでにある行は足さない。
+        assert!(!missing.iter().any(|l| l == "/target"));
+        // コメント行と空行は足さない。
+        assert!(!missing.iter().any(|l| l.starts_with('#') || l.is_empty()));
+    }
+
+    #[test]
+    fn 揃っているgitignoreには足さない() {
+        assert!(missing_lines(stub("gitignore"), stub("gitignore")).is_empty());
+        // 前後の空白と並びの違いは無視する。
+        let current = "  /.env  \n/database/*.sqlite-wal\n/storage/framework\n\
+                       /database/*.sqlite\n/database/*.sqlite-shm\n/target\n";
+        assert!(missing_lines(current, stub("gitignore")).is_empty());
+    }
+
+    #[test]
+    fn artisanの別名は雛形から取る() {
+        let line = artisan_alias_line();
+        assert!(line.starts_with("artisan"), "{line}");
+        assert!(line.contains("--bin"), "{line}");
+        // 既存の .cargo/config.toml に足したとき、そのまま別名として読める形になる。
+        let mut config = CargoToml::load_for_test("[build]\nrustflags = []\n");
+        assert!(!config.has_key("alias", "artisan"));
+        config.add_line("alias", line);
+        assert!(config.has_key("alias", "artisan"));
     }
 
     #[test]

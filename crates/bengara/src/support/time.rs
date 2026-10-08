@@ -22,6 +22,16 @@ pub(crate) fn now_seconds() -> i64 {
 /// `YYYY-MM-DD HH:MM:SS` を UNIX 時刻（秒）に戻す。読めなければ `None`。
 ///
 /// 日付だけ（`YYYY-MM-DD`）も受け付け、00:00:00 として扱います。
+///
+/// # 時刻の後ろに付いたものは落とします
+///
+/// 秒より細かい桁（`.123`）と、タイムゾーンの指定（`Z`・`+09:00`・`-05:00`）は
+/// 見ません。**時刻部分の先頭の `HH:MM:SS` だけを読みます。**
+/// `-` を区切りの一覧に並べる形だと負の時差を読み落とし、`None`（＝期限切れ扱い）
+/// になっていました。
+///
+/// タイムゾーンを**足し引きはしません。** 自分で書く値は UTC だけで、
+/// 外から入った値の時差まで扱い出すと、どこで直すかが分からなくなるためです。
 pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     let text = text.trim();
     let (date, time) = match text.split_once(['T', ' ']) {
@@ -33,22 +43,48 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // 日の上限は月（とうるう年）で変わる。31 で通すと、`2026-02-31` が
+    // `2026-03-03` として読めてしまう。
+    if date_parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    if !(1..=days_in_month(year, month)).contains(&day) {
         return None;
     }
 
-    // 秒より細かい桁とタイムゾーンの指定は切り捨てる。
-    let time = time.split(['.', '+', 'Z']).next()?;
-    let mut time_parts = time.split(':');
+    // 先頭の `HH:MM:SS` だけを取る。数字と `:` 以外が出たところで切ります。
+    let time = time.trim();
+    let end = time
+        .find(|c: char| !(c.is_ascii_digit() || c == ':'))
+        .unwrap_or(time.len());
+    let mut time_parts = time[..end].split(':');
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let minute: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
     let second: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
-    if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..=60).contains(&second) {
+    // うるう秒（60 秒）は受け付けません。保存する側が作らない値です。
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..60).contains(&second) {
         return None;
     }
 
     let days = days_from_civil(year, month, day);
     Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// その月の日数。
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        // 月の範囲は呼ぶ側で確かめています。
+        _ => 0,
+    }
+}
+
+/// うるう年か（グレゴリオ暦）。
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 /// 年・月・日を 1970-01-01 からの日数に直す。`civil_from_days` の逆です。
@@ -144,8 +180,53 @@ mod tests {
             "2026-01-32",
             "2026-01",
             "x-01-01",
+            // 月末を超えた日。31 で通していたころは繰り上がって読めてしまった。
+            "2026-02-29",
+            "2026-02-31",
+            "2026-04-31",
+            "2026-06-31",
+            "2026-09-31",
+            "2026-11-31",
+            "2026-01-00",
+            // 時刻の範囲。
+            "2026-01-01 24:00:00",
+            "2026-01-01 00:60:00",
+            "2026-01-01 00:00:60",
+            "2026-01-01T",
         ] {
             assert_eq!(parse_timestamp(broken), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn うるう年の二月二十九日は読める() {
+        assert_eq!(parse_timestamp("2024-02-29"), Some(1_709_164_800));
+        assert!(parse_timestamp("2000-02-29").is_some(), "400 の倍数");
+        assert_eq!(parse_timestamp("1900-02-29"), None, "100 の倍数は平年");
+        assert!(parse_timestamp("2026-02-28").is_some());
+        // 月末ちょうどは通る。
+        for text in ["2026-01-31", "2026-04-30", "2026-12-31"] {
+            assert!(parse_timestamp(text).is_some(), "{text}");
+        }
+    }
+
+    #[test]
+    fn タイムゾーンつきの時刻も読める() {
+        // 時差は足し引きせず、先頭の HH:MM:SS だけを読む。
+        let base = parse_timestamp("2026-10-09 10:00:00").unwrap();
+        for text in [
+            "2026-10-09 10:00:00Z",
+            "2026-10-09T10:00:00Z",
+            "2026-10-09 10:00:00+09:00",
+            // `-` が区切りの一覧に無かったころ、ここだけ None になっていた。
+            // `PasswordReset::expired` は None を期限切れにするので、
+            // こうした値が入るとトークンが常に拒否された。
+            "2026-10-09 10:00:00-05:00",
+            "2026-10-09 10:00:00-0500",
+            "2026-10-09T10:00:00.123456-05:00",
+            "2026-10-09 10:00:00.5",
+        ] {
+            assert_eq!(parse_timestamp(text), Some(base), "{text}");
         }
     }
 

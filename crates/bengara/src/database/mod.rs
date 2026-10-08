@@ -29,7 +29,7 @@ pub(crate) mod commands;
 pub(crate) mod migrator;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 pub(crate) use backend::Backend;
 
@@ -143,8 +143,11 @@ impl ConnectionConfig {
     /// メモリの上のデータベースか。
     ///
     /// `:memory:` を指したときは真になります。接続は1本に固定されます。
+    ///
+    /// 見るのは `:memory:` だけです。`memory` という語を含むだけの
+    /// ファイル名（`data/memory_2026.db` など）を取り違えないためです。
     pub fn is_memory(&self) -> bool {
-        self.database.contains(":memory:") || self.url.contains("memory")
+        self.database.contains(":memory:") || self.url.contains(":memory:")
     }
 }
 
@@ -156,7 +159,11 @@ pub(crate) fn database_config() -> &'static DatabaseConfig {
 }
 
 static DEFAULT_BACKEND: OnceLock<Arc<dyn Backend>> = OnceLock::new();
-static NAMED_BACKENDS: OnceLock<Mutex<HashMap<String, Arc<dyn Backend>>>> = OnceLock::new();
+/// 名前で指した接続の置き場所。
+///
+/// 読むほうが圧倒的に多いので `RwLock` にします。2回目以降は読みのロックだけで
+/// 済み、書き込みのロックを取りません。
+static NAMED_BACKENDS: OnceLock<RwLock<HashMap<String, Arc<dyn Backend>>>> = OnceLock::new();
 static TEST_BACKEND: OnceLock<Arc<dyn Backend>> = OnceLock::new();
 
 /// 接続を取り出す。初回だけ実際につなぎます。
@@ -193,20 +200,23 @@ pub(crate) async fn backend(name: Option<&str>) -> Result<Arc<dyn Backend>> {
         let _ = DEFAULT_BACKEND.set(Arc::clone(&created));
         return Ok(DEFAULT_BACKEND.get().map(Arc::clone).unwrap_or(created));
     }
-    let mut map = named_map();
+    // 書き込みのロックを取るのは、初回だけです。
+    let mut map = named_lock().write().unwrap_or_else(|e| e.into_inner());
     let stored = map.entry(target.to_string()).or_insert(created).clone();
     Ok(stored)
 }
 
-fn named_map() -> std::sync::MutexGuard<'static, HashMap<String, Arc<dyn Backend>>> {
-    NAMED_BACKENDS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+fn named_lock() -> &'static RwLock<HashMap<String, Arc<dyn Backend>>> {
+    NAMED_BACKENDS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// 名前で指した接続を、読みのロックだけで探す。
 fn named_backend(name: &str) -> Option<Arc<dyn Backend>> {
-    named_map().get(name).map(Arc::clone)
+    named_lock()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .map(Arc::clone)
 }
 
 /// 設定に従って実際につなぐ。
@@ -462,6 +472,21 @@ mod tests {
         assert_eq!(c.max_connections, 1, "0 を渡しても1本は残す");
         assert!(!c.foreign_keys);
         assert!(c.is_memory());
+    }
+
+    #[test]
+    fn メモリ上かどうかは_memory_の指定だけで決める() {
+        assert!(ConnectionConfig::sqlite("main", ":memory:").is_memory());
+        assert!(ConnectionConfig::sqlite("main", "x")
+            .url("sqlite::memory:")
+            .is_memory());
+
+        // `memory` という語を含むだけのファイル名は、メモリ上ではない。
+        // 取り違えると接続1本・WAL なしになってしまう。
+        assert!(!ConnectionConfig::sqlite("main", "data/memory_2026.db").is_memory());
+        assert!(!ConnectionConfig::sqlite("main", "x")
+            .url("sqlite://data/memory_2026.db")
+            .is_memory());
     }
 
     #[test]

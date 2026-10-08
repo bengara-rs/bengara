@@ -1,6 +1,7 @@
 # ファイルの置き場所
 
 アップロードされたファイルや、アプリが作ったファイルを置く場所です。
+置き場所を「ディスク」という名前で分けて扱います。
 
 ## ディスク
 
@@ -9,7 +10,7 @@
 | `local`（既定） | `storage/app/`        | 外から直接は見えない |
 | `public`        | `storage/app/public/` | 公開してよいもの     |
 
-`config/filesystems.rs` を置けば増やせます。無くても動きます。
+`config/filesystems.rs` を置くと増やせます。無くても動きます。
 
 ```rust
 // config/filesystems.rs
@@ -29,7 +30,9 @@ pub fn config() -> StorageConfig {
 
 `DiskConfig::new` の 2 つめは **`storage/` からの相対パス**です。
 
-## 読み書き
+## 既定のディスクに読み書きする
+
+`Storage::put` のような静的メソッドは、 **既定のディスク**に対して動きます。
 
 ```rust
 use bengara::prelude::*;
@@ -38,13 +41,11 @@ Storage::put("notes/memo.txt", "本文").await?;
 Storage::put_bytes("images/a.png", bytes).await?;
 
 let body: Option<String> = Storage::get("notes/memo.txt").await?;
-let bytes: Option<Vec<u8> > = Storage::get_bytes("images/a.png").await?;
+let bytes: Option<Vec<u8>> = Storage::get_bytes("images/a.png").await?;
 
 let there = Storage::exists("notes/memo.txt").await?;
 Storage::delete("notes/memo.txt").await?;
 ```
-
-関連関数（`Storage::put` など）は **既定のディスク**に対して動きます。
 
 | メソッド                         | 返るもの                  | 覚えること               |
 |----------------------------------|---------------------------|--------------------------|
@@ -55,6 +56,13 @@ Storage::delete("notes/memo.txt").await?;
 | `exists(パス)` / `missing(パス)` | `Result<bool>`            |                          |
 | `delete(パス)`                   | `Result<()>`              | 無くてもエラーにしない   |
 
+既定のディスク（`Storage::default_disk()`）の置き場所は **最初の 1 回だけ組み立てて覚えます。**
+静的メソッドは毎回ここを通るので、設定の走査とパスの組み立てを繰り返さないためです。
+設定は起動時に決まって変わらない前提です。
+
+**実行中に設定を差し替えても、既定のディスクは変わりません。**
+別の場所を使いたいときは `Storage::disk("名前")` を呼んでください。
+
 ## ディスクを選ぶ
 
 ```rust
@@ -62,8 +70,8 @@ let disk = Storage::disk("public");
 
 disk.write("logo.png", bytes).await?;
 let size: Option<u64> = disk.size("logo.png").await?;
-let files: Vec<String> = disk.files("").await?;      // 下まで全部
-let real: PathBuf = disk.path("logo.png") ?;          // 実際の場所
+let files: Vec<String> = disk.files("").await?;     // 下まで全部
+let real: PathBuf = disk.path("logo.png")?;         // 実際の場所
 ```
 
 | メソッド               | 返るもの                  |
@@ -80,7 +88,7 @@ let real: PathBuf = disk.path("logo.png") ?;          // 実際の場所
 `files` が返すのは **ディスクからの相対パス**です。下のディレクトリまで全部見ます。
 
 ```rust
-Storage::default_disk() ?.files("notes").await?;
+Storage::default_disk()?.files("notes").await?;
 // => ["notes/memo.txt", "notes/2026/01.txt"]
 ```
 
@@ -88,11 +96,24 @@ Storage::default_disk() ?.files("notes").await?;
 
 **利用者が決めたパスをそのまま渡して構いません。** 次のものはエラーになります。
 
-| 断るもの    | 例            |
-|-------------|---------------|
-| `..` を含む | `../../.env`  |
-| 絶対パス    | `/etc/passwd` |
-| `:` を含む  | `C:\Windows`  |
+| 断るもの                    | 例                              |
+|-----------------------------|---------------------------------|
+| `..` を含む                 | `../../.env`                    |
+| 絶対パス                    | `/etc/passwd`                   |
+| `:` を含む                  | `C:\Windows`                    |
+| Windows の装置の名前        | `nul`、`con`、`com1`、`nul.txt` |
+| 末尾が空白か `.` のパス要素 | `note.txt `、`notes./a.txt`     |
+
+装置の名前は、拡張子を付けても装置のままです（`nul.txt` も `nul`）。最初の `.` より
+前だけを見て判定します。
+
+**装置の名前は全 OS で断ります。** Windows だけで断ると、Linux で通ったコードが
+Windows で黙ってデータを捨てます（`storage/app/nul` へ書くと成功が返るのに中身は
+0 バイトになり、`con` は読み戻しで止まります）。開発と本番で挙動が変わるほうが困るので、
+どの OS でも同じ名前を断ります。
+
+末尾の空白と `.` も同じ理由です。Windows はこれを落とすので、`a.txt ` と `a.txt` が
+同じファイルになります。
 
 ```rust
 pub async fn write_note(req: Request) -> Result<Response> {
@@ -165,6 +186,20 @@ public_path("robots.txt") // <プロジェクト>/public/robots.txt
 app_path("Models")        // <プロジェクト>/app/Models
 ```
 
+## 置き場所を動かす
+
+`storage/` そのものを別の場所に移せます。
+
+```
+APP_STORAGE_PATH=/var/lib/myapp/storage
+```
+
+**絶対パスのみです。** 相対パスを指定すると起動しません。
+プロセスを 2 つ以上動かすときは、全プロセスで同じ場所を指してください
+（[deployment.md](deployment.md)）。
+
+`storage/` の中のディレクトリは、`cargo artisan storage:init` が作ります。 **起動時には作りません。**
+
 ## 無いもの
 
 | 項目                                | 代わりにすること                      |
@@ -173,19 +208,9 @@ app_path("Models")        // <プロジェクト>/app/Models
 | `storage:link`                      | `/storage/...` で直接配信します       |
 | `Storage::url(path)`                | `/storage/` ＋ パスを自分で組み立てる |
 | アップロードの受け取り（multipart） | ありません。本文をそのまま受け取る    |
-| `ETag` / 範囲リクエスト             | 前段のプロキシに任せる                |
+| 範囲リクエスト（`Range`）           | 前段のプロキシに任せる                |
 
-## 置き場所を動かす
-
-```
-APP_STORAGE_PATH=/var/lib/myapp/storage
-```
-
-**絶対パスのみです。** 相対パスを指定すると起動しません。
-プロセスを2つ以上動かすときは、全プロセスで同じ場所を指してください
-（[deployment.md](deployment.md)）。
-
-`storage/` の中のディレクトリは、`cargo artisan storage:init` が作ります。 **起動時には作りません。**
+`ETag` と 304 は内蔵しています（[requests-and-responses.md](requests-and-responses.md)）。
 
 ## 関連
 

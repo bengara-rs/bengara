@@ -11,7 +11,7 @@ use sqlx::sqlite::{
     SqliteArguments, SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
     SqliteQueryResult, SqliteRow,
 };
-use sqlx::{Column, Row as SqlxRow, Sqlite, ValueRef};
+use sqlx::{Column, Row as SqlxRow, Sqlite, TypeInfo, ValueRef};
 
 use super::backend::{Backend, DbFuture, RawTx};
 use super::grammar::Driver;
@@ -114,7 +114,7 @@ impl Backend for SqliteBackend {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| failed(sql, e))?;
-            rows.iter().map(convert_row).collect()
+            convert_rows(&rows)
         })
     }
 
@@ -147,8 +147,9 @@ impl Backend for SqliteBackend {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| failed(sql, e))?;
-            rows.iter()
-                .map(|row| convert_row(row)?.get::<String>("name"))
+            convert_rows(&rows)?
+                .iter()
+                .map(|row| row.get::<String>("name"))
                 .collect()
         })
     }
@@ -166,7 +167,7 @@ impl RawTx for SqliteTx {
                 .fetch_all(&mut *self.tx)
                 .await
                 .map_err(|e| failed(sql, e))?;
-            rows.iter().map(convert_row).collect()
+            convert_rows(&rows)
         })
     }
 
@@ -233,39 +234,79 @@ fn bind<'q>(
     query
 }
 
-/// sqlx の行を `Row` に直す。
+/// sqlx の行をまとめて `Row` に直す。
 ///
-/// SQLite は値ごとに型が決まるので、取り出せる順に試します。
-fn convert_row(row: &SqliteRow) -> Result<Row> {
-    let mut columns = Vec::with_capacity(row.len());
-    let mut values = Vec::with_capacity(row.len());
+/// 列の名前は最初の行から1回だけ作り、行ごとに clone します。
+/// 1行ごとに `to_string()` すると、列の数だけ無駄に確保するためです。
+fn convert_rows(rows: &[SqliteRow]) -> Result<Vec<Row>> {
+    let Some(first) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    let columns: Vec<String> = first
+        .columns()
+        .iter()
+        .map(|column| column.name().to_string())
+        .collect();
+    rows.iter().map(|row| convert_row(row, &columns)).collect()
+}
 
-    for (index, column) in row.columns().iter().enumerate() {
-        columns.push(column.name().to_string());
-        let raw = row
-            .try_get_raw(index)
-            .map_err(|e| Error::msg(format!("列 `{}` を読めません: {e}", column.name())))?;
-        if raw.is_null() {
-            values.push(Value::Null);
-            continue;
-        }
-        let value = if let Ok(v) = row.try_get::<i64, _>(index) {
-            Value::Int(v)
-        } else if let Ok(v) = row.try_get::<f64, _>(index) {
-            Value::Float(v)
-        } else if let Ok(v) = row.try_get::<String, _>(index) {
-            Value::Text(v)
-        } else if let Ok(v) = row.try_get::<Vec<u8>, _>(index) {
-            Value::Bytes(v)
-        } else {
-            return Err(Error::msg(format!(
-                "列 `{}` の値の種類が分かりません",
-                column.name()
-            )));
-        };
-        values.push(value);
+/// sqlx の行を `Row` に直す。列の名前は呼ぶ側から受け取ります。
+fn convert_row(row: &SqliteRow, columns: &[String]) -> Result<Row> {
+    let mut values = Vec::with_capacity(columns.len());
+    for (index, name) in columns.iter().enumerate() {
+        values.push(convert_value(row, index, name)?);
     }
-    Ok(Row::new(columns, values))
+    Ok(Row::new(columns.to_vec(), values))
+}
+
+/// 1つの値を `Value` に直す。
+///
+/// SQLite は値ごとに型が決まります。その型の名前で**1回だけ**分かれます。
+/// 取り出せる順に試すと、失敗するたび sqlx がエラーの文を組み立てるので、
+/// 1セルあたり2〜3回の無駄な確保が起きます。
+/// 知らない型の名前のときだけ、順に試す経路に落とします。
+fn convert_value(row: &SqliteRow, index: usize, name: &str) -> Result<Value> {
+    let raw = row
+        .try_get_raw(index)
+        .map_err(|e| Error::msg(format!("列 `{name}` を読めません: {e}")))?;
+    if raw.is_null() {
+        return Ok(Value::Null);
+    }
+    let info = raw.type_info();
+    match info.name() {
+        "INTEGER" => read::<i64>(row, index, name).map(Value::Int),
+        "REAL" => read::<f64>(row, index, name).map(Value::Float),
+        "TEXT" => read::<String>(row, index, name).map(Value::Text),
+        "BLOB" => read::<Vec<u8>>(row, index, name).map(Value::Bytes),
+        "NULL" => Ok(Value::Null),
+        _ => try_in_order(row, index, name),
+    }
+}
+
+/// 型が分かっている値を取り出す。
+fn read<'r, T>(row: &'r SqliteRow, index: usize, name: &str) -> Result<T>
+where
+    T: sqlx::Decode<'r, Sqlite> + sqlx::Type<Sqlite>,
+{
+    row.try_get::<T, _>(index)
+        .map_err(|e| Error::msg(format!("列 `{name}` を読めません: {e}")))
+}
+
+/// 型の名前が分からないときに、取り出せる順に試す。
+fn try_in_order(row: &SqliteRow, index: usize, name: &str) -> Result<Value> {
+    if let Ok(v) = row.try_get::<i64, _>(index) {
+        return Ok(Value::Int(v));
+    }
+    if let Ok(v) = row.try_get::<f64, _>(index) {
+        return Ok(Value::Float(v));
+    }
+    if let Ok(v) = row.try_get::<String, _>(index) {
+        return Ok(Value::Text(v));
+    }
+    if let Ok(v) = row.try_get::<Vec<u8>, _>(index) {
+        return Ok(Value::Bytes(v));
+    }
+    Err(Error::msg(format!("列 `{name}` の値の種類が分かりません")))
 }
 
 /// SQL の失敗を、どの文で起きたか分かる形にする。

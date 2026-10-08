@@ -178,11 +178,6 @@ impl Middlewares {
         }
         stack.into()
     }
-
-    /// 共通のミドルウェアが1つも無く、名前も無いか（組み立てを省けるか）。
-    pub(crate) fn is_empty(&self) -> bool {
-        self.global.is_empty() && self.aliases.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -326,7 +321,6 @@ mod tests {
     #[test]
     fn 何も登録しなければ空() {
         let mw = Middlewares::default();
-        assert!(mw.is_empty());
         assert!(stack_for(&mw, &[]).is_empty());
     }
 

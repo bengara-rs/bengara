@@ -70,6 +70,17 @@ const NEEDS_LOCK: &[&str] = &[
     "db:wipe",
 ];
 
+/// 中身が消えるコマンド。本番では `--force` が無いと止めます。
+///
+/// `migrate:reset` と `migrate:refresh` も入れます。`down` を流すので、
+/// 名前に「消す」と書いていなくても中身は消えます。
+const DESTRUCTIVE: &[&str] = &[
+    "migrate:reset",
+    "migrate:refresh",
+    "migrate:fresh",
+    "db:wipe",
+];
+
 async fn execute(
     command: &str,
     options: &Options,
@@ -100,6 +111,10 @@ async fn run_one(
     seeders: &[Seeder],
     migrator: &Migrator,
 ) -> Result<()> {
+    if DESTRUCTIVE.contains(&command) {
+        // 腕ごとに書くと足し忘れるので、一覧で見る。
+        guard_destructive(options)?;
+    }
     match command {
         "migrate" => {
             report("実行した", migrator.run(migrations).await?);
@@ -133,7 +148,6 @@ async fn run_one(
             }
         }
         "migrate:fresh" => {
-            guard_destructive(options)?;
             report("消した", migrator.drop_all_tables().await?);
             report("実行した", migrator.run(migrations).await?);
             if options.seed {
@@ -152,7 +166,6 @@ async fn run_one(
             }
         }
         "db:wipe" => {
-            guard_destructive(options)?;
             report("消した", migrator.drop_all_tables().await?);
         }
         "migrate:unlock" => match migrator.lock_holder().await? {
@@ -305,6 +318,34 @@ mod tests {
         assert!(!NEEDS_LOCK.contains(&"migrate:status"));
         // 札を外すコマンド自身は札を取らない。
         assert!(!NEEDS_LOCK.contains(&"migrate:unlock"));
+    }
+
+    #[test]
+    fn 中身が消えるコマンドは本番の保護を通る() {
+        // `migrate:reset` と `migrate:refresh` は down を流すので中身が消える。
+        for command in [
+            "migrate:reset",
+            "migrate:refresh",
+            "migrate:fresh",
+            "db:wipe",
+        ] {
+            assert!(DESTRUCTIVE.contains(&command), "{command} が一覧に無い");
+            assert!(is_command(command), "{command} が一覧に無い");
+        }
+        // 足すだけのものは入れない。
+        assert!(!DESTRUCTIVE.contains(&"migrate"));
+        assert!(!DESTRUCTIVE.contains(&"migrate:rollback"));
+        assert!(!DESTRUCTIVE.contains(&"migrate:status"));
+    }
+
+    #[test]
+    fn 本番では_force_が無いと断る() {
+        // `--force` を付けたときは、本番かどうかを見ずに通る。
+        let forced = Options {
+            force: true,
+            ..Options::default()
+        };
+        guard_destructive(&forced).expect("--force なら通る");
     }
 
     #[test]

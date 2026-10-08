@@ -1,8 +1,11 @@
 # セッションと CSRF
 
-リクエストをまたいで値を覚えておく仕組みと、別のサイトからの書き込みを防ぐ仕組みです。
+リクエストをまたいで値を覚えておく仕組みの説明です。
+あわせて、別のサイトからの書き込みを防ぐ仕組み（CSRF）も扱います。
 
 ## 準備
+
+### 鍵を作る
 
 **`APP_KEY` が要ります。** Cookie の署名に使います。
 
@@ -10,27 +13,34 @@
 cargo artisan key:generate
 ```
 
-- `.env` に書き込まれます。
-- **64 文字以上が必須です。** 短いと、最初のリクエストでエラーになります。
-- **この鍵を変えると、いまのセッションと署名付き URL は全部無効になります。**
+| こと       | 内容                                                   |
+|------------|--------------------------------------------------------|
+| 書き込み先 | `.env`                                                 |
+| 長さ       | **64 文字以上が必須**。短いと最初のリクエストでエラー   |
+| 作り直すと | いまのセッションと署名付き URL が**全部無効**になります |
 
 くわしくは [configuration.md](configuration.md) の APP_KEY を見てください。
 
-`bootstrap/app.rs` に登録します。 **順番が大事です。**
+### ミドルウェアを登録する
+
+`bootstrap/app.rs` に 2 つ登録します。**順番が大事です。**
 
 ```rust
 Application::configure()
-.with_middleware( | m| {
-m.append(StartSession::from_env())            // 先に
-.append(VerifyCsrfToken::new())           // 後に
-})
-.with_routing( | r| r.web( crate::routes::web::routes))
-.create()
+    .with_middleware(|m| {
+        m.append(StartSession::from_env())      // 先に
+            .append(VerifyCsrfToken::new())     // 後に
+    })
+    .with_routing(|r| r.web(crate::routes::web::routes))
+    .create()
 ```
+
+逆に置くと 500 になります。
 
 ## 置き場所
 
-中身は **サーバー側**に置き、ブラウザには ID だけを署名つきの Cookie で渡します。
+中身は **サーバー側**に置きます。
+ブラウザには ID だけを署名つきの Cookie で渡します。
 中身がブラウザに出ないので、Cookie の 4 KB という上限にも縛られません。
 
 | `SESSION_DRIVER` | 置き場所                                   |
@@ -40,13 +50,13 @@ m.append(StartSession::from_env())            // 先に
 
 `SESSION_LIFETIME` は分です（既定 120）。
 
-**プロセスを2つ以上動かすときは、全プロセスが同じ `storage/` を見るようにしてください。**
-`memory` はプロセスをまたげないので本番では使えません。
+- **プロセスを 2 つ以上動かすときは、全プロセスが同じ `storage/` を見るようにしてください。**
+- `memory` はプロセスをまたげません。本番では使えません。
+- 置き場所は `StartSession` に渡したものが、そのリクエストのセッションに結びつきます。
+  `req.session()` の操作は必ずその置き場所に向かいます。
 
-置き場所は `StartSession` に渡したものが、 **そのリクエストのセッションに結びつきます。**
-`req.session()` の操作は、必ずその置き場所に向かいます。
-
-期限切れは読むときに消えますが、ファイルを掃除するコマンドもあります。
+期限切れは読むときに消えます。
+ファイルをまとめて掃除するコマンドもあります。
 
 ```sh
 cargo artisan session:gc
@@ -73,11 +83,11 @@ Windows では設定しません（OS の既定のままです）。
 | `destroy_for_user_except(user_id, keep)` | あり           |
 
 - 後ろの 2 つは **実装しなくても壊れません。** 警告を出して 0 を返します。
-- `Auth::logout_all_devices()` と `logout_other_devices()` がこれを呼びます
+- この 2 つを呼ぶのは `Auth::logout_all_devices()` と `logout_other_devices()` です
   （[authentication.md](authentication.md)）。
 - 必要になったときに足してください。利用者で引く方法は置き場所ごとに違います。
 
-## 使う
+## セッションを使う
 
 ```rust
 pub async fn store(req: Request) -> Result<Response> {
@@ -98,6 +108,7 @@ pub async fn store(req: Request) -> Result<Response> {
 | `pull(key)`            | 読んでから消す                         |
 | `all()`                | 全部の組                               |
 | `old(key)`             | 検査に落ちたときの入力                 |
+| `intended()`           | ログイン後の戻り先。**読むと消える**   |
 | `flush()`              | 中身を全部消す                         |
 | `regenerate()`         | ID を作り直す                          |
 | `invalidate()`         | 中身を消して ID も作り直す             |
@@ -144,18 +155,18 @@ req.session().put("user_id", id);
 
 ```rust
 StartSession::from_env().with_config(SessionConfig {
-cookie: "myapp_session".into(),
-same_site: SameSite::Strict,
-..Default::default ()
+    cookie: "myapp_session".into(),
+    same_site: SameSite::Strict,
+    ..Default::default()
 })
 ```
 
 ## CSRF
 
-`GET` / `HEAD` / `OPTIONS` は素通しし、それ以外でトークンを確かめます。
-合わなければ **419** を返します。
+`GET` / `HEAD` / `OPTIONS` は素通しします。
+それ以外のメソッドでトークンを確かめ、合わなければ **419** を返します。
 
-### フォームから
+### フォームから送る
 
 ```html
 <input type="hidden" name="_token" value="{{ token }}">
@@ -163,9 +174,9 @@ same_site: SameSite::Strict,
 
 トークンは `req.csrf_token()` で取り出せます。
 
-### SPA から
+### SPA から送る
 
-トークンを配るルートを1本作ります。
+トークンを配るルートを 1 本作ります。
 
 ```rust
 // routes/web.rs
@@ -184,23 +195,43 @@ pub async fn token(req: Request) -> Result<Response> {
 **ルートに当たらなかったリクエストでは、CSRF を確かめません。**
 無いページへの POST は 419 ではなく 404 のままです。
 
+**トークンも用意しません。** Cookie を持たない人が無いページを叩いても、
+`Set-Cookie` は返りませんし、`storage/framework/sessions/` にファイルも増えません。
+用意していた頃は、クローラが来るだけでファイルがたまりました。
+
 共通のミドルウェアがルートの無いリクエストにも掛かる話は
 [middleware.md](middleware.md) にあります。
 
-### 確かめない場所
+### 確かめない場所を決める
+
+外し方は 2 つあります。**ルート名で外すほうを勧めます。**
+
+| 書き方                  | 見るもの     | 備考                           |
+|-------------------------|--------------|--------------------------------|
+| `except_route(pattern)` | ルートの名前 | **こちらを勧めます**           |
+| `except(pattern)`       | パス         | 名前の無いルートを外すときだけ |
 
 ```rust
-VerifyCsrfToken::new().except("/webhook")
+VerifyCsrfToken::new()
+    .except_route("webhook")      // 名前が webhook のルート
+    .except_route("api.stripe.*") // api.stripe. で始まる名前のルート
+    .except("/webhook")           // パスで外す
 ```
 
-末尾の `*` で前方一致になります。
+どちらも末尾の `*` で前方一致になります。
 
-**外すのは、Cookie で認証しない API だけ**
+ルート名のほうが安全です。
+パスはルート表と二重に管理することになり、書き間違えると思っていない所まで外れます。
+
+**名前の無いルートは `except_route` では外せません。**
+`.name(...)` を付けるか、パスで外してください。
+
+### 外してよいのは Cookie で認証しない API だけ
 
 **`/api/*` のようにまとめて外さないでください。**
 
 - `StartSession` は **全ルートに掛かります**。だから `/api/*` も Cookie で認証されます。
-- そこで CSRF だけ外すと、 **別のサイトから Cookie に便乗して書き込めます。**
+- そこで CSRF だけ外すと、**別のサイトから Cookie に便乗して書き込めます。**
 - 支えているのは `SameSite=Lax` だけ、という状態になります。
 
 外してよいのは、次のどちらかです。
@@ -212,7 +243,7 @@ VerifyCsrfToken::new().except("/webhook")
 
 **外すときは、必ず別の方法で相手を確かめてください。**
 
-**`*` の直前は `/` にする**
+### `*` の直前は `/` にする
 
 ```rust
 .except("/admin*")     // /administration にも当たる
@@ -238,13 +269,15 @@ Ok(response.with_cookie(&cookie))
 
 ## 気をつけること
 
-- **セッションに秘密を入れすぎない。** 中身はサーバー側にありますが、置き場所は平文のファイルです。
-- `req.session()` は `StartSession` を登録していないと **パニックします**。登録し忘れにすぐ気づくためです。
-- `VerifyCsrfToken` を `StartSession` より前に置くと 500 になります。
+| こと                                 | 内容                                                     |
+|--------------------------------------|----------------------------------------------------------|
+| セッションに秘密を入れすぎない       | 中身はサーバー側ですが、置き場所は平文のファイルです     |
+| `StartSession` を登録し忘れない      | `req.session()` が**パニックします**。すぐ気づくためです |
+| `VerifyCsrfToken` は後に置く         | `StartSession` より前に置くと 500 になります             |
 
 ## まだ無いもの
 
-DB / Redis への保存と、1回だけ有効なトークンはありません。
+DB / Redis への保存と、1 回だけ有効なトークンはありません。
 [backlog.md](backlog.md) を参照してください。
 
 ログインの仕組みは **あります**。[authentication.md](authentication.md) を見てください。

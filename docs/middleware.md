@@ -26,7 +26,7 @@ impl EnsureAdmin {
 - `next.run(req).await` で先へ進みます。
 - 呼ばなければ、そこで止まります。`abort(403)` がその形です。
 
-コントローラと同じく、 **トレイトを手で実装する必要はありません**。
+コントローラと同じく、**トレイトを手で実装する必要はありません**。
 
 ## 登録する
 
@@ -34,12 +34,12 @@ impl EnsureAdmin {
 
 ```rust
 Application::configure()
-.with_middleware( | m| {
-m.append(AddPoweredBy::handle)            // 全ルートに掛ける
-.alias("admin", EnsureAdmin::handle)  // 名前を付ける
-})
-.with_routing( | r| r.web( crate::routes::web::routes).health("/up"))
-.create()
+    .with_middleware(|m| {
+        m.append(AddPoweredBy::handle)        // 全ルートに掛ける
+            .alias("admin", EnsureAdmin::handle)  // 名前を付ける
+    })
+    .with_routing(|r| r.web(crate::routes::web::routes).health("/up"))
+    .create()
 ```
 
 | メソッド          | 中身                                       |
@@ -48,13 +48,17 @@ m.append(AddPoweredBy::handle)            // 全ルートに掛ける
 | `prepend(mw)`     | 全ルートの**前**に足す                     |
 | `alias(name, mw)` | 名前を付ける。ルート側から呼べるようになる |
 
+**登録していない名前を `.middleware(...)` に書くと、起動時に止まります。**
+`with_middleware(...)` を一度も書いていないときも同じです。
+黙って素通しにすると、`admin` を付けたつもりの画面が誰にでも見えてしまいます。
+
 ## ルートに付ける
 
 ```rust
 // routes/web.rs
 Route::get("/admin", AdminController::index)
-.middleware("admin")
-.name("admin.index");
+    .middleware("admin")
+    .name("admin.index");
 ```
 
 `.middleware()` は何回でも書けます。書いた順に通ります。
@@ -69,12 +73,12 @@ Route::get("/admin", AdminController::index)
 レスポンス（逆順に戻る）
 ```
 
-戻りは逆順です。 **外側のミドルウェアが最後にレスポンスへ手を入れます。**
+戻りは逆順です。**外側のミドルウェアが最後にレスポンスへ手を入れます。**
 
 ## ルートが無いときも通る
 
-**`append` / `prepend` で登録した共通のミドルウェアは、ルートに当たらなかったリクエストにも
-掛かります。** Laravel と同じです。
+**`append` / `prepend` で登録した共通のミドルウェアは、ルートに当たらなかった
+リクエストにも掛かります。** Laravel と同じです。
 
 | リクエスト               | 共通のミドルウェア |
 |--------------------------|--------------------|
@@ -89,6 +93,8 @@ Route::get("/admin", AdminController::index)
 
 - **`VerifyCsrfToken` は、ルートが無いときは確かめません。**
   無いページへの POST は 419 ではなく 404 のままです。
+  トークンも用意しないので、**404 の応答にはセッションの Cookie も付きません**
+  （もともと Cookie を持っていた人には付きます）。
 
 自分のミドルウェアで同じことをしたいときは `req.route_matched()` を見ます。
 
@@ -105,7 +111,7 @@ pub async fn handle(req: Request, next: Next) -> Result<Response> {
 
 ## エラーのときも通る
 
-`next.run(req).await` が返すのは **いつも成功**です。
+`next.run(req).await` が返すのは**いつも成功**です。
 内側で `abort(403)` が起きても、ここではもうレスポンスになっています。
 
 ```rust
@@ -118,8 +124,7 @@ pub async fn handle(req: Request, next: Next) -> Result<Response> {
 こうしてあるのは、レスポンスに手を入れるミドルウェアが、
 エラーのときだけ素通りされるのを防ぐためです。
 
-内側で起きたエラーの中身（`Error` そのもの）はミドルウェアからは見えません。
-必要になったら足します（[backlog.md](backlog.md)）。
+内側で起きたエラーの中身そのものは、ミドルウェアからは見えません。
 
 ## 起動時に止まる場合
 
@@ -144,7 +149,31 @@ GET     /              home
 GET     /admin         admin.index  admin
 ```
 
+## 状態を持たせたいとき
+
+設定の値を持つミドルウェアは、`Middleware` トレイトを自分で実装します。
+
+```rust
+pub struct MaxLength(pub usize);
+
+impl Middleware for MaxLength {
+    fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        let limit = self.0;
+        Box::pin(async move {
+            if req.body().len() > limit {
+                return abort(413);
+            }
+            next.run(req).await
+        })
+    }
+}
+```
+
+`self` は future の中へ持ち込めません。必要な値を先に取り出してください。
+
 ## 回数の制限（throttle）
+
+同じ相手から短い間に何度も来るのを止めます。
 
 ```rust
 // bootstrap/app.rs
@@ -156,8 +185,8 @@ Route::post("/login", AuthController::login).middleware("throttle");
 
 | 作り方                                       | 中身                                    |
 |----------------------------------------------|-----------------------------------------|
-| `Throttle::per_minute(60)`                   | 1分に60回                               |
-| `Throttle::new(10, Duration::from_secs(30))` | 30秒に10回                              |
+| `Throttle::per_minute(60)`                   | 1 分に 60 回                            |
+| `Throttle::new(10, Duration::from_secs(30))` | 30 秒に 10 回                           |
 | `Throttle::from_spec("60,1")?`               | Laravel の `throttle:60,1` と同じ書き方 |
 
 超えると **429** を返し、`Retry-After`（秒）が付きます。
@@ -165,7 +194,13 @@ Route::post("/login", AuthController::login).middleware("throttle");
 
 ### 誰を数えるか
 
-数えるのは「相手とパスの組」です。相手の決め方は次のとおりです。
+数えるのは「相手と**ルート名**の組」です。ルートに名前が無いときだけパスで数えます。
+
+ルート名で数えるので、`/api/items/{id}` のようなルートでは `/api/items/1` と
+`/api/items/99` が**同じ枠**になります。パスで数えると、相手が値を変えるだけで
+枠を無限に増やせてしまいます。**制限を掛けるルートには名前を付けてください。**
+
+相手の決め方は次のとおりです。
 
 | 状況                 | 数える相手                   |
 |----------------------|------------------------------|
@@ -173,10 +208,11 @@ Route::post("/login", AuthController::login).middleware("throttle");
 | していない           | **つないできたアドレス**     |
 | アドレスが分からない | 数えない。制限を掛けずに通す |
 
-ログインしている人ごとに数えるので、同じ回線にいる別の人（会社や学校）が巻き込まれません。
+ログインしている人ごとに数えます。
+同じ回線にいる別の人（会社や学校）が巻き込まれません。
 
 アドレスが分からないのは、ソケットを使わない呼び出し（テストなど）です。
-そのときは **警告を 1 回だけ出して通します**。
+そのときは**警告を 1 回だけ出して通します**。
 
 ### プロキシのヘッダー
 
@@ -195,48 +231,27 @@ Route::post("/login", AuthController::login).middleware("throttle");
 ### 大事な制限
 
 **回数はプロセスのメモリに数えます。**
-プロセスを2つ動かすと、それぞれが別々に数えるので、 **実際の上限は指定の約2倍になります。**
+プロセスを 2 つ動かすと、それぞれが別々に数えます。
+**実際の上限は指定の約 2 倍になります。**
 
 厳密に守りたいときは、前段のプロキシ（nginx の `limit_req` など）で掛けてください。
-共通の置き場所に載せ替えるのは、キャッシュを作ってからです（[backlog.md](backlog.md)）。
 
-期限切れの掃除は、 **件数ではなく時刻**で間隔を決めます。どれだけ混んでも、
-指定した期間に 1 回だけ走ります。
-
-## 状態を持たせたいとき
-
-設定を持つミドルウェアは、`Middleware` トレイトを自分で実装します。
-
-```rust
-pub struct MaxLength(pub usize);
-
-impl Middleware for MaxLength {
-    fn handle(&self, req: Request, next: Next) -> BoxFuture {
-        let limit = self.0;
-        Box::pin(async move {
-            if req.body().len() > limit {
-                return abort(413);
-            }
-            next.run(req).await
-        })
-    }
-}
-```
-
-`self` は future の中へ持ち込めないので、必要な値を先に取り出してください。
+期限切れの掃除は、**件数ではなく時刻**で間隔を決めます。
+どれだけ混んでも、指定した期間に 1 回だけ走ります。
 
 ## 動きの前提
 
-- 並びは **起動時に組み立てて固定**します。リクエスト処理中はロックを取りません。
+- 並びは**起動時に組み立てて固定**します。リクエスト処理中はロックを取りません。
 - ミドルウェアがパニックしても、ハンドラと同じく 1 リクエストに閉じ込めて 500 を返します。
 
 ## まだ無いもの
 
-ミドルウェアへの引数（`throttle:60,1`）と、優先順の指定はまだありません。
+ミドルウェアへの引数（`throttle:60,1`）と、優先順の指定はありません。
 [backlog.md](backlog.md) を参照してください。
 
 ルートのグループはあります（[routing.md](routing.md)）。
 
----
+## 関連
 
-関連: [routing.md](routing.md) / [requests-and-responses.md](requests-and-responses.md)
+- [routing.md](routing.md)
+- [requests-and-responses.md](requests-and-responses.md)

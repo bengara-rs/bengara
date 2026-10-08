@@ -180,14 +180,31 @@ mod tests {
 
     #[test]
     fn app_keyが空ならエラーになる() {
-        // `cipher()` は AppConfig の鍵を使う。空のときの案内を確かめる。
-        if crate::config_registry::app_config().key.is_empty() {
-            // ChaCha20Poly1305 は Debug を実装していないので unwrap_err は使えない。
-            let error = match cipher() {
-                Ok(_) => panic!("鍵が空なのに作れてしまった"),
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("key:generate"), "{error}");
-        }
+        // `AppConfig` を直接作って確かめる。
+        // `app_config()` を見る形だと、ほかのテストが先に鍵を入れていた場合に
+        // 判定ごと飛ばされ、**何も確かめないまま通って**しまう。
+        let config = crate::AppConfig {
+            name: "test".into(),
+            env: "testing".into(),
+            debug: false,
+            url: "http://localhost".into(),
+            key: String::new(),
+        };
+        let error = config.derived_key(ENCRYPTION_LABEL).unwrap_err();
+        assert!(error.to_string().contains("key:generate"), "{error}");
+    }
+
+    #[test]
+    fn app_keyが短ければエラーになる() {
+        // 短い鍵でも HMAC は計算できてしまうので、断れるのは導出のところだけ。
+        let config = crate::AppConfig {
+            name: "test".into(),
+            env: "testing".into(),
+            debug: false,
+            url: "http://localhost".into(),
+            key: "x".into(),
+        };
+        let error = config.derived_key(ENCRYPTION_LABEL).unwrap_err();
+        assert!(error.to_string().contains("短すぎます"), "{error}");
     }
 }

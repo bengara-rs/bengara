@@ -62,12 +62,12 @@ pub(crate) fn placeholder(driver: Driver, index: usize) -> String {
 
 /// 名前を引用符でくくる。`users.id` は `"users"."id"` になります。
 ///
-/// `*`、`count(*)` のような式はそのまま返します。`as` を含む指定も触りません。
+/// `*`、`count(*)`、`id as key` のような式はそのまま返します。
 ///
 /// **そのまま返す経路は意図した逃げ道です。** `select(&["count(*) as total"])` が
-/// これに頼っています。代わりに、外から来た文字列が入りうる場所
-/// （`order_by` / `group_by` / `having_op` の列名）では
-/// [`is_plain_identifier`] で先に検査します。
+/// これに頼っています。引用符を含む名前は素通しせず、`""` に逃がしてくくります。
+/// そのうえで、外から来た文字列が入りうる場所（`where_` / `order_by` / `join` の
+/// 列名など）では [`is_plain_identifier`] で先に検査します。
 pub(crate) fn quote(driver: Driver, name: &str) -> String {
     let trimmed = name.trim();
     if is_expression(trimmed) {
@@ -81,15 +81,18 @@ pub(crate) fn quote(driver: Driver, name: &str) -> String {
 }
 
 /// 引用符でくくらずにそのまま置く式か。
+///
+/// 引用符（`"` と `` ` ``）は見ません。`quote_part` が `""` に逃がすので、
+/// 素通しさせる必要がないためです。素通しすると、引用符を1つ混ぜるだけで
+/// 検査を抜けられてしまいます。
 fn is_expression(name: &str) -> bool {
-    name == "*"
-        || name.contains('(')
-        || name.contains(' ')
-        || name.contains('"')
-        || name.contains('`')
+    name == "*" || name.contains('(') || name.contains(' ')
 }
 
 /// ただの列名か。英数字と `_` `.` だけを許します。
+///
+/// 英数字は Unicode で見ます。日本語の列名も通ります。`"` `;` `(` `-` と空白は
+/// Unicode でも英数字ではないので、検査の強さは変わりません。
 ///
 /// `*` も式も通しません。式を書きたいときは `order_by_raw` / `having_raw` /
 /// `where_raw` を使ってください。
@@ -100,7 +103,7 @@ pub(crate) fn is_plain_identifier(name: &str) -> bool {
     }
     trimmed
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
 }
 
 /// 比べるのに使える演算子の一覧。これ以外は受け付けません。
@@ -175,6 +178,15 @@ mod tests {
     }
 
     #[test]
+    fn 引用符を含む名前は素通しせず逃がす() {
+        // `"` を混ぜて検査を抜ける道を塞ぐ。
+        assert_eq!(quote(Driver::Sqlite, "a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote(Driver::MySql, "a`b"), "`a``b`");
+        // バックティックは SQLite では普通の文字なので、そのままくくる。
+        assert_eq!(quote(Driver::Sqlite, "a`b"), "\"a`b\"");
+    }
+
+    #[test]
     fn プレースホルダはpostgresだけ番号付き() {
         assert_eq!(placeholder(Driver::Sqlite, 1), "?");
         assert_eq!(placeholder(Driver::MySql, 3), "?");
@@ -192,6 +204,16 @@ mod tests {
         assert!(!is_plain_identifier("id desc"));
         assert!(!is_plain_identifier("id; drop table posts"));
         assert!(!is_plain_identifier("\"id\""));
+        assert!(!is_plain_identifier("a`b"));
+        assert!(!is_plain_identifier("id-1"));
+    }
+
+    #[test]
+    fn 日本語の列名も通る() {
+        // 英数字を Unicode で見るので、`where_` と `order_by` で結果がそろう。
+        assert!(is_plain_identifier("題名"));
+        assert!(is_plain_identifier("posts.題名"));
+        assert_eq!(quote(Driver::Sqlite, "題名"), "\"題名\"");
     }
 
     #[test]

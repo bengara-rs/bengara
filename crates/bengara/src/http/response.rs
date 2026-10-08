@@ -1,15 +1,20 @@
 //! レスポンス。
 
+use std::borrow::Cow;
+
 use serde::Serialize;
 
 use crate::error::{reason_phrase, Error, Result};
 
 /// クライアントに返す内容。
+///
+/// 本文は `Cow` で持ちます。バイナリに埋め込んだ `public/` を配信するときに、
+/// `&'static [u8]` をコピーせずそのまま返せるようにするためです。
 #[derive(Debug, Clone)]
 pub struct Response {
     status: u16,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: Cow<'static, [u8]>,
 }
 
 impl Response {
@@ -18,7 +23,7 @@ impl Response {
         Self {
             status,
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Cow::Borrowed(&[]),
         }
     }
 
@@ -56,6 +61,16 @@ impl Response {
             .with_body(body)
     }
 
+    /// バイナリに埋め込んだ中身を、コピーせずに返す。
+    ///
+    /// `public/` の埋め込み配信で使います。`&'static [u8]` をそのまま持つので、
+    /// 1本のアセットを返すたびに全文をコピーすることがなくなります。
+    pub(crate) fn static_bytes(content_type: &str, body: &'static [u8]) -> Self {
+        let mut response = Self::new(200).with_header("content-type", content_type);
+        response.body = Cow::Borrowed(body);
+        response
+    }
+
     /// ステータスを変える。
     pub fn with_status(mut self, status: u16) -> Self {
         self.status = status;
@@ -89,8 +104,16 @@ impl Response {
 
     /// 本文を差し替える。
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
-        self.body = body.into();
+        self.body = Cow::Owned(body.into());
         self
+    }
+
+    /// 本文を取り出す。
+    ///
+    /// 返すときにもう一度コピーしないための入口です。埋め込んだ `public/` は
+    /// `Cow::Borrowed` のまま返るので、下回りへ渡すときもコピーが起きません。
+    pub(crate) fn into_body(self) -> Cow<'static, [u8]> {
+        self.body
     }
 
     /// ステータス。

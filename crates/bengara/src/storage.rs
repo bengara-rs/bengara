@@ -88,8 +88,22 @@ pub struct Storage {
 
 impl Storage {
     /// 既定の置き場所。
+    ///
+    /// 既定の置き場所は**1回だけ組み立てて覚えます**。`Storage::put` のような
+    /// 静的メソッドは毎回ここを通るので、設定の走査とパスの組み立てを
+    /// 呼ぶ回数ぶん繰り返さないようにするためです。
+    /// 設定は起動時に決まって変わらない前提です。
     pub fn default_disk() -> Result<Self> {
-        Self::named(&config().default)
+        // エラーも覚える。`Error` はクローンできないので文字列で持ちます。
+        static ROOT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
+        match ROOT.get_or_init(|| {
+            Self::named(&config().default)
+                .map(|disk| disk.root)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(root) => Ok(Self { root: root.clone() }),
+            Err(message) => Err(Error::msg(message.clone())),
+        }
     }
 
     /// 名前で置き場所を選ぶ。
@@ -207,9 +221,11 @@ impl Storage {
     }
 
     /// あるか。
+    ///
+    /// `is_file()` 1 回だけなので、裏のスレッド（`spawn_blocking`）を経由しません。
+    /// 往復のほうが調べるより高く付きます。
     pub async fn has(&self, path: &str) -> Result<bool> {
-        let full = self.absolute(path)?;
-        crate::support::blocking(move || full.is_file()).await
+        Ok(self.absolute(path)?.is_file())
     }
 
     /// 消す。無くてもエラーにはしません。
@@ -224,14 +240,15 @@ impl Storage {
     }
 
     /// バイト数。無ければ `None`。
+    ///
+    /// `metadata()` 1 回だけなので、`has` と同じく裏のスレッドを経由しません。
     pub async fn size(&self, path: &str) -> Result<Option<u64>> {
         let full = self.absolute(path)?;
-        crate::support::blocking(move || match std::fs::metadata(&full) {
+        match std::fs::metadata(&full) {
             Ok(meta) => Ok(Some(meta.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::Io(e)),
-        })
-        .await?
+        }
     }
 
     /// その下にあるファイルの一覧（置き場所からの相対パス）。
@@ -254,7 +271,10 @@ impl Storage {
 
     /// 置き場所の中の絶対パスにする。
     ///
-    /// `..` や絶対パスは**断ります**。置き場所の外を触らせないためです。
+    /// 次の 2 つを**断ります**。
+    ///
+    /// - `..` と絶対パス（`:` を含むもの）。置き場所の外を触らせないため。
+    /// - 装置の名前（`nul` など）と、末尾が空白・`.` の名前。[`usable_name`] を見てください。
     fn absolute(&self, path: &str) -> Result<PathBuf> {
         let trimmed = path.trim_start_matches(['/', '\\']);
         if trimmed.is_empty() {
@@ -267,9 +287,45 @@ impl Storage {
             if part == ".." || part.contains(':') {
                 return Err(Error::msg(format!("`{path}` は置き場所の外を指しています")));
             }
+            if let Err(reason) = usable_name(part) {
+                return Err(Error::msg(format!(
+                    "`{path}` は使えない名前です（`{part}` が{reason}）"
+                )));
+            }
         }
         Ok(self.root.join(trimmed.replace('\\', "/")))
     }
+}
+
+/// Windows が**どのディレクトリの下でも**装置として解決してしまう名前。
+///
+/// `storage/app/nul` へ書くと、`std::fs::write` は成功を返すのに中身は
+/// 0 バイトになります（画面に出さずに捨てられます）。`con` は読み戻しで止まります。
+const RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// パスの 1 要素として使える名前か。使えないときは理由を返します。
+///
+/// **`#[cfg(windows)]` で分けません。** OS で挙動を変えると、Linux で通った
+/// コードが Windows で黙ってデータを捨てます。全 OS で同じ名前を断ります。
+fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
+    // 装置の名前は拡張子を付けても装置のまま（`nul.txt` も `nul`）。
+    // 最初の `.` より前だけを見ます。
+    let stem = part.split('.').next().unwrap_or(part);
+    if RESERVED_NAMES
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name))
+    {
+        return Err("装置の名前です");
+    }
+    // Windows は末尾の空白と `.` を落とすので、`a.txt ` と `a.txt` が
+    // 同じファイルになります。別の鍵のつもりが同じ中身を指します。
+    if part.ends_with(' ') || part.ends_with('.') {
+        return Err("末尾が空白か `.` です");
+    }
+    Ok(())
 }
 
 /// ディレクトリの中のファイルを集める（再帰）。
@@ -325,6 +381,61 @@ mod tests {
         ] {
             assert!(disk.absolute(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn 装置の名前は断る() {
+        let disk = disk("device");
+        // 実機で確かめたもの。`nul` に書くと成功を返すのに 0 バイトになる。
+        for bad in [
+            "nul",
+            "NUL",
+            "nul.txt",
+            "notes/nul",
+            "notes/con/a.txt",
+            "aux",
+            "prn",
+            "com1",
+            "COM9.log",
+            "lpt1",
+            "Nul.tar.gz",
+        ] {
+            let error = disk.absolute(bad).unwrap_err().to_string();
+            assert!(error.contains("使えない名前"), "{bad}: {error}");
+        }
+
+        // 装置の名前を含むだけの名前は通す。
+        for ok in ["null", "nula", "console", "com10", "com", "lpt0", "a.nul"] {
+            assert!(disk.absolute(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn 末尾の空白とドットは断る() {
+        let disk = disk("trailing");
+        // Windows は末尾を落とすので、`a.txt ` と `a.txt` が同じファイルになる。
+        for bad in ["a.txt ", "a.txt.", "notes /a.txt", "notes./a.txt", "a..."] {
+            let error = disk.absolute(bad).unwrap_err().to_string();
+            assert!(error.contains("使えない名前"), "{bad}: {error}");
+        }
+        // 先頭や途中の空白・`.` は通す。
+        assert!(disk.absolute("a b.txt").is_ok());
+        assert!(disk.absolute(" a.txt").is_ok());
+    }
+
+    #[test]
+    fn 置き場所の外と使えない名前はエラー文で分かれる() {
+        let disk = disk("reason");
+        assert!(disk
+            .absolute("../secret")
+            .unwrap_err()
+            .to_string()
+            .contains("置き場所の外"));
+        assert!(disk
+            .absolute("nul")
+            .unwrap_err()
+            .to_string()
+            .contains("使えない名前"));
     }
 
     #[test]

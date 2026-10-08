@@ -1,6 +1,6 @@
 # リクエストとレスポンス
 
-ハンドラは `Result<Response>` を返します。
+届いた入力を読む方法と、返すものを作る方法です。ハンドラは `Result<Response>` を返します。
 
 ```rust
 use bengara::prelude::*;
@@ -17,6 +17,8 @@ impl PostController {
 
 ## Request
 
+`Request` から読めるものの一覧です。
+
 | 分類     | メソッド                                                          |
 |----------|-------------------------------------------------------------------|
 | 基本     | `method()` `path()` `query_string()` `full_path()` `route_name()` |
@@ -28,17 +30,19 @@ impl PostController {
 | 入力     | `input(key)` `input_all()` `form(key)` `form_all()`               |
 | 本文     | `body()` `body_text()` `json::<T>()`                              |
 
-- `header(name)` は大文字小文字を区別しません。
-- `query` / `query_all` は `%xx` と `+` を元に戻します。
-- `param` / `param_as` は `%xx` を元に戻します。 **`+` は空白にしません。**
-- `param_as::<T>` は変換できないときにエラーを返すので、`?` を付けて使えます。
-
 ```rust
 let page: u32 = req.query("page").and_then(|v| v.parse().ok()).unwrap_or(1);
 let body: MyInput = req.json()?;
 ```
 
-入力の読み方は [validation.md](validation.md) にあります。
+読むときの決まりごとは 4 つです。
+
+- `header(name)` は大文字小文字を区別しません。
+- `query` / `query_all` は `%xx` と `+` を元に戻します。
+- `param` / `param_as` は `%xx` を元に戻します。**`+` は空白にしません。**
+- `param_as::<T>` は変換できないときにエラーを返すので、`?` を付けて使えます。
+
+フォームの値の読み方は [validation.md](validation.md) にあります。
 
 ### 接続元を見る
 
@@ -70,12 +74,12 @@ if !req.route_matched() {
 | 申告された長さが上限を超えている | **413**  |
 | 読んでいる途中で失敗した         | **400**  |
 
-読み取りの失敗は「大きすぎる」とは限りません（接続が切れただけのこともあります）。
+読み取りの失敗は「大きすぎる」とは限りません。接続が切れただけのこともあります。
 だから 413 と決めつけません。
 
 ### 解析は 1 回だけ
 
-`input` / `input_all` / `form_all` / `cookies` は、 **1 リクエストにつき 1 回だけ**
+`input` / `input_all` / `form_all` / `cookies` は、**1 リクエストにつき 1 回だけ**
 中身を解析します。2 回目からは取っておいた結果を返します。何度呼んでも遅くなりません。
 
 ## Response
@@ -85,13 +89,14 @@ if !req.route_matched() {
 ```rust
 Response::text("ok")
 Response::html("<h1>hi</h1>")
-Response::json( & value) ?        // Result<Response>
+Response::json(&value)?        // Result<Response>
 Response::no_content()
 Response::bytes("image/png", data)
 Response::new(204)
 ```
 
-自由関数の `text(..)` `html(..)` `json(&..)` は `Result<Response>` を返すので、ハンドラの戻り値にそのまま書けます。
+自由関数の `text(..)` `html(..)` `json(&..)` は `Result<Response>` を返します。
+ハンドラの戻り値にそのまま書けます。
 
 ```rust
 pub async fn index() -> Result<Response> {
@@ -101,8 +106,8 @@ pub async fn index() -> Result<Response> {
 
 ### HTML に文字列を埋め込むとき
 
-外から来た文字列は `escape_html` を通してください。通さないと、意図しないタグを
-書き込まれます（クロスサイトスクリプティング）。
+外から来た文字列は `escape_html` を通してください。
+通さないと、意図しないタグを書き込まれます（クロスサイトスクリプティング）。
 
 ```rust
 pub async fn hello(req: Request) -> Result<Response> {
@@ -113,27 +118,27 @@ pub async fn hello(req: Request) -> Result<Response> {
 
 ### JSON を作るとき
 
-`serde` と `serde_json` は bengara から使えます。`Cargo.toml` に書く必要はありません
-（フレームワークと同じ版が使われます）。
+`serde` と `serde_json` は bengara から使えます。
+`Cargo.toml` に書く必要はありません（フレームワークと同じ版が使われます）。
 
 ```rust
-json( & bengara::serde_json::json!({ "status": "ok" }))
+json(&bengara::serde_json::json!({ "status": "ok" }))
 ```
 
 ### 整える
 
 ```rust
 Response::text("ok")
-.with_status(201)
-.with_header("X-Foo", "bar")
-.with_body("changed")
+    .with_status(201)
+    .with_header("X-Foo", "bar")
+    .with_body("changed")
 ```
 
 | メソッド                         | 中身                                                       |
 |----------------------------------|------------------------------------------------------------|
 | `with_status(code)`              | ステータスを変える                                         |
 | `with_header(name, value)`       | ヘッダーを**置き換える**。同じ名前があれば消してから入れる |
-| `with_added_header(name, value)` | ヘッダーを**足す**。`set-cookie` のように何本も送るとき    |
+| `with_added_header(name, value)` | ヘッダーを**足す**。`set-cookie` のように何本も送るとき     |
 | `with_body(body)`                | 本文を差し替える                                           |
 
 名前の大文字小文字は区別しません（内部で小文字にそろえます）。
@@ -145,10 +150,10 @@ Response::text("ok")
 ## リダイレクト
 
 ```rust
-redirect().to("/login")                                  // 302
+redirect().to("/login")                                 // 302
 redirect().route("home")
-redirect().route_with("posts.show", & [("post", "12")])
-redirect().to("/new").permanent()                        // 301
+redirect().route_with("posts.show", &[("post", "12")])
+redirect().to("/new").permanent()                       // 301
 redirect().to("/other").with_status(303)
 ```
 
@@ -173,12 +178,9 @@ return abort_with(404, "記事が見つかりません");
 | `Error::Json`                     | `serde_json::Error` から変換 |
 
 作り方は `Error::msg("...")` と `Error::http(404, "...")` です。
-`io::Error` と `serde_json::Error` からは `From` があるので `?` で変換されます。
+`io::Error` と `serde_json::Error` からは `From` があるので、`?` で変換されます。
 
-`Err` が返ったときの扱い:
-
-- `Error::Http` → そのステータス
-- それ以外 → 500
+`Err` が返ったときは、`Error::Http` ならそのステータスになります。それ以外は 500 です。
 
 ## 404 と 405
 
@@ -190,10 +192,10 @@ return abort_with(404, "記事が見つかりません");
 | **パスは当たるが、メソッドが違う**         | 405 と `allow` ヘッダー |
 
 `allow` には、そのパスで通るメソッドがアルファベット順に入ります（`allow: GET, HEAD, POST`）。
-`GET` があるときは `HEAD` も並びます。くわしくは [routing.md](routing.md) を見てください。
+`GET` があるときは `HEAD` も並びます（[routing.md](routing.md)）。
 
-**共通のミドルウェアは、この 2 つにも掛かります。** ルートがあるかどうかは
-`req.route_matched()` で見分けます（[middleware.md](middleware.md)）。
+**共通のミドルウェアは、この 2 つにも掛かります。**
+ルートがあるかどうかは `req.route_matched()` で見分けます（[middleware.md](middleware.md)）。
 
 ## HEAD
 
@@ -226,18 +228,18 @@ return abort_with(404, "記事が見つかりません");
 ```rust
 // bootstrap/app.rs
 Application::configure()
-.with_exceptions( | e| {
-e.render( | error | {
-(error.status() == 404).then( | | {
-Response::json( & bengara::serde_json::json! ({ "message": "ありません" }))
-.unwrap_or_else( | _ | Response::text("not found"))
-.with_status(404)
-})
-})
-})
+    .with_exceptions(|e| {
+        e.render(|error| {
+            (error.status() == 404).then(|| {
+                Response::json(&bengara::serde_json::json!({ "message": "ありません" }))
+                    .unwrap_or_else(|_| Response::text("not found"))
+                    .with_status(404)
+            })
+        })
+    })
 ```
 
-- 登録した関数を **上から順に試し**、最初に `Some` を返したものを使います。
+- 登録した関数を**上から順に試し**、最初に `Some` を返したものを使います。
 - どれも返さなければ、bengara の既定の形になります。
 - `render` は何回でも呼べます。
 
@@ -267,14 +269,37 @@ Response::json( & bengara::serde_json::json! ({ "message": "ありません" }))
 - `..` や絶対パスは受け付けません。
 - シンボリックリンクで `public/` の外に出ていないかを確かめます。
 - Content-Type は拡張子から決めます。
-- パスの `%xx` は元に戻します。 **`+` は空白にしません。**
+- パスの `%xx` は元に戻します。**`+` は空白にしません。**
+- `ETag` と `Cache-Control: public, max-age=0, must-revalidate` を付けます。
+- `If-None-Match` が合えば **304** を返します（本文は送りません）。
+- `HEAD` ではファイルを読まず、`content-length` だけを返します。
 
 パスの組み立てには `public_path(rel)` / `storage_path(rel)` / `base_path()` が使えます。
 
+### ETag と 304
+
+| 配信元   | ETag の中身            |
+|----------|------------------------|
+| ディスク | 長さ ＋ 更新時刻（秒） |
+| 埋め込み | 長さ ＋ 中身のハッシュ |
+
+- 弱い ETag（`W/"..."`）です。中身が同じかではなく、**変わっていないか**を見ます。
+- `If-None-Match` は `*` とカンマ区切りの一覧に対応します。`W/` の有無は無視します。
+- **同じ秒の内に、同じ長さで書き換えると ETag が変わりません。**
+  ディスクの ETag は更新時刻を秒で見るためです。差し替え直後に古いものが
+  返ることがあるので、本番では名前にハッシュを付けたファイル名を使ってください。
+- 長く持たせたい（`max-age=31536000` など）ときは、前段のプロキシで上書きしてください。
+
 ## ログ
 
-リクエストごとに `GET / -> 200 (0 ms)` の形で出ます。
-細かさは `RUST_LOG` で指定します。指定がなければ `APP_DEBUG` が真なら `debug`、そうでなければ `info` です。
+リクエストごとに `GET /posts?page=2 -> 200 (0 ms)` の形で出ます。
+
+**秘密になりうるクエリの値は `***` に伏せます。** 判定は `old()` が覚えない語と
+同じ決まりです（[validation.md](validation.md)）。署名付き URL をログに出しても、
+`?signature=***&expires=...` となり、署名そのものは残りません。
+
+細かさは `RUST_LOG` で指定します。
+指定がなければ、`APP_DEBUG` が真なら `debug`、そうでなければ `info` です。
 
 ## 関連
 

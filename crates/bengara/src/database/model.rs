@@ -179,10 +179,20 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
         let id = query.insert_get_id_as(&attributes, T::PRIMARY_KEY).await?;
         model.set_key(Value::Int(id));
     } else {
-        query
-            .where_(T::PRIMARY_KEY, model.key())
+        let key = model.key();
+        let affected = query
+            .where_(T::PRIMARY_KEY, key.clone())
             .update(&attributes)
             .await?;
+        if affected == 0 {
+            // 当てはまる行が無かった。消えた行を保存しようとしていることが多い。
+            // 黙って成功に見せると気づけないので知らせる。
+            tracing::warn!(
+                "{}.{} = {key} の行が無いので、save() は何も更新しませんでした",
+                T::TABLE,
+                T::PRIMARY_KEY
+            );
+        }
     }
     Ok(())
 }
@@ -260,6 +270,9 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// 中のクエリビルダを取り出す。生の行が欲しいときの逃げ道です。
+    ///
+    /// **ここに無い操作は、これで降りてください。** 戻るのは `QueryBuilder` なので、
+    /// モデルの型は外れます。
     pub fn query_builder(&self) -> QueryBuilder {
         self.inner.clone()
     }
@@ -267,6 +280,23 @@ impl<T: Model> ModelQuery<T> {
     /// 組み立てた SQL と値の一覧（テストとデバッグ用）。
     pub fn to_sql(&self) -> (String, Vec<Value>) {
         self.inner.to_sql()
+    }
+
+    // ---- 取る列 ----
+
+    /// 取る列を決める。`QueryBuilder::select` と同じく列名を検査しません。
+    pub fn select(self, columns: &[&str]) -> Self {
+        self.map(|q| q.select(columns))
+    }
+
+    /// 取る列を足す。列名を検査しません。
+    pub fn add_select(self, column: &str) -> Self {
+        self.map(|q| q.add_select(column))
+    }
+
+    /// 重なりを捨てる。
+    pub fn distinct(self) -> Self {
+        self.map(QueryBuilder::distinct)
     }
 
     // ---- 条件 ----
@@ -301,6 +331,11 @@ impl<T: Model> ModelQuery<T> {
         self.map(|q| q.where_not_in(column, values))
     }
 
+    /// `or` でつないで、列が一覧のどれかと等しい。
+    pub fn or_where_in<V: IntoValue + Clone>(self, column: &str, values: &[V]) -> Self {
+        self.map(|q| q.or_where_in(column, values))
+    }
+
     /// 列が `NULL`。
     pub fn where_null(self, column: &str) -> Self {
         self.map(|q| q.where_null(column))
@@ -314,6 +349,16 @@ impl<T: Model> ModelQuery<T> {
     /// 列が2つの値の間にある。
     pub fn where_between(self, column: &str, low: impl IntoValue, high: impl IntoValue) -> Self {
         self.map(|q| q.where_between(column, low, high))
+    }
+
+    /// 列が2つの値の間に無い。
+    pub fn where_not_between(
+        self,
+        column: &str,
+        low: impl IntoValue,
+        high: impl IntoValue,
+    ) -> Self {
+        self.map(|q| q.where_not_between(column, low, high))
     }
 
     /// 列が形に当てはまる（`like`）。
@@ -336,6 +381,28 @@ impl<T: Model> ModelQuery<T> {
         self.map(|q| q.where_group(build))
     }
 
+    /// `or` でつないで、括弧でくくった条件の塊を足す。
+    pub fn or_where_group(self, build: impl FnOnce(QueryBuilder) -> QueryBuilder) -> Self {
+        self.map(|q| q.or_where_group(build))
+    }
+
+    // ---- 束ね ----
+
+    /// 列で束ねる。
+    pub fn group_by(self, columns: &[&str]) -> Self {
+        self.map(|q| q.group_by(columns))
+    }
+
+    /// 束ねた結果を絞る。`group_by` と一緒に使ってください。
+    pub fn having_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+        self.map(|q| q.having_op(column, operator, value))
+    }
+
+    /// 束ねた結果を SQL で絞る。
+    pub fn having_raw(self, sql: &str, bindings: &[Value]) -> Self {
+        self.map(|q| q.having_raw(sql, bindings))
+    }
+
     // ---- 並び・件数 ----
 
     /// 昇順に並べる。
@@ -346,6 +413,11 @@ impl<T: Model> ModelQuery<T> {
     /// 降順に並べる。
     pub fn order_by_desc(self, column: &str) -> Self {
         self.map(|q| q.order_by_desc(column))
+    }
+
+    /// 並べ方を SQL で直接書く。**外から来た文字列を渡さないでください。**
+    pub fn order_by_raw(self, sql: &str) -> Self {
+        self.map(|q| q.order_by_raw(sql))
     }
 
     /// 新しい順（`created_at` の降順）。
@@ -424,6 +496,31 @@ impl<T: Model> ModelQuery<T> {
     /// 1件でもあるか。
     pub async fn exists(&self) -> Result<bool> {
         self.inner.exists().await
+    }
+
+    /// 1件も無いか。
+    pub async fn doesnt_exist(&self) -> Result<bool> {
+        self.inner.doesnt_exist().await
+    }
+
+    /// 合計。
+    pub async fn sum<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
+        self.inner.sum(column).await
+    }
+
+    /// 平均。
+    pub async fn avg<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
+        self.inner.avg(column).await
+    }
+
+    /// 最小。
+    pub async fn min<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
+        self.inner.min(column).await
+    }
+
+    /// 最大。
+    pub async fn max<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
+        self.inner.max(column).await
     }
 
     /// ある列だけを一覧で取る。
@@ -620,6 +717,28 @@ mod tests {
             title: String::new(),
         };
         assert!(post.is_new());
+    }
+
+    #[test]
+    fn 委譲した操作でもモデルの型が外れない() {
+        // 戻るのが ModelQuery<Post> のままなので、最後まで型が付いて回る。
+        let (sql, bindings) = Post::query()
+            .select(&["id", "title"])
+            .distinct()
+            .where_not_between("id", 1, 3)
+            .or_where_in("id", &[7, 8])
+            .or_where_group(|q| q.where_("title", "x"))
+            .group_by(&["title"])
+            .having_op("id", ">", 0)
+            .order_by_raw("title asc")
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select distinct \"id\", \"title\" from \"posts\" \
+             where \"id\" not between ? and ? or \"id\" in (?, ?) or (\"title\" = ?) \
+             group by \"title\" having \"id\" > ? order by title asc"
+        );
+        assert_eq!(bindings.len(), 6);
     }
 
     #[test]

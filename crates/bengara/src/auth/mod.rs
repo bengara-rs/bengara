@@ -23,10 +23,12 @@ pub use middleware::Authenticate;
 pub use reset::PasswordReset;
 
 pub(crate) use hashing::install_test_iterations;
+pub(crate) use middleware::INTENDED_KEY;
 
 use crate::database::Model;
 use crate::error::{Error, Result};
 use crate::session::Session;
+use crate::support::blocking;
 
 /// セッションに入れる鍵の名前。
 ///
@@ -212,8 +214,10 @@ impl<'a> Auth<'a> {
 
         let Some(user) = found else {
             // 見つからないときも時間を合わせる。
+            // **送られてきたパスワードをそのまま渡します。** 固定のダミーだと、
+            // 長い入力のときに登録済みの側だけが重くなり、登録の有無が漏れます。
             blocking(move || {
-                Hash::waste_time();
+                Hash::waste_time(&password);
                 false
             })
             .await?;
@@ -240,20 +244,6 @@ impl<'a> Auth<'a> {
         let password = password.to_string();
         blocking(move || Hash::check(&password, &stored)).await
     }
-}
-
-/// 時間のかかる計算を裏のスレッドで行う。
-///
-/// ハッシュの計算は 0.2 秒ほどかかります。そのまま待つと、同じスレッドで動いている
-/// ほかのリクエストが止まります。
-pub(crate) async fn blocking<T, F>(f: F) -> Result<T>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Error::msg(format!("パスワードの計算に失敗しました: {e}")))
 }
 
 /// 許されていなければ 403 で止める。

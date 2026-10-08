@@ -23,7 +23,7 @@ use syn::{parse_macro_input, ItemFn};
 /// | 指定 | 置き場所 | 既定 |
 /// |---|---|---|
 /// | `#[model(table = "posts")]` | 構造体 | 必須 |
-/// | `#[model(primary)]` | フィールド | `id` という名前のフィールド |
+/// | `#[model(primary)]` | フィールド | 列名が `id` の項目 |
 /// | `#[model(column = "名前")]` | フィールド | フィールド名と同じ |
 /// | `#[model(skip)]` | フィールド | 表にない項目として扱う |
 #[proc_macro_derive(Model, attributes(model))]
@@ -46,7 +46,7 @@ pub fn derive_model(item: TokenStream) -> TokenStream {
 /// - `bootstrap/app.rs` のアプリを組み立てる
 /// - tokio のランタイムを用意して、本体を直接呼ぶ
 /// - 関数の中で `client`、`get`、`post`、`put`、`patch`、`delete`、
-///   `refresh_database`、`seed_database` を使えるようにする
+///   `refresh_database`、`seed_database`、`exclusive` を使えるようにする
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
@@ -114,42 +114,26 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         async move { __client.post(&__uri, &__body).await }
                     };
                     // PUT / PATCH / DELETE。Route::put などに合わせて揃えてある。
-                    // 本文の形は post と同じ（application/x-www-form-urlencoded）。
+                    // 本文の形は post と同じ。中身は TestClient 側で決めている。
                     #[allow(unused_variables)]
                     let put = |__uri: &str, __body: &str| {
                         let __uri = ::std::string::String::from(__uri);
                         let __body = ::std::string::String::from(__body);
                         let __client = ::core::clone::Clone::clone(&client);
-                        async move {
-                            __client.send(
-                                "PUT",
-                                &__uri,
-                                __body.into_bytes(),
-                                &[("content-type", "application/x-www-form-urlencoded")],
-                            ).await
-                        }
+                        async move { __client.put(&__uri, &__body).await }
                     };
                     #[allow(unused_variables)]
                     let patch = |__uri: &str, __body: &str| {
                         let __uri = ::std::string::String::from(__uri);
                         let __body = ::std::string::String::from(__body);
                         let __client = ::core::clone::Clone::clone(&client);
-                        async move {
-                            __client.send(
-                                "PATCH",
-                                &__uri,
-                                __body.into_bytes(),
-                                &[("content-type", "application/x-www-form-urlencoded")],
-                            ).await
-                        }
+                        async move { __client.patch(&__uri, &__body).await }
                     };
                     #[allow(unused_variables)]
                     let delete = |__uri: &str| {
                         let __uri = ::std::string::String::from(__uri);
                         let __client = ::core::clone::Clone::clone(&client);
-                        async move {
-                            __client.send("DELETE", &__uri, ::std::vec::Vec::new(), &[]).await
-                        }
+                        async move { __client.delete(&__uri).await }
                     };
                     #body
                 },

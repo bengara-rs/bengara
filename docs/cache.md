@@ -1,8 +1,10 @@
 # キャッシュ
 
-計算やクエリの結果を取っておいて、次からは取っておいたほうを返す仕組みです。
+計算やクエリの結果を取っておき、次からは取っておいたほうを返す仕組みです。
 
 ## 置き場所
+
+置き場所は `.env` の `CACHE_DRIVER` で選びます。
 
 ```
 CACHE_DRIVER=file
@@ -13,7 +15,7 @@ CACHE_DRIVER=file
 | `file`（既定） | `storage/framework/cache/`                 |
 | `memory`       | プロセスのメモリ。**テストと手元の確認用** |
 
-`config/cache.rs` を置けば `.env` より優先します。無くても動きます（`file` になります）。
+`config/cache.rs` を置くと `.env` より優先します。無くても動きます（`file` になります）。
 
 ```rust
 // config/cache.rs
@@ -26,7 +28,7 @@ pub fn config() -> CacheConfig {
 }
 ```
 
-**プロセスを2つ以上動かすときは、全プロセスが同じ `storage/` を見るようにしてください。**
+**プロセスを 2 つ以上動かすときは、全プロセスが同じ `storage/` を見るようにしてください。**
 `memory` はプロセスをまたげません。
 
 いまの置き場所は `Cache::location()` で分かります。言えないときは `None` が返ります。
@@ -43,7 +45,7 @@ let value: Option<String> = Cache::get("stats.posts").await?;
 let there = Cache::has("stats.posts").await?;
 
 Cache::forget("stats.posts").await?;
-Cache::flush().await?;                            // 全部捨てる
+Cache::flush().await?;                           // 全部捨てる
 ```
 
 | メソッド          | 返るもの                 | 覚えること                           |
@@ -57,13 +59,16 @@ Cache::flush().await?;                            // 全部捨てる
 | `prune()`         | `Result<Option<usize>>`  | 期限切れだけ消す。下の「掃除」を見る |
 | `location()`      | `Option<String>`         | 置き場所の表示。`await` は要らない   |
 
+**鍵には何を入れても構いません。** 日本語や記号が入っても壊れません。
+ファイル名の決め方は下の「中でどう置いているか」にあります。
+
 ## 無ければ作る
 
 よく使う形です。あればそれを返し、無ければ作って入れます。
 
 ```rust
-let posts = Cache::remember("stats.posts", 60, | | async {
-Ok(Post::count().await?.to_string())
+let posts = Cache::remember("stats.posts", 60, || async {
+    Ok(Post::count().await?.to_string())
 })
 .await?;
 ```
@@ -98,35 +103,14 @@ struct Stats {
     users: i64,
 }
 
-Cache::put_json("stats", & stats, 600).await?;
+Cache::put_json("stats", &stats, 600).await?;
 let stats: Option<Stats> = Cache::get_json("stats").await?;
 
 // 無ければ作る版もあります。
-let stats: Stats = Cache::remember_json("stats", 600, | | async { Ok(count().await?) }).await?;
+let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().await?) }).await?;
 ```
 
 形が変わって読めなくなったときは `None` が返ります（落ちません）。
-
-## 鍵の付け方
-
-鍵はそのままファイル名になります。ただし、安全な文字だけのときです。
-
-| 鍵                           | ファイル名                  |
-|------------------------------|-----------------------------|
-| `stats.posts`                | `stats.posts`               |
-| `user:1`                     | `user~1`（`:` を `~` に）   |
-| `User:1`（**大文字を含む**） | SHA-256 の 16 進（64 文字） |
-| 日本語や記号が入るもの       | SHA-256 の 16 進（64 文字） |
-
-そのまま使うのは、小文字の英数字と `. _ - :` だけのときです。 **大文字が混じるとハッシュにします。**
-Windows と macOS はファイル名の大文字小文字を区別しないので、`User:1` と `user:1` が
-同じファイルになってしまうためです。
-
-`storage/framework/cache/` を見れば何が入っているか分かるようにするための決まりです。 **鍵には何を入れても構いません。**
-壊れるファイル名にはなりません。
-
-書き込みは一時ファイルを経由します。一時ファイルの名前は鍵ごとに分かれているので、
-`test.put` と `test.count` のように似た鍵を同時に書いても値が混ざりません。
 
 ## 掃除
 
@@ -141,8 +125,8 @@ cargo artisan cache:clear     # 全部
 
 ```rust
 match Cache::prune().await? {
-Some(n) => println ! ("{n} 件消しました"),
-None => println ! ("この置き場所は掃除できません"),
+    Some(n) => println!("{n} 件消しました"),
+    None => println!("この置き場所は掃除できません"),
 }
 ```
 
@@ -153,12 +137,75 @@ None => println ! ("この置き場所は掃除できません"),
 
 `memory` には掃除の仕組みがありません。`cache:prune` は、そう分かる表示をして終わります。
 
-`cache:prune` は cron やタスクスケジューラから1日1回ほど呼ぶとよいです。
+`cache:prune` は cron やタスクスケジューラから 1 日 1 回ほど呼ぶとよいです。
 放っておいても壊れませんが、ファイルが増えていきます。
+
+## テスト
+
+`#[bengara::test]` はキャッシュを自動では消しません。 **鍵が重ならないようにしてください。**
+テストは並んで走るので、同じ鍵を使うと互いに踏みます。
+
+```rust
+#[bengara::test]
+async fn 数えた結果を取っておく() {
+    Cache::forget("test.count").await.unwrap();
+    assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
+    Cache::forget("test.count").await.unwrap();
+}
+```
+
+## 中でどう置いているか
+
+`file` の置き場所がファイル名をどう決めるかの話です。
+**ふだんは気にしなくて構いません。** `storage/framework/cache/` を直接のぞくときに読んでください。
+
+### 鍵からファイル名へ
+
+鍵はそのままファイル名になります。ただし、安全な文字だけのときです。
+
+| 鍵                            | ファイル名                        |
+|-------------------------------|-----------------------------------|
+| `stats.posts`                 | `stats.posts`                     |
+| `user:1`                      | `user~1`（`:` を `~` に）         |
+| `User:1`（**大文字を含む**）  | `~` + SHA-256 の 16 進（65 文字） |
+| `:config`（**`:` で始まる**） | `~` + SHA-256 の 16 進（65 文字） |
+| 日本語や記号が入るもの        | `~` + SHA-256 の 16 進（65 文字） |
+
+そのまま使うのは、小文字の英数字と `. _ - :` だけのときです。 **大文字が混じるとハッシュにします。**
+Windows と macOS はファイル名の大文字小文字を区別しないので、`User:1` と `user:1` が
+同じファイルになってしまうためです。
+
+ハッシュ側の名前には `~` を頭に付けます。印が無いと、ほかの鍵の SHA-256 を
+そのまま鍵として渡すだけで、狙って同じファイルを指せてしまいます。
+`:` で始まる鍵は置き換えると `~` で始まるので、ぶつからないようハッシュ側に回します。
+
+`storage/framework/cache/` を見れば何が入っているか分かるようにするための決まりです。
+
+### 一時ファイルと錠
+
+書き込みは一時ファイルを経由します。名前は `<鍵>.+tmp.<プロセス番号>.<連番>` です。
+鍵ごとに分かれているので、`test.put` と `test.count` のように似た鍵を同時に書いても
+値が混ざりません。
+
+`increment` と `decrement` が使う錠は `+locks/` の中に置きます。ディレクトリ名を
+`locks` にすると鍵 `locks` の本体とぶつかるので、`+` を付けています
+（なので鍵 `locks` もそのまま使えます）。
+
+### `~` と `+` という印
+
+| 印  | 使う所           | 選んだ理由                         |
+|-----|------------------|------------------------------------|
+| `~` | ハッシュの頭     | `:` の置き換えとしてしか出てこない |
+| `+` | 一時ファイルと錠 | そのまま使う鍵には出てこない       |
+
+どちらも **鍵のファイル名として現れない文字** を選んでいます。大文字（`LOCKS` など）で
+分けると、大文字小文字を区別しない OS では取り違えます。`:` はファイル名に使えないので、
+代わりに `~` を選びました。
 
 ## 置き場所を自分で作る
 
 `CacheStore` を実装して、`cache::install_store` で入れ替えます。 **起動時に 1 回だけ呼びます。**
+2 回目以降は効きません（警告がログに出ます）。
 
 ```rust
 // main.rs の入口や bootstrap/app.rs の中で
@@ -190,20 +237,6 @@ impl CacheStore for MyStore {
 
 - **複数のプロセスから同時に使われます。** プロセスのメモリだけに置かないでください。
 - 期限切れは読むときに捨ててください。
-
-## テスト
-
-`#[bengara::test]` はキャッシュを自動では消しません。 **鍵が重ならないようにしてください。**
-テストは並んで走るので、同じ鍵を使うと互いに踏みます。
-
-```rust
-#[bengara::test]
-async fn 数えた結果を取っておく() {
-    Cache::forget("test.count").await.unwrap();
-    assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
-    Cache::forget("test.count").await.unwrap();
-}
-```
 
 ## 無いもの
 

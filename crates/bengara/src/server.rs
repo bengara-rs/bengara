@@ -116,9 +116,18 @@ async fn dispatch(
 ) -> axum::response::Response {
     let (parts, body) = request.into_parts();
 
+    // アプリへ渡す前に返すときも、相手が JSON を欲しがっているなら JSON で返す。
+    // 判定に使うヘッダーはこの時点で手元にあるので、先に求めておく。
+    let wants_json = crate::application::wants_json_with(|name| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    });
+
     // 先に長さの申告を見る。上限を超えていると分かっているときだけ 413 にする。
     if too_large(declared_length(&parts.headers)) {
-        return early_error(Error::http(413, "本文が大きすぎます"));
+        return early_error(Error::http(413, "本文が大きすぎます"), wants_json);
     }
 
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -127,18 +136,21 @@ async fn dispatch(
             // ここに来るのは、途中で接続が切れた・chunked が壊れていた・
             // 長さの申告が無いまま上限を超えた、のどれかです。
             // 「大きすぎる」と分かっているのは申告を見た上の分岐だけなので、ここは 400。
-            return early_error(Error::http(400, "本文を読み取れませんでした"));
+            return early_error(Error::http(400, "本文を読み取れませんでした"), wants_json);
         }
     };
 
     let headers = parts
         .headers
         .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        .map(|(name, value)| {
+            // 読めないバイトは置換文字に落として**残します**。まるごと捨てると、
+            // 1本の `Cookie` ヘッダーに同梱されたセッション Cookie まで消えて、
+            // 毎回ログアウトする・CSRF が 419 になる、という症状になります。
+            (
+                name.as_str().to_ascii_lowercase(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
         })
         .collect();
 
@@ -150,15 +162,49 @@ async fn dispatch(
 
     let started = std::time::Instant::now();
     let method = req.method().to_string();
-    let path = req.full_path();
+    let target = log_target(&req);
     let response = app.handle(req).await;
     tracing::info!(
-        "{method} {path} -> {} ({} ms)",
+        "{method} {target} -> {} ({} ms)",
         response.status(),
         started.elapsed().as_millis()
     );
 
     into_axum(response)
+}
+
+/// ログに出す行き先。クエリは残すが、秘密になりうる値は伏せる。
+///
+/// 署名付き URL の `signature` やパスワードの再設定の `token` は、**それ自体が
+/// 認証情報**です。そのままログに書くと、ログを読める人がリンクを使い回せます。
+/// 伏せる名前の判定は、セッションに覚えない入力と同じ一覧（`request::is_sensitive`）です。
+fn log_target(req: &Request) -> String {
+    let query = req.query_string();
+    if query.is_empty() {
+        return req.path().to_string();
+    }
+    let mut out = String::with_capacity(req.path().len() + query.len() + 1);
+    out.push_str(req.path());
+    out.push('?');
+    for (index, pair) in query.split('&').enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        match pair.split_once('=') {
+            Some((name, value)) => {
+                out.push_str(name);
+                out.push('=');
+                if crate::http::request::is_sensitive(name) {
+                    out.push_str("***");
+                } else {
+                    out.push_str(value);
+                }
+            }
+            // `=` が無い組はそのまま出す（値が無いので伏せるものがない）。
+            None => out.push_str(pair),
+        }
+    }
+    out
 }
 
 /// `Content-Length` の申告を読む。無い・読めないときは `None`。
@@ -179,11 +225,12 @@ fn too_large(declared: Option<usize>) -> bool {
 
 /// アプリに渡す前に返すエラー。
 ///
-/// 設定の読み方（`APP_DEBUG` など）に触れないので、いつも素の見せ方にします。
-fn early_error(error: Error) -> axum::response::Response {
+/// 設定（`APP_DEBUG`）はまだ読めないので詳細は出しませんが、
+/// **JSON で返すかどうかはヘッダーから分かる**ので、そこは尊重します。
+fn early_error(error: Error, wants_json: bool) -> axum::response::Response {
     into_axum(crate::http::response::error_response(
         &error,
-        crate::http::response::RenderOptions::new(false, false),
+        crate::http::response::RenderOptions::new(false, wants_json),
     ))
 }
 
@@ -193,7 +240,12 @@ fn into_axum(response: Response) -> axum::response::Response {
     for (name, value) in response.headers() {
         builder = builder.header(name, value);
     }
-    match builder.body(axum::body::Body::from(response.body().to_vec())) {
+    // 本文は所有ごと渡す。`Cow::Borrowed`（埋め込んだ `public/`）はコピーされない。
+    let body = match response.into_body() {
+        std::borrow::Cow::Borrowed(bytes) => axum::body::Body::from(bytes),
+        std::borrow::Cow::Owned(bytes) => axum::body::Body::from(bytes),
+    };
+    match builder.body(body) {
         Ok(response) => response,
         Err(e) => {
             // ヘッダーの値が HTTP として不正だったときの保険。
@@ -365,6 +417,24 @@ mod tests {
             !too_large(None),
             "申告が無ければ、読んで失敗しても 413 にはしない"
         );
+    }
+
+    #[test]
+    fn ログのクエリは秘密を伏せる() {
+        let req = Request::new("GET", "/unsubscribe")
+            .with_query("user=12&signature=9f3c&token=abc&page=2");
+        assert_eq!(
+            log_target(&req),
+            "/unsubscribe?user=12&signature=***&token=***&page=2"
+        );
+    }
+
+    #[test]
+    fn クエリが無ければパスだけ出す() {
+        assert_eq!(log_target(&Request::new("GET", "/posts")), "/posts");
+        // `=` が無い組はそのまま出す。
+        let req = Request::new("GET", "/posts").with_query("draft");
+        assert_eq!(log_target(&req), "/posts?draft");
     }
 
     #[test]

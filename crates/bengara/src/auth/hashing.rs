@@ -39,6 +39,13 @@ const SCHEME: &str = "pbkdf2-sha256";
 /// 1,000 万回なら 20 秒ほど）。上限を超える値は照合せずに偽とします。
 const MAX_ITERATIONS: u32 = 10_000_000;
 
+/// 照合に渡せるパスワードの長さの上限（バイト）。
+///
+/// PBKDF2 の計算量は長さに左右されませんが、入口の `sha256` だけは長さに比例します。
+/// 2 MB の文字列を毎回ハッシュする意味は無いので、ここで断ります。
+/// 人が覚えて入力するパスワードは、これより桁違いに短いです。
+const MAX_PASSWORD_BYTES: usize = 1024;
+
 /// ハッシュの設定。`config/hashing.rs` が返します。
 ///
 /// ```ignore
@@ -104,6 +111,10 @@ impl Hash {
     ///
     /// **非同期の処理の中では [`make_async`](Hash::make_async) を使ってください。**
     /// ここでは 0.2 秒ほどスレッドを塞ぎます。
+    ///
+    /// 長さの上限はありません（`String` を返すので、断る手段がありません）。
+    /// ただし [`check`](Hash::check) は 1024 バイトを超える入力を断るので、
+    /// **登録のときに `max:1024` を付けて検査してください。**
     pub fn make(password: &str) -> String {
         Self::make_with(password, iterations())
     }
@@ -115,7 +126,9 @@ impl Hash {
     /// ```
     pub async fn make_async(password: &str) -> Result<String> {
         let password = password.to_string();
-        crate::auth::blocking(move || Self::make(&password)).await
+        crate::support::blocking(move || Self::make(&password))
+            .await
+            .map_err(|e| crate::Error::msg(format!("パスワードの計算に失敗しました: {e}")))
     }
 
     /// 回数を指定して変える。
@@ -133,10 +146,19 @@ impl Hash {
     /// 平文と、保存してある値を照合する。
     ///
     /// 値の形が壊れているときは偽を返します（エラーにはしません）。
+    /// 平文が 1024 バイトを超えるときも、計算せずに偽を返します。
     ///
     /// **非同期の処理の中では [`check_async`](Hash::check_async) を使ってください。**
     /// ここでは 0.2 秒ほどスレッドを塞ぎます。
     pub fn check(password: &str, hashed: &str) -> bool {
+        // 長すぎる入力は計算せずに断る。合うはずのない値に時間を使わない。
+        if password.len() > MAX_PASSWORD_BYTES {
+            tracing::warn!(
+                "パスワードが長すぎます（{} バイト、上限は {MAX_PASSWORD_BYTES} バイト）",
+                password.len()
+            );
+            return false;
+        }
         let Some(parsed) = Parsed::parse(hashed) else {
             tracing::warn!("保存されているパスワードの形が正しくありません");
             return false;
@@ -161,7 +183,9 @@ impl Hash {
     pub async fn check_async(password: &str, hashed: &str) -> Result<bool> {
         let password = password.to_string();
         let hashed = hashed.to_string();
-        crate::auth::blocking(move || Self::check(&password, &hashed)).await
+        crate::support::blocking(move || Self::check(&password, &hashed))
+            .await
+            .map_err(|e| crate::Error::msg(format!("パスワードの計算に失敗しました: {e}")))
     }
 
     /// 保存してある値を作り直したほうがよいか。
@@ -184,8 +208,13 @@ impl Hash {
     /// プロセス起動後の最初の1件だけ PBKDF2 が 2 回走り、そこだけ約 2 倍遅くなります。
     /// それでは「登録されていない1件目」が見分けられてしまいます。
     /// 照合は必ず外れますが、かかる時間は本物の照合と同じ（PBKDF2 を 1 回）です。
-    pub(crate) fn waste_time() {
-        let _ = Hash::check("bengara-dummy-password", &dummy_hash(iterations()));
+    ///
+    /// **送られてきたパスワードをそのまま渡します。** 固定のダミーを使うと、
+    /// 入力の長さで差が出る処理（入口の `sha256`、長さの上限の判定）が
+    /// 登録済みの側にだけ効き、登録の有無が時間差で分かってしまいます。
+    /// 比べる相手だけが固定のダミーです。
+    pub(crate) fn waste_time(password: &str) {
+        let _ = Hash::check(password, &dummy_hash(iterations()));
     }
 }
 
@@ -334,8 +363,53 @@ mod tests {
 
         // 2 回続けて呼んでも落ちない（回数は下げておく）。
         install_test_iterations();
-        Hash::waste_time();
-        Hash::waste_time();
+        Hash::waste_time("ひみつの言葉");
+        Hash::waste_time("ひみつの言葉");
+    }
+
+    #[test]
+    fn 空回しは送られてきたパスワードを使う() {
+        // 固定のダミーを使っていたころは、長い入力のときだけ
+        // 「登録済み」側が重くなり、登録の有無が時間差で漏れていた。
+        // いまは本物と同じ値を同じ経路に通すので、差が出ない。
+        install_test_iterations();
+        let long = "x".repeat(MAX_PASSWORD_BYTES + 1);
+        // 上限を超える入力も、本物の `check` と同じようにすぐ帰る。
+        Hash::waste_time(&long);
+        Hash::waste_time("");
+    }
+
+    #[test]
+    fn 長すぎるパスワードは計算せずに偽になる() {
+        let stored = Hash::make_with("ok", FAST);
+        assert!(Hash::check("ok", &stored));
+
+        // 上限ちょうどは断らない（合わないだけ）。
+        let limit = "a".repeat(MAX_PASSWORD_BYTES);
+        assert!(!Hash::check(&limit, &stored), "計算はするが合わない");
+
+        // 1 バイト超えたら計算せずに偽。
+        let over = "a".repeat(MAX_PASSWORD_BYTES + 1);
+        let started = std::time::Instant::now();
+        assert!(!Hash::check(&over, &stored));
+        assert!(started.elapsed().as_secs() < 1, "すぐ返る");
+
+        // 上限はバイト数で見る（日本語は 1 文字 3 バイト）。
+        let kana = "あ".repeat(MAX_PASSWORD_BYTES / 3 + 1);
+        assert!(kana.len() > MAX_PASSWORD_BYTES);
+        assert!(!Hash::check(&kana, &stored));
+    }
+
+    #[test]
+    fn 長いパスワードでも照合の時間が変わらない() {
+        // PBKDF2 の鍵のそろえ直しが入口の 1 回だけになったことを、時間で確かめる。
+        // 直す前は、繰り返しのたびにパスワード全体を `sha256` していた。
+        let long = "x".repeat(MAX_PASSWORD_BYTES);
+        let stored = Hash::make_with(&long, 2_000);
+        let started = std::time::Instant::now();
+        assert!(Hash::check(&long, &stored));
+        let elapsed = started.elapsed();
+        assert!(elapsed.as_secs() < 3, "{elapsed:?} かかった");
     }
 
     #[tokio::test]

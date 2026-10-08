@@ -1,10 +1,18 @@
 # 自分のコマンド
 
 `cargo artisan <名前>` で動かす処理を、自分で足せます。
+置き場所は `app/Console/Commands/` で、ファイル名がコマンド名になります。
 
 ## 書く
 
-`app/Console/Commands/` に置きます。 **2 つとも必要です。**
+1 つのファイルに **2 つとも必要です。**
+
+| 書くもの                                             | 役割                        |
+|------------------------------------------------------|-----------------------------|
+| `pub const DESCRIPTION: &str`                        | `list` に出す説明。**必須** |
+| `pub async fn handle(args: &[String]) -> Result<()>` | 中身。**必須**              |
+
+どちらかが無いと **コンパイルエラー**になります。
 
 ```rust
 //! app/Console/Commands/Greet.rs
@@ -19,16 +27,11 @@ pub async fn handle(args: &[String]) -> Result<()> {
 }
 ```
 
-| 書くもの                                             | 役割                        |
-|------------------------------------------------------|-----------------------------|
-| `pub const DESCRIPTION: &str`                        | `list` に出す説明。**必須** |
-| `pub async fn handle(args: &[String]) -> Result<()>` | 中身。**必須**              |
-
-どちらかが無いと **コンパイルエラー**になります。
+`Err` を返すと、理由を出して終了コード 1 で終わります。
 
 ## 名前の付き方
 
-ファイル名からコマンド名を作ります。
+ファイル名からコマンド名を作ります。 **大文字の前で `-` を入れます。**
 
 | ファイル名         | コマンド名                     |
 |--------------------|--------------------------------|
@@ -37,8 +40,10 @@ pub async fn handle(args: &[String]) -> Result<()> {
 | `ClearOldPosts.rs` | `clear-old-posts`              |
 | `send_report.rs`   | `send-report`（`_` も `-` に） |
 
-**大文字の前で `-` を入れます。** Laravel の `make:command` が作る `app:send-report` に
-近い形です（頭の `app:` は付けません）。
+Laravel の `make:command` が作る `app:send-report` に近い形です（頭の `app:` は付けません）。
+
+**フレームワークのコマンドが先です。** `migrate` や `queue:work` と同じ名前を付けると、
+自分のほうは呼ばれません。`list` で確かめてください。
 
 ## 動かす
 
@@ -106,13 +111,6 @@ pub async fn handle(_args: &[String]) -> Result<()> {
     Ok(())
 }
 ```
-
-`Err` を返すと、理由を出して終了コード 1 で終わります。
-
-## 名前が重なったとき
-
-フレームワークのコマンド（`migrate`・`queue:work` など）が先です。
-同じ名前を付けると、自分のほうは呼ばれません。`list` で確かめてください。
 
 ## 無いもの
 

@@ -5,8 +5,8 @@
 
 ## 書く
 
-`database/migrations/` にファイルを置きます。名前は Laravel と同じ
-`日付_連番_説明.rs` です。 **名前順に実行されます。**
+`database/migrations/` にファイルを置きます。
+名前は Laravel と同じ `日付_連番_説明.rs` です。**名前順に実行されます。**
 
 ```rust
 // database/migrations/2026_10_05_000000_create_posts_table.rs
@@ -29,8 +29,8 @@ pub fn down(schema: &mut Schema) {
 }
 ```
 
-- `pub fn up` と `pub fn down` の **2つが必要**です。無いとコンパイルエラーになります。
-- **`up` / `down` は同期の関数です。** ここでやるのは SQL の組み立てだけで、
+- `pub fn up` と `pub fn down` の **2 つが必要**です。無いとコンパイルエラーになります。
+- **`up` / `down` は同期の関数です。** ここでやるのは SQL の組み立てだけです。
   実際に投げるのは bengara 側（ランナー）です。
 - 登録の作業はありません。ファイルを置けば `build.rs` が拾います。
 
@@ -41,28 +41,43 @@ cargo artisan migrate          # まだ流していないものを順に流す
 cargo artisan migrate --seed   # 流してからシーダーも動かす
 ```
 
-本番は実行ファイル1つで動きます。
+本番は実行ファイル 1 つで動きます。
 
 ```sh
 ./myapp migrate
 ```
 
-| コマンド           | すること                                         |
-|--------------------|--------------------------------------------------|
-| `migrate`          | まだ流していないものを流す                       |
-| `migrate:status`   | 流したかどうかを一覧にする                       |
-| `migrate:rollback` | 最後のバッチを巻き戻す（`--step=2` で2バッチ分） |
-| `migrate:reset`    | 全部巻き戻す                                     |
-| `migrate:refresh`  | 全部巻き戻してから流し直す                       |
-| `migrate:fresh`    | **表を全部消して**から流し直す                   |
-| `db:seed`          | シーダーだけ動かす                               |
-| `db:wipe`          | 表を全部消す                                     |
+| コマンド           | すること                                           |
+|--------------------|----------------------------------------------------|
+| `migrate`          | まだ流していないものを流す                         |
+| `migrate:status`   | 流したかどうかを一覧にする                         |
+| `migrate:rollback` | 最後のバッチを巻き戻す（`--step=2` で 2 バッチ分） |
+| `migrate:reset`    | 全部巻き戻す                                       |
+| `migrate:refresh`  | 全部巻き戻してから流し直す                         |
+| `migrate:fresh`    | **表を全部消して**から流し直す                     |
+| `db:seed`          | シーダーだけ動かす                                 |
+| `db:wipe`          | 表を全部消す                                       |
 
 - どれにも `--database=接続の名前` を付けられます。既定は `DB_CONNECTION` です。
-- `migrate:fresh` と `db:wipe` は、`APP_ENV=production` のとき `--force` が無いと止まります。
 - 流した記録は `migrations` 表に残ります（名前とバッチ番号）。
-  同じものが2回流れることはありません。
-- **1本ごとにトランザクションで実行します。** 途中で失敗したらその1本を巻き戻して止まります。
+  同じものが 2 回流れることはありません。
+- **1 本ごとにトランザクションで実行します。**
+  途中で失敗したら、その 1 本を巻き戻して止まります。
+
+### 本番で止まるコマンド
+
+次の 4 つは、`APP_ENV=production` のとき `--force` が無いと止まります。
+
+| コマンド           | 消えるもの                             |
+|--------------------|----------------------------------------|
+| `migrate:reset`    | `down` が流れるので中身が消えます      |
+| `migrate:refresh`  | 同じく `down` が流れます               |
+| `migrate:fresh`    | 表ごと消えます                         |
+| `db:wipe`          | 表ごと消えます                         |
+
+`migrate:reset` と `migrate:refresh` は、名前に「消す」と無くても中身が消えます。
+
+### 状態を見る
 
 ```
 $ cargo artisan migrate:status
@@ -100,7 +115,7 @@ $ cargo artisan migrate:status
 ```rust
 t.string("email").unique();
 t.text("body").nullable();
-t.integer("views").default (0);
+t.integer("views").default(0);
 t.date_time("at").default_raw("current_timestamp");
 t.uuid("key").primary();
 ```
@@ -117,20 +132,19 @@ t.uuid("key").primary();
 
 **`t.id()` と `t.increments(..)` には、これらの指定が効きません。**
 自動採番の主キーは型名ひとつで全部を書くので、置く場所がありません。
-`nullable()` / `default()` / `unique()` を付けると、無視したことを警告で知らせます。
 
 ## 表に付ける指定
 
 ```rust
-schema.create("comments", | t| {
-t.id();
-t.foreign_id("post_id");
-t.string("author");
-t.timestamps();
+schema.create("comments", |t| {
+    t.id();
+    t.foreign_id("post_id");
+    t.string("author");
+    t.timestamps();
 
-t.index(& ["post_id"]);
-t.unique(& ["post_id", "author"]);
-t.foreign("post_id").on("posts").cascade_on_delete();
+    t.index(&["post_id"]);
+    t.unique(&["post_id", "author"]);
+    t.foreign("post_id").on("posts").cascade_on_delete();
 });
 ```
 
@@ -143,8 +157,8 @@ t.foreign("post_id").on("posts").cascade_on_delete();
 | `.on_delete("cascade")` / `.cascade_on_delete()` | 元の行が消えたときの動き   |
 | `.on_update("restrict")`                         | 元の行が変わったときの動き |
 
-索引は `create index ...` という別の文になります。名前は自動で付きます
-（`posts_status_index` のような形）。
+索引は `create index ...` という別の文になります。
+名前は自動で付きます（`posts_status_index` のような形）。
 
 ## 表を変える
 
@@ -163,16 +177,12 @@ pub fn down(schema: &mut Schema) {
 
 **できるのは「列を足す」「索引を足す」までです。**
 
-- 列の型を変える `change()` はありません。SQLite が苦手なためです。
-  型を変えたいときは、新しい表を作って移し替えてください。
-- **`t.id()` と `t.increments(..)` は使えません。**
-  `alter table add column` で自動採番の主キーは足せません。
-  書くと警告が出て、その文は流れません。
+列の型を変えたいときは、新しい表を作って移し替えてください。
 
-## そのほか
+## そのほかの操作
 
 ```rust
-schema.create_if_not_exists("posts", | t| { /* ... */ });
+schema.create_if_not_exists("posts", |t| { /* ... */ });
 schema.drop("posts");
 schema.drop_if_exists("posts");
 schema.rename("posts", "articles");
@@ -180,7 +190,7 @@ schema.drop_column("posts", "slug");
 schema.raw("pragma foreign_keys = on");   // SQL をそのまま
 ```
 
-`create_if_not_exists` は、 **索引の文にも `if not exists` を付けます。**
+`create_if_not_exists` は、**索引の文にも `if not exists` を付けます。**
 表だけを飛ばして索引で失敗する、ということはありません。
 
 ```
@@ -204,6 +214,16 @@ pub fn up(schema: &mut Schema) {
 ```
 
 `schema.driver()` でつながる先の種類も分かります。
+
+## できないこと・警告が出ること
+
+| 書き方                                             | どうなるか                           | 理由                                               |
+|----------------------------------------------------|--------------------------------------|----------------------------------------------------|
+| `pub fn up` / `pub fn down` が無い                 | コンパイルエラー                     | 両方必要です                                       |
+| 列の型を変える `change()`                          | **ありません**                       | SQLite が苦手なためです                            |
+| `t.id()` に `nullable()` / `default()` / `unique()`| 無視して警告                         | 型名ひとつで書くので、置く場所がありません         |
+| `schema.table(..)` の中の `t.id()` / `t.increments`| 警告が出て、その文は流れません       | `alter table add column` では自動採番を足せません |
+| `t.foreign(col)` に `.on(表名)` が無い             | 警告が出て、その外部キーは流れません | 指す先が決まりません                               |
 
 ## 関連
 

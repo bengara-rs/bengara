@@ -1,10 +1,18 @@
 # 多言語
 
 画面に出す文字を、言語ごとに分けて持つ仕組みです。
+文字は `resources/lang/` の TOML に書きます。
 
-## 文字を置く
+## 置き方は 2 通り
 
-`resources/lang/<言語>.toml` に置きます。言語の名前はファイル名です。
+どちらも読みます。 **同じ言語で両方を置いてもよく、1 つの表にまとまります。**
+
+| 置き方                            | `[x] y = ".."` の鍵 | 言語の名前     | 向くとき                 |
+|-----------------------------------|---------------------|----------------|--------------------------|
+| `resources/lang/<言語>.toml`      | `x.y`               | ファイル名     | 鍵が少ない。1 枚で見たい |
+| `resources/lang/<言語>/<群>.toml` | `<群>.x.y`          | ディレクトリ名 | 群ごとにファイルを分ける |
+
+下が Laravel 本来の置き方です。ファイル名（`<群>`）が鍵の頭に付きます。
 
 ```toml
 # resources/lang/ja.toml
@@ -24,6 +32,14 @@ welcome = "Welcome"
 greeting = "Hello, :name"
 ```
 
+```toml
+# resources/lang/ja/messages.toml — 鍵は messages.welcome になります
+welcome = "ようこそ"
+```
+
+**`resources/lang/<言語>/` より下のディレクトリは読みません。** Laravel も 1 階層だけです。
+置いてあると、読まないことを知らせる警告が出ます。
+
 **ビルド時に読み込んで、バイナリに入ります。** 実行時にファイルを読みません。
 中身を書き換えると `cargo build` が自動で走り直します。
 
@@ -32,8 +48,8 @@ greeting = "Hello, :name"
 ```rust
 use bengara::prelude::*;
 
-__("messages.welcome");                                 // ようこそ
-__with("messages.greeting", & [("name", "アリス")]);     // こんにちは、アリス さん
+__("messages.welcome");                               // ようこそ
+__with("messages.greeting", &[("name", "アリス")]);   // こんにちは、アリス さん
 ```
 
 鍵は `節.鍵` の形です。`__` は Laravel と同じ名前です。
@@ -74,7 +90,7 @@ pub async fn show(req: Request) -> Result<Response> {
     Lang::with(locale, async {
         json(&bengara::serde_json::json!({ "welcome": __("messages.welcome") }))
     })
-        .await
+    .await
 }
 ```
 
@@ -90,7 +106,6 @@ __("messages.ない鍵");   // => "messages.ない鍵"
 ```
 
 画面が真っ白になるより、鍵が見えるほうが直しやすいためです。
-
 探す順番は次のとおりです。
 
 1. いまの言語（`Lang::current()`）
@@ -108,7 +123,7 @@ name_both = ":name（:name_kanji）"
 ```
 
 ```rust
-__with("messages.count", & [("total", "10"), ("done", "3")]);
+__with("messages.count", &[("total", "10"), ("done", "3")]);
 ```
 
 **差し替えは長い名前から順に当てます。** `:name` と `:name_kanji` のように
@@ -116,7 +131,7 @@ __with("messages.count", & [("total", "10"), ("done", "3")]);
 
 **エスケープはしません。** HTML に出すときは `escape_html` を通してください。
 
-## 読めない TOML
+## 読める TOML の範囲
 
 必要な分だけ読む作りです。読めるのは次だけです。
 
@@ -124,7 +139,7 @@ __with("messages.count", & [("total", "10"), ("done", "3")]);
 |-------------------------------------|---------------------------------|
 | `[節]`。`[a.b]` は `a.b.鍵` になる  | 配列（`[1, 2]`）                |
 | `鍵 = "値"` / `鍵 = '値'`           | 引用符なしの値（数・真偽）      |
-| `"` の中の `\n` `\t` `\r` `\\` `\"` | 複数行の文字列（`"""`）         |
+| `"` の中の `\n` `\t` `\r` `\` `\"` | 複数行の文字列（`"""`）         |
 | `#` から行末のコメント              | インラインのテーブル（`{ … }`） |
 
 節の外に書いた鍵は、そのままの鍵になります（`title = "x"` → `title`）。
@@ -134,10 +149,18 @@ __with("messages.count", & [("total", "10"), ("done", "3")]);
 **同じ鍵を 2 回書いてもビルドが止まります。** どちらが勝つか分からない状態にしません。
 
 ```toml
+# resources/lang/ja.toml
 [messages]
 welcome = "ようこそ"
-welcome = "いらっしゃい"   # => resources/lang/ja.toml に鍵 `messages.welcome` が2回書かれています
+welcome = "いらっしゃい"
 ```
+
+```
+`ja` に鍵 `messages.welcome` が2回書かれています: resources/lang/ja.toml と resources/lang/ja.toml
+```
+
+言語の名前と、鍵が書かれていた 2 つのファイルを出します。
+`ja.toml` と `ja/` を混ぜて同じ鍵になったときも、同じ形で止まります。
 
 ## 一覧を見る
 

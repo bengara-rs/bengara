@@ -88,20 +88,28 @@ pub(crate) fn sha256(input: &[u8]) -> Digest {
     out
 }
 
+/// HMAC のブロックの長さ（RFC 2104）。
+const HMAC_BLOCK: usize = 64;
+
+/// 鍵をブロックの長さにそろえる（RFC 2104）。
+///
+/// ブロックより長い鍵は**先にハッシュして縮めます**。短い鍵は 0 で埋めます。
+fn hmac_block_key(key: &[u8]) -> [u8; HMAC_BLOCK] {
+    let mut out = [0u8; HMAC_BLOCK];
+    if key.len() > HMAC_BLOCK {
+        out[..32].copy_from_slice(&sha256(key));
+    } else {
+        out[..key.len()].copy_from_slice(key);
+    }
+    out
+}
+
 /// HMAC-SHA256（RFC 2104）。鍵つきの署名を作ります。
 pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Digest {
-    const BLOCK: usize = 64;
+    let k = hmac_block_key(key);
 
-    // 鍵がブロックより長ければハッシュして縮める。短ければ 0 で埋める。
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        k[..32].copy_from_slice(&sha256(key));
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-
-    let mut inner = Vec::with_capacity(BLOCK + message.len());
-    let mut outer = Vec::with_capacity(BLOCK + 32);
+    let mut inner = Vec::with_capacity(HMAC_BLOCK + message.len());
+    let mut outer = Vec::with_capacity(HMAC_BLOCK + 32);
     for byte in k.iter() {
         inner.push(byte ^ 0x36);
         outer.push(byte ^ 0x5c);
@@ -111,6 +119,59 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Digest {
     sha256(&outer)
 }
 
+/// PBKDF2 の中だけで使う HMAC。鍵を 1 回だけ用意して使い回します。
+///
+/// `hmac_sha256` を繰り返し呼ぶと、**呼ぶたびに**鍵をそろえ直し（長い鍵なら
+/// `sha256` をやり直し）、`Vec` を 3 本確保します。12 万回ぶんだと、
+/// 計算量がパスワードの長さに比例し、確保も 36 万本になります。
+/// ここでは鍵から作る `ipad` / `opad` を持ち回り、確保もしません。
+struct Pbkdf2Hmac {
+    /// 鍵 ^ 0x36。
+    ipad: [u8; HMAC_BLOCK],
+    /// 鍵 ^ 0x5c。
+    opad: [u8; HMAC_BLOCK],
+}
+
+impl Pbkdf2Hmac {
+    /// 鍵をそろえて `ipad` / `opad` を作る。**ここだけで 1 回**です。
+    fn new(key: &[u8]) -> Self {
+        let k = hmac_block_key(key);
+        let mut ipad = [0u8; HMAC_BLOCK];
+        let mut opad = [0u8; HMAC_BLOCK];
+        for ((i, o), byte) in ipad.iter_mut().zip(opad.iter_mut()).zip(k.iter()) {
+            *i = byte ^ 0x36;
+            *o = byte ^ 0x5c;
+        }
+        Self { ipad, opad }
+    }
+
+    /// 長さの決まっていないメッセージに署名する。1 回目（`塩 || 1`）だけで使います。
+    fn sign(&self, message: &[u8]) -> Digest {
+        let mut inner = Vec::with_capacity(HMAC_BLOCK + message.len());
+        inner.extend_from_slice(&self.ipad);
+        inner.extend_from_slice(message);
+        self.finish(&sha256(&inner))
+    }
+
+    /// 32 バイトのメッセージに署名する。2 回目以降はこちらだけです。
+    ///
+    /// メッセージの長さが決まっているので、積む先は固定長の配列です。
+    fn sign_digest(&self, message: &Digest) -> Digest {
+        let mut inner = [0u8; HMAC_BLOCK + 32];
+        inner[..HMAC_BLOCK].copy_from_slice(&self.ipad);
+        inner[HMAC_BLOCK..].copy_from_slice(message);
+        self.finish(&sha256(&inner))
+    }
+
+    /// 外側のハッシュ。`opad || 内側のハッシュ` を取ります。
+    fn finish(&self, inner: &Digest) -> Digest {
+        let mut outer = [0u8; HMAC_BLOCK + 32];
+        outer[..HMAC_BLOCK].copy_from_slice(&self.opad);
+        outer[HMAC_BLOCK..].copy_from_slice(inner);
+        sha256(&outer)
+    }
+}
+
 /// PBKDF2-HMAC-SHA256（RFC 8018）。パスワードを総当たりしにくい形に変えます。
 ///
 /// `iterations` 回 HMAC を繰り返します。回数が多いほど、1回の照合に時間がかかり、
@@ -118,16 +179,24 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Digest {
 ///
 /// 出力は 32 バイト（SHA-256 の1ブロックぶん）に固定しています。
 /// それより長い鍵が要る使い方は、いまありません。
+///
+/// # かかる時間はパスワードの長さに左右されません
+///
+/// 鍵のそろえ直し（64 バイトを超える鍵の `sha256`）は**入口で 1 回だけ**です。
+/// 繰り返しのたびにやり直すと、長いパスワードを送られただけで 1 件の照合が
+/// 何十秒もかかり、登録の有無まで時間差で漏れます。
 pub(crate) fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> Digest {
+    let hmac = Pbkdf2Hmac::new(password);
+
     // ブロック番号は 1 つだけ（出力が 32 バイトのため）。
     let mut block = Vec::with_capacity(salt.len() + 4);
     block.extend_from_slice(salt);
     block.extend_from_slice(&1u32.to_be_bytes());
 
-    let mut u = hmac_sha256(password, &block);
+    let mut u = hmac.sign(&block);
     let mut out = u;
     for _ in 1..iterations.max(1) {
-        u = hmac_sha256(password, &u);
+        u = hmac.sign_digest(&u);
         for (slot, value) in out.iter_mut().zip(u.iter()) {
             *slot ^= value;
         }
@@ -339,6 +408,67 @@ mod tests {
         assert_ne!(a, c, "回数が違えば結果も違う");
         // 0 回は 1 回として扱う（0 除算のような壊れ方をしないこと）。
         assert_eq!(pbkdf2_sha256(b"x", b"y", 0), pbkdf2_sha256(b"x", b"y", 1));
+    }
+
+    /// `hmac_sha256` を素直に繰り返しただけの PBKDF2。
+    ///
+    /// 速さのために足した `Pbkdf2Hmac` が、公式のテストベクタだけでなく
+    /// **どの入力でも**元の形と同じ答えを出すことを確かめるための見本です。
+    fn naive_pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> Digest {
+        let mut block = salt.to_vec();
+        block.extend_from_slice(&1u32.to_be_bytes());
+        let mut u = hmac_sha256(password, &block);
+        let mut out = u;
+        for _ in 1..iterations.max(1) {
+            u = hmac_sha256(password, &u);
+            for (slot, value) in out.iter_mut().zip(u.iter()) {
+                *slot ^= value;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pbkdf2は素直な実装と同じ答えになる() {
+        // 鍵が 64 バイト以下・ちょうど 64 バイト・64 バイトを超える場合。
+        // 超える場合は鍵をそろえ直すので、1 回だけにしても答えが変わらないこと。
+        for password in [
+            b"".to_vec(),
+            b"password".to_vec(),
+            vec![0xaa; 63],
+            vec![0xaa; 64],
+            vec![0xaa; 65],
+            vec![0xaa; 131],
+            vec![b'x'; 4096],
+        ] {
+            for iterations in [1u32, 2, 5] {
+                assert_eq!(
+                    pbkdf2_sha256(&password, b"salt", iterations),
+                    naive_pbkdf2(&password, b"salt", iterations),
+                    "鍵 {} バイト・{iterations} 回",
+                    password.len()
+                );
+            }
+        }
+        // 塩の長さが変わっても同じ（1 回目だけ長さが決まっていない）。
+        for salt in [b"".to_vec(), b"s".to_vec(), vec![0x5a; 100]] {
+            assert_eq!(
+                pbkdf2_sha256(b"password", &salt, 3),
+                naive_pbkdf2(b"password", &salt, 3)
+            );
+        }
+    }
+
+    #[test]
+    fn pbkdf2の時間はパスワードの長さに比例しない() {
+        // 直す前は、繰り返しのたびに `sha256(パスワード)` をやり直していた。
+        // 256 KB のパスワードを 2,000 回だと 512 MB ぶんのハッシュになり、
+        // デバッグビルドでは数十秒かかる。いまは入口で 1 回だけなので一瞬で終わる。
+        let long = vec![b'x'; 256 * 1024];
+        let started = std::time::Instant::now();
+        let _ = pbkdf2_sha256(&long, b"0123456789abcdef", 2_000);
+        let elapsed = started.elapsed();
+        assert!(elapsed.as_secs() < 3, "{elapsed:?} かかった");
     }
 
     #[test]

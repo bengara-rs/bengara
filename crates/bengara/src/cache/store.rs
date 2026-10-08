@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::support::lock::{is_stale, FileLock};
 use crate::support::time;
 
 /// キャッシュの置き場所。
@@ -105,7 +106,13 @@ struct Entry {
 impl Entry {
     fn encode(value: &str, seconds: Option<u64>) -> String {
         let expires_at = match seconds {
-            Some(seconds) => time::now_seconds() + seconds as i64,
+            // **あふれさせません。** `as i64` だと `u64::MAX` が `-1` になって
+            // 即時失効し、`i64::MAX` の近くはデバッグビルドでパニックします。
+            // 上限で切り詰めてから飽和加算します。
+            Some(seconds) => {
+                let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+                time::now_seconds().saturating_add(seconds)
+            }
             None => 0,
         };
         format!("{expires_at}|{value}")
@@ -129,20 +136,24 @@ impl Entry {
 /// 鍵が違えば一時ファイルも違う名前になるように、プロセス番号と合わせて使います。
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 同じプロセスの中で `increment` を直列化する錠。
+/// 一時ファイルの印。**`normalize_key` が絶対に作らない形**にします。
 ///
-/// プロセスをまたぐ分は錠ファイルで守ります。
-static INCREMENT_LOCK: Mutex<()> = Mutex::new(());
+/// `normalize_key` が通すのは小文字英数字と `. _ - ~` だけなので、`+` は出てきません。
+/// 「後ろ2つが数字」で見分けていたときは、`report.2024.12` のような鍵の本体を
+/// 一時ファイルと取り違えていました（`cache:clear` で消えず、`cache:prune` では
+/// 期限が残っていても消えていました）。
+const TEMP_MARK: &str = ".+tmp.";
+
+/// 錠ファイルを置くディレクトリの名前。**`normalize_key` が絶対に作らない形**にします。
+///
+/// `locks` のような普通の名前だと、鍵 `locks` の本体とぶつかって
+/// `Cache::get("locks")` がディレクトリを読もうとして必ずエラーになりました。
+/// 大文字（`LOCKS`）では直りません。NTFS と APFS は大文字小文字を区別しないので、
+/// Windows と macOS では鍵 `locks` と同じ名前のままです。
+const LOCK_DIR: &str = "+locks";
 
 /// 一時ファイルがこの秒数より古ければ、書き込みに失敗した残骸と見なして消す。
 const TEMP_STALE_SECS: u64 = 300;
-
-/// 錠ファイルがこの秒数より古ければ、置いたプロセスが落ちたと見なして外す。
-const LOCK_STALE_SECS: u64 = 10;
-
-/// 錠を取るのを諦めるまでの回数と、1回あたりの待ち時間（ミリ秒）。
-const LOCK_TRIES: u32 = 100;
-const LOCK_SLEEP_MS: u64 = 10;
 
 /// `storage/framework/cache/` にファイルとして置く。既定の置き場所です。
 ///
@@ -164,7 +175,7 @@ impl FileCache {
     }
 
     /// 既定の置き場所。**パスの定義はここ1か所だけです。**
-    pub(crate) fn default_dir() -> PathBuf {
+    fn default_dir() -> PathBuf {
         // join を 2 回に分けて、Windows でも区切りが混ざらないようにする。
         crate::paths::storage_path("framework").join("cache")
     }
@@ -175,21 +186,24 @@ impl FileCache {
 
     /// 書き込み途中に使う名前。
     ///
-    /// `with_extension("tmp")` は最後の `.` 以降を置き換えるので、`test.put` と
-    /// `test.count` が同じ `test.tmp` を共有してしまいます。鍵の後ろに
-    /// プロセス番号と連番を足して、鍵をまたいでも重ならない名前にします。
+    /// `<鍵>.+tmp.<プロセス番号>.<連番>` にします。`with_extension("tmp")` は
+    /// 最後の `.` 以降を置き換えるので、`test.put` と `test.count` が同じ
+    /// `test.tmp` を共有してしまいます。プロセス番号と連番を足して、
+    /// 鍵をまたいでも重ならない名前にします。
+    ///
+    /// 印（[`TEMP_MARK`]）を入れるのは、利用者の鍵と確実に見分けるためです。
     fn temp_path_of(&self, key: &str) -> PathBuf {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         self.dir
-            .join(format!("{key}.{}.{seq}.tmp", std::process::id()))
+            .join(format!("{key}{TEMP_MARK}{}.{seq}", std::process::id()))
     }
 
     /// 1つの鍵を守る錠ファイルの場所。
     ///
-    /// 本体と混ざらないよう、別のディレクトリに置きます（`read_dir` では
-    /// ファイルだけを見ているので、掃除の対象にもなりません）。
+    /// 本体と混ざらないよう、別のディレクトリ（[`LOCK_DIR`]）に置きます
+    /// （`read_dir` ではファイルだけを見ているので、掃除の対象にもなりません）。
     fn lock_path_of(&self, key: &str) -> PathBuf {
-        self.dir.join("locks").join(format!("{key}.lock"))
+        self.dir.join(LOCK_DIR).join(format!("{key}.lock"))
     }
 
     fn ensure_dir(&self) -> Result<()> {
@@ -280,14 +294,17 @@ impl CacheStore for FileCache {
 
     /// 錠を取ってから「読む → 足す → 書く」を行う。
     ///
-    /// 同じプロセスの中は `Mutex`、プロセスをまたぐ分は錠ファイルで守ります。
-    /// 錠ファイルは `create_new(true)` で作るので、作れた側だけが進めます。
+    /// 錠は**鍵ごとの錠ファイル1つだけ**です。`create_new(true)` で作るので、
+    /// 作れた側だけが進めます。これはプロセスをまたぐ分にも、同じプロセスの
+    /// スレッド同士にも効きます。
+    ///
+    /// プロセス全体で1つの `Mutex` は**持ちません**。握ったまま錠ファイルを
+    /// 待つので、別プロセスが錠を持つ間、無関係な鍵の `increment` まで止まりました。
     ///
     /// **期限は引き継ぎません**（期限なしで書き直します）。Laravel の
     /// `increment` は元の期限を保つので、そこは挙動が違います。
     fn increment(&self, key: &str, by: i64) -> Result<i64> {
         self.ensure_dir()?;
-        let _process = INCREMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _file = FileLock::acquire(&self.lock_path_of(key))?;
 
         let current = parse_number(key, self.get(key)?)?;
@@ -306,53 +323,6 @@ impl CacheStore for FileCache {
 
     fn location(&self) -> Option<String> {
         Some(self.dir.display().to_string())
-    }
-}
-
-/// 1つの鍵を守る錠ファイル。手放すと消えます。
-struct FileLock {
-    path: PathBuf,
-}
-
-impl FileLock {
-    /// 錠を取る。取れなければ少し待って試し直し、諦めたらエラーにします。
-    fn acquire(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        for _ in 0..LOCK_TRIES {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(_) => {
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    })
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if is_stale(path, LOCK_STALE_SECS) {
-                        // 錠を取ったプロセスが落ちたと見なして外す。
-                        tracing::warn!("古い錠 {} を外します", path.display());
-                        let _ = std::fs::remove_file(path);
-                        continue;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(LOCK_SLEEP_MS));
-                }
-                Err(e) => return Err(Error::Io(e)),
-            }
-        }
-        Err(Error::msg(format!(
-            "キャッシュの錠 {} を取れませんでした",
-            path.display()
-        )))
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -435,34 +405,22 @@ impl CacheStore for MemoryCache {
 
 /// 書き込み途中の一時ファイルの名前か。
 ///
-/// `put` が作る `鍵.プロセス番号.連番.tmp` だけを一時ファイルと見なします。
-/// `.tmp` で終わるだけの名前（鍵が `a.tmp` のとき）は本体として扱います。
+/// `put` が付ける印（[`TEMP_MARK`]）で見分けます。`normalize_key` は `+` を
+/// 通さないので、利用者の鍵がこの印を含むことはありません。
+///
+/// 「後ろ2つが数字」で見ていたときは、`report.2024.12.tmp` や `page.1.2.tmp`
+/// のような鍵の本体を一時ファイルと取り違えていました。
 fn is_temp_path(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let Some(rest) = name.strip_suffix(".tmp") else {
-        return false;
-    };
-    let mut parts = rest.rsplit('.');
-    let digits = |part: Option<&str>| {
-        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    };
-    // 連番・プロセス番号・鍵の3つに分かれていること。
-    digits(parts.next()) && digits(parts.next()) && parts.next().is_some()
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.contains(TEMP_MARK))
 }
 
-/// 最後に書かれてから `secs` 秒以上たっているか。分からないときは偽。
-fn is_stale(path: &Path, secs: u64) -> bool {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age.as_secs() >= secs)
-}
-
-/// 期限切れのファイルを消す。`cache:clear` と `cache:prune` が使います。
-pub(crate) fn sweep_expired(dir: &Path) -> Result<usize> {
+/// 期限切れのファイルを消す。
+///
+/// 呼び出し元は [`FileCache::prune`]（`cache:prune`）だけです。
+/// `cache:clear` は `flush()` を通るので、ここは通りません。
+fn sweep_expired(dir: &Path) -> Result<usize> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -630,12 +588,75 @@ mod tests {
         let a = store.temp_path_of("test.put");
         let b = store.temp_path_of("test.count");
         assert_ne!(a, b);
-        assert!(a.file_name().unwrap().to_str().unwrap().ends_with(".tmp"));
+        // 印が入っているので、一時ファイルだと分かる。
+        assert!(is_temp_path(&a));
+        assert!(a.file_name().unwrap().to_str().unwrap().contains(TEMP_MARK));
 
         // 同じ鍵でも、呼ぶたびに別の名前になる。
         assert_ne!(store.temp_path_of("test.put"), a);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 数字で終わる鍵は一時ファイルと取り違えない() {
+        // 「後ろ2つが数字」で見ていたときは、この 2 つを一時ファイルと見なしていた。
+        assert!(!is_temp_path(Path::new("report.2024.12.tmp")));
+        assert!(!is_temp_path(Path::new("page.1.2.tmp")));
+        assert!(!is_temp_path(Path::new("1.2")));
+        // 印が入っているものだけが一時ファイル。
+        assert!(is_temp_path(Path::new("report.2024.12.+tmp.1234.5")));
+        assert!(is_temp_path(Path::new("a.+tmp.1.0")));
+    }
+
+    #[test]
+    fn 数字で終わる鍵は期限が残っていれば消さない() {
+        let dir = temp_dir("digitkey");
+        let store = FileCache::new(&dir);
+
+        // 前は `cache:prune` で期限なしでも消えていた。
+        store.put("report.2024.12", "1", None).unwrap();
+        assert_eq!(sweep_expired(&dir).unwrap(), 0);
+        assert_eq!(store.get("report.2024.12").unwrap().as_deref(), Some("1"));
+
+        // `cache:clear`（flush）では消える。前は「書き込み中」として飛ばしていた。
+        store.flush().unwrap();
+        assert_eq!(store.get("report.2024.12").unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 鍵locksは錠の置き場所とぶつからない() {
+        let dir = temp_dir("lockskey");
+        let store = FileCache::new(&dir);
+
+        // 一度 increment を使って錠の置き場所を作る。
+        store.increment("n", 1).unwrap();
+        // `normalize_key("locks")` はそのまま `locks` なので、避けようがない。
+        store.put("locks", "値", Some(60)).unwrap();
+        assert_eq!(store.get("locks").unwrap().as_deref(), Some("値"));
+
+        // 錠の置き場所は `normalize_key` が作れない名前。大文字では駄目（NTFS）。
+        assert!(!LOCK_DIR.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert_ne!(LOCK_DIR.to_ascii_lowercase(), "locks");
+        assert!(dir.join(LOCK_DIR).is_dir());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 長すぎる期限でもあふれない() {
+        // `as i64` だと `u64::MAX` が `-1` になって即時失効していた。
+        let raw = Entry::encode("値", Some(u64::MAX));
+        let entry = Entry::decode(&raw).unwrap();
+        assert_eq!(entry.expires_at, i64::MAX);
+        assert!(!entry.expired(), "即時失効しない");
+
+        // i64 の上限に近い値でもパニックしない。
+        let entry = Entry::decode(&Entry::encode("値", Some(i64::MAX as u64))).unwrap();
+        assert_eq!(entry.expires_at, i64::MAX);
+        assert!(!entry.expired());
     }
 
     #[test]
@@ -647,7 +668,7 @@ mod tests {
         assert_eq!(store.get("a.tmp").unwrap().as_deref(), Some("1"));
         // 一時ファイルと見なされないので、本体として掃除の対象になる。
         assert!(!is_temp_path(&dir.join("a.tmp")));
-        assert!(is_temp_path(&dir.join("a.tmp.1234.5.tmp")));
+        assert!(is_temp_path(&dir.join("a.tmp.+tmp.1234.5")));
 
         store.put("b", "2", Some(0)).unwrap();
         assert_eq!(sweep_expired(&dir).unwrap(), 1, "期限切れの b だけ");
