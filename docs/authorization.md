@@ -121,9 +121,25 @@ async fn 他人の記事は直せない() {
 ```
 
 画面ごしに確かめるなら、ログインしてから叩きます。
+`client` は `#[bengara::test]` が用意する `TestClient` です。
 
 ```rust
-bob.send("PUT", "/api/my/articles/1", b"title=x".to_vec(), &[FORM])
+// 送るヘッダーは自分で組み立てます。bengara は定数を用意していません。
+const FORM: (&str, &str) = ("content-type", "application/x-www-form-urlencoded");
+
+// ボブでログインする（Cookie が client に残ります）。
+client
+    .post_with_csrf(
+        "/api/login",
+        "email=bob@example.com&password=password123",
+        "/csrf-token",
+    )
+    .await
+    .assert_ok();
+
+// 他人の記事を直そうとすると 403。
+client
+    .send("PUT", "/api/my/articles/1", b"title=x".to_vec(), &[FORM])
     .await
     .assert_status(403);
 ```

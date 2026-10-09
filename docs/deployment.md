@@ -57,6 +57,7 @@ cd /opt/myapp
 
 `public/`・`config/`・`resources/`・`routes/` は **置きません。** 全部バイナリに入っています。
 リリースビルドの実行ファイルは **約 6.0 MB** です（`features = ["sqlite"]` のとき）。
+`mysql` / `postgres` / `mail` を足すと、暗号化（rustls）が入るぶん大きくなります。
 
 ## 入れ替える
 

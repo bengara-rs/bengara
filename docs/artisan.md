@@ -37,7 +37,8 @@
 | `schedule:list`    | 定期処理の一覧                                 | [scheduling.md](scheduling.md)     |
 | `lang:list`        | 読み込まれている言語の一覧                     | [localization.md](localization.md) |
 
-- `migrate*` / `db:*` / `queue:*` は機能フラグ `sqlite` が要ります（[configuration.md](configuration.md)）。
+- `migrate*` / `db:*` / `queue:*` はデータベースの機能フラグ（`sqlite` / `mysql` /
+  `mariadb` / `postgres` のどれか）が要ります（[configuration.md](configuration.md)）。
 - 引数なしの `cargo artisan` は `list` と同じです。引数なしで本体を動かすと `serve` になります。
 - `make:*` コマンドはありません。意図的な判断です（[decisions.md](decisions.md)）。
 - `app/Console/Commands/*.rs` に置いた自作コマンドも、同じ一覧に並びます。

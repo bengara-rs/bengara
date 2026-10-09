@@ -1,15 +1,53 @@
 //! データベースの設定。Laravel の config/database.php に当たります。
 //!
-//! 値は .env から来ます。いまつなげるのは SQLite だけです。
+//! 値は .env から来ます。`DB_CONNECTION` で下の4つから選びます。
+//!
+//! | 名前     | データベース      | Cargo の機能フラグ      |
+//! |----------|-------------------|-------------------------|
+//! | `sqlite` | SQLite            | `sqlite`                |
+//! | `mysql`  | MySQL             | `mysql`                 |
+//! | `mariadb`| MariaDB           | `mysql`（`mariadb` も） |
+//! | `pgsql`  | PostgreSQL        | `postgres`              |
+//!
+//! **フラグを付けたドライバだけがつながります。** 雛形の Cargo.toml は
+//! `features = ["sqlite"]` で始まります。MySQL に変えるなら `"mysql"` に、
+//! PostgreSQL なら `"postgres"` に書き換えてください。
+//! データベースを使わないなら、`features` の行ごと消せます。
 
 use bengara::prelude::*;
 
 pub fn config() -> DatabaseConfig {
-    // ファイルは無ければ作られます。相対パスはプロジェクト直下から見ます。
+    // SQLite ではファイルの場所です。
     let database: String = env("DB_DATABASE", "database/database.sqlite");
+    // MySQL と PostgreSQL ではデータベース名です。同じ DB_DATABASE を見ます。
+    let db_name: String = env("DB_DATABASE", "bengara");
+    let host: String = env("DB_HOST", "127.0.0.1");
+    // 0 は「ドライバの既定（MySQL 3306 / PostgreSQL 5432）を使う」の合図です。
+    let port: u16 = env("DB_PORT", 0u16);
+    let username: String = env("DB_USERNAME", "");
+    let password: String = env("DB_PASSWORD", "");
 
     DatabaseConfig {
         default: env("DB_CONNECTION", "sqlite"),
-        connections: vec![ConnectionConfig::sqlite("sqlite", database)],
+        connections: vec![
+            // ファイルは無ければ作られます。相対パスはプロジェクト直下から見ます。
+            ConnectionConfig::sqlite("sqlite", database),
+            ConnectionConfig::mysql("mysql", db_name.clone())
+                .host(host.clone())
+                .port(port)
+                .username(username.clone())
+                .password(password.clone()),
+            // MariaDB は MySQL と同じドライバです。Laravel と同じく名前を分けておきます。
+            ConnectionConfig::mysql("mariadb", db_name.clone())
+                .host(host.clone())
+                .port(port)
+                .username(username.clone())
+                .password(password.clone()),
+            ConnectionConfig::postgres("pgsql", db_name)
+                .host(host)
+                .port(port)
+                .username(username)
+                .password(password),
+        ],
     }
 }

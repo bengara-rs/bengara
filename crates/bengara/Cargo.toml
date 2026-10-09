@@ -23,13 +23,39 @@ log-filter = ["tracing-subscriber/env-filter"]
 # フラグが無いときも database モジュールはコンパイルされ、実際に接続しようとした
 # ときだけ「features = ["sqlite"] を付けてください」というエラーになります。
 sqlite = ["database", "sqlx/sqlite"]
+# MySQL と MariaDB。同じドライバで両方につながります。
+# 日付の列を読むために sqlx/time、JSON の列のために sqlx/json を使います。
+# どちらも bengara の公開 API には出ません（database/mysql.rs の中だけ）。
+mysql = ["database", "sqlx/mysql", "sqlx/time", "sqlx/json", "tls"]
+# MariaDB は mysql と同じものです。名前で探した人が見つけられるように置いてあります。
+mariadb = ["mysql"]
+# PostgreSQL。
+# numeric（`t.decimal()` が作る列）を桁を落とさずに読むため sqlx/bigdecimal を使います。
+# MySQL は numeric を文字列で送ってくるので、そちらでは要りません。
+postgres = [
+    "database",
+    "sqlx/postgres",
+    "sqlx/time",
+    "sqlx/json",
+    "sqlx/bigdecimal",
+    "tls",
+]
 # ドライバ共通の土台。単体では指定しません。
 database = ["sqlx"]
+# ネットワーク越しの接続を暗号化する。mysql と postgres が内側で付けます。
+# 単体では指定しません。rustls と webpki-roots を使うので、OS の証明書置き場に
+# 依存しません（ビルドには C コンパイラが要ります）。
+tls = ["sqlx/tls-rustls-ring-webpki"]
 
 # 暗号化（encrypt / decrypt）。既定では入りません。
 # 署名（SHA-256 / HMAC）は自前なのでフラグは要りませんが、
 # 暗号は実績のあるクレートに任せます（決定記録 #050）。
 encryption = ["chacha20poly1305"]
+
+# SMTP でメールを送る。既定では入りません。
+# フラグが無いときも mail モジュールはコンパイルされ、MAIL_DRIVER=smtp に
+# したときだけ「features = ["mail"] を付けてください」というエラーになります。
+mail = ["lettre"]
 
 [dependencies]
 bengara-macros = { workspace = true }
@@ -54,10 +80,19 @@ sqlx = { version = "0.8", default-features = false, features = [
 chacha20poly1305 = { version = "0.10", default-features = false, features = [
     "alloc",
 ], optional = true }
+# メール。待つ形（同期）の送り口だけを使います。
+# bengara は `Mailer::send` を `spawn_blocking` の中で呼ぶので、
+# tokio 向けの送り口（tokio1-rustls-tls）は要りません。依存も少なくなります。
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",        # 文面の組み立て
+    "smtp-transport", # SMTP
+    "rustls-tls",     # TLS は rustls + webpki-roots（OS の証明書置き場に依存しない）
+    "pool",           # つなぎっぱなしにして TLS の握り直しを減らす
+], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# docs.rs では SQLite 付きの状態で説明を出す。
+# docs.rs では、つなげるドライバとメールを入れた状態で説明を出す。
 [package.metadata.docs.rs]
-features = ["sqlite"]
+features = ["sqlite", "mysql", "postgres", "encryption", "mail"]

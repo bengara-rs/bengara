@@ -8,37 +8,84 @@
 //!     .await?;
 //! ```
 //!
-//! **送り先は2つだけです。**
+//! **送り先は3つです。** `MAIL_DRIVER` で選びます。
 //!
-//! | 送り先 | 何をするか |
-//! |---|---|
-//! | `log`（既定） | `storage/logs/mail.log` に書き出す |
-//! | `array` | プロセスのメモリに溜める（テスト用） |
+//! | 送り先 | 何をするか | 要るもの |
+//! |---|---|---|
+//! | `log`（既定） | `storage/logs/mail.log` に書き出す | 無し |
+//! | `array` | プロセスのメモリに溜める（テスト用） | 無し |
+//! | `smtp` | SMTP サーバへ送る | Cargo の機能フラグ `mail` |
 //!
-//! **SMTP はまだありません。** TLS を自前で書けないためです。
-//! 形（`Mailer`）は用意してあるので、決まれば差し替えられます。
+//! `smtp` は既定では入りません。フラグが無いままでもコンパイルはできて、
+//! 送ろうとしたときに直し方を書いたエラーになります。
+//!
+//! ```toml
+//! bengara = { version = "0.1", features = ["mail"] }
+//! ```
 
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{Error, Result};
 
+/// SMTP の送り口。`mail` フラグを付けたときだけ入ります。
+#[cfg(feature = "mail")]
+mod smtp;
+
 /// メールの設定。`config/mail.rs` が返します。
+///
+/// `host` から下は `smtp` のときだけ使います。
 #[derive(Debug, Clone)]
 pub struct MailConfig {
-    /// 送り先の名前（`log` / `array`）。
+    /// 送り先の名前（`log` / `array` / `smtp`）。
     pub driver: String,
     /// 差出人（`.from(..)` を書かなかったときに使う）。
     pub from: String,
     /// 差出人の名前。
     pub from_name: String,
+    /// SMTP サーバの名前。
+    pub host: String,
+    /// SMTP サーバのポート。**0 のときは `encryption` から決めます**
+    /// （`tls` は 465、`starttls` は 587、`none` は 25）。
+    pub port: u16,
+    /// 暗号化の仕方（`tls` / `starttls` / `none`）。
+    pub encryption: String,
+    /// SMTP の利用者名。空のときは認証しません。
+    pub username: String,
+    /// SMTP のパスワード。
+    pub password: String,
+    /// `EHLO` で名乗る名前。空のときは lettre の既定（`localhost`）です。
+    pub ehlo_name: String,
+    /// 返事を待つ上限（秒）。
+    pub timeout: u64,
 }
 
 impl Default for MailConfig {
+    /// 環境変数から組み立てます。
+    ///
+    /// | 環境変数          | 既定値                 |
+    /// |-------------------|------------------------|
+    /// | `MAIL_DRIVER`     | `log`                  |
+    /// | `MAIL_FROM`       | `noreply@example.com`  |
+    /// | `MAIL_FROM_NAME`  | `bengara`              |
+    /// | `MAIL_HOST`       | `127.0.0.1`            |
+    /// | `MAIL_PORT`       | 0（暗号化から決める）  |
+    /// | `MAIL_ENCRYPTION` | `starttls`             |
+    /// | `MAIL_USERNAME`   | 空（認証しない）       |
+    /// | `MAIL_PASSWORD`   | 空                     |
+    /// | `MAIL_EHLO_NAME`  | 空                     |
+    /// | `MAIL_TIMEOUT`    | 10（秒）               |
     fn default() -> Self {
         Self {
             driver: crate::env("MAIL_DRIVER", "log"),
             from: crate::env("MAIL_FROM", "noreply@example.com"),
             from_name: crate::env("MAIL_FROM_NAME", "bengara"),
+            host: crate::env("MAIL_HOST", "127.0.0.1"),
+            port: crate::env::<u16>("MAIL_PORT", 0u16),
+            encryption: crate::env("MAIL_ENCRYPTION", "starttls"),
+            username: crate::env("MAIL_USERNAME", ""),
+            password: crate::env("MAIL_PASSWORD", ""),
+            ehlo_name: crate::env("MAIL_EHLO_NAME", ""),
+            timeout: crate::env::<u64>("MAIL_TIMEOUT", 10u64),
         }
     }
 }
@@ -174,6 +221,21 @@ pub(crate) fn install_test_mailer() {
     install_mailer(Box::new(ArrayMailer));
 }
 
+/// 送れない送り先。理由だけを持ちます。
+///
+/// 設定が足りなくても**起動そのものは止めません。** メールを送ろうとした
+/// ときに、直し方を書いたエラーを返します。起動時に落とすと、メールを
+/// 使わない画面まで開けなくなるためです。
+struct UnavailableMailer {
+    reason: String,
+}
+
+impl Mailer for UnavailableMailer {
+    fn send(&self, _message: &Message) -> Result<()> {
+        Err(Error::msg(self.reason.clone()))
+    }
+}
+
 /// 名前から送り先を作る。**知らない名前は `log`** にします。
 ///
 /// `mailer()` から切り出してあります。`MAILER` は 1 回しか決まらないので、
@@ -182,10 +244,36 @@ fn make_mailer(driver: &str) -> Box<dyn Mailer> {
     match driver {
         "array" | "memory" => Box::new(ArrayMailer) as Box<dyn Mailer>,
         "log" => Box::new(LogMailer),
+        "smtp" => make_smtp_mailer(),
         other => {
             tracing::warn!("MAIL_DRIVER `{other}` は知りません。log を使います");
             Box::new(LogMailer)
         }
+    }
+}
+
+/// SMTP の送り先を作る。
+///
+/// 機能フラグ `mail` が無いときと、設定が足りないときは、どちらも
+/// [`UnavailableMailer`] になります。**黙って log に落としません。**
+/// SMTP を指定した人は送れたつもりになってしまうためです。
+fn make_smtp_mailer() -> Box<dyn Mailer> {
+    #[cfg(feature = "mail")]
+    {
+        match smtp::SmtpMailer::new(config()) {
+            Ok(mailer) => Box::new(mailer) as Box<dyn Mailer>,
+            Err(error) => Box::new(UnavailableMailer {
+                reason: error.to_string(),
+            }),
+        }
+    }
+    #[cfg(not(feature = "mail"))]
+    {
+        Box::new(UnavailableMailer {
+            reason: "SMTP で送るには Cargo.toml を \
+                     `bengara = { version = \"0.1\", features = [\"mail\"] }` にしてください"
+                .to_string(),
+        })
     }
 }
 
@@ -323,6 +411,12 @@ mod tests {
         let config = MailConfig::default();
         assert_eq!(config.driver, "log");
         assert!(config.from.contains('@'));
+        // SMTP の値は入っているが、driver が log なので使われない。
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.encryption, "starttls");
+        assert_eq!(config.port, 0, "0 は「暗号化から決める」の合図");
+        assert!(config.username.is_empty(), "既定では認証しない");
+        assert_eq!(config.timeout, 10);
     }
 
     #[test]
@@ -480,11 +574,41 @@ mod tests {
         }
 
         // `log` と知らない名前は書き出す送り先。溜まりません。
-        for driver in ["log", "smtp", ""] {
+        for driver in ["log", "nowhere", ""] {
             Mail::clear_sent();
             make_mailer(driver).send(&message).unwrap();
             assert!(Mail::sent().is_empty(), "{driver}");
         }
+        Mail::clear_sent();
+    }
+
+    #[test]
+    fn smtp_は_log_にも_array_にも落ちない() {
+        let _guard = SENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Mail::clear_sent();
+        let mailer = make_mailer("smtp");
+
+        // 機能フラグが無いときは、送ろうとした所で断る。log に落としません。
+        #[cfg(not(feature = "mail"))]
+        {
+            let message = Message {
+                to: vec!["a@example.com".to_string()],
+                subject: "件名".into(),
+                text: Some("本文".into()),
+                ..Message::default()
+            };
+            let error = mailer.send(&message).unwrap_err().to_string();
+            assert!(error.contains("features"), "{error}");
+            assert!(error.contains("mail"), "{error}");
+        }
+
+        // フラグがあるときは、つなぎ口ができる。
+        // 実際につなぐのは送るときなので、ここでは送りません
+        //（テストがネットワークに出ないようにするため）。
+        #[cfg(feature = "mail")]
+        let _ = &mailer;
+
+        assert!(Mail::sent().is_empty(), "溜める送り先には渡らない");
         Mail::clear_sent();
     }
 

@@ -14,6 +14,7 @@ use sqlx::sqlite::{
 use sqlx::{Column, Row as SqlxRow, Sqlite, TypeInfo, ValueRef};
 
 use super::backend::{Backend, DbFuture, RawTx};
+use super::failure::failed;
 use super::grammar::Driver;
 use super::value::{Affected, Row, Value};
 use super::ConnectionConfig;
@@ -279,7 +280,7 @@ fn convert_value(row: &SqliteRow, index: usize, name: &str) -> Result<Value> {
         "TEXT" => read::<String>(row, index, name).map(Value::Text),
         "BLOB" => read::<Vec<u8>>(row, index, name).map(Value::Bytes),
         "NULL" => Ok(Value::Null),
-        _ => try_in_order(row, index, name),
+        other => try_in_order(row, index, name, other),
     }
 }
 
@@ -293,7 +294,7 @@ where
 }
 
 /// 型の名前が分からないときに、取り出せる順に試す。
-fn try_in_order(row: &SqliteRow, index: usize, name: &str) -> Result<Value> {
+fn try_in_order(row: &SqliteRow, index: usize, name: &str, type_name: &str) -> Result<Value> {
     if let Ok(v) = row.try_get::<i64, _>(index) {
         return Ok(Value::Int(v));
     }
@@ -306,67 +307,7 @@ fn try_in_order(row: &SqliteRow, index: usize, name: &str) -> Result<Value> {
     if let Ok(v) = row.try_get::<Vec<u8>, _>(index) {
         return Ok(Value::Bytes(v));
     }
-    Err(Error::msg(format!("列 `{name}` の値の種類が分かりません")))
-}
-
-/// SQL の失敗を、どの文で起きたか分かる形にする。
-///
-/// **渡した値は出しません。** 個人情報が混じることがあるためです。
-fn failed(sql: &str, error: sqlx::Error) -> Error {
-    Error::other(SqlFailure {
-        sql: sql.to_string(),
-        source: error,
-    })
-}
-
-/// SQL の実行に失敗したときのエラー。
-///
-/// **sqlx のエラーを原因として残します。** 一意制約違反などを種類で見分けるためです。
-/// `Error::msg` に文だけ入れると、残るのは文字列だけになります。
-/// 表に出る文はこれまでと同じです。
-#[derive(Debug)]
-struct SqlFailure {
-    sql: String,
-    source: sqlx::Error,
-}
-
-impl SqlFailure {
-    /// 一意制約（unique / primary key）に当たったか。
-    fn is_unique_violation(&self) -> bool {
-        self.source
-            .as_database_error()
-            .is_some_and(|e| e.is_unique_violation())
-    }
-}
-
-impl std::fmt::Display for SqlFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "SQL の実行に失敗しました: {}\n  SQL: {}",
-            self.source, self.sql
-        )
-    }
-}
-
-impl std::error::Error for SqlFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-/// 一意制約違反かどうかを、原因の連鎖から探す。
-///
-/// `Error::Other` に包んだ `SqlFailure` を見つけて、そこから判断します。
-pub(crate) fn is_unique_violation(error: &Error) -> bool {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(found) = current {
-        if let Some(failure) = found.downcast_ref::<SqlFailure>() {
-            return failure.is_unique_violation();
-        }
-        current = found.source();
-    }
-    false
+    Err(super::failure::unsupported_column(name, type_name))
 }
 
 #[cfg(test)]
@@ -502,5 +443,34 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("SQL の実行に失敗しました"));
         assert!(message.contains("select * from nope"));
+    }
+    #[tokio::test]
+    async fn 真偽と小数の列は整数と小数で返る() {
+        // ドキュメント（database.md の「ドライバの違い」）に載せた形を固定します。
+        // SQLite は値ごとに型が決まるので、MySQL / PostgreSQL と腕が違います。
+        let db = memory().await;
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.create("t", |t| {
+            t.boolean("published");
+            t.decimal("total", 8, 2);
+        });
+        for sql in schema.into_statements() {
+            db.execute(&sql, &[]).await.unwrap();
+        }
+        db.execute(
+            "insert into \"t\" (\"published\", \"total\") values (?, ?)",
+            &[Value::Bool(true), Value::Text("1234.56".into())],
+        )
+        .await
+        .unwrap();
+
+        let rows = db.fetch_all("select * from \"t\"", &[]).await.unwrap();
+        let row = &rows[0];
+        // 真偽は整数で返る。`get::<bool>()` ならどのドライバでも同じ結果になる。
+        assert_eq!(row.value("published"), Some(&Value::Int(1)));
+        assert!(row.get::<bool>("published").unwrap());
+        // 小数は小数で返る（SQLite に小数専用の型が無いため）。
+        assert_eq!(row.value("total"), Some(&Value::Float(1234.56)));
+        assert_eq!(row.get::<f64>("total").unwrap(), 1234.56);
     }
 }

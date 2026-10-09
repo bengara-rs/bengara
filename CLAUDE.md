@@ -15,7 +15,7 @@
 |-------------------------|-------------------------|----------------------------------------------------------------------------------------------|
 | `crates/bengara`        | 利用者が依存に書く本体  | 公開 API は `prelude` 経由で使える形を保つ。axum / hyper を外に漏らさない                    |
 | `crates/bengara-build`  | `build.rs` の自動検出   | **依存クレートを持たない**。**パニック禁止**（問題は生成コードの `compile_error!` で伝える） |
-| `crates/bengara-macros` | `#[bengara::test]` のみ | ここに機能を増やさない。マクロのエラーは分かりやすい文で出す                                 |
+| `crates/bengara-macros` | `#[bengara::test]` と `#[derive(Model)]` | ここに機能を増やさない。マクロのエラーは分かりやすい文で出す |
 
 - workspace 共通: version 0.1.0 / edition 2021 / rust-version 1.85 / license `MIT OR Apache-2.0`。
   bengara 自身は edition 2021 で書くが、依存の hyper-util が edition 2024 を要求するため MSRV は 1.85。

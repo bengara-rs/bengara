@@ -6,23 +6,52 @@
 
 ## 使えるようにする
 
-データベースは **機能フラグ**です。`Cargo.toml` に書きます。
+データベースは **機能フラグ**です。`Cargo.toml` に、使うものだけを書きます。
 
 ```toml
 [dependencies]
 bengara = { version = "0.1", features = ["sqlite"] }
 ```
 
-`cargo run -- init` で作ったプロジェクトには最初から入っています。
+| データベース    | フラグ                  | `DB_CONNECTION` に書く名前 |
+|-----------------|-------------------------|----------------------------|
+| SQLite          | `sqlite`                | `sqlite`                   |
+| MySQL           | `mysql`                 | `mysql`                    |
+| MariaDB         | `mariadb`（`mysql` と同じもの） | `mariadb`          |
+| PostgreSQL      | `postgres`              | `pgsql`                    |
+
+`DB_CONNECTION` の名前は `config/database.rs` が返す接続の名前です。
+`cargo run -- init` が作る `config/database.rs` には、上の 4 つが入っています。
+
 下回りは sqlx 0.8 ですが、その型は外に出ません。
 
-| 使えるもの         | 状況                                                    |
-|--------------------|---------------------------------------------------------|
-| SQLite             | **使えます**（`features = ["sqlite"]`）                 |
-| MySQL / PostgreSQL | **まだ使えません。** SQL の組み立てだけ用意してあります |
+**既定ではどのドライバも入りません。** `cargo run -- init` が作る `Cargo.toml` には
+`features = ["sqlite"]` が書かれます。 **データベースを使わないプロジェクトでは、
+その 1 語（または `features` の行ごと）を消してください。** 消しても他の機能は動きます。
 
 フラグが無いままでもコンパイルは通ります。
 `DB::...` を呼んだときに、直し方を書いたエラーが返ります。
+
+```
+mysql につなぐには Cargo.toml を `bengara = { version = "0.1", features = ["mysql"] }` にしてください
+```
+
+2 つ以上を同時に入れてもかまいません。`DB::connection("名前")` で使い分けられます。
+
+```toml
+bengara = { version = "0.1", features = ["sqlite", "postgres"] }
+```
+
+### ビルドに要るもの
+
+`mysql` と `postgres` を入れると、通信を暗号化するために C コンパイラが要ります
+（rustls が使う `ring`）。`sqlite` だけなら要りません。
+
+| OS      | 用意するもの                      |
+|---------|-----------------------------------|
+| Linux   | `cc`（`build-essential` など）    |
+| macOS   | Xcode Command Line Tools          |
+| Windows | Visual Studio の C++ ビルドツール |
 
 > Rust 1.85（最低対応版）で使うときは、依存を 1 つ固定してください。
 > `cargo update idna_adapter --precise 1.2.0`（[getting-started.md](getting-started.md)）
@@ -31,6 +60,8 @@ bengara = { version = "0.1", features = ["sqlite"] }
 
 `.env` に書きます。
 
+SQLite のとき。
+
 ```
 DB_CONNECTION=sqlite
 DB_DATABASE=database/database.sqlite
@@ -38,6 +69,35 @@ DB_DATABASE=database/database.sqlite
 # テストで使うデータベース（:memory: ならディスクに残りません）
 DB_TEST_DATABASE=:memory:
 ```
+
+MySQL / MariaDB / PostgreSQL のとき。
+
+```
+DB_CONNECTION=mysql
+DB_DATABASE=myapp
+DB_HOST=127.0.0.1
+# 空にすると 3306（mysql）/ 5432（pgsql）を使います
+DB_PORT=
+DB_USERNAME=myapp
+DB_PASSWORD=ここにパスワード
+
+# **テスト用に別のデータベースを用意してください**（下の「テスト」）
+DB_TEST_DATABASE=myapp_test
+```
+
+見る環境変数は次のとおりです。
+
+| 環境変数             | 既定                          | 使うドライバ   |
+|----------------------|-------------------------------|----------------|
+| `DB_CONNECTION`      | `sqlite`                      | すべて         |
+| `DB_DATABASE`        | SQLite は `database/database.sqlite`、ほかは `bengara` | すべて |
+| `DB_URL`             | 空                            | すべて         |
+| `DB_HOST`            | `127.0.0.1`                   | MySQL / pgsql  |
+| `DB_PORT`            | 3306 / 5432                   | MySQL / pgsql  |
+| `DB_USERNAME`        | `root` / `postgres`           | MySQL / pgsql  |
+| `DB_PASSWORD`        | 空（渡しません）              | MySQL / pgsql  |
+| `DB_MAX_CONNECTIONS` | 5                             | すべて         |
+| `DB_TEST_DATABASE`   | SQLite は `:memory:`、ほかは無し | すべて      |
 
 細かく決めたいときは `config/database.rs` を書きます。
 置かなければ、上の環境変数から組み立てた既定の設定が使われます。
@@ -54,25 +114,57 @@ pub fn config() -> DatabaseConfig {
             ConnectionConfig::sqlite("sqlite", database).max_connections(5),
             // 2 本目。DB::connection("logs") で指します。
             ConnectionConfig::sqlite("logs", "database/logs.sqlite"),
+            // MySQL / MariaDB。ホストと利用者名は書かなければ 127.0.0.1 / root です。
+            ConnectionConfig::mysql("mysql", env::<String>("DB_DATABASE", "myapp"))
+                .host(env::<String>("DB_HOST", "127.0.0.1"))
+                .username(env::<String>("DB_USERNAME", "root"))
+                .password(env::<String>("DB_PASSWORD", "")),
+            // PostgreSQL。
+            ConnectionConfig::postgres("pgsql", env::<String>("DB_DATABASE", "myapp"))
+                .host(env::<String>("DB_HOST", "127.0.0.1"))
+                .username(env::<String>("DB_USERNAME", "postgres"))
+                .password(env::<String>("DB_PASSWORD", "")),
         ],
     }
 }
 ```
 
-| 指定                 | 既定 | 意味                                                     |
-|----------------------|------|----------------------------------------------------------|
-| `max_connections(n)` | 5    | 同時に張る接続の数。`:memory:` のときは 1 に固定されます |
-| `foreign_keys(b)`    | 真   | SQLite で外部キーの制約を効かせるか                      |
-| `url(s)`             | 空   | 接続文字列を直接書く。書くと `database` より優先します   |
+| 作り方                        | ポートの既定 | 利用者名の既定 |
+|-------------------------------|--------------|----------------|
+| `ConnectionConfig::sqlite`    | –            | –              |
+| `ConnectionConfig::mysql`     | 3306         | `root`         |
+| `ConnectionConfig::postgres`  | 5432         | `postgres`     |
+
+| 指定                 | 既定        | 意味                                                     |
+|----------------------|-------------|----------------------------------------------------------|
+| `host(s)`            | `127.0.0.1` | つなぎ先。**空の文字列は無視します**                     |
+| `port(n)`            | 3306 / 5432 | ポート。**0 は無視します**（既定のまま）                 |
+| `username(s)`        | 上の表      | 利用者名。**空の文字列は無視します**                     |
+| `password(s)`        | 空          | パスワード。空のままなら渡しません                       |
+| `max_connections(n)` | 5           | 同時に張る接続の数。`:memory:` のときは 1 に固定されます |
+| `foreign_keys(b)`    | 真          | SQLite で外部キーの制約を効かせるか（ほかでは常に効きます） |
+| `url(s)`             | 空          | 接続文字列を直接書く。書くと他の値より優先します         |
+
+`url(s)` の形は sqlx と同じです。
+
+```
+sqlite://database/database.sqlite
+mysql://利用者名:パスワード@127.0.0.1:3306/データベース名
+postgres://利用者名:パスワード@127.0.0.1:5432/データベース名
+```
 
 気をつけること。
 
 - SQLite のファイルは **無ければ作ります。** 置くディレクトリは先に用意してください。
+  MySQL と PostgreSQL では、**データベースは先に作っておいてください。** 作りません。
 - 相対パスはプロジェクト直下（`base_path()`）から見ます。
 - 接続は **最初に使ったときに**張ります。起動は速いままです。
 - メモリ上のデータベースかどうかは、**`:memory:` を含むかどうか**だけで決めます。
   `data/memory_2026.db` のように `memory` という語を含むだけのファイル名は、
   メモリ扱いになりません（接続 1 本に固定されず、ファイル向けの設定が使われます）。
+- MySQL と PostgreSQL は、サーバが暗号化に対応していれば暗号化してつなぎます
+  （sqlx の既定。MySQL は `PREFERRED`、PostgreSQL は `prefer`）。
+  **証明書は OS の置き場所を見ません**（rustls + webpki-roots）。
 
 ## 問い合わせを組み立てる
 
@@ -525,6 +617,129 @@ SQL が失敗したときは、文だけを添えて返します。
 
 列と列を比べる側（`where_column` / `join`）は、これに `in` / `between` / `<=>` を加えた
 広い一覧を使います。
+
+## ドライバの違い
+
+**同じコードが 3 つのドライバで動きます。** SQL の引用符・プレースホルダ・列の型名は
+bengara が書き分けます。それでも残る違いをここにまとめます。
+
+### 列の型
+
+`Schema` が書く SQL の型名です（[migrations.md](migrations.md)）。
+
+| 書き方                 | SQLite                      | MySQL                       | PostgreSQL         |
+|------------------------|-----------------------------|-----------------------------|--------------------|
+| `id()`                 | `integer primary key autoincrement` | `bigint unsigned auto_increment` | `bigserial` |
+| `integer(..)`          | `integer`                   | `integer`                   | `integer`          |
+| `big_integer(..)`      | `integer`                   | `bigint`                    | `bigint`           |
+| `string(..)`           | `varchar(255)`              | `varchar(255)`              | `varchar(255)`     |
+| `text(..)`             | `text`                      | `text`                      | `text`             |
+| `boolean(..)`          | `boolean`                   | `tinyint(1)`                | `boolean`          |
+| `float(..)`            | `real`                      | `float`                     | `float`            |
+| `double(..)`           | `real`                      | `double precision`          | `double precision` |
+| `decimal(.., 8, 2)`    | `numeric(8, 2)`             | `numeric(8, 2)`             | `numeric(8, 2)`    |
+| `date(..)`             | `date`                      | `date`                      | **`text`**         |
+| `date_time(..)` / `timestamp(..)` | `datetime`       | `datetime`                  | **`text`**         |
+| `json(..)`             | `text`                      | `json`                      | **`text`**         |
+| `binary(..)`           | `blob`                      | `blob`                      | `bytea`            |
+| `uuid(..)`             | `varchar(36)`               | `varchar(36)`               | `varchar(36)`      |
+
+**PostgreSQL では日付と JSON が `text` 列になります。** bengara は日時を文字列で
+扱うので（上の「日時」）、`insert` に渡すのも文字列です。PostgreSQL は値を渡す場所の
+型に厳しく、`$1` が文字列のままでは `timestamp` 列に入れさせてくれません。
+
+```
+column "created_at" is of type timestamp without time zone but expression is of type text
+```
+
+SQLite と MySQL は文字列を日付として受け取るので、本来の型のままにしています。
+
+本物の `timestamp` 列や `json` 列が**すでにある**データベースにつなぐときは、
+**読む**ぶんには困りません（下の表）。書くときは `cast` を自分で書いてください。
+
+### 読み出した値
+
+`row.get::<T>()` は型を合わせて読むので、**どのドライバでも同じ結果になります。**
+下の表は `row.value()` で生の `Value` を見たときの腕です。
+
+| 列                    | SQLite        | MySQL         | PostgreSQL    |
+|-----------------------|---------------|---------------|---------------|
+| 整数                  | `Int`         | `Int`         | `Int`         |
+| 小数（float/double）  | `Float`       | `Float`       | `Float`       |
+| 真偽（boolean）       | **`Int`**     | `Bool`        | `Bool`        |
+| `decimal` / `numeric` | **`Float`**   | `Text`        | `Text`        |
+| 文字列                | `Text`        | `Text`        | `Text`        |
+| 日付・日時            | `Text`        | `Text`        | `Text`        |
+| JSON                  | `Text`        | `Text`        | `Text`        |
+| バイト列              | `Bytes`       | `Bytes`       | `Bytes`       |
+| `null`                | `Null`        | `Null`        | `Null`        |
+
+- **`decimal` は MySQL と PostgreSQL では文字列で返します。** 小数に直すと桁が
+  落ちるためです。SQLite には小数の型が無いので `Float` になります。
+- 文字列の形は 2 つのドライバでそろえます。末尾の 0 は落とします
+  （`12.50` も `12.5000` も `12.5`）。
+- 日付と日時は `YYYY-MM-DD HH:MM:SS` に直して返します。`now()` と同じ形です。
+  PostgreSQL の `timestamptz` は **UTC に直して**返します。
+- MySQL の `bigint unsigned` が `i64` に収まらないときは、丸めずに `Text` で返します。
+- **照合順序が `_bin` の文字列の列は `Bytes` になります。** MySQL の通信の決まりでは
+  「バイナリ」と伝わるためです。MariaDB の `json` 列がこれに当たります
+  （MariaDB の `json` は `utf8mb4_bin` の `longtext` です）。
+  `row.get::<String>()` なら、どちらでも文字列で読めます。
+
+### 読めない列
+
+`Value` に直せない型は、**黙って別の値にせず**エラーにします。
+
+```
+列 `id` の型 `UUID` は読めません。select で文字列に変換して取り出してください（例: `cast(列 as text) as 列`）
+```
+
+| ドライバ   | 読めない型の例                                          |
+|------------|---------------------------------------------------------|
+| PostgreSQL | `uuid` / `money` / `inet` / 配列 / 範囲（range） / `interval` |
+| MySQL      | 上の表に無い型                                          |
+| SQLite     | ほぼ起きません（値ごとに型が決まるため）                |
+
+`select` で `cast(列 as text) as 列` と書けば読めます。
+
+### 自動採番の番号
+
+| 書き方                      | SQLite / MySQL        | PostgreSQL                       |
+|-----------------------------|-----------------------|----------------------------------|
+| `insert_get_id()`           | **使えます**          | **使えます**（`returning` を付けます） |
+| `Affected::last_insert_id`  | 入ります              | **いつも `None`**                |
+
+PostgreSQL には「最後に入れた行の番号」を返す仕組みがありません。
+`insert_get_id()` は内側で `returning "id"` を付けるので、どのドライバでも同じように
+使えます。 **`statement()` で自分で `insert` を書いたときだけ**、PostgreSQL では
+番号が返りません。`returning` を自分で書いて `select()` で受け取ってください。
+
+### そのほか
+
+| こと                   | 内容                                                                 |
+|------------------------|----------------------------------------------------------------------|
+| `truncate()`           | SQLite には `truncate` が無いので、条件なしの `delete` と採番の戻しの 2 文になります |
+| `offset` だけ指定      | 補う `limit` が方言で違います（`limit all` / `limit -1` など）        |
+| `ilike`                | PostgreSQL だけの演算子です。ほかのドライバでは SQL エラーになります |
+| `<=>`                  | MySQL だけの演算子です。`where_op`（値 1 つ）では使えません          |
+| 索引                   | MySQL には `create index if not exists` が無いので、`create_if_not_exists` のときは表の定義の中に書きます |
+| 外部キー               | MySQL と PostgreSQL では常に効きます。`foreign_keys(false)` は SQLite だけに効きます |
+
+### テスト
+
+SQLite はテスト用のデータベースをメモリの上に逃がせます（`DB_TEST_DATABASE=:memory:`）。
+MySQL と PostgreSQL は**すでにあるデータベース**を指すので、逃がせません。
+
+**`DB_TEST_DATABASE` に別のデータベース名を必ず書いてください。**
+書かないと、テストの最初につなぐところで止まります。
+
+```
+mysql のテストには DB_TEST_DATABASE が必要です。テスト用のデータベースを別に作って、
+その名前を .env の DB_TEST_DATABASE に書いてください（テストは表を全部消すので、開発用のデータベースには触りません）
+```
+
+テストは表を全部消して作り直します（[testing.md](testing.md)）。
+開発用のデータベースを指すと中身が消えるので、この確かめを入れています。
 
 ## できないこと・エラーになること
 

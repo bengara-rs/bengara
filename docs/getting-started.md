@@ -11,7 +11,8 @@ bengara 自身のコードは edition 2021 で書いています。
 ただし依存クレートの hyper-util が edition 2024 を要求します。
 そのため Rust 1.82 では依存の解決に失敗し、実際の下限は 1.85 になります。
 
-> **Rust 1.85 でデータベース（`features = ["sqlite"]`）を使うとき**は、依存を 1 つ古い版に固定してください。
+> **Rust 1.85 でデータベース（`sqlite` / `mysql` / `postgres`）を使うとき**は、
+> 依存を 1 つ古い版に固定してください。
 > sqlx がたどる `icu_*` が、新しい版では Rust 1.88 以上を要求します。
 >
 > ```sh
@@ -27,7 +28,8 @@ cargo new myapp && cd myapp
 cargo add bengara --features sqlite
 ```
 
-**データベースを使うなら `--features sqlite` を忘れないでください。**
+**データベースを使うなら機能フラグを忘れないでください。** SQLite なら `sqlite`、
+MySQL / MariaDB なら `mysql`、PostgreSQL なら `postgres` です。
 後から足すときは `Cargo.toml` を次の形にします。
 
 ```toml
@@ -35,6 +37,8 @@ bengara = { version = "0.1", features = ["sqlite"] }
 ```
 
 使わないなら `cargo add bengara` だけで構いません。依存が 74 個少なくなります。
+
+SMTP でメールを送るなら `mail` も足します（[mail.md](mail.md)）。
 
 ## 2. main.rs を仮の形にする
 

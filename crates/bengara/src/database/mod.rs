@@ -16,12 +16,25 @@
 //! 直し方を書いたエラーになります。
 
 mod backend;
+/// 小数の文字列をそろえる。SQLite には小数の型が無いので要りません。
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+mod decimal;
+/// SQL の失敗の包み方。3つのドライバで共通です。
+#[cfg(feature = "database")]
+mod failure;
 mod grammar;
 mod model;
+#[cfg(feature = "mysql")]
+mod mysql;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod query;
 mod schema;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+/// 日時の列を文字列に直す。SQLite は値がそのまま文字列なので要りません。
+#[cfg(any(feature = "mysql", feature = "postgres"))]
+mod temporal;
 mod transaction;
 mod value;
 
@@ -67,14 +80,58 @@ pub struct DatabaseConfig {
 
 impl Default for DatabaseConfig {
     /// `config/database.rs` が無いときに使われる値。環境変数から組み立てます。
+    ///
+    /// 見る環境変数は次のとおりです。
+    ///
+    /// | 環境変数           | 既定値                        | 使うドライバ   |
+    /// |--------------------|-------------------------------|----------------|
+    /// | `DB_CONNECTION`    | `sqlite`                      | すべて         |
+    /// | `DB_DATABASE`      | ドライバごと（下の表）        | すべて         |
+    /// | `DB_URL`           | 空（他の値から組み立てる）    | すべて         |
+    /// | `DB_HOST`          | `127.0.0.1`                   | MySQL / pgsql  |
+    /// | `DB_PORT`          | 3306 / 5432                   | MySQL / pgsql  |
+    /// | `DB_USERNAME`      | `root` / `postgres`           | MySQL / pgsql  |
+    /// | `DB_PASSWORD`      | 空                            | MySQL / pgsql  |
+    /// | `DB_MAX_CONNECTIONS` | 5                           | すべて         |
+    ///
+    /// `DB_DATABASE` の既定値は、SQLite では `database/database.sqlite`、
+    /// MySQL と PostgreSQL では `bengara` です。
     fn default() -> Self {
         let default: String = crate::env("DB_CONNECTION", "sqlite");
-        let database: String = crate::env("DB_DATABASE", "database/database.sqlite");
+        // 名前が読めないときは SQLite とみなします。本当のエラーは接続のときに出ます。
+        let driver = Driver::parse(&default).unwrap_or(Driver::Sqlite);
+        let connection = match driver {
+            Driver::Sqlite => ConnectionConfig::sqlite(
+                default.clone(),
+                crate::env::<String>("DB_DATABASE", "database/database.sqlite"),
+            ),
+            Driver::MySql => ConnectionConfig::mysql(
+                default.clone(),
+                crate::env::<String>("DB_DATABASE", "bengara"),
+            ),
+            Driver::Postgres => ConnectionConfig::postgres(
+                default.clone(),
+                crate::env::<String>("DB_DATABASE", "bengara"),
+            ),
+        };
         Self {
-            connections: vec![ConnectionConfig::sqlite(default.clone(), database)],
+            connections: vec![from_env(connection)],
             default,
         }
     }
+}
+
+/// 環境変数で接続の細かいところを上書きする。
+///
+/// 空の文字列と 0 は「指定なし」として無視します（[`ConnectionConfig::host`] ほか）。
+/// SQLite では host / port / username / password を見ないので、入っていても害はありません。
+fn from_env(base: ConnectionConfig) -> ConnectionConfig {
+    base.host(crate::env::<String>("DB_HOST", ""))
+        .port(crate::env::<u16>("DB_PORT", 0u16))
+        .username(crate::env::<String>("DB_USERNAME", ""))
+        .password(crate::env::<String>("DB_PASSWORD", ""))
+        .url(crate::env::<String>("DB_URL", ""))
+        .max_connections(crate::env::<u32>("DB_MAX_CONNECTIONS", 5u32))
 }
 
 impl DatabaseConfig {
@@ -101,11 +158,21 @@ pub struct ConnectionConfig {
     /// 相対パスは基準ディレクトリ（`base_path()`）から見ます。
     /// `:memory:` にすると、プロセスの中だけのデータベースになります。
     pub database: String,
+    /// つなぎ先のホスト。SQLite では使いません。
+    pub host: String,
+    /// つなぎ先のポート。SQLite では使いません。
+    pub port: u16,
+    /// 利用者名。SQLite では使いません。
+    pub username: String,
+    /// パスワード。空のときは渡しません。SQLite では使いません。
+    pub password: String,
     /// 接続文字列。空でなければ、他の値より優先します。
     pub url: String,
     /// 同時に張る接続の数の上限。
     pub max_connections: u32,
     /// SQLite で外部キーの制約を効かせるか。
+    ///
+    /// MySQL と PostgreSQL では外部キーは常に効きます。この値は見ません。
     pub foreign_keys: bool,
 }
 
@@ -116,10 +183,91 @@ impl ConnectionConfig {
             name: name.into(),
             driver: Driver::Sqlite,
             database: database.into(),
+            host: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
             url: String::new(),
             max_connections: 5,
             foreign_keys: true,
         }
+    }
+
+    /// MySQL / MariaDB の接続を作る。
+    ///
+    /// ホストは `127.0.0.1`、ポートは 3306、利用者名は `root` から始まります。
+    /// 変えるときは [`host`](Self::host) / [`port`](Self::port) /
+    /// [`username`](Self::username) / [`password`](Self::password) を続けます。
+    ///
+    /// ```ignore
+    /// ConnectionConfig::mysql("mysql", env("DB_DATABASE", "bengara"))
+    ///     .host(env("DB_HOST", "127.0.0.1"))
+    ///     .username(env("DB_USERNAME", "root"))
+    ///     .password(env("DB_PASSWORD", ""))
+    /// ```
+    pub fn mysql(name: impl Into<String>, database: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            driver: Driver::MySql,
+            database: database.into(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            username: "root".to_string(),
+            password: String::new(),
+            url: String::new(),
+            max_connections: 5,
+            foreign_keys: true,
+        }
+    }
+
+    /// PostgreSQL の接続を作る。
+    ///
+    /// ホストは `127.0.0.1`、ポートは 5432、利用者名は `postgres` から始まります。
+    pub fn postgres(name: impl Into<String>, database: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            driver: Driver::Postgres,
+            database: database.into(),
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            username: "postgres".to_string(),
+            password: String::new(),
+            url: String::new(),
+            max_connections: 5,
+            foreign_keys: true,
+        }
+    }
+
+    /// つなぎ先のホストを決める。空の文字列は無視します。
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        let host = host.into();
+        if !host.is_empty() {
+            self.host = host;
+        }
+        self
+    }
+
+    /// つなぎ先のポートを決める。0 は無視します。
+    pub fn port(mut self, port: u16) -> Self {
+        if port != 0 {
+            self.port = port;
+        }
+        self
+    }
+
+    /// 利用者名を決める。空の文字列は無視します。
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        let username = username.into();
+        if !username.is_empty() {
+            self.username = username;
+        }
+        self
+    }
+
+    /// パスワードを決める。空のままならパスワード無しでつなぎます。
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = password.into();
+        self
     }
 
     /// 接続文字列を直接指定する。
@@ -220,28 +368,43 @@ fn named_backend(name: &str) -> Option<Arc<dyn Backend>> {
 }
 
 /// 設定に従って実際につなぐ。
+///
+/// ドライバを選ぶのはここだけです。機能フラグが無いドライバは、つなぐ前に止めます。
 async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backend>> {
-    // 機能フラグが無い、または、まだ作っていないドライバは、ここで止める。
+    // 機能フラグが無いドライバは、ここで止める。
     if !settings.driver.is_available() {
         return Err(unavailable(settings.driver));
     }
-    #[cfg(feature = "sqlite")]
-    if settings.driver == Driver::Sqlite {
-        return sqlite::connect(settings).await;
+    // 3つのフラグを全部付けると最後の腕に届かなくなるので、警告を外す。
+    #[allow(unreachable_patterns)]
+    match settings.driver {
+        #[cfg(feature = "sqlite")]
+        Driver::Sqlite => sqlite::connect(settings).await,
+        #[cfg(feature = "mysql")]
+        Driver::MySql => mysql::connect(settings).await,
+        #[cfg(feature = "postgres")]
+        Driver::Postgres => postgres::connect(settings).await,
+        other => Err(unavailable(other)),
     }
-    Err(unavailable(settings.driver))
 }
 
-/// 機能フラグが無い、または、まだ作っていないドライバを使おうとしたときのエラー。
+/// 機能フラグが無いドライバを使おうとしたときのエラー。
+///
+/// 付けるフラグの名前をそのまま出します。MySQL は `mariadb` でも同じものが入ります。
 fn unavailable(driver: Driver) -> Error {
-    match driver {
-        Driver::Sqlite => Error::msg(
-            "SQLite を使うには Cargo.toml を `bengara = { version = \"0.1\", features = [\"sqlite\"] }` にしてください",
+    let (flag, note) = match driver {
+        Driver::Sqlite => ("sqlite", ""),
+        // MariaDB を指した人にも分かるように、同じものだと添えます。
+        Driver::MySql => (
+            "mysql",
+            "（MariaDB なら \"mariadb\" でも同じものが入ります）",
         ),
-        other => Error::msg(format!(
-            "{other} はまだ作っていません。いまつなげるのは SQLite だけです"
-        )),
-    }
+        Driver::Postgres => ("postgres", ""),
+    };
+    Error::msg(format!(
+        "{driver} につなぐには Cargo.toml を \
+         `bengara = {{ version = \"0.1\", features = [\"{flag}\"] }}` にしてください{note}"
+    ))
 }
 
 /// テストで使う接続を用意する。`testing::refresh_database()` から呼びます。
@@ -257,8 +420,25 @@ pub(crate) async fn connect_for_tests() -> Result<()> {
         .get(&config.default)
         .cloned()
         .unwrap_or_else(|| ConnectionConfig::sqlite("sqlite", ":memory:"));
+    // SQLite はファイルを指すので、既定でメモリの上に逃がせます。
+    // MySQL と PostgreSQL は**既にあるデータベース**を指すので、逃がせません。
+    // `refresh_database()` は表を全部消すので、指定が無ければ**つなぎません。**
+    let database: String = if base.driver == Driver::Sqlite {
+        crate::env("DB_TEST_DATABASE", ":memory:")
+    } else {
+        let name: String = crate::env("DB_TEST_DATABASE", "");
+        if name.is_empty() {
+            return Err(Error::msg(format!(
+                "{} のテストには DB_TEST_DATABASE が必要です。\
+                 テスト用のデータベースを別に作って、その名前を .env の DB_TEST_DATABASE に書いてください\
+                 （テストは表を全部消すので、開発用のデータベースには触りません）",
+                base.driver
+            )));
+        }
+        name
+    };
     let settings = ConnectionConfig {
-        database: crate::env("DB_TEST_DATABASE", ":memory:"),
+        database,
         url: String::new(),
         ..base
     };
@@ -290,11 +470,11 @@ pub(crate) fn test_backend() -> Option<Arc<dyn Backend>> {
 ///
 /// `Error` の列挙に腕は足しません。利用者が書いた `match` を壊さないためです。
 pub fn is_unique_violation(error: &Error) -> bool {
-    #[cfg(feature = "sqlite")]
+    #[cfg(feature = "database")]
     {
-        sqlite::is_unique_violation(error)
+        failure::is_unique_violation(error)
     }
-    #[cfg(not(feature = "sqlite"))]
+    #[cfg(not(feature = "database"))]
     {
         let _ = error;
         false

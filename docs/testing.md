@@ -66,7 +66,10 @@ async fn 一覧が見える() {
 }
 ```
 
-`Cargo.toml` に `features = ["sqlite"]` が書かれていれば、`cargo test` でそのまま動きます。
+`Cargo.toml` にデータベースの機能フラグが書かれていれば、`cargo test` でそのまま動きます。
+SQLite なら `DB_TEST_DATABASE` の既定が `:memory:` なので、用意は要りません。
+**MySQL と PostgreSQL では、テスト用のデータベースを別に作って `DB_TEST_DATABASE` に
+書いてください**（[database.md](database.md) の「ドライバの違い」）。
 
 ### ログインしてから送る
 

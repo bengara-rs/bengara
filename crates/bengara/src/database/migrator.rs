@@ -393,25 +393,35 @@ impl Migrator {
         if tables.is_empty() {
             return Ok(Vec::new());
         }
-        let mut schema = Schema::new(self.driver());
-        for table in &tables {
-            schema.drop_if_exists(table);
-        }
-        let statements = schema.into_statements();
+        let statements = super::grammar::drop_all(self.driver(), &tables);
+        let (before, after) = super::grammar::defer_foreign_keys(self.driver());
 
         // 1つのトランザクションの中で流す。
-        // `pragma foreign_keys` は**接続ごと**の設定なので、プールから取り直すと
-        // 別の接続に当たりえます。途中で失敗したときに、外したままの接続が
+        // 外部キーの確かめを止める指定は**接続ごと**なので、プールから取り直すと
+        // 別の接続に当たりえます。途中で失敗したときに、止めたままの接続が
         // プールに戻るのも防ぎます。
+        //
+        // MySQL は DDL でトランザクションが勝手に確定します。それでも
+        // トランザクションを使うのは、接続を1本に固定するためです。
         let tx = self.begin().await?;
-        if self.driver() == Driver::Sqlite {
-            // 外部キーの順番を気にせず消せるように、この中だけ確かめを後回しにする。
-            // `defer_foreign_keys` は確定のときに自動で元へ戻ります。
-            tx.statement("pragma defer_foreign_keys = on", &[]).await?;
-        }
-        for sql in &statements {
+        if let Some(sql) = before {
             tx.statement(sql, &[]).await?;
         }
+        let mut result = Ok(());
+        for sql in &statements {
+            if let Err(error) = tx.statement(sql, &[]).await {
+                result = Err(error);
+                break;
+            }
+        }
+        // 失敗しても確かめを戻す。止めたままの接続をプールに返さないため。
+        if let Some(sql) = after {
+            let restored = tx.statement(sql, &[]).await;
+            if result.is_ok() {
+                result = restored.map(|_| ());
+            }
+        }
+        result?;
         tx.commit().await?;
         Ok(tables)
     }

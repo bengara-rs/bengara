@@ -325,7 +325,8 @@ pub async fn me(req: Request) -> Result<Response> {
 
 ## パスワードの再設定
 
-**メールの送信はまだありません。** トークンとリンクを作るところまでです。
+**文面と送信は自分で書きます。** bengara が作るのはトークンとリンクまでです。
+送るときは `Mail` を使います（[mail.md](mail.md)）。SMTP で送るなら機能フラグ `mail` が要ります。
 
 ```rust
 // database/migrations/..._create_password_resets_table.rs
@@ -417,7 +418,7 @@ let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 | 複数の認証の仕組み（Laravel の guard）      | [backlog.md](backlog.md)       |
 | API トークン                                | [backlog.md](backlog.md)       |
 | Argon2 / bcrypt                             | [backlog.md](backlog.md)       |
-| 再設定のメールの送信                        | `SMTP` が無いため（[mail.md](mail.md)） |
+| 再設定メールの文面と画面                    | 文面は自分で書きます（送信は [mail.md](mail.md)） |
 
 ## 関連
 

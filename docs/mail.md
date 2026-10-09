@@ -2,15 +2,15 @@
 
 文面を組み立てて送る仕組みです。
 
-> **本当のメールは送れません。** SMTP はありません。TLS を自前で書けないためです。
-> できるのは次の 2 つだけです。
->
-> | `MAIL_DRIVER` | 何をするか                             |
-> |---------------|----------------------------------------|
-> | `log`（既定） | `storage/logs/mail.log` に書き出す     |
-> | `array`       | プロセスのメモリに溜める。**テスト用** |
->
-> 送り先の差し替え口（`Mailer`）は用意してあります（下の「送り先を自分で作る」）。
+送り先は 3 つです。
+
+| `MAIL_DRIVER` | 何をするか                             | 要るもの                   |
+|---------------|----------------------------------------|----------------------------|
+| `log`（既定） | `storage/logs/mail.log` に書き出す     | 無し                       |
+| `array`       | プロセスのメモリに溜める。**テスト用** | 無し                       |
+| `smtp`        | SMTP サーバへ送る                      | Cargo の機能フラグ `mail`  |
+
+送り先の差し替え口（`Mailer`）もあります（下の「送り先を自分で作る」）。
 
 ## 設定
 
@@ -30,6 +30,28 @@ MAIL_FROM_NAME=myapp
 | `MAIL_FROM`      | `noreply@example.com` | 差出人のアドレス |
 | `MAIL_FROM_NAME` | `bengara`             | 差出人の名前     |
 
+`smtp` のときは次も見ます。`log` と `array` では使いません。
+
+| 設定              | 既定                 | 意味                              |
+|-------------------|----------------------|-----------------------------------|
+| `MAIL_HOST`       | `127.0.0.1`          | SMTP サーバの名前                 |
+| `MAIL_PORT`       | 0（下の表のとおり）  | ポート                            |
+| `MAIL_ENCRYPTION` | `starttls`           | 暗号化の仕方（`tls` / `starttls` / `none`） |
+| `MAIL_USERNAME`   | 空（認証しない）     | 利用者名                          |
+| `MAIL_PASSWORD`   | 空                   | パスワード                        |
+| `MAIL_EHLO_NAME`  | 空（`localhost`）    | `EHLO` で名乗る名前               |
+| `MAIL_TIMEOUT`    | 10                   | 返事を待つ上限の秒数              |
+
+`MAIL_PORT` を書かないと、暗号化に合わせて決めます。
+
+| `MAIL_ENCRYPTION` | 既定のポート | つなぎ方                          |
+|-------------------|--------------|-----------------------------------|
+| `tls`（`ssl` も） | 465          | つないだ直後から暗号化する        |
+| `starttls`        | 587          | 平文でつないで `STARTTLS` で切り替える |
+| `none`（`null` も） | 25         | 暗号化しない                      |
+
+`MAIL_ENCRYPTION` に知らない語を書いたときは `starttls` にします。暗号化する側に倒します。
+
 **`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名にしたいときは、上の例のように
 `.env` へ書いてください。
 
@@ -45,9 +67,14 @@ pub fn config() -> MailConfig {
         from: env("MAIL_FROM", "noreply@example.com"),
         // 第2引数は「このアプリでの既定」です。bengara の既定は `bengara` です。
         from_name: env("MAIL_FROM_NAME", "myapp"),
+        // 残りは既定のまま（`.env` の MAIL_HOST などを見ます）。
+        ..MailConfig::default()
     }
 }
 ```
+
+**`..MailConfig::default()` を忘れないでください。** `MailConfig` には SMTP 用の欄が
+あるので、3 つだけ書くとコンパイルが通りません。
 
 ## 送る
 
@@ -167,6 +194,66 @@ async fn お知らせを送る() {
 MAIL_DRIVER=log cargo test
 ```
 
+## SMTP で送る
+
+Cargo の機能フラグ `mail` を付けます。 **既定では入りません。**
+
+```toml
+[dependencies]
+bengara = { version = "0.1", features = ["sqlite", "mail"] }
+```
+
+`.env` に送り先を書きます。
+
+```
+MAIL_DRIVER=smtp
+MAIL_HOST=smtp.example.com
+MAIL_ENCRYPTION=starttls
+MAIL_USERNAME=noreply@example.com
+MAIL_PASSWORD=ここにパスワード
+MAIL_FROM=noreply@example.com
+MAIL_FROM_NAME=myapp
+```
+
+送り方は `log` と同じです。書き換えるのは `.env` だけです。
+
+```rust
+Mail::to("alice@example.com")
+    .subject("ようこそ")
+    .text("登録ありがとうございます。")
+    .send()
+    .await?;
+```
+
+### 知っておくこと
+
+- **つなぐのは1通目を送るときです。** 起動時にはつなぎません。接続は溜めておくので、
+  2通目から暗号化の握り直しが起きません。
+- **TLS は rustls を使います。** OS の証明書置き場は見ません。自分で建てた
+  証明書（自己署名）のサーバにはつながりません。
+- `text` と `html` の両方を書くと `multipart/alternative` になります。読む側が選びます。
+- 差出人と宛先は `alice@example.com` と `アリス <alice@example.com>` の両方の形を
+  受け付けます。読めないときは、どの欄のどの文字列かを添えて断ります。
+- **フラグを付けずに `MAIL_DRIVER=smtp` にすると、送るときにエラーになります。**
+  黙って `log` には落ちません。送れたつもりになるのを防ぐためです。
+
+  ```
+  SMTP で送るには Cargo.toml を `bengara = { version = "0.1", features = ["mail"] }` にしてください
+  ```
+
+- `MAIL_ENCRYPTION=none` のまま `MAIL_USERNAME` を使うと、警告をログに出します。
+  利用者名とパスワードが暗号化されずに流れるためです。
+
+### ビルドに要るもの
+
+`mail` を付けると、暗号化のために C コンパイラが要ります（rustls が使う `ring`）。
+
+| OS      | 用意するもの                                    |
+|---------|-------------------------------------------------|
+| Linux   | `cc`（`build-essential` など）                  |
+| macOS   | Xcode Command Line Tools                        |
+| Windows | Visual Studio の C++ ビルドツール               |
+
 ## 送り先を自分で作る
 
 `Mailer` を実装して、起動時に入れ替えます。
@@ -182,8 +269,9 @@ bengara::mail::install_mailer(Box::new(MyMailer));
 
 | 項目                  | 代わりにすること       |
 |-----------------------|------------------------|
-| SMTP での送信         | ありません             |
 | 添付ファイル          | ありません             |
+| 自己署名の証明書      | ありません（rustls が断ります） |
+| 送れなかったときの再送 | キューの再試行に任せる（[queue.md](queue.md)） |
 | Markdown の文面       | `html` に自分で入れる  |
 | テンプレート（Blade） | `format!` で組み立てる |
 | 通知（Notification）  | `Mail` を直接使う      |

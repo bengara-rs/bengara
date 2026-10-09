@@ -26,7 +26,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `route:list`                         | 同じ                                                          |
 | `make:controller` などの生成コマンド | **ありません。** 基本的なコードは AI で生成できます            |
 | `serve` はビルド不要                 | ビルドしてから起動します。変更があれば作り直します            |
-| `serve` が見張る対象は広い           | `.rs` と `resources/lang/` の `.toml` だけです                |
+| `serve` が見張る対象は広い           | `app` `bootstrap` `config` `database` `routes` `resources` の中だけ（`tests/` は見張りません）|
 | コマンドの旗は共通で緩い             | **旗はコマンドごとに分かれています。** 知らない旗はエラーです  |
 
 ## 設定
@@ -144,7 +144,10 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `->get()` が Collection を返す                     | `.get().await?` が `Vec<Row>` を返します                     |
 | `$row->title`                                      | `row.get::<String>("title")?`                                |
 | `DB::transaction(fn () => ...)`                    | `let tx = DB::begin().await?;` … `tx.commit().await?;`       |
-| MySQL / PostgreSQL / SQLite / SQL Server           | **SQLite だけ**（機能フラグ `sqlite`）                       |
+| MySQL / PostgreSQL / SQLite / SQL Server           | **SQL Server 以外**（機能フラグ `sqlite` / `mysql` / `postgres`） |
+| `$table->timestamp('at')` が PostgreSQL で `timestamp`  | PostgreSQL では **`text` 列**になります（日時は文字列のため）  |
+| `decimal` の値が文字列で返る                       | MySQL / PostgreSQL では `Value::Text`。末尾の 0 は落ちます    |
+| `charset` / `collation` の指定                      | **ありません。** サーバの既定に従います                       |
 | 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作ります |
 
 `update` / `delete` / `truncate` に `join` / `limit` / `offset` / `group_by` / `having` /
@@ -217,7 +220,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `Storage::url($path)` / `storage:link`    | ありません。`/storage/` ＋ パスを組み立てます                            |
 | ジョブのクラス＋`SendWelcome::dispatch()` | `app/Jobs/SendWelcome.rs` の関数＋`Queue::push("SendWelcome", &payload)` |
 | `$job->handle()` に型つきの引数           | `handle(payload: String)` の 1 つだけです                                |
-| `config/queue.php` の `retry_after`       | `WorkerOptions` と `queue:work --retry-after=`（既定 90 秒）             |
+| `config/queue.php` の `retry_after`       | `cargo artisan queue:work --retry-after=`（既定 90 秒）。設定ファイルはありません |
 | `Redis` のキュー・キャッシュ              | ありません。キューは DB、キャッシュはファイルです                        |
 | `->everyMinute()` / `->cron('0 3 * * 1')` | `Every::Minute` などの列挙。cron の式は読みません                        |
 | 間隔は分の頭で判定する                    | 前回から数えます。**30 秒の遅れは許します**（間隔が 1 分以上のとき）     |
@@ -225,7 +228,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | 前回の実行時刻はキャッシュに置く          | `storage/framework/schedule/` のファイルに置きます                       |
 | イベントクラス＋`EventServiceProvider`    | 名前は文字列。登録は `bootstrap/app.rs` の `with_events`                 |
 | `Mail::to(...)->send(new WelcomeMail)`    | `Mail::to(..).subject(..).text(..).send().await?`                        |
-| SMTP での送信                             | **ありません。** `log` と `array` だけです                               |
+| SMTP での送信                             | **あります**（機能フラグ `mail`）。ほかに `log` と `array`                |
 | `Notification`                            | 作りません。`Mail` を直接使います                                        |
 | `__('messages.welcome')`                  | 同じ名前（`__`）。`:name` の差し替えは `__with`                          |
 | `App::setLocale()`                        | `Lang::set`（プロセス全体）。リクエストごとに変えるなら `Lang::with`     |

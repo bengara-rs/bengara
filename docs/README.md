@@ -53,10 +53,10 @@ bengara を使う人のための資料です。フレームワークの紹介は
 |--------------------------------------------|-------------------------------------|
 | [cache.md](cache.md)                       | 結果を取っておく                    |
 | [storage.md](storage.md)                   | ファイルの置き場所                  |
-| [queue.md](queue.md)                       | キューとジョブ（`sqlite` が必要）   |
+| [queue.md](queue.md)                       | キューとジョブ（データベースが必要） |
 | [scheduling.md](scheduling.md)             | 定期処理                            |
 | [events.md](events.md)                     | イベントと、聞く側                  |
-| [mail.md](mail.md)                         | メール（**SMTP はありません**）     |
+| [mail.md](mail.md)                         | メール（`log` / `array` / SMTP）    |
 | [localization.md](localization.md)         | 多言語                              |
 | [console-commands.md](console-commands.md) | 自分のコマンド                      |
 

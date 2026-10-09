@@ -29,8 +29,69 @@ jobs:
       # データベースを入れた状態でも通ることを確かめる。
       - run: cargo clippy --workspace --all-targets --features "sqlite encryption" -- -D warnings
       - run: cargo test --workspace --features "sqlite encryption"
+      # ドライバとメールを全部入れた状態。
+      # TLS（rustls + ring）のビルドに C コンパイラが要るので、3つの OS で確かめる。
+      - run: cargo clippy --workspace --all-targets --features "sqlite mysql postgres mail encryption" -- -D warnings
+      - run: cargo test --workspace --features "sqlite mysql postgres mail encryption"
       # 機能フラグを外しても通ることを確かめる。
       - run: cargo clippy -p bengara --no-default-features --all-targets -- -D warnings
+
+  # 機能フラグを1つずつ入れた状態。組み合わせの取りこぼしを防ぐ。
+  features:
+    name: features
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [ sqlite, mysql, mariadb, postgres, mail, encryption ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p bengara --no-default-features --all-targets --features ${{ matrix.feature }} -- -D warnings
+      - run: cargo test -p bengara --no-default-features --features ${{ matrix.feature }}
+
+  # 本物の MySQL と PostgreSQL につないで確かめる。
+  # 接続先の環境変数が無いときは、ドライバのテストは何もしません。
+  database:
+    name: database
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: secret
+          MYSQL_DATABASE: bengara
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -psecret"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: bengara
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: bengara
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd=pg_isready
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      BENGARA_TEST_MYSQL_URL: mysql://root:secret@127.0.0.1:3306/bengara
+      BENGARA_TEST_POSTGRES_URL: postgres://bengara:secret@127.0.0.1:5432/bengara
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p bengara --features "mysql postgres"
 
   # 対応する一番古い Rust 版（Cargo.toml の rust-version）で通ることを確かめる。
   msrv:
@@ -40,7 +101,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --features "sqlite encryption"
+      - run: cargo test --workspace --features "sqlite mysql postgres mail encryption"
 
   # 利用者の手順をそのまま再現する。
   # cargo new → init → build → test が通ること。

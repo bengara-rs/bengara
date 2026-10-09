@@ -36,12 +36,20 @@ impl Driver {
 
     /// いまの作りで実際につなげるか。
     ///
-    /// SQLite は機能フラグ `sqlite` が必要です。
-    /// MySQL と PostgreSQL は SQL の組み立てだけ用意してあり、**まだつなげません。**
+    /// ドライバごとに Cargo の機能フラグが必要です。
+    ///
+    /// | ドライバ   | フラグ                  |
+    /// |------------|-------------------------|
+    /// | SQLite     | `sqlite`                |
+    /// | MySQL      | `mysql`（`mariadb` も） |
+    /// | PostgreSQL | `postgres`              |
+    ///
+    /// SQL の組み立てはフラグが無くてもできます。つなぐところだけが変わります。
     pub fn is_available(&self) -> bool {
         match self {
             Driver::Sqlite => cfg!(feature = "sqlite"),
-            Driver::MySql | Driver::Postgres => false,
+            Driver::MySql => cfg!(feature = "mysql"),
+            Driver::Postgres => cfg!(feature = "postgres"),
         }
     }
 }
@@ -210,6 +218,54 @@ fn quote_part(driver: Driver, part: &str) -> String {
     }
 }
 
+/// 表を全部消す文。外部キーの向きを気にせず消せる形にします。
+///
+/// | ドライバ   | 形                                              |
+/// |------------|-------------------------------------------------|
+/// | PostgreSQL | 1文にまとめて `cascade` を付ける                |
+/// | MySQL      | 1表ずつ。確かめの止め方は [`defer_foreign_keys`] |
+/// | SQLite     | 1表ずつ。同上                                   |
+///
+/// PostgreSQL の `cascade` は、**この文で消す表を指している外部キーも一緒に**
+/// 落とします。表を全部消す場面だけで使います。
+pub(crate) fn drop_all(driver: Driver, tables: &[String]) -> Vec<String> {
+    if tables.is_empty() {
+        return Vec::new();
+    }
+    let quoted: Vec<String> = tables.iter().map(|t| quote(driver, t)).collect();
+    match driver {
+        Driver::Postgres => vec![format!(
+            "drop table if exists {} cascade",
+            quoted.join(", ")
+        )],
+        _ => quoted
+            .iter()
+            .map(|t| format!("drop table if exists {t}"))
+            .collect(),
+    }
+}
+
+/// 表を全部消す間だけ、外部キーの確かめを止める SQL。
+///
+/// 返すのは（始めに流す文、終わりに流す文）です。終わりが `None` のときは、
+/// 流しっぱなしにしてかまいません。
+///
+/// | ドライバ   | 始め                                | 終わり                              |
+/// |------------|-------------------------------------|-------------------------------------|
+/// | SQLite     | `pragma defer_foreign_keys = on`    | 無し（確定のときに自動で戻る）      |
+/// | MySQL      | `set session foreign_key_checks = 0` | `set session foreign_key_checks = 1` |
+/// | PostgreSQL | 無し（`cascade` で足りる）          | 無し                                |
+pub(crate) fn defer_foreign_keys(driver: Driver) -> (Option<&'static str>, Option<&'static str>) {
+    match driver {
+        Driver::Sqlite => (Some("pragma defer_foreign_keys = on"), None),
+        Driver::MySql => (
+            Some("set session foreign_key_checks = 0"),
+            Some("set session foreign_key_checks = 1"),
+        ),
+        Driver::Postgres => (None, None),
+    }
+}
+
 /// `insert` の後に自動採番の ID を受け取るための追記（PostgreSQL だけ必要）。
 pub(crate) fn returning_id(driver: Driver, primary_key: &str) -> String {
     match driver {
@@ -326,5 +382,48 @@ mod tests {
         assert_eq!(Driver::parse("sqlite"), Some(Driver::Sqlite));
         assert_eq!(Driver::parse("PgSQL"), Some(Driver::Postgres));
         assert_eq!(Driver::parse("oracle"), None);
+    }
+    #[test]
+    fn 表を全部消す文は方言で違う() {
+        let tables = vec!["posts".to_string(), "users".to_string()];
+
+        // PostgreSQL は1文にまとめて cascade を付ける。
+        assert_eq!(
+            drop_all(Driver::Postgres, &tables),
+            vec![r#"drop table if exists "posts", "users" cascade"#.to_string()]
+        );
+        // MySQL と SQLite は1表ずつ。
+        assert_eq!(
+            drop_all(Driver::MySql, &tables),
+            vec![
+                "drop table if exists `posts`".to_string(),
+                "drop table if exists `users`".to_string(),
+            ]
+        );
+        assert_eq!(
+            drop_all(Driver::Sqlite, &tables),
+            vec![
+                r#"drop table if exists "posts""#.to_string(),
+                r#"drop table if exists "users""#.to_string(),
+            ]
+        );
+        // 表が無いときは何も出さない（空の文を投げないため）。
+        assert!(drop_all(Driver::Postgres, &[]).is_empty());
+    }
+
+    #[test]
+    fn 外部キーの止め方は方言で違う() {
+        // SQLite は確定のときに自動で戻るので、戻す文が無い。
+        let (before, after) = defer_foreign_keys(Driver::Sqlite);
+        assert_eq!(before, Some("pragma defer_foreign_keys = on"));
+        assert_eq!(after, None);
+
+        // MySQL は接続ごとの設定なので、必ず戻す。
+        let (before, after) = defer_foreign_keys(Driver::MySql);
+        assert_eq!(before, Some("set session foreign_key_checks = 0"));
+        assert_eq!(after, Some("set session foreign_key_checks = 1"));
+
+        // PostgreSQL は cascade で足りる。
+        assert_eq!(defer_foreign_keys(Driver::Postgres), (None, None));
     }
 }

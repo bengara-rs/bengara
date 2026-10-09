@@ -220,19 +220,33 @@ APP_PORT=8000
 | 名前               | 既定                       | 何に効くか                                        | 読む側        |
 |--------------------|----------------------------|---------------------------------------------------|---------------|
 | `DB_CONNECTION`    | `sqlite`                   | 既定で使う接続の名前                              | `config/*.rs` |
-| `DB_DATABASE`      | `database/database.sqlite` | SQLite のファイル。相対パスはプロジェクト直下から | `config/*.rs` |
-| `DB_TEST_DATABASE` | `:memory:`                 | テストで使うデータベース                          | 本体          |
+| `DB_DATABASE`      | SQLite は `database/database.sqlite`、ほかは `bengara` | SQLite はファイル、ほかはデータベース名 | `config/*.rs` |
+| `DB_URL`           | 空                         | 接続文字列。**他の値より優先します**              | `config/*.rs` |
+| `DB_HOST`          | `127.0.0.1`                | つなぎ先（MySQL / PostgreSQL）                    | `config/*.rs` |
+| `DB_PORT`          | 3306 / 5432                | ポート（MySQL / PostgreSQL）                      | `config/*.rs` |
+| `DB_USERNAME`      | `root` / `postgres`        | 利用者名（MySQL / PostgreSQL）                    | `config/*.rs` |
+| `DB_PASSWORD`      | 空                         | パスワード（MySQL / PostgreSQL）                  | `config/*.rs` |
+| `DB_MAX_CONNECTIONS` | 5                        | 同時に張る接続の数の上限                          | `config/*.rs` |
+| `DB_TEST_DATABASE` | SQLite は `:memory:`       | テストで使うデータベース。**MySQL / PostgreSQL では必須** | 本体 |
 
-`DB_CONNECTION` と `DB_DATABASE` は `config/database.rs` が読みます（[database.md](database.md)）。
+`DB_` で始まるものは `config/database.rs` が読みます（[database.md](database.md)）。
+`config/database.rs` を書き換えれば、別の名前の環境変数にもできます。
 
 ### キャッシュとメールと言語
 
 | 名前                  | 既定                  | 何に効くか                                | 読む側         |
 |-----------------------|-----------------------|-------------------------------------------|----------------|
 | `CACHE_DRIVER`        | `file`                | キャッシュの置き場所（`file` / `memory`） | 本体か config/ |
-| `MAIL_DRIVER`         | `log`                 | メールの送り先（`log` / `array`）         | 本体か config/ |
+| `MAIL_DRIVER`         | `log`                 | メールの送り先（`log` / `array` / `smtp`） | 本体か config/ |
 | `MAIL_FROM`           | `noreply@example.com` | 差出人                                    | 本体か config/ |
 | `MAIL_FROM_NAME`      | `bengara`             | 差出人の名前。普通はアプリ名を書く        | 本体か config/ |
+| `MAIL_HOST`           | `127.0.0.1`           | SMTP サーバ（`smtp` のときだけ）          | 本体か config/ |
+| `MAIL_PORT`           | 465 / 587 / 25        | ポート。空なら暗号化に合わせて決めます    | 本体か config/ |
+| `MAIL_ENCRYPTION`     | `starttls`            | `tls` / `starttls` / `none`               | 本体か config/ |
+| `MAIL_USERNAME`       | 空（認証しない）      | SMTP の利用者名                           | 本体か config/ |
+| `MAIL_PASSWORD`       | 空                    | SMTP のパスワード                         | 本体か config/ |
+| `MAIL_EHLO_NAME`      | 空（`localhost`）     | `EHLO` で名乗る名前                       | 本体か config/ |
+| `MAIL_TIMEOUT`        | 10                    | 返事を待つ上限の秒数                      | 本体か config/ |
 | `APP_LOCALE`          | `ja`                  | 画面の言語                                | 本体か config/ |
 | `APP_FALLBACK_LOCALE` | `ja`                  | 鍵が無いときに見る言語                    | 本体か config/ |
 
@@ -301,30 +315,62 @@ TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 
 ## 機能フラグ
 
-bengara は使わない機能をバイナリに入れないようにしています。今あるフラグは 3 つです。
+bengara は使わない機能をバイナリに入れないようにしています。今あるフラグは次のとおりです。
 
 | フラグ       | 既定             | 中身                                                              |
 |--------------|------------------|-------------------------------------------------------------------|
 | `log-filter` | 入っている       | `RUST_LOG=myapp=debug` のような細かい絞り込みを使えるようにします |
-| `sqlite`     | **入っていない** | SQLite につながるようにします（[database.md](database.md)）       |
+| `sqlite`     | **入っていない** | SQLite につながるようにします（[database.md](database.md)） |
+| `mysql`      | **入っていない** | MySQL につながるようにします |
+| `mariadb`    | **入っていない** | `mysql` と同じものです。名前で探せるように置いてあります |
+| `postgres`   | **入っていない** | PostgreSQL につながるようにします |
+| `mail`       | **入っていない** | SMTP でメールを送れます（[mail.md](mail.md)） |
 | `encryption` | **入っていない** | `encrypt` / `decrypt` が使えます（+14 クレート）                  |
 
 認証（`Hash` / `Auth` / `authorize` / `PasswordReset`）は **フラグが要りません。**
 依存クレートを増やさずに作っているためです（[authentication.md](authentication.md)）。
-キャッシュ・ファイル・メール・多言語・イベント・定期処理も、フラグなしで使えます。
+キャッシュ・ファイル・多言語・イベント・定期処理も、フラグなしで使えます。
+メールは `log` と `array` だけフラグなしで使えます。
 
-### sqlite
+`Cargo.toml` には `database` と `tls` というフラグも入っていますが、
+**これは内側の土台で、利用者が書くものではありません。**
+上の表のフラグを指定すると、必要なぶんが自動で入ります。
 
-**依存クレートが大きく増えます**（依存の木が 59 → 133）。
-データベースを使わないアプリには入れないでください。
-**キューも `sqlite` が要ります**（[queue.md](queue.md)）。
+### データベース（sqlite / mysql / mariadb / postgres）
+
+**依存クレートが大きく増えます。** データベースを使わないアプリには入れないでください。
+**キューにもデータベースが要ります**（[queue.md](queue.md)）。
+
+| フラグ                     | 依存の木 |
+|----------------------------|----------|
+| 無し（既定）               | 59       |
+| `sqlite`                   | 133      |
+| `mysql`（`mariadb` も同じ）| 176      |
+| `postgres`                 | 170      |
+| `sqlite mysql postgres`    | 190      |
 
 ```toml
 [dependencies]
 bengara = { version = "0.1", features = ["sqlite"] }
 ```
 
-`cargo run -- init` で作ったプロジェクトには最初から入っています。
+`cargo run -- init` で作ったプロジェクトには `features = ["sqlite"]` が入ります。
+**別のデータベースを使うなら書き換えてください。** 使わないなら消してください。
+
+`mysql` と `postgres` は、通信を暗号化するために C コンパイラが要ります
+（rustls が使う `ring`）。`sqlite` だけなら要りません。
+
+### mail
+
+SMTP でメールを送れるようになります（依存の木が 59 → 107）。
+フラグが無いときは `log` と `array` だけが使えます（[mail.md](mail.md)）。
+
+```toml
+[dependencies]
+bengara = { version = "0.1", features = ["mail"] }
+```
+
+こちらも TLS のために C コンパイラが要ります。
 
 ### log-filter
 

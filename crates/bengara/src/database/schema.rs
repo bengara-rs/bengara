@@ -315,6 +315,11 @@ impl Blueprint {
         for foreign in &self.foreigns {
             parts.push(self.foreign_sql(foreign));
         }
+        // MySQL には `create index if not exists` がありません。
+        // 表の定義の中に書くと、`create table if not exists` の守りがそのまま効きます。
+        if driver == Driver::MySql {
+            parts.extend(self.index_definitions());
+        }
 
         let head = if if_not_exists {
             "create table if not exists "
@@ -326,7 +331,9 @@ impl Blueprint {
             grammar::quote(driver, &self.table),
             parts.join(", ")
         )];
-        statements.extend(self.index_statements());
+        if driver != Driver::MySql {
+            statements.extend(self.index_statements());
+        }
         statements
     }
 
@@ -347,33 +354,68 @@ impl Blueprint {
         statements
     }
 
-    /// 列に付いた `index()` / `unique()` と、表に付けた索引をまとめる。
-    fn index_statements(&self) -> Vec<String> {
+    /// 索引として足すものを「列の一覧」と「一意か」の組で並べる。
+    ///
+    /// 別の文にするとき（[`index_statements`](Self::index_statements)）と、表の定義の中に
+    /// 書くとき（[`index_definitions`](Self::index_definitions)）で、選び方をそろえるためです。
+    fn index_targets(&self) -> Vec<(Vec<String>, bool)> {
         let mut out = Vec::new();
         for column in &self.columns {
             if column.index {
-                out.push(self.index_sql(std::slice::from_ref(&column.name), false));
+                out.push((vec![column.name.clone()], false));
             }
             // 列に付けた unique は、作るときは列の指定に入れている。
             // 表を変えるときだけ、後から索引として足す。
             if column.unique && self.mode == Mode::Alter {
-                out.push(self.index_sql(std::slice::from_ref(&column.name), true));
+                out.push((vec![column.name.clone()], true));
             }
         }
         for index in &self.indexes {
-            out.push(self.index_sql(&index.columns, index.unique));
+            out.push((index.columns.clone(), index.unique));
         }
         out
     }
 
-    fn index_sql(&self, columns: &[String], unique: bool) -> String {
-        let driver = self.driver;
-        let name = format!(
+    /// 列に付いた `index()` / `unique()` と、表に付けた索引を別の文にする。
+    fn index_statements(&self) -> Vec<String> {
+        self.index_targets()
+            .iter()
+            .map(|(columns, unique)| self.index_sql(columns, *unique))
+            .collect()
+    }
+
+    /// 同じものを `create table` の中に書く形にする（MySQL 用）。
+    fn index_definitions(&self) -> Vec<String> {
+        self.index_targets()
+            .iter()
+            .map(|(columns, unique)| {
+                let quoted: Vec<String> = columns
+                    .iter()
+                    .map(|c| grammar::quote(self.driver, c))
+                    .collect();
+                format!(
+                    "{} {} ({})",
+                    if *unique { "unique key" } else { "key" },
+                    grammar::quote(self.driver, &self.index_name(columns, *unique)),
+                    quoted.join(", ")
+                )
+            })
+            .collect()
+    }
+
+    /// 索引の名前。ドライバで変えません。
+    fn index_name(&self, columns: &[String], unique: bool) -> String {
+        format!(
             "{}_{}_{}",
             self.table,
             columns.join("_"),
             if unique { "unique" } else { "index" }
-        );
+        )
+    }
+
+    fn index_sql(&self, columns: &[String], unique: bool) -> String {
+        let driver = self.driver;
+        let name = self.index_name(columns, unique);
         let quoted: Vec<String> = columns.iter().map(|c| grammar::quote(driver, c)).collect();
         // 表が `if not exists` なら索引にも付ける。
         // 付けないと、2回流したときに索引の作成だけが落ちる。
@@ -702,8 +744,15 @@ fn type_sql(driver: Driver, kind: &PlainType) -> String {
         (_, PlainType::Float) => "float".into(),
         (_, PlainType::Double) => "double precision".into(),
         (_, PlainType::Decimal(total, places)) => format!("numeric({total}, {places})"),
+        // PostgreSQL では日付と JSON も `text` にします。
+        // bengara の `Value` に日時型が無く（決定記録 #040）、日時は文字列で渡すためです。
+        // PostgreSQL は `insert into t (ts) values ($1)` の `$1` が text だと
+        // 「column "ts" is of type timestamp but expression is of type text」で断ります。
+        // SQLite と MySQL は文字列をそのまま受け取るので、本来の型のままにします。
+        (Driver::Postgres, PlainType::Date) => "text".into(),
+        (Driver::Postgres, PlainType::DateTime) => "text".into(),
+        (Driver::Postgres, PlainType::Json) => "text".into(),
         (_, PlainType::Date) => "date".into(),
-        (Driver::Postgres, PlainType::DateTime) => "timestamp".into(),
         (_, PlainType::DateTime) => "datetime".into(),
         (Driver::Sqlite, PlainType::Json) => "text".into(),
         (_, PlainType::Json) => "json".into(),
@@ -958,5 +1007,87 @@ mod tests {
             assert_eq!(schema.to_sql().len(), 1);
             assert_eq!(schema.driver(), driver);
         }
+    }
+    #[test]
+    fn postgres_では日付と_json_が_text_列になる() {
+        // `Value` に日時型が無いので、文字列をそのまま入れられる型にする。
+        let mut schema = Schema::new(Driver::Postgres);
+        schema.create("t", |t| {
+            t.date("day");
+            t.date_time("at");
+            t.timestamp("ts");
+            t.json("meta");
+            t.string("title");
+        });
+        let sql = schema.to_sql().join("\n");
+        assert!(sql.contains(r#""day" text not null"#), "{sql}");
+        assert!(sql.contains(r#""at" text not null"#), "{sql}");
+        assert!(sql.contains(r#""ts" text not null"#), "{sql}");
+        assert!(sql.contains(r#""meta" text not null"#), "{sql}");
+        // 文字列の型はそのまま。
+        assert!(sql.contains(r#""title" varchar(255) not null"#), "{sql}");
+
+        // MySQL と SQLite は本来の型のまま。文字列を受け取れるため。
+        let mut schema = Schema::new(Driver::MySql);
+        schema.create("t", |t| {
+            t.date_time("at");
+            t.json("meta");
+        });
+        let sql = schema.to_sql().join("\n");
+        assert!(sql.contains("`at` datetime not null"), "{sql}");
+        assert!(sql.contains("`meta` json not null"), "{sql}");
+    }
+
+    #[test]
+    fn mysql_の索引は表の定義の中に書く() {
+        // MySQL に `create index if not exists` は無い。
+        // 表の定義の中に書けば `create table if not exists` の守りがそのまま効く。
+        let mut schema = Schema::new(Driver::MySql);
+        schema.create_if_not_exists("posts", |t| {
+            t.id();
+            t.string("slug").unique();
+            t.string("status").index();
+            t.index(&["status", "slug"]);
+        });
+        let statements = schema.to_sql();
+        assert_eq!(statements.len(), 1, "1文だけ: {statements:?}");
+        let sql = &statements[0];
+        assert!(
+            sql.starts_with("create table if not exists `posts` ("),
+            "{sql}"
+        );
+        assert!(sql.contains("key `posts_status_index` (`status`)"), "{sql}");
+        assert!(
+            sql.contains("key `posts_status_slug_index` (`status`, `slug`)"),
+            "{sql}"
+        );
+        assert!(!sql.contains("create index"), "{sql}");
+
+        // SQLite と PostgreSQL は今までどおり別の文。
+        for driver in [Driver::Sqlite, Driver::Postgres] {
+            let mut schema = Schema::new(driver);
+            schema.create("posts", |t| {
+                t.string("status").index();
+            });
+            let statements = schema.to_sql();
+            assert_eq!(statements.len(), 2, "{driver}: {statements:?}");
+            assert!(statements[1].starts_with("create index"), "{driver}");
+        }
+    }
+
+    #[test]
+    fn mysql_でも表を変えるときは索引を別の文にする() {
+        // `alter table` の後ろに索引は書けないため。
+        let mut schema = Schema::new(Driver::MySql);
+        schema.table("posts", |t| {
+            t.string("status").index();
+        });
+        let statements = schema.to_sql();
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert!(statements[0].starts_with("alter table"), "{statements:?}");
+        assert_eq!(
+            statements[1],
+            "create index `posts_status_index` on `posts` (`status`)"
+        );
     }
 }

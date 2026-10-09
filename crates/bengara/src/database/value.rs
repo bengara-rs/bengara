@@ -359,8 +359,8 @@ impl Row {
 
     /// 列の名前を共有して作る。同じ問い合わせの行をまとめて作るときに使います。
     ///
-    /// 呼ぶのは下回りのドライバだけなので、`sqlite` を入れないときは出番がありません。
-    #[cfg(feature = "sqlite")]
+    /// 呼ぶのは下回りのドライバだけなので、ドライバを1つも入れないときは出番がありません。
+    #[cfg(feature = "database")]
     pub(crate) fn with_columns(columns: Arc<[String]>, values: Vec<Value>) -> Self {
         Self { columns, values }
     }

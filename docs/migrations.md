@@ -108,6 +108,9 @@ $ cargo artisan migrate:status
 | `t.timestamps()`                                              | `created_at` と `updated_at`（どちらも null 可） |
 | `t.soft_deletes()`                                            | `deleted_at`（null 可）                          |
 
+**MySQL と PostgreSQL では型名が変わります。** PostgreSQL では日付と JSON が
+`text` 列になります。一覧は [database.md](database.md) の「ドライバの違い」にあります。
+
 ## 列に付ける指定
 
 続けて書けます。
@@ -128,7 +131,7 @@ t.uuid("key").primary();
 | `unique()`           | 重なりを禁じる                  |
 | `index()`            | 索引を付ける                    |
 | `primary()`          | 主キーにする                    |
-| `comment("説明")`    | 説明（SQLite では無視されます） |
+| `comment("説明")`    | 説明（**どのドライバでも無視します**） |
 
 **`t.id()` と `t.increments(..)` には、これらの指定が効きません。**
 自動採番の主キーは型名ひとつで全部を書くので、置く場所がありません。
@@ -220,7 +223,7 @@ pub fn up(schema: &mut Schema) {
 | 書き方                                             | どうなるか                           | 理由                                               |
 |----------------------------------------------------|--------------------------------------|----------------------------------------------------|
 | `pub fn up` / `pub fn down` が無い                 | コンパイルエラー                     | 両方必要です                                       |
-| 列の型を変える `change()`                          | **ありません**                       | SQLite が苦手なためです                            |
+| 列の型を変える `change()`                          | **ありません**                       | SQLite が苦手で、3 つのドライバでそろえられないためです |
 | `t.id()` に `nullable()` / `default()` / `unique()`| 無視して警告                         | 型名ひとつで書くので、置く場所がありません         |
 | `schema.table(..)` の中の `t.id()` / `t.increments`| 警告が出て、**その文は実行時に失敗します** | `alter table add column` では自動採番を足せません |
 | `t.foreign(col)` に `.on(表名)` が無い             | 警告が出て、**その文は実行時に失敗します** | 指す先が決まりません                         |
