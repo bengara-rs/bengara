@@ -13,6 +13,9 @@ const SIGNATURE: &str = "signature";
 /// 期限を入れるクエリの名前。
 const EXPIRES: &str = "expires";
 
+/// 署名の文字数。HMAC-SHA256 の 32 バイトを16進にすると 64 文字で固定です。
+const SIGNATURE_CHARS: usize = 64;
+
 /// 署名に使う鍵の用途名。
 ///
 /// `APP_KEY` をそのまま使わず、用途ごとに別の鍵を作ります。
@@ -75,7 +78,19 @@ pub fn temporary_signed_url(
 
 fn build_signed(path: &str, params: &[(&str, &str)], expires: Option<u64>) -> Result<String> {
     let key = crate::config_registry::app_config().derived_key(SIGNING_LABEL)?;
+    build_signed_with(&key, path, params, expires)
+}
 
+/// 鍵を受け取って組み立てる。設定を触らないので、試験からも呼べます。
+fn build_signed_with(
+    key: &[u8],
+    path: &str,
+    params: &[(&str, &str)],
+    expires: Option<u64>,
+) -> Result<String> {
+    // 空の path はルートとして扱う。ブラウザが開くと `req.path()` は `/` になるので、
+    // ここで `/` にそろえないと末尾の 1 文字差で必ず署名が合わなくなる。
+    let path = if path.is_empty() { "/" } else { path };
     check_signable_path(path)?;
 
     let mut pairs: Vec<(String, String)> = params
@@ -94,7 +109,7 @@ fn build_signed(path: &str, params: &[(&str, &str)], expires: Option<u64>) -> Re
     let absolute = url(path);
     let query = canonical_query(&pairs);
     let signature = crypto::to_hex(&crypto::hmac_sha256(
-        &key,
+        key,
         payload(&absolute, &query).as_bytes(),
     ));
 
@@ -125,33 +140,47 @@ pub fn has_valid_signature(req: &super::Request) -> Result<bool> {
 
     // クエリは `Request` が1回だけ解析したものを借りる（呼ぶたびに解析し直さない）。
     let mut pairs = Vec::new();
-    let mut given = None;
+    let mut given = Vec::new();
     for (k, v) in req.query_pairs() {
         if k == SIGNATURE {
-            given = Some(v.clone());
+            given.push(v.clone());
         } else {
             pairs.push((k.clone(), v.clone()));
         }
     }
-    let Some(given) = given else {
-        return Ok(false);
+    Ok(verify_signature(&key, req.path(), &pairs, &given))
+}
+
+/// 鍵を受け取って照合する。設定を触らないので、試験からも呼べます。
+///
+/// `given` は、クエリに入っていた `signature` の値を**全部**並べたものです。
+fn verify_signature(key: &[u8], path: &str, pairs: &[(String, String)], given: &[String]) -> bool {
+    // `signature` は 1 つだけ。2 つ以上を後ろ勝ちにすると、前の値を無視したまま
+    // 通ってしまう（`?signature=ごみ&signature=本物` が通る）。
+    let [given] = given else {
+        return false;
     };
+    // 長さは 16 進に解く**前**に見る。32 バイトの 16 進は 64 文字で固定なので、
+    // 1 MB の `signature` を送られても確保しない。
+    if given.len() != SIGNATURE_CHARS {
+        return false;
+    }
 
     // 期限が入っていれば、まず時間を見る。
     if let Some((_, expires)) = pairs.iter().find(|(k, _)| k == EXPIRES) {
         match expires.parse::<u64>() {
             Ok(expires) if expires > now() => {}
-            _ => return Ok(false),
+            _ => return false,
         }
     }
 
-    let absolute = url(req.path());
-    let query = canonical_query(&pairs);
-    let expected = crypto::hmac_sha256(&key, payload(&absolute, &query).as_bytes());
-    let Some(given) = crypto::from_hex(&given) else {
-        return Ok(false);
+    let absolute = url(path);
+    let query = canonical_query(pairs);
+    let expected = crypto::hmac_sha256(key, payload(&absolute, &query).as_bytes());
+    let Some(given) = crypto::from_hex(given) else {
+        return false;
     };
-    Ok(crypto::constant_time_eq(&expected, &given))
+    crypto::constant_time_eq(&expected, &given)
 }
 
 /// 署名付き URL にできるパスか確かめる。
@@ -161,16 +190,29 @@ pub fn has_valid_signature(req: &super::Request) -> Result<bool> {
 /// 符号化してしまい、どちらが生の値かを見分けられません。
 /// そこで黙って直さず、**署名が必ず合わなくなる文字**が入っていたらエラーにします。
 /// 気づかないまま「いつも 403 になる」より、作ったところで止まるほうが分かります。
+///
+/// 断る文字を数えるのではなく、**通す文字を数えます**（`percent::path_literal`）。
+/// 数え落とすと「作れるのに必ず 403」になるので、分からない文字は断る側に寄せます。
 fn check_signable_path(path: &str) -> Result<()> {
     let bad = path
         .chars()
-        .find(|c| *c == '?' || *c == '#' || !c.is_ascii());
+        .find(|c| !c.is_ascii() || !super::percent::path_literal(*c as u8))
+        .map(escape);
     match bad {
         Some(bad) => Err(Error::msg(format!(
             "署名付き URL のパスに `{bad}` は使えません。\
              パーセントエンコードしてから渡してください（確かめる側は符号化されたパスを見ます）"
         ))),
         None => Ok(()),
+    }
+}
+
+/// エラー文に出すための見た目。空白と制御文字はそのまま出さず `U+xxxx` にします。
+fn escape(c: char) -> String {
+    if c.is_control() || c == ' ' {
+        format!("U+{:04X}", c as u32)
+    } else {
+        c.to_string()
     }
 }
 
@@ -239,6 +281,62 @@ mod tests {
         assert_eq!(canonical_query(&[]), "");
     }
 
+    /// 試験用の鍵。設定を入れずに済むように、組み立てと照合の両方へ手で渡します。
+    const KEY: &[u8] = b"test-key-for-signed-url";
+
+    /// 署名付き URL を作り、照合する側と同じ形（path とクエリ）に分けて確かめる。
+    fn roundtrip(path: &str) -> bool {
+        let link = build_signed_with(KEY, path, &[("user", "12")], None).unwrap();
+        // ブラウザが送る形にする。`?` の前が path、後ろがクエリ。
+        let (absolute, query) = link.split_once('?').unwrap();
+        let base = crate::config_registry::app_config()
+            .url
+            .trim_end_matches('/');
+        let request_path = absolute.strip_prefix(base).unwrap();
+        // 空の path でも、ブラウザは `/` を送る。
+        let request_path = if request_path.is_empty() {
+            "/"
+        } else {
+            request_path
+        };
+
+        let mut pairs = Vec::new();
+        let mut given = Vec::new();
+        for pair in query.split('&') {
+            let (k, v) = pair.split_once('=').unwrap();
+            if k == SIGNATURE {
+                given.push(v.to_string());
+            } else {
+                pairs.push((k.to_string(), v.to_string()));
+            }
+        }
+        verify_signature(KEY, request_path, &pairs, &given)
+    }
+
+    #[test]
+    fn 空のパスでも署名が通る() {
+        // `signed_url("")` の署名対象は、`/` を付けた形にそろえる。
+        assert!(roundtrip(""), "空のパスで必ず 403 になってはいけない");
+        assert!(roundtrip("/"));
+        assert!(roundtrip("/unsubscribe"));
+    }
+
+    #[test]
+    fn 署名が2つあると偽になる() {
+        let sig = "a".repeat(SIGNATURE_CHARS);
+        let given = vec![sig.clone(), sig];
+        assert!(!verify_signature(KEY, "/x", &[], &given));
+    }
+
+    #[test]
+    fn 長すぎる署名は解かずに偽にする() {
+        // 1 MB の 16 進を送られても、確保する前に長さで断る。
+        let given = vec!["ab".repeat(512 * 1024)];
+        assert!(!verify_signature(KEY, "/x", &[], &given));
+        // 短すぎるものも同じ。
+        assert!(!verify_signature(KEY, "/x", &[], &["ab".to_string()]));
+    }
+
     #[test]
     fn 署名できないパスは作る時点で断る() {
         // 符号化された形ならそのまま通る（確かめる側と同じ文字列になる）。
@@ -247,7 +345,23 @@ mod tests {
         assert!(check_signable_path("/a+b").is_ok());
 
         // 確かめる側の `req.path()` と必ず食い違うものは断る。
-        for bad in ["/hello/あ", "/search?q=1", "/page#top"] {
+        for bad in [
+            "/hello/あ",
+            "/search?q=1",
+            "/page#top",
+            "/a b",
+            "/a<b",
+            "/a>b",
+            "/a|b",
+            "/a\\b",
+            "/a^b",
+            "/a`b",
+            "/a{b}",
+            "/a\"b",
+            "/a\tb",
+            "/a\nb",
+            "/a\u{7f}b",
+        ] {
             let error = check_signable_path(bad).unwrap_err();
             assert!(
                 error.to_string().contains("使えません"),

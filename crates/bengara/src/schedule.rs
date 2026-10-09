@@ -154,12 +154,36 @@ impl std::fmt::Debug for Schedule {
     }
 }
 
+/// 分の粒度で許す遅れ（秒）。
+///
+/// cron は 1 分ごとに呼ぶので、動いた秒はぶれます。ある回が 10:00:05 に
+/// 動くと、`Every::Minutes(5)` の次は 10:05:05 以降＝ cron が呼ぶのは 10:06:00
+/// なので、1 回ぶん飛んで 6 分ごとになります。間隔が 1 分以上のものだけ、
+/// この秒数だけ早くても動かします。
+///
+/// **ずれがこの秒数を超えると、やはり 1 回ぶん飛びます。** 30 秒より長く
+/// 遅れて動く環境では、`Every::Seconds` で間隔を指定してください。
+const DUE_SLACK_SECS: i64 = 30;
+
 /// いま動かすべきか。前回の時刻（UNIX 秒）と間隔から決めます。
+///
+/// 間隔が 1 分以上のときは [`DUE_SLACK_SECS`] だけ早くても動かします。
+/// `Every::Seconds(n)` には許容を付けません（秒を指定した意図を崩さないため）。
 pub(crate) fn is_due(last_run: Option<i64>, every: Every, now: i64) -> bool {
     match last_run {
         // 1 度も動いていなければ動かす。
         None => true,
-        Some(last) => now - last >= every.seconds() as i64,
+        Some(last) => {
+            let seconds = every.seconds();
+            // 秒を指定したものは、秒のまま守る。
+            let exact = matches!(every, Every::Seconds(_)) || seconds < 60;
+            let need = if exact {
+                seconds as i64
+            } else {
+                seconds as i64 - DUE_SLACK_SECS
+            };
+            now - last >= need
+        }
     }
 }
 
@@ -195,9 +219,15 @@ fn read_last_run(dir: &Path, task: &Task) -> Option<i64> {
 }
 
 /// 前回動いた時刻を書く。
+///
+/// **名前の改行は空白に潰します。** 1 行目が名前、2 行目が時刻という形なので、
+/// 名前に改行が入ると 2 行目が名前の続きになり、読み戻しが必ず `None` に
+/// なります。`is_due(None, ..)` は真なので、`Every::Day` のタスクが黙って
+/// 毎分走っていました。ファイルの中身は内部の形なので、公開 API は変わりません。
 fn write_last_run(dir: &Path, task: &Task, now: i64) -> Result<()> {
     let path = dir.join(task.state_file());
-    std::fs::write(&path, format!("{}\n{now}\n", task.name))?;
+    let name = task.name.replace(['\n', '\r'], " ");
+    std::fs::write(&path, format!("{name}\n{now}\n"))?;
     Ok(())
 }
 
@@ -207,6 +237,13 @@ fn write_last_run(dir: &Path, task: &Task, now: i64) -> Result<()> {
 /// ぶつかりません。
 const LOCK_DIR: &str = "+locks";
 
+/// 錠を待つ回数（1 回 10ms なので約 1 秒）。
+///
+/// 守るのは「読む → 判定 → 書く」だけで、1 秒も掛かりません。待ち続けずに
+/// 諦めます。取れなければ次の 1 分の `schedule:run` で動けます
+/// （落ちたプロセスの錠も、そのときには古い錠として外れます）。
+const CLAIM_LOCK_TRIES: u32 = 100;
+
 /// そのタスクを守る錠ファイルの場所。
 fn lock_path(dir: &Path, task: &Task) -> PathBuf {
     dir.join(LOCK_DIR)
@@ -215,15 +252,17 @@ fn lock_path(dir: &Path, task: &Task) -> PathBuf {
 
 /// 錠を取って「読む → 判定 → 書く」を行う。動かすべきなら真を返す。
 ///
-/// **排他が無いと、cron が重なったとき（前の `schedule:run` が終わる前に
-/// 次が始まる）や、2 台が同じ `storage/` を共有しているときに、
-/// 同じ処理が 2 回走ります。**
+/// 錠が守るのは**前回時刻の読み書きだけ**です。2 台が同じ `storage/` を
+/// 共有していても、読んだ直後に別の側が書く、という食い違いは起きません。
 ///
-/// 錠を握るのはここだけです。**処理そのものは錠を手放してから動かします。**
-/// 長い処理の間ずっと握ると、古い錠と見なされて外されてしまいます。
-/// 先に時刻を書くので、動かすと決めたのは 1 つだけになります。
+/// **間隔より長くかかる処理の重なりは防ぎません。** 処理そのものは錠を
+/// 手放してから動かします（長い処理の間ずっと握ると、古い錠と見なされて
+/// 外されてしまうため）。`Every::Minute` は `seconds()` が 0 で `is_due` が
+/// 常に真なので、2 つの `schedule:run` が同時に走れば毎回両方が動きます。
+/// 重なりの防止は未実装で、時間での錠の自動解除は却下済みです（決定記録 #076）。
 fn claim(dir: &Path, task: &Task, now: i64) -> Result<bool> {
-    let _lock = crate::support::lock::FileLock::acquire(&lock_path(dir, task))?;
+    let _lock =
+        crate::support::lock::FileLock::acquire_tries(&lock_path(dir, task), CLAIM_LOCK_TRIES)?;
     if !is_due(read_last_run(dir, task), task.every, now) {
         return Ok(false);
     }
@@ -349,10 +388,34 @@ mod tests {
         let now = 100_000;
         assert!(is_due(Some(now - 3_600), Every::Hour, now), "ちょうど1時間");
         assert!(is_due(Some(now - 3_601), Every::Hour, now));
-        assert!(!is_due(Some(now - 3_599), Every::Hour, now), "まだ早い");
+        assert!(!is_due(Some(now - 3_569), Every::Hour, now), "まだ早い");
 
         // 毎分は、前回がいつでも動かす（1分ごとに呼ばれる前提）。
         assert!(is_due(Some(now), Every::Minute, now));
+    }
+
+    #[test]
+    fn 分の粒度は少しの遅れを許す() {
+        let now = 100_000;
+        // 前回が秒の単位でずれても、次の回を飛ばさない。
+        // 許容が無いと 10:00:05 → 10:05:05 以降＝ cron の 10:06:00 まで待ち、
+        // `Every::Minutes(5)` が 1 回ぶん飛んで 6 分ごとになっていた。
+        assert!(is_due(Some(now - 300 + 30), Every::Minutes(5), now));
+        assert!(is_due(Some(now - 3_600 + 30), Every::Hour, now));
+        assert!(is_due(Some(now - 86_400 + 30), Every::Day, now));
+        // 許容（30 秒）を超えて早いものは動かさない。
+        assert!(!is_due(Some(now - 300 + 31), Every::Minutes(5), now));
+        assert_eq!(DUE_SLACK_SECS, 30);
+    }
+
+    #[test]
+    fn 秒の指定には許容を付けない() {
+        let now = 100_000;
+        assert!(is_due(Some(now - 30), Every::Seconds(30), now));
+        assert!(!is_due(Some(now - 29), Every::Seconds(30), now));
+        // 60 秒以上でも、秒を指定したものは秒のまま守る。
+        assert!(!is_due(Some(now - 299), Every::Seconds(300), now));
+        assert!(is_due(Some(now - 300), Every::Seconds(300), now));
     }
 
     #[test]
@@ -415,6 +478,25 @@ mod tests {
         let mut lines = raw.lines();
         assert_eq!(lines.next(), Some("1時間ごとの処理"));
         assert!(lines.next().unwrap().parse::<i64>().unwrap() > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 改行入りの名前でも前回の時刻を読める() {
+        let dir = temp_dir("newline");
+        let mut schedule = Schedule::new();
+        schedule.job("1行目\n2行目", Every::Day, || async { Ok(()) });
+
+        // 1 回目は動く。
+        assert_eq!(run_due_in(&dir, &schedule).await.unwrap().len(), 1);
+        // 名前の改行で 2 行目がずれると、前回の時刻が読めず毎分走っていた。
+        assert!(read_last_run(&dir, &schedule.tasks()[0]).is_some());
+        assert!(run_due_in(&dir, &schedule).await.unwrap().is_empty());
+
+        // 1 行目は名前（改行は空白に潰す）、2 行目が時刻。
+        let raw = std::fs::read_to_string(dir.join(schedule.tasks()[0].state_file())).unwrap();
+        assert_eq!(raw.lines().next(), Some("1行目 2行目"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

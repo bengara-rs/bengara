@@ -108,13 +108,26 @@ jobs:
     name: sandbox
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bengara-rs/bengara-sandbox
-          path: sandbox
-          # bengara-sandbox が非公開なら、読み取り権限のある SANDBOX_TOKEN を登録する。
-          # 公開なら登録不要で、既定のトークンで取得できる。
-          token: ${{ secrets.SANDBOX_TOKEN || github.token }}
+      # bengara-sandbox は、いま検査しているブランチと同じ名前のブランチを使う。
+      # 無ければ develop に落とす。開発は両リポジトリとも develop で進めていて、
+      # main は README だけの置き場だからです。
+      # 非公開なら、読み取り権限のある SANDBOX_TOKEN を登録する。
+      # 公開なら登録不要で、既定のトークンで取得できる。
+      - name: bengara-sandbox を取得する
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.SANDBOX_TOKEN || github.token }}
+        run: |
+          URL="https://x-access-token:${TOKEN}@github.com/bengara-rs/bengara-sandbox.git"
+          for ref in "${{ github.ref_name }}" develop; do
+            if git clone --depth 1 --branch "$ref" "$URL" sandbox 2>/dev/null; then
+              echo "bengara-sandbox の $ref を使います"
+              exit 0
+            fi
+          done
+          # どちらも取れなかった。理由を見せるために、もう一度だけ黙らせずに試す。
+          echo "bengara-sandbox を取得できませんでした。理由を出します"
+          git clone --depth 1 --branch develop "$URL" sandbox
       - uses: actions/checkout@v4
         with:
           # 変更中の bengara を、サブモジュールの位置に置く。

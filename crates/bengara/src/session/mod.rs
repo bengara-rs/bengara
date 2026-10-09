@@ -110,13 +110,18 @@ impl Session {
     }
 
     /// 値を読む。1 回だけの値（flash）も読めます。
+    ///
+    /// **新しく入れたほうが勝ちます。** 今回の `flash` → 持ち越しの `flash` →
+    /// `put` の値、の順で探します。[`all`](Self::all) と同じ順です。
+    /// 逆にすると、`put("status", "1")` のあとの `flash("status", "2")` が
+    /// `get` から永久に見えなくなります。
     pub fn get(&self, key: &str) -> Option<String> {
         let inner = self.lock();
         inner
-            .data
+            .flash
             .get(key)
             .or_else(|| inner.old_flash.get(key))
-            .or_else(|| inner.flash.get(key))
+            .or_else(|| inner.data.get(key))
             .cloned()
     }
 
@@ -486,6 +491,26 @@ mod tests {
         let all = s.all();
         assert_eq!(all.get("a").map(String::as_str), Some("1"));
         assert_eq!(all.get("b").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn 同じ鍵にflashしたら新しいほうを読む() {
+        // `get` と `all` の順をそろえる。逆だと、あとから入れた flash が
+        // `get` から永久に見えなくなる。
+        let s = session();
+        s.put("status", "1");
+        s.flash("status", "2");
+        assert_eq!(s.get("status").as_deref(), Some("2"));
+        assert_eq!(s.all().get("status").map(String::as_str), Some("2"));
+
+        // 持ち越しの値より、今回入れた flash が勝つ。
+        let mut old_flash = Data::new();
+        old_flash.insert("status".into(), "古い".into());
+        let s = Session::new("id".into(), Data::new(), old_flash);
+        assert_eq!(s.get("status").as_deref(), Some("古い"));
+        s.flash("status", "新しい");
+        assert_eq!(s.get("status").as_deref(), Some("新しい"));
+        assert_eq!(s.all().get("status").map(String::as_str), Some("新しい"));
     }
 
     #[test]

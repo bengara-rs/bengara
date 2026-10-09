@@ -63,29 +63,57 @@ impl SessionConfig {
 pub struct StartSession {
     store: Arc<dyn SessionStore>,
     config: SessionConfig,
+    /// 置き場所をどうやって作ったか。`with_config` で作り直せるか決めます。
+    kind: StoreKind,
+}
+
+/// 置き場所の作り方。
+///
+/// 置き場所は「放っておいて消えるまでの秒数」を**作るときに焼き付けます**。
+/// `with_config` で秒数が変わったら作り直さないと、Cookie の `Max-Age` と
+/// サーバー側の期限が食い違います。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreKind {
+    /// `file()` / `from_env()` が作った `FileStore`。
+    File,
+    /// `memory()` / `from_env()` が作った `MemoryStore`。
+    Memory,
+    /// `new()` で外から渡された。**作り直せません。**
+    Given,
 }
 
 impl StartSession {
     /// 置き場所を指定して作る。
     ///
     /// 設定はここで実際に使う形にそろえます（`APP_ENV=production` なら `Secure`）。
+    ///
+    /// **`lifetime_secs` は置き場所にも伝えてください。** 外から渡した置き場所は
+    /// [`with_config`](Self::with_config) では作り直せません。
     pub fn new(store: impl SessionStore, config: SessionConfig) -> Self {
+        Self::of(Arc::new(store), config, StoreKind::Given)
+    }
+
+    /// 作り方つきで組み立てる（中だけで使います）。
+    fn of(store: Arc<dyn SessionStore>, config: SessionConfig, kind: StoreKind) -> Self {
         Self {
-            store: Arc::new(store),
+            store,
             config: config.resolved(),
+            kind,
         }
     }
 
     /// `storage/framework/sessions/` に置く（既定）。
     pub fn file() -> Self {
         let config = SessionConfig::default();
-        Self::new(super::FileStore::default_path(config.lifetime_secs), config)
+        let store = Arc::new(super::FileStore::default_path(config.lifetime_secs));
+        Self::of(store, config, StoreKind::File)
     }
 
     /// プロセスのメモリに置く。**テスト専用です。**
     pub fn memory() -> Self {
         let config = SessionConfig::default();
-        Self::new(super::MemoryStore::new(config.lifetime_secs), config)
+        let store = Arc::new(super::MemoryStore::new(config.lifetime_secs));
+        Self::of(store, config, StoreKind::Memory)
     }
 
     /// `.env` の `SESSION_DRIVER` と `SESSION_LIFETIME` を見て作る。
@@ -104,14 +132,44 @@ impl StartSession {
         };
         let driver: String = crate::env("SESSION_DRIVER", "file");
         match driver.as_str() {
-            "memory" | "array" => Self::new(super::MemoryStore::new(config.lifetime_secs), config),
-            _ => Self::new(super::FileStore::default_path(config.lifetime_secs), config),
+            "memory" | "array" => {
+                let store = Arc::new(super::MemoryStore::new(config.lifetime_secs));
+                Self::of(store, config, StoreKind::Memory)
+            }
+            _ => {
+                let store = Arc::new(super::FileStore::default_path(config.lifetime_secs));
+                Self::of(store, config, StoreKind::File)
+            }
         }
     }
 
     /// 設定を差し替える。
+    ///
+    /// `lifetime_secs` を変えたときは、**組み込みの置き場所も作り直します。**
+    /// 置き場所は秒数を作るときに焼き付けるので、作り直さないと Cookie の
+    /// `Max-Age` だけが変わり、サーバー側の期限が食い違います。
+    ///
+    /// [`new`](Self::new) で外から渡した置き場所は作り直せません。
+    /// 食い違うときは警告を出します。
     pub fn with_config(mut self, config: SessionConfig) -> Self {
-        self.config = config.resolved();
+        let config = config.resolved();
+        if config.lifetime_secs != self.config.lifetime_secs {
+            match self.kind {
+                StoreKind::File => {
+                    self.store = Arc::new(super::FileStore::default_path(config.lifetime_secs));
+                }
+                StoreKind::Memory => {
+                    self.store = Arc::new(super::MemoryStore::new(config.lifetime_secs));
+                }
+                StoreKind::Given => tracing::warn!(
+                    "with_config の lifetime_secs を {} 秒に変えましたが、\
+                     StartSession::new に渡した置き場所は作り直せません。\
+                     置き場所にも同じ秒数を渡してください",
+                    config.lifetime_secs
+                ),
+            }
+        }
+        self.config = config;
         self
     }
 }
@@ -128,7 +186,10 @@ impl Middleware for StartSession {
             // 1. Cookie から ID を読む。署名が合わないものは無かったことにする。
             let incoming = req.cookie(&config.cookie).and_then(|raw| unsign(&raw, key));
 
-            let had_cookie = incoming.is_some();
+            // 置き場所から**実際に読めたか**。署名は合うが中身が無い Cookie
+            // （期限切れ・ログアウト後）を持っている人に、保存していない新しい ID を
+            // 毎リクエスト配り続けないための目印です。
+            let mut loaded = false;
 
             // 2. 置き場所から中身を読む。
             let session = match incoming {
@@ -142,6 +203,7 @@ impl Middleware for StartSession {
                     };
                     match found {
                         Some(stored) => {
+                            loaded = true;
                             let (data, old_flash) = Session::split_flash(stored);
                             Session::new(id, data, old_flash)
                         }
@@ -170,8 +232,9 @@ impl Middleware for StartSession {
             // `regenerate()` が `dirty` を立てるので、保存の判定には足しません。
             let id_changed = id_before != id_after;
             let saved = session.should_save();
+            let after = after_request(saved, loaded);
 
-            if saved {
+            if after == AfterRequest::Save {
                 let data = session.snapshot_for_save();
                 if id_changed {
                     // 古いほうは残さない。
@@ -205,11 +268,32 @@ impl Middleware for StartSession {
                 }
             }
 
+            // 4.5. 保存は要らないが、置き場所から読めていたとき。
+            //
+            // **置き場所の期限も延ばします。** `expires_at` は「最後に書いたとき」から
+            // 数えるので、延ばさないと GET の画面を見て回っていた人が、
+            // ログインや POST から `SESSION_LIFETIME` で突然ログアウトされます。
+            // Cookie の `Max-Age` を延ばしても、サーバー側が切れていれば読めません。
+            //
+            // 毎リクエスト書かないよう、**延ばすかどうかは置き場所が決めます**
+            // （`SessionStore::touch`。残りが半分を切ったときだけ書く）。
+            // 延ばせなくても応答は返します。致命的ではありません。
+            if after == AfterRequest::Touch {
+                let store = store.clone();
+                let id = id_after.clone();
+                match tokio::task::spawn_blocking(move || store.touch(&id)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("セッションの期限を延ばせませんでした: {e}"),
+                    Err(_) => tracing::warn!("セッションの期限の延長が中断されました"),
+                }
+            }
+
             // 5. Cookie を返す。
             //
-            // 保存したときと、もともと有効な Cookie を持っていたとき（期限を延ばす）だけです。
-            // 何も起きなかった人に配ると、置き場所に無い ID の Cookie を持たせることになります。
-            if saved || had_cookie {
+            // 保存したときと、**置き場所から実際に読めたとき**（期限を延ばす）だけです。
+            // 「署名の合う Cookie を持っていた」だけで配ると、置き場所に中身が無い人に
+            // 保存していない新しい ID を毎リクエスト配り続けます。
+            if after != AfterRequest::Nothing {
                 let cookie = Cookie::new(&config.cookie, sign(&id_after, key))
                     .with_path(&config.path)
                     .with_max_age(config.lifetime_secs as i64)
@@ -220,6 +304,36 @@ impl Middleware for StartSession {
             }
             Ok(response)
         })
+    }
+}
+
+/// リクエストの終わりにすること。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterRequest {
+    /// 何もしない。Cookie も返しません。
+    Nothing,
+    /// 期限だけ延ばして、Cookie を返す。
+    Touch,
+    /// 保存して、Cookie を返す。
+    Save,
+}
+
+/// 保存が要るか・置き場所から読めたかで、終わりにすることを決める。
+///
+/// | 保存が要る | 読めた | すること |
+/// |---|---|---|
+/// | はい | - | 保存して Cookie |
+/// | いいえ | はい | 期限を延ばして Cookie |
+/// | いいえ | いいえ | 何もしない |
+///
+/// **「Cookie を持っていた」ではなく「置き場所から読めた」で決めます。**
+/// 署名は合うが中身が無い Cookie（期限切れ・ログアウト後）の人に Cookie を返すと、
+/// 保存していない新しい ID を毎リクエスト配り続けることになります。
+fn after_request(saved: bool, loaded: bool) -> AfterRequest {
+    match (saved, loaded) {
+        (true, _) => AfterRequest::Save,
+        (false, true) => AfterRequest::Touch,
+        (false, false) => AfterRequest::Nothing,
     }
 }
 
@@ -644,6 +758,56 @@ mod tests {
         });
         assert_eq!(mw.config.cookie, "other");
         assert_eq!(mw.config.path, "/app");
+    }
+
+    #[test]
+    fn 置き場所に無いcookieには何も返さない() {
+        // 署名は合うが中身が無い Cookie（期限切れ・ログアウト後）の人に、
+        // 保存していない新しい ID を毎リクエスト配らない。
+        assert_eq!(after_request(false, false), AfterRequest::Nothing);
+        // 読めたときは、読むだけのリクエストでも期限を延ばす。
+        assert_eq!(after_request(false, true), AfterRequest::Touch);
+        // 保存が要るときは保存する。
+        assert_eq!(after_request(true, false), AfterRequest::Save);
+        assert_eq!(after_request(true, true), AfterRequest::Save);
+    }
+
+    #[test]
+    fn with_configの秒数は置き場所にも届く() {
+        use std::collections::BTreeMap;
+
+        // 0 秒にすると、置き場所に書いた直後から読めない。
+        let mw = StartSession::memory().with_config(SessionConfig {
+            lifetime_secs: 0,
+            ..SessionConfig::default()
+        });
+        assert_eq!(mw.config.lifetime_secs, 0);
+        mw.store.write("abc", &BTreeMap::new()).unwrap();
+        assert!(
+            mw.store.read("abc").unwrap().is_none(),
+            "置き場所を作り直している"
+        );
+
+        // 秒数を変えなければ、既定（7200 秒）のまま読める。
+        let mw = StartSession::memory();
+        mw.store.write("abc", &BTreeMap::new()).unwrap();
+        assert!(mw.store.read("abc").unwrap().is_some());
+
+        // `new` で渡した置き場所は作り直さない（警告だけ）。設定は変わる。
+        let mw = StartSession::new(
+            crate::session::MemoryStore::new(7200),
+            SessionConfig::default(),
+        )
+        .with_config(SessionConfig {
+            lifetime_secs: 0,
+            ..SessionConfig::default()
+        });
+        assert_eq!(mw.config.lifetime_secs, 0);
+        mw.store.write("abc", &BTreeMap::new()).unwrap();
+        assert!(
+            mw.store.read("abc").unwrap().is_some(),
+            "外から渡した置き場所はそのまま"
+        );
     }
 
     #[test]

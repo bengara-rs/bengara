@@ -153,24 +153,24 @@ impl Application {
     fn innermost(&self, req: &mut Request, options: &RenderOptions) -> Arc<dyn ErasedHandler> {
         match self.inner.routes.find(req.method(), req.path()) {
             Matched::Found { def, params } => {
-                let handler = def.handler.clone();
-                let stack = def.stack.clone();
                 let name = def.name.clone();
-                let options = options.clone();
                 req.set_params(params);
                 req.set_route_name(name);
                 req.mark_matched();
+
+                // ルートごとの並びが無ければ、ハンドラをそのまま返す。
+                // 包み直すと `Arc` を1つ作って捨てるだけなので、何もしない。
+                let Some(stack) = def.stack.clone() else {
+                    return def.handler.clone();
+                };
+
+                let handler = def.handler.clone();
+                let options = options.clone();
                 Arc::new(Erased::new(move |req: Request| {
-                    let handler = handler.clone();
-                    let stack = stack.clone();
-                    let options = options.clone();
-                    async move {
-                        // ルートごとの並びは、共通の並びの内側で回す。
-                        match stack {
-                            Some(stack) => Next::new(stack, handler, options).run(req).await,
-                            None => handler.call(req).await,
-                        }
-                    }
+                    // ルートごとの並びは、共通の並びの内側で回す。
+                    // `Fn` なので捕まえたものは動かせない。どれも `Arc` のクローンで済む。
+                    let next = Next::new(stack.clone(), handler.clone(), options.clone());
+                    async move { next.run(req).await }
                 }))
             }
             Matched::MethodNotAllowed { mut allowed } => {
@@ -179,12 +179,24 @@ impl Application {
                     allowed.push("HEAD");
                 }
                 allowed.sort_unstable();
+                // パスが同じでもメソッドが違うときは、先に静的ファイルを探す。
+                // `Route::post("/report", ...)` があると `public/report` が
+                // `GET` で見えなくなるためです。`GET` のルートがあるときは触りません。
+                let try_static =
+                    matches!(req.method(), "GET" | "HEAD") && !allowed.contains(&"GET");
                 let allow = allowed.join(", ");
+                let app = self.clone();
                 let options = options.clone();
-                Arc::new(Erased::new(move |_req: Request| {
+                Arc::new(Erased::new(move |req: Request| {
                     let allow = allow.clone();
+                    let app = app.clone();
                     let options = options.clone();
                     async move {
+                        if try_static {
+                            if let Some(response) = app.serve_static(&req).await {
+                                return Ok(response);
+                            }
+                        }
                         let error = Error::Http {
                             status: 405,
                             message: String::new(),
@@ -210,6 +222,23 @@ impl Application {
         req: &Request,
         options: crate::http::response::RenderOptions,
     ) -> Response {
+        if let Some(response) = self.serve_static(req).await {
+            return response;
+        }
+        error_response(
+            &Error::Http {
+                status: 404,
+                message: String::new(),
+            },
+            options,
+        )
+    }
+
+    /// 静的ファイルを探して返す。無ければ `None`。
+    ///
+    /// `GET` と `HEAD` のときだけ探します。入口はパスで決まります
+    /// （`/storage/...` なら置き場所だけ、それ以外は埋め込み → ディスク）。
+    async fn serve_static(&self, req: &Request) -> Option<Response> {
         if matches!(req.method(), "GET" | "HEAD") {
             let path = req.path().to_string();
             let if_none_match = req.header("if-none-match").map(str::to_string);
@@ -231,8 +260,8 @@ impl Application {
                 })
                 .await
                 .unwrap_or(None);
-                if let Some(response) = found {
-                    return response;
+                if found.is_some() {
+                    return found;
                 }
             } else {
                 // 2. バイナリに埋め込んだ public/（リリースビルドのとき）。
@@ -242,7 +271,7 @@ impl Application {
                     &path,
                     if_none_match.as_deref(),
                 ) {
-                    return response;
+                    return Some(response);
                 }
                 // 3. ディスクの public/。
                 let dir = self.inner.public_dir.clone();
@@ -258,18 +287,12 @@ impl Application {
                 })
                 .await
                 .unwrap_or(None);
-                if let Some(response) = found {
-                    return response;
+                if found.is_some() {
+                    return found;
                 }
             }
         }
-        error_response(
-            &Error::Http {
-                status: 404,
-                message: String::new(),
-            },
-            options,
-        )
+        None
     }
 }
 
@@ -288,12 +311,12 @@ fn wants_json(req: &Request) -> bool {
 /// `header` に渡す名前は小文字です。
 pub(crate) fn wants_json_with<'a>(header: impl Fn(&str) -> Option<&'a str>) -> bool {
     if let Some(accept) = header("accept") {
-        let accept = accept.to_ascii_lowercase();
-        if accept.contains("application/json") || accept.contains("+json") {
+        if contains_ignore_case(accept, "application/json") || contains_ignore_case(accept, "+json")
+        {
             return true;
         }
         // ブラウザは text/html を先に書く。それが無く */* だけなら API 呼び出しとみなす。
-        if !accept.contains("text/html") && accept.contains("*/*") {
+        if !contains_ignore_case(accept, "text/html") && accept.contains("*/*") {
             return true;
         }
     }
@@ -302,6 +325,21 @@ pub(crate) fn wants_json_with<'a>(header: impl Fn(&str) -> Option<&'a str>) -> b
     }
     // 自分が JSON を送ってきたか。判定は `Request` と同じ関数を使う（食い違いを作らない）。
     header("content-type").is_some_and(crate::http::request::json_content_type)
+}
+
+/// 大文字小文字を区別せずに部分一致を見る。
+///
+/// `Accept` を小文字に直してから探すと、1リクエストで `String` を作ってしまいます。
+/// 探す語はどれも ASCII なので、バイト列のまま見れば確保が要りません。
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// パニックしたハンドラの、見せる文を決める。
@@ -536,6 +574,49 @@ mod tests {
         assert_eq!(response.header("x-powered-by"), Some("bengara"));
         // HEAD は GET で受けるので、GET があれば HEAD も並べる。
         assert_eq!(response.header("allow"), Some("GET, HEAD"));
+    }
+
+    #[tokio::test]
+    async fn メソッドが違うだけなら静的ファイルを探す() {
+        // `Route::post("/report", ...)` があると、以前は `public/report` が
+        // `GET` で見えずに 405 だけを返していた。
+        static FILES: &[(&str, &[u8])] = &[("report", b"report!")];
+        crate::http::statics::install_embedded(FILES);
+
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::post("/report", ok);
+                })
+            })
+            .create();
+
+        let response = app.handle(Request::new("GET", "/report")).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"report!");
+
+        // 静的ファイルが無いパスは、これまでどおり 405。
+        let response = app.handle(Request::new("GET", "/missing")).await;
+        assert_eq!(response.status(), 404);
+        let response = app.handle(Request::new("DELETE", "/report")).await;
+        assert_eq!(response.status(), 405);
+        assert_eq!(response.header("allow"), Some("POST"));
+    }
+
+    #[test]
+    fn 大文字のacceptでもjsonを欲しがっていると分かる() {
+        // `Accept` を小文字に直さずに見るので、大文字でも効くことを確かめる。
+        fn accept(value: &'static str) -> impl Fn(&str) -> Option<&'static str> {
+            move |want: &str| (want == "accept").then_some(value)
+        }
+        assert!(wants_json_with(accept("APPLICATION/JSON")));
+        assert!(wants_json_with(accept("application/VND.api+JSON")));
+        // ブラウザの Accept は JSON ではない。
+        assert!(!wants_json_with(accept(
+            "TEXT/HTML,application/xhtml+xml,*/*;q=0.8"
+        )));
+        // text/html が無く */* だけなら API 呼び出しとみなす。
+        assert!(wants_json_with(accept("*/*")));
     }
 
     #[tokio::test]

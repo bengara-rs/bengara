@@ -145,8 +145,8 @@ artisan = ["run", "-q", "--bin", "artisan", "--"]
 `cargo` 経由ならルートは `CARGO_MANIFEST_DIR` から決まるので、サブディレクトリからでも
 正しい場所を見ます。`cargo` を通さずに `./target/debug/myapp` と打つときは、ルートで実行してください。
 
-ルートの決め方（全 5 段階）と、決まらないときの動きは [deployment.md](deployment.md) にあります。
-**決まらなければ起動しません。**
+ルートの決め方（4 か所を順に見ます）と、決まらないときの動きは
+[deployment.md](deployment.md) にあります。**決まらなければ起動しません。**
 
 ## 6. データベースを用意する
 
@@ -205,12 +205,12 @@ cargo build --release
 | `.env`                | 環境ごとの値               |
 | 書き込める `storage/` | 実行時の書き込み先         |
 
-`storage/` の下は `./myapp storage:init` が作ります。作るのは 7 つです。
+`storage/` の下は `./myapp storage:init` が作ります。作るのは 8 つです。
 
 ```
 storage/app  storage/app/public  storage/framework
-storage/framework/cache  storage/framework/schedule  storage/framework/sessions
-storage/logs
+storage/framework/cache  storage/framework/schedule  storage/framework/serve
+storage/framework/sessions  storage/logs
 ```
 
 ## src/ を作り直さない

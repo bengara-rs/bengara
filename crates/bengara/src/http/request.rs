@@ -496,7 +496,11 @@ pub(crate) fn is_sensitive(name: &str) -> bool {
 
 /// 名前を語に区切って1語ずつ渡す。真を返した時点で止めて真を返します。
 ///
-/// 区切りは `_` `-` `.` 空白と、大文字の直前です（`apiKey` は `api` と `Key`）。
+/// 区切りは `_` `-` `.` 空白と、**小文字から大文字へ変わる所**です
+/// （`apiKey` は `api` と `Key`）。
+///
+/// 大文字が続くところでは切りません。1文字ずつに切ると、`PASSWORD` や `API_KEY`
+/// のような全部大文字の名前がどの語にも当たらなくなります。
 /// 区切りに使う文字はどれも1バイトなので、UTF-8 の途中で切ることはありません。
 /// 文字列を作らないので、1リクエストごとに呼んでも確保が増えません。
 fn for_each_word(name: &str, mut found: impl FnMut(&str) -> bool) -> bool {
@@ -505,7 +509,8 @@ fn for_each_word(name: &str, mut found: impl FnMut(&str) -> bool) -> bool {
     for index in 0..bytes.len() {
         let byte = bytes[index];
         let separator = matches!(byte, b'_' | b'-' | b'.' | b' ');
-        let upper = byte.is_ascii_uppercase() && index > start;
+        let upper =
+            byte.is_ascii_uppercase() && index > start && bytes[index - 1].is_ascii_lowercase();
         if !separator && !upper {
             continue;
         }
@@ -728,6 +733,26 @@ mod tests {
         // 日本語の名前でも、UTF-8 の途中で切らない。
         assert_eq!(collect("題名_副題"), ["題名", "副題"]);
         assert_eq!(collect(""), Vec::<String>::new());
+        // 大文字が続くところでは切らない。1文字ずつにすると語として当たらなくなる。
+        assert_eq!(collect("API_KEY"), ["API", "KEY"]);
+        assert_eq!(collect("PASSWORD"), ["PASSWORD"]);
+        assert_eq!(collect("X-CSRF-TOKEN"), ["X", "CSRF", "TOKEN"]);
+    }
+
+    #[test]
+    fn 全部大文字の名前も伏せる() {
+        // 以前は大文字が1文字ずつの語に切れていたので、どれも素通りしていた。
+        for name in [
+            "PASSWORD",
+            "API_KEY",
+            "TOKEN",
+            "SSN",
+            "CVV",
+            "X-CSRF-TOKEN",
+            "SIGNATURE",
+        ] {
+            assert!(is_sensitive(name), "{name} は残してはいけない");
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //!
 //! 受け取るときは `Cookie` ヘッダーを分解し、返すときは `Set-Cookie` を1本ずつ足します。
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 /// 返す Cookie 1本。
@@ -112,9 +113,9 @@ impl Cookie {
     /// `Set-Cookie` ヘッダーの中身にする。
     pub fn to_header_value(&self) -> String {
         let mut out = format!("{}={}", encode(&self.name), encode(&self.value));
-        let _ = write!(out, "; Path={}", self.path);
+        let _ = write!(out, "; Path={}", sanitize_attribute("Path", &self.path));
         if let Some(domain) = &self.domain {
-            let _ = write!(out, "; Domain={domain}");
+            let _ = write!(out, "; Domain={}", sanitize_attribute("Domain", domain));
         }
         if let Some(max_age) = self.max_age {
             let _ = write!(out, "; Max-Age={max_age}");
@@ -133,6 +134,21 @@ impl Cookie {
         let _ = write!(out, "; SameSite={}", self.same_site.as_str());
         out
     }
+}
+
+/// `Path` / `Domain` から、ヘッダーを壊す文字を落とす。
+///
+/// 落とすのは制御文字（`\r` `\n` `\0`）と、属性の区切りの `;` です。名前と値は
+/// `%xx` に逃がしますが、この2つは逃がすと意味が変わるので落とします。
+/// 残すと `Set-Cookie` ヘッダーが作れず、**そのリクエストが 500 になります**。
+/// 黙って落とすので、落としたときだけ1行だけ残します。
+fn sanitize_attribute<'a>(attribute: &str, value: &'a str) -> Cow<'a, str> {
+    let bad = |c: char| matches!(c, '\r' | '\n' | '\0' | ';');
+    if !value.contains(bad) {
+        return Cow::Borrowed(value);
+    }
+    tracing::warn!("Cookie の {attribute} に使えない文字があったので落としました");
+    Cow::Owned(value.replace(bad, ""))
 }
 
 /// `Cookie` ヘッダーを名前と値に分ける。
@@ -215,6 +231,19 @@ mod tests {
         assert!(header.starts_with("session="));
         assert!(header.contains("; Max-Age=0"));
         assert!(header.contains("Expires=Thu, 01 Jan 1970"));
+    }
+
+    #[test]
+    fn pathとdomainの危ない文字は落とす() {
+        // 改行や `;` が残ると `Set-Cookie` ヘッダーを作れず、応答全体が 500 になる。
+        let header = Cookie::new("a", "b")
+            .with_path("/x\r\nSet-Cookie: evil=1")
+            .with_domain("example.com\n; Secure")
+            .to_header_value();
+        assert!(!header.contains('\r'));
+        assert!(!header.contains('\n'));
+        assert!(header.contains("; Path=/xSet-Cookie: evil=1"));
+        assert!(header.contains("; Domain=example.com Secure"));
     }
 
     #[test]

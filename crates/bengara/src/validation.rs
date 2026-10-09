@@ -203,7 +203,19 @@ impl Rule {
             "alpha_dash" => Rule::AlphaDash,
             "min" => Rule::Min(number("min")?),
             "max" => Rule::Max(number("max")?),
-            "size" => Rule::Size(number("size")? as usize),
+            // `size` だけは文字数と突き合わせるので `usize` にします。
+            // `as usize` は飽和変換なので、`size:-3` が `0`、`size:1e30` が
+            // `usize::MAX` に化けます。書き間違いを黙って通さないよう、
+            // 0 以上の整数であることを確かめます（引数忘れと同じ扱いで 500）。
+            "size" => {
+                let n = number("size")?;
+                if !(n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= usize::MAX as f64) {
+                    return Err(Error::msg(
+                        "規則 `size` には 0 以上の整数が要ります（例: size:10）",
+                    ));
+                }
+                Rule::Size(n as usize)
+            }
             "between" => {
                 let raw = text("between")?;
                 let (lo, hi) = raw.split_once(',').ok_or_else(|| {
@@ -449,11 +461,18 @@ fn check(
             }
             _ => {}
         },
-        Rule::Size(size) => {
-            if value.chars().count() != *size {
+        // `size` も `min` / `max` と同じ決まりです。
+        // `numeric` か `integer` が付いていれば値そのもの、付いていなければ文字数。
+        // 数値として読めない値のときは何も言いません（`integer` が言います）。
+        Rule::Size(size) => match measure(value, rules) {
+            Measure::Number(n) if n != *size as f64 => {
+                errors.add(field, format!("{field} は {size} にしてください。"));
+            }
+            Measure::Length(len) if len != *size => {
                 errors.add(field, format!("{field} は {size} 文字で入力してください。"));
             }
-        }
+            _ => {}
+        },
 
         Rule::In(allowed) => {
             if !allowed.iter().any(|a| a == value) {
@@ -675,6 +694,38 @@ mod tests {
         assert!(errors_of(&input(&[("s", "11")]), &[("s", "between:1,10")]).is_empty());
         assert!(errors_of(&input(&[("s", "abc")]), &[("s", "size:3")]).is_empty());
         assert!(!errors_of(&input(&[("s", "ab")]), &[("s", "size:3")]).is_empty());
+    }
+
+    #[test]
+    fn sizeもnumericかintegerが付いていれば値で見る() {
+        // 値で比べる。`5` は `size:5` を通る（文字数では 1 文字なので落ちていた）。
+        assert!(errors_of(&input(&[("n", "5")]), &[("n", "integer|size:5")]).is_empty());
+        assert!(!errors_of(&input(&[("n", "6")]), &[("n", "integer|size:5")]).is_empty());
+        assert!(errors_of(&input(&[("n", "5.0")]), &[("n", "numeric|size:5")]).is_empty());
+
+        // 数値として読めない値には何も言わない（`integer` の 1 件だけ）。
+        let e = errors_of(&input(&[("n", "abc")]), &[("n", "integer|size:5")]);
+        assert_eq!(e.total(), 1, "理由は 1 件だけ: {:?}", e.all());
+
+        // 規則が無ければ文字数で見る（従来どおり）。
+        assert!(errors_of(&input(&[("s", "abcde")]), &[("s", "size:5")]).is_empty());
+        assert!(!errors_of(&input(&[("s", "abcd")]), &[("s", "size:5")]).is_empty());
+    }
+
+    #[test]
+    fn sizeの書き間違いはエラーになる() {
+        // `as usize` の飽和変換で黙って `0` や `usize::MAX` にしない。
+        let i = input(&[("n", "1")]);
+        for bad in ["size:-3", "size:1e30", "size:1.5", "size:abc", "size"] {
+            let error = validate(&i, &[("n", bad)]).unwrap_err();
+            assert!(
+                !matches!(error, Error::Validation(_)),
+                "`{bad}` は 422 にしない: {error}"
+            );
+        }
+        // 正しい書き方は通る。
+        assert!(validate(&i, &[("n", "size:1")]).is_ok());
+        assert!(validate(&input(&[("n", "")]), &[("n", "size:0")]).is_ok());
     }
 
     #[test]

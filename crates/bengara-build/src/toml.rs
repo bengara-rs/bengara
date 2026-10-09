@@ -32,11 +32,24 @@ pub(crate) fn parse(text: &str) -> Result<Vec<(String, String)>, String> {
             continue;
         }
 
-        // 節の始まり。
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+        // 節の始まり。`[` で始まる行は、`]` で終わらなければその場でエラーにします。
+        // ここで落とさずに `鍵 = 値` の処理へ送ると、`[a] b = "c"` のような行が
+        // `[a] b` という引けない鍵になって通ってしまいます。
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some(name) = rest.strip_suffix(']') else {
+                return Err(format!(
+                    "{line_number} 行目: 節は `[名前]` の形にしてください"
+                ));
+            };
             let name = name.trim();
             if name.is_empty() {
                 return Err(format!("{line_number} 行目: 節の名前が空です"));
+            }
+            if !is_key(name) {
+                return Err(format!(
+                    "{line_number} 行目: 節の名前 `{name}` は使えません。\
+                     英数字・`_`・`-`・`.` だけにしてください（`.` は区切りなので端や連続では使えません）"
+                ));
             }
             section = name.to_string();
             continue;
@@ -51,8 +64,18 @@ pub(crate) fn parse(text: &str) -> Result<Vec<(String, String)>, String> {
         if key.is_empty() {
             return Err(format!("{line_number} 行目: 鍵が空です"));
         }
-        let value = unquote(value.trim())
-            .ok_or_else(|| format!("{line_number} 行目: 値を引用符でくくってください"))?;
+        if !is_key(key) {
+            return Err(format!(
+                "{line_number} 行目: 鍵 `{key}` は使えません。\
+                 英数字・`_`・`-`・`.` だけにしてください（引用符でくくる書き方は読みません）"
+            ));
+        }
+        let value = unquote(value.trim()).ok_or_else(|| {
+            format!(
+                "{line_number} 行目: 値は `\"値\"` の形にしてください。\
+                 引用符でくくり、中の `\"` は `\\\"` にします"
+            )
+        })?;
 
         let full = if section.is_empty() {
             key.to_string()
@@ -87,16 +110,42 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// 鍵と節の名前に使える形か。
+///
+/// 使えるのは英数字・`_`・`-`・`.` だけです。`.` は鍵の区切りなので、端に置いたり
+/// 続けたりはできません。`[a.]` を通すと `a..b` という、実行時に引けない鍵になります。
+fn is_key(name: &str) -> bool {
+    if name.starts_with('.') || name.ends_with('.') || name.contains("..") {
+        return false;
+    }
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 /// 引用符を外す。`"..."` は `\n` などを解釈し、`'...'` はそのままです。
+///
+/// 閉じの引用符は**行の終わり**になければなりません。途中で閉じていると、
+/// `a = "x""y"` のような行が `x""y` という値になって通ってしまいます。
 fn unquote(value: &str) -> Option<String> {
-    if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+    if let Some(rest) = value.strip_prefix('\'') {
+        let inner = rest.strip_suffix('\'')?;
+        // 単引用符の中では `\` も文字なので、`'` が出たらそこで値が終わっています。
+        if inner.contains('\'') {
+            return None;
+        }
         return Some(inner.to_string());
     }
-    let inner = value.strip_prefix('"').and_then(|v| v.strip_suffix('"'))?;
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
 
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
+        // 逃がしていない `"`。ここで値が終わっていて、後ろに余りがあります。
+        if c == '"' {
+            return None;
+        }
         if c != '\\' {
             out.push(c);
             continue;
@@ -195,6 +244,38 @@ mod tests {
             .contains("2 行目"));
         assert!(parse("[]\n").unwrap_err().contains("1 行目"));
         assert!(parse("= 値\n").unwrap_err().contains("1 行目"));
+    }
+
+    #[test]
+    fn 節として読めない行はエラーにする() {
+        // `[a] b = "c"` は `[a] b` という引けない鍵になっていた。
+        assert!(parse("[a] b = \"c\"\n").unwrap_err().contains("1 行目"));
+        // `[a.]` は `a..b` という引けない鍵になっていた。
+        assert!(parse("[a.]\nb = \"1\"\n").unwrap_err().contains("1 行目"));
+    }
+
+    #[test]
+    fn 使えない鍵と閉じ忘れの値はエラーにする() {
+        // 引用符でくくった鍵は読まない。`"a.b"` が鍵のまま残っていた。
+        assert!(parse("\"a.b\" = \"x\"\n").unwrap_err().contains("1 行目"));
+        // 値の途中で引用符が閉じている。`x""y` という値になっていた。
+        assert!(parse("a = \"x\"\"y\"\n").unwrap_err().contains("1 行目"));
+        // 単引用符も同じ。
+        assert!(parse("a = 'x''y'\n").unwrap_err().contains("1 行目"));
+    }
+
+    #[test]
+    fn 鍵の形を見分ける() {
+        assert!(is_key("messages"));
+        assert!(is_key("a.b"));
+        assert!(is_key("a_b-c2"));
+        assert!(!is_key(""));
+        assert!(!is_key("a."));
+        assert!(!is_key(".a"));
+        assert!(!is_key("a..b"));
+        assert!(!is_key("\"a.b\""));
+        assert!(!is_key("a b"));
+        assert!(!is_key("日本語"));
     }
 
     #[test]

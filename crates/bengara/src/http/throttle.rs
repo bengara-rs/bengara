@@ -19,8 +19,16 @@ use std::time::{Duration, Instant};
 use crate::error::Error;
 use crate::http::{BoxFuture, Middleware, Next, Request};
 
-/// 置き場所に置ける鍵の上限。超えたら古いものから落とします。
+/// 置き場所に置ける鍵の上限。
+///
+/// 超えたときは `count` の多い鍵（制限に近いもの）を残して落とします。詳しくは `sweep`。
 const MAX_BUCKETS: usize = 10_000;
+
+/// これを超えたら、掃除の間隔を待たずにその場で落とす硬い上限。
+///
+/// `sweep` は `window`（既定 60 秒）に1回しか走りません。その間に鍵を増やされても
+/// メモリを食いつぶされないように、挿入のときだけこの線を見ます。
+const HARD_MAX_BUCKETS: usize = MAX_BUCKETS * 2;
 
 /// 信頼する前段のプロキシを決める環境変数の名前。
 ///
@@ -108,6 +116,11 @@ impl Throttle {
 
         // 既にある鍵のときは `String` を作らない（`entry` は毎回 `to_string` が要る）。
         if !buckets.map.contains_key(key) {
+            // 掃除の間隔を待つと、その間は無制限に鍵が増えます。
+            // 硬い上限だけは、挿入の直前にその場で守ります。
+            if buckets.map.len() > HARD_MAX_BUCKETS {
+                self.evict(&mut buckets, now);
+            }
             buckets.map.insert(
                 key.to_string(),
                 Bucket {
@@ -139,6 +152,13 @@ impl Throttle {
             return;
         }
         buckets.last_swept = now;
+        self.evict(buckets, now);
+    }
+
+    /// 期限切れを捨て、それでも天井を超えるなら件数で落とす。
+    ///
+    /// `sweep`（間隔つき）と、硬い上限を超えたとき（`hit` の挿入の直前）で共用します。
+    fn evict(&self, buckets: &mut Buckets, now: Instant) {
         buckets.map.retain(|_, b| b.resets_at > now);
         if buckets.map.len() <= MAX_BUCKETS {
             return;
@@ -172,7 +192,8 @@ impl Throttle {
         if !self.warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 "接続元のアドレスが分からないため、throttle を掛けずに通します。\
-                 ソケットを使わない呼び出し（テストなど）で起きます"
+                 アドレスを入れずに Request を手で組み立てたときに起きます\
+                 （#[bengara::test] からの呼び出しは 127.0.0.1 になるので掛かります）"
             );
         }
     }
@@ -252,10 +273,11 @@ fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
     // 接続元が分からなければ鍵を作らない。`"unknown"` のような1つの鍵にまとめると、
     // 誰か1人が使い切るだけで全員を締め出せてしまいます。
     let peer = req.ip()?;
+    // ヘッダーから採るのも `IpAddr` です。`user:5` のような文字列は鍵になりません。
     let who = if trusted.allows(&peer) {
-        forwarded_ip(req).unwrap_or_else(|| peer.to_string())
+        forwarded_ip(req, trusted).unwrap_or(peer)
     } else {
-        peer.to_string()
+        peer
     };
     Some(format!("{who}|{target}"))
 }
@@ -273,17 +295,42 @@ fn target_of(req: &Request) -> &str {
 }
 
 /// 前段のプロキシが伝えてきた、元の相手。
-fn forwarded_ip(req: &Request) -> Option<String> {
-    req.header("x-forwarded-for")
-        .and_then(|v| v.split(',').next())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            req.header("x-real-ip")
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-        })
-        .map(str::to_string)
+///
+/// `X-Forwarded-For` は「クライアント, プロキシ1, プロキシ2」の順に並びます。
+/// nginx の `$proxy_add_x_forwarded_for` は**クライアントが送った値に追記する**ので、
+/// 先頭は相手が自由に決められます。検査せずに鍵にすると、ヘッダーを毎回変えるだけで
+/// 回数制限を回せます。`user:5` のような値を送れば、利用者 ID 5 の枠も使い切れます。
+///
+/// そこで、**必ず `IpAddr` として読める要素だけを使います。** 読めない要素は捨てます。
+/// どれを採るかは信頼の設定で変えます。
+///
+/// | 設定 | 採る場所 |
+/// |---|---|
+/// | `Trusted::List` | **右端から**見て、信頼一覧に無い最初のアドレス |
+/// | `Trusted::All` | 先頭（右端から辿る手がかりが無い） |
+///
+/// `Trusted::List` で右端から辿るのは Laravel / Symfony と同じ考え方です。
+/// 自分の前段を右から順に取り除くと、残った右端が本当の相手になります。
+///
+/// 1つも採れなければ `X-Real-IP` を見て、それも読めなければ `None`
+/// （呼ぶ側が接続元のアドレスに落とします）。
+fn forwarded_ip(req: &Request, trusted: &Trusted) -> Option<IpAddr> {
+    let parse = |part: &str| part.trim().parse::<IpAddr>().ok();
+    if let Some(raw) = req.header("x-forwarded-for") {
+        let found = match trusted {
+            Trusted::None => None,
+            Trusted::All => raw.split(',').filter_map(parse).next(),
+            Trusted::List(_) => raw
+                .split(',')
+                .rev()
+                .filter_map(parse)
+                .find(|ip| !trusted.allows(ip)),
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    req.header("x-real-ip").and_then(parse)
 }
 
 impl Middleware for Throttle {
@@ -470,12 +517,13 @@ mod tests {
         let trusted = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
         assert_eq!(
             key_for_with(&req, &trusted),
-            Some("1.2.3.4|/login".to_string()),
-            "先頭だけを使う"
+            Some("5.6.7.8|/login".to_string()),
+            "一覧で絞るときは右端から（1.2.3.4 は相手が足した値かもしれない）"
         );
         assert_eq!(
             key_for_with(&req, &Trusted::All),
-            Some("1.2.3.4|/login".to_string())
+            Some("1.2.3.4|/login".to_string()),
+            "すべて信頼するときは右端から辿れないので先頭"
         );
 
         // X-Forwarded-For が無ければ X-Real-IP を見る。
@@ -490,6 +538,104 @@ mod tests {
         assert_eq!(
             key_for_with(&req, &trusted),
             Some("10.0.0.1|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 読めない値は鍵にしない() {
+        let trusted = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
+
+        // `user:5` を鍵にすると、その利用者の枠を外から使い切れてしまう。
+        let req = from("10.0.0.1").with_headers(vec![("x-forwarded-for".into(), "user:5".into())]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("10.0.0.1|/login".to_string()),
+            "読めない値は捨てて接続元のアドレスに落ちる"
+        );
+        assert_eq!(
+            key_for_with(&req, &Trusted::All),
+            Some("10.0.0.1|/login".to_string())
+        );
+
+        // 読めない要素が混じっていても、読める要素だけを使う。
+        let req = from("10.0.0.1").with_headers(vec![(
+            "x-forwarded-for".into(),
+            "nonsense, 1.2.3.4, , bad".into(),
+        )]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("1.2.3.4|/login".to_string())
+        );
+        assert_eq!(
+            key_for_with(&req, &Trusted::All),
+            Some("1.2.3.4|/login".to_string()),
+            "先頭が読めなければ次を見る"
+        );
+
+        // X-Real-IP も検査を通す。
+        let req = from("10.0.0.1").with_headers(vec![("x-real-ip".into(), "user:5".into())]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("10.0.0.1|/login".to_string())
+        );
+
+        // X-Forwarded-For が読めなければ X-Real-IP に落ちる。
+        let req = from("10.0.0.1").with_headers(vec![
+            ("x-forwarded-for".into(), "nonsense".into()),
+            ("x-real-ip".into(), "9.9.9.9".into()),
+        ]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("9.9.9.9|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 信頼一覧のときは右端から採る() {
+        // nginx を2段重ねた形。右の2つは自分の前段なので、本当の相手は 203.0.113.9。
+        let trusted = Trusted::List(vec![
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+        ]);
+        let req = from("10.0.0.1").with_headers(vec![(
+            "x-forwarded-for".into(),
+            "1.2.3.4, 203.0.113.9, 10.0.0.2, 10.0.0.1".into(),
+        )]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("203.0.113.9|/login".to_string()),
+            "相手が足した 1.2.3.4 は使わない"
+        );
+
+        // 全部が信頼一覧なら、採れるものが無いので接続元のアドレスに落ちる。
+        let req = from("10.0.0.1").with_headers(vec![(
+            "x-forwarded-for".into(),
+            "10.0.0.2, 10.0.0.1".into(),
+        )]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("10.0.0.1|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 硬い上限は掃除の間隔を待たずに守る() {
+        let throttle = Throttle::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        let swept = throttle.buckets.lock().unwrap().last_swept;
+        // 掃除は `window` に1回しか走らないので、この間はずっと同じ時刻で呼ぶ。
+        for i in 0..(HARD_MAX_BUCKETS + 10) {
+            let _ = throttle.hit(&format!("key-{i}"), now);
+        }
+        let count = throttle.buckets.lock().unwrap().map.len();
+        assert!(
+            count <= MAX_BUCKETS + 10,
+            "硬い上限を超えたらその場で落とす（残り {count}）"
+        );
+        assert_eq!(
+            throttle.buckets.lock().unwrap().last_swept,
+            swept,
+            "掃除そのものは走っていない"
         );
     }
 

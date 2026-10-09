@@ -159,9 +159,10 @@ app/Jobs/
 |------------------------------|-----------------------------|
 | `storage/app`                | アプリが置くファイル        |
 | `storage/app/public`         | `/storage/...` で配信する分 |
-| `storage/framework`          | 下の 3 つの親               |
+| `storage/framework`          | 下の 4 つの親               |
 | `storage/framework/cache`    | キャッシュ                  |
 | `storage/framework/schedule` | 定期処理の前回時刻          |
+| `storage/framework/serve`    | `serve` が作る控え（開発用）|
 | `storage/framework/sessions` | セッション                  |
 | `storage/logs`               | ログ                        |
 

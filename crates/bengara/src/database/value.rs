@@ -3,6 +3,8 @@
 //! sqlx の型を利用者に見せないための層です。ここを通るので、下回りを差し替えても
 //! アプリのコードは変わりません。
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 
 /// DB に渡す値、DB から来た値。
@@ -329,15 +331,37 @@ impl<T: FromValue> FromValue for Option<T> {
 /// let row = DB::table("posts").find(1).await?.unwrap();
 /// let title: String = row.get("title")?;
 /// ```
-#[derive(Debug, Clone, Default, PartialEq)]
+/// 列の名前は `Arc` で共有します。同じ問い合わせの行はすべて同じ名前なので、
+/// 行ごとに `Vec<String>` を複製すると、1万行×20列で20万回の確保になります。
+#[derive(Debug, Clone, PartialEq)]
 pub struct Row {
-    columns: Vec<String>,
+    columns: Arc<[String]>,
     values: Vec<Value>,
+}
+
+impl Default for Row {
+    fn default() -> Self {
+        Self {
+            columns: Arc::from(Vec::new()),
+            values: Vec::new(),
+        }
+    }
 }
 
 impl Row {
     /// 列の名前と値から作る。下回りのドライバが使います。
     pub fn new(columns: Vec<String>, values: Vec<Value>) -> Self {
+        Self {
+            columns: Arc::from(columns),
+            values,
+        }
+    }
+
+    /// 列の名前を共有して作る。同じ問い合わせの行をまとめて作るときに使います。
+    ///
+    /// 呼ぶのは下回りのドライバだけなので、`sqlite` を入れないときは出番がありません。
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn with_columns(columns: Arc<[String]>, values: Vec<Value>) -> Self {
         Self { columns, values }
     }
 

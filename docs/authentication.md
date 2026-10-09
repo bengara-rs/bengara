@@ -112,6 +112,10 @@ pub async fn register(name: &str, email: &str, password: &str) -> Result<User> {
 入口で `max:1024` を付けておくと、利用者には 422 で返せます。
 上限が無いと、長い文字列を送るだけで CPU を使わせられます。
 
+**`Hash::make` には上限がありません。** そのかわり、1024 バイトを超える平文を
+渡したときは警告を出します。その値で保存すると、**その人は二度とログインできません**
+（`check` が計算せずに偽を返すため）。`max:1024` を忘れていないか確かめてください。
+
 ### 同期版と非同期版の使い分け
 
 | 場面                                             | 使うもの                     |
@@ -226,6 +230,19 @@ pub async fn login(req: Request) -> Result<Response> {
 | `logout_all_devices()`   | 同じ利用者のすべて（自分も切る） | 消した数     | 「全部の端末からログアウト」|
 | `logout_user(id)`        | **指定した利用者**のすべて       | 消した数     | パスワードの再設定         |
 
+**非同期の処理の中では `*_async` を使ってください。**
+
+| 同期                     | 非同期                         |
+|--------------------------|--------------------------------|
+| `logout_other_devices()` | `logout_other_devices_async()` |
+| `logout_all_devices()`   | `logout_all_devices_async()`   |
+| `logout_user(id)`        | `logout_user_async(id)`        |
+
+同期版は置き場所の中を**そのスレッドで**全部見ます。セッションが数千本あると、
+同じスレッドに乗っているほかのリクエストが止まります。
+`*_async` は裏のスレッドに逃がすので待たせません。`Hash::make` と `make_async` の
+使い分けと同じ考え方です。`logout()` は 1 本だけなので同期のままでよいです。
+
 - **パスワードを変えたら `logout_other_devices()` を呼んでください。**
   変えただけでは、盗まれたセッションが期限まで生き残ります。
 - パスワードの再設定で `logout_user(id)` を使うのは、本人がログインしていないからです。
@@ -235,7 +252,7 @@ pub async fn login(req: Request) -> Result<Response> {
 // パスワードを書き換えたあとで、ほかの端末を切る
 user.password = Hash::make_async(&new_password).await?;
 user.save().await?;
-req.auth().logout_other_devices()?;
+req.auth().logout_other_devices_async().await?;
 ```
 
 気をつけること。
@@ -341,12 +358,17 @@ req.auth().logout_user(user.id)?;
 | `consume(email)`              | トークンを消す                                     |
 | `sweep_expired()`             | 期限切れをまとめて消す                             |
 | `link(パス, email, 鍵, 秒)`   | 署名付き・期限つきの URL を作る                    |
+| `lifetime_minutes()`          | トークンが使える時間（分）。いまは 60 で固定       |
 | `define(&mut Schema)`         | 表を作る定義                                       |
 
 **`consume_if_valid` を使ってください。**
 照合と削除を 1 つの文で行うので、トークンは 1 回しか使えません。
 `verify` で真を見てから `consume` を呼ぶ 2 段の書き方はやめてください。
 その間に別のリクエストが入ると、同じトークンが 2 回使えてしまいます。
+
+`verify` は「入力欄を出してよいか」の下調べ用です。
+**応答の速さの差は埋められません**（DB の往復時間が支配するため）。
+登録の有無を知られたくない場面では、`consume_if_valid` だけを入口にしてください。
 
 - 表に入るのは **トークンのハッシュ**です。表が漏れても、そのままでは使えません。
 - 期限は 60 分です。

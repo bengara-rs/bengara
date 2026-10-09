@@ -310,7 +310,10 @@ const RESERVED_NAMES: &[&str] = &[
 ///
 /// **`#[cfg(windows)]` で分けません。** OS で挙動を変えると、Linux で通った
 /// コードが Windows で黙ってデータを捨てます。全 OS で同じ名前を断ります。
-fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
+///
+/// キャッシュの鍵（`cache/mod.rs` の `normalize_key`）からも使います。
+/// 判定を 1 か所にまとめるためです。
+pub(crate) fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
     // 装置の名前は拡張子を付けても装置のまま（`nul.txt` も `nul`）。
     // 最初の `.` より前だけを見ます。
     let stem = part.split('.').next().unwrap_or(part);
@@ -328,17 +331,44 @@ fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
     Ok(())
 }
 
+/// どこまで深く潜るか。これより深いディレクトリは見ません。
+///
+/// 印（シンボリックリンク・ジャンクション）は飛ばすので輪にはなりませんが、
+/// 深いだけのディレクトリでもスタックを使い切らないよう上限を置きます。
+const MAX_DEPTH: usize = 32;
+
 /// ディレクトリの中のファイルを集める（再帰）。
 fn collect_files(dir: &Path, base: &Path, out: &mut Vec<String>) -> Result<()> {
+    collect_files_at(dir, base, out, 0)
+}
+
+/// 深さを数えながら集める。
+///
+/// **印（シンボリックリンク・ジャンクション）はたどりません。**
+/// `Path::is_dir()` は印の先を見るので、`storage/app/` の下に親を指す印が
+/// 1 つあるだけで再帰が止まらず、`Err` にもならずプロセスが落ちます。
+/// `storage:link` は作らない決まり（決定記録 #047）なので、印をたどる
+/// 前提は要りません。`entry.file_type()` は追加の問い合わせを出さない点でも
+/// `is_dir()` より軽いです。
+fn collect_files_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize) -> Result<()> {
+    if depth >= MAX_DEPTH {
+        return Ok(());
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(Error::Io(e)),
     };
     for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, base, out)?;
+        if kind.is_dir() {
+            collect_files_at(&path, base, out, depth + 1)?;
             continue;
         }
         if let Ok(relative) = path.strip_prefix(base) {
@@ -498,6 +528,28 @@ mod tests {
         assert!(disk.read("bin/a.dat").await.is_err());
 
         let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[test]
+    fn 一覧は深さの上限で止まる() {
+        let dir = std::env::temp_dir().join(format!("bengara-depth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 上限より深いところにもファイルを置く。
+        let mut deep = dir.clone();
+        for i in 0..(MAX_DEPTH + 2) {
+            deep = deep.join(format!("d{i}"));
+            std::fs::create_dir_all(&deep).unwrap();
+            std::fs::write(deep.join("a.txt"), "x").unwrap();
+        }
+
+        let mut out = Vec::new();
+        collect_files(&dir, &dir, &mut out).unwrap();
+        // 上限の手前までしか見ない（`d0` の 1 件目は深さ 1 で数える）。
+        assert_eq!(out.len(), MAX_DEPTH - 1);
+        assert!(out.iter().all(|p| p.ends_with("a.txt")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -235,6 +235,11 @@ crate::app::jobs::send_welcome::handle(r#"{"user_id":1}"#.to_string())
 assert_eq!(Mail::sent().len(), 1);
 ```
 
+## `queue:retry` を 2 つ同時に流しても二重に入りません
+
+失敗したジョブを戻すときは、**先に `failed_jobs` から消して、消せた分だけ**
+`jobs` に入れます。消せるのは 1 つだけなので、同じジョブが 2 本入りません。
+
 ## 無いもの
 
 | 項目                             | 代わりにすること              |

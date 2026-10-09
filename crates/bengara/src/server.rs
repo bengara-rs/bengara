@@ -194,7 +194,7 @@ fn log_target(req: &Request) -> String {
             Some((name, value)) => {
                 out.push_str(name);
                 out.push('=');
-                if crate::http::request::is_sensitive(name) {
+                if is_sensitive_name(name) {
                     out.push_str("***");
                 } else {
                     out.push_str(value);
@@ -205,6 +205,18 @@ fn log_target(req: &Request) -> String {
         }
     }
     out
+}
+
+/// 伏せる名前か。**符号化した名前も元に戻してから見ます。**
+///
+/// `?%74oken=abc` は `?token=abc` と同じものです。生のまま見ると素通りするので、
+/// `%` が入っているときだけ元に戻して確かめます（入っていなければ確保も増えません）。
+/// ログに出すのは生の名前のままです。
+fn is_sensitive_name(name: &str) -> bool {
+    if crate::http::request::is_sensitive(name) {
+        return true;
+    }
+    name.contains('%') && crate::http::request::is_sensitive(&crate::http::percent::decode(name))
 }
 
 /// `Content-Length` の申告を読む。無い・読めないときは `None`。
@@ -426,6 +438,17 @@ mod tests {
         assert_eq!(
             log_target(&req),
             "/unsubscribe?user=12&signature=***&token=***&page=2"
+        );
+    }
+
+    #[test]
+    fn ログは符号化した名前も伏せる() {
+        // `%74oken` は `token` と同じもの。生のまま見ると素通りしていた。
+        let req = Request::new("GET", "/reset").with_query("%74oken=abc&%73ignature=9f3c&page=2");
+        assert_eq!(
+            log_target(&req),
+            "/reset?%74oken=***&%73ignature=***&page=2",
+            "名前は生のまま出し、値だけ伏せる"
         );
     }
 

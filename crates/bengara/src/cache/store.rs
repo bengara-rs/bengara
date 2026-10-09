@@ -416,6 +416,29 @@ fn is_temp_path(path: &Path) -> bool {
         .is_some_and(|name| name.contains(TEMP_MARK))
 }
 
+/// 期限だけを読む。読めない・壊れているときは `None`。
+///
+/// 期限は `期限|値` の `|` より前にしかありません。`read_to_string` だと、
+/// `put_json` で入れた大きな構造体まで**捨てるためだけに**読み込みます。
+/// 先頭だけ読めば足ります（`i64` は最大 20 文字なので 32 バイト見れば十分）。
+fn read_expires_at(path: &Path) -> Option<i64> {
+    use std::io::Read;
+
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut head = [0u8; 32];
+    let mut filled = 0;
+    while filled < head.len() {
+        match reader.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return None,
+        }
+    }
+    let head = &head[..filled];
+    let end = head.iter().position(|b| *b == b'|')?;
+    std::str::from_utf8(&head[..end]).ok()?.trim().parse().ok()
+}
+
 /// 期限切れのファイルを消す。
 ///
 /// 呼び出し元は [`FileCache::prune`]（`cache:prune`）だけです。
@@ -440,11 +463,9 @@ fn sweep_expired(dir: &Path) -> Result<usize> {
             }
             continue;
         }
-        let expired = match std::fs::read_to_string(&path) {
-            Ok(raw) => Entry::decode(&raw).map(|e| e.expired()).unwrap_or(true),
-            // 読めないものは消す対象にする。
-            Err(_) => true,
-        };
+        // 期限は 1 行目の `|` より前にしかない。値は読まない。
+        let expired = read_expires_at(&path)
+            .is_none_or(|expires_at| expires_at != 0 && expires_at <= time::now_seconds());
         if expired && std::fs::remove_file(&path).is_ok() {
             removed += 1;
         }
@@ -622,6 +643,42 @@ mod tests {
         // `cache:clear`（flush）では消える。前は「書き込み中」として飛ばしていた。
         store.flush().unwrap();
         assert_eq!(store.get("report.2024.12").unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 大きな値でも期限だけ見て消す() {
+        let dir = temp_dir("prunehead");
+        let store = FileCache::new(&dir);
+
+        // 期限は 1 行目の `|` より前にしかない。値の全体は読まない。
+        let big = "あ".repeat(200_000);
+        store.put("big", &big, Some(0)).unwrap();
+        store.put("keep", &big, Some(3_600)).unwrap();
+        // 期限だけ読めていることを押さえる。
+        let expires = read_expires_at(&store.path_of("keep")).unwrap();
+        assert!(expires > time::now_seconds());
+
+        assert_eq!(sweep_expired(&dir).unwrap(), 1);
+        assert!(!store.path_of("big").exists());
+        assert_eq!(store.get("keep").unwrap().as_deref(), Some(big.as_str()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 壊れたファイルは消す() {
+        let dir = temp_dir("prunebroken");
+        let store = FileCache::new(&dir);
+
+        // `|` が無い・期限が数でない・空。どれも壊れている扱い。
+        for (key, raw) in [("a", "|"), ("b", "ごみ"), ("c", "x|値"), ("d", "")] {
+            std::fs::write(store.path_of(key), raw).unwrap();
+            assert!(read_expires_at(&store.path_of(key)).is_none(), "{key}");
+        }
+        assert_eq!(sweep_expired(&dir).unwrap(), 4);
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().count() == 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

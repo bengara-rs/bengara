@@ -20,6 +20,9 @@ pub(crate) const STORAGE_DIRECTORIES: &[&str] = &[
     "framework",
     "framework/cache",
     "framework/schedule",
+    // `cargo artisan serve` が本体の実行ファイルをコピーする場所。
+    // ここに入るのはアプリの実行ファイルそのものなので、`restrict` を通す。
+    "framework/serve",
     "framework/sessions",
     "logs",
 ];
@@ -71,14 +74,14 @@ fn join(root: &Path, relative: &str) -> PathBuf {
 ///
 /// Windows では何もしません。既定の継承に任せます。
 #[cfg(unix)]
-fn restrict(path: &Path) -> Result<()> {
+pub(crate) fn restrict(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &Path) -> Result<()> {
+pub(crate) fn restrict(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -151,6 +154,8 @@ mod tests {
         assert!(STORAGE_DIRECTORIES.contains(&"framework/cache"));
         assert!(STORAGE_DIRECTORIES.contains(&"framework/schedule"));
         assert!(STORAGE_DIRECTORIES.contains(&"framework/sessions"));
+        // `cargo artisan serve` のコピー置き場。入れないと 0700 に絞られない。
+        assert!(STORAGE_DIRECTORIES.contains(&"framework/serve"));
         assert!(STORAGE_DIRECTORIES.contains(&"logs"));
     }
 }

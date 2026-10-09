@@ -35,6 +35,40 @@ pub(crate) fn unreserved_or_slash(byte: u8) -> bool {
     unreserved(byte) || byte == b'/'
 }
 
+/// 符号化された URL のパスに、そのまま書ける文字。
+///
+/// RFC 3986 の path に出てこられる文字だけです。中身は次の 4 つ。
+///
+/// | 種類            | 文字                    |
+/// |-----------------|-------------------------|
+/// | unreserved      | 英数字 `-` `_` `.` `~`  |
+/// | sub-delims      | `!$&'()*+,;=`           |
+/// | pchar の残り    | `:` `@`                 |
+/// | 区切りと逃がし  | `/` `%`                 |
+///
+/// 署名付き URL のパスを確かめるのに使います。これ以外の文字は、ブラウザが
+/// 送るときに `%xx` に変わるので、署名が必ず合わなくなります。
+pub(crate) fn path_literal(byte: u8) -> bool {
+    unreserved(byte)
+        || matches!(
+            byte,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'/'
+                | b'%'
+        )
+}
+
 /// Cookie の名前と値にそのまま書ける文字。
 ///
 /// 区切りに使う文字（`;` `,` 空白 `=`）と、制御文字・非 ASCII は逃がします。
@@ -139,6 +173,16 @@ mod tests {
     fn スラッシュを残す形もある() {
         assert_eq!(encode("a/b.txt", unreserved_or_slash), "a/b.txt");
         assert_eq!(encode("a b/c", unreserved_or_slash), "a%20b/c");
+    }
+
+    #[test]
+    fn パスに書ける文字だけを通す() {
+        for ok in b"abzAZ09-_.~!$&'()*+,;=:@/%" {
+            assert!(path_literal(*ok), "{} は通すはず", *ok as char);
+        }
+        for bad in b" \"<>\\^`{}|?#\t\n\x7f\xe3" {
+            assert!(!path_literal(*bad), "{:#04x} は断るはず", bad);
+        }
     }
 
     #[test]

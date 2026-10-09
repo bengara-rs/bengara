@@ -50,14 +50,24 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
         .package_name()
         .ok_or_else(|| Error::msg("Cargo.toml の [package] に name がありません"))?;
 
+    // 置き場所は `storage:init` が作るが、無ければここで作る。
+    // 中に入るのはアプリの実行ファイルそのものなので、所有者だけに絞る。
     let run_dir = root.join("storage/framework/serve");
+    let created = !run_dir.is_dir();
     std::fs::create_dir_all(&run_dir)
         .map_err(|e| Error::msg(format!("{} を作れません: {e}", run_dir.display())))?;
+    if created {
+        crate::ops::restrict(&run_dir)?;
+    }
 
     // コピーの名前に自分のプロセス id を入れる。別の serve が動いていても
-    // 名前がぶつからず、片付けも自分のものだけに絞れる。
+    // 名前がぶつからず、ビルドのたびの片付けを自分のものだけに絞れる。
     let prefix = copy_prefix(&name, std::process::id());
-    clean_old_copies(&run_dir, &prefix);
+    // **起動時の1回だけ**は、pid を抜いた前置きで片付ける。前回の `serve` の
+    // コピーは別の pid なので、自分の pid に絞ると永久に残り、立ち上げ直すたびに
+    // 実行ファイルが積み上がる。動いている `serve` のコピーは、Windows では
+    // `remove_file` が失敗して自然に守られ、Unix では消しても動作に影響しない。
+    clean_old_copies(&run_dir, &startup_prefix(&name));
 
     println!("bengara serve: {name} を見張ります（Ctrl+C で終了）");
     println!(
@@ -198,6 +208,14 @@ fn copy_prefix(name: &str, pid: u32) -> String {
     format!("{name}-{pid}-")
 }
 
+/// 起動時の片付けで使う、名前の始まり。
+///
+/// プロセス id を入れません。前回の `serve` が残したコピー（別の pid）まで
+/// 消したいためです。**起動時の1回だけ**使います。
+fn startup_prefix(name: &str) -> String {
+    format!("{name}-")
+}
+
 /// できた実行ファイルを別の名前にコピーして起動する。
 ///
 /// Windows は動いている exe を上書きできないため、毎回違う名前にします。
@@ -258,8 +276,12 @@ fn stop(child: &mut Option<Child>) {
 /// 起動時と、本体を止めた直後に呼びます。動いている本体のコピーは消せませんが、
 /// そのときは黙って残します（次の機会に消えます）。
 ///
-/// **自分のプロセス id が付いたものだけ**を消します。他の `serve` が動かしている
-/// コピーを消すと、Linux / macOS では本当に消えてしまうためです。
+/// 消す範囲は `prefix` で決めます。
+///
+/// | 呼ぶところ   | `prefix`                      | 消すもの               |
+/// |--------------|-------------------------------|------------------------|
+/// | 起動時に1回  | `startup_prefix`（pid 抜き）  | 前回の分も含めて全部   |
+/// | ビルドのたび | `copy_prefix`（自分の pid）   | 自分が作った分だけ     |
 fn clean_old_copies(run_dir: &Path, prefix: &str) {
     let Ok(entries) = std::fs::read_dir(run_dir) else {
         return;
@@ -448,6 +470,38 @@ mod tests {
         assert!("myapp-4242-1.exe".starts_with(&prefix));
         // 別の serve のものは触らない。
         assert!(!"myapp-9999-1.exe".starts_with(&prefix));
+    }
+
+    #[test]
+    fn 起動時の片付けはプロセスidを問わない() {
+        // 自分の pid に絞ると、前回の serve のコピーが永久に残って積み上がる。
+        let prefix = startup_prefix("myapp");
+        assert_eq!(prefix, "myapp-");
+        assert!("myapp-4242-1.exe".starts_with(&prefix));
+        assert!("myapp-9999-1.exe".starts_with(&prefix));
+        // 別のプロジェクトの名前は含まない。
+        assert!(!"other-9999-1.exe".starts_with(&prefix));
+    }
+
+    #[test]
+    fn 起動時に別のプロセスidのコピーを消す() {
+        let dir = std::env::temp_dir().join(format!("bengara-serve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 前回の serve が残したコピー（別の pid）と、関係ないファイル。
+        for name in ["myapp-4242-1.exe", "myapp-9999-3.exe", "other-1-1.exe"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        clean_old_copies(&dir, &startup_prefix("myapp"));
+
+        assert!(!dir.join("myapp-4242-1.exe").exists());
+        assert!(!dir.join("myapp-9999-3.exe").exists());
+        // 別のプロジェクトのものは残す。
+        assert!(dir.join("other-1-1.exe").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

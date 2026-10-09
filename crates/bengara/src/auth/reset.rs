@@ -101,6 +101,11 @@ impl PasswordReset {
     ///
     /// 期限切れ・不一致・記録なしは、すべて偽。
     /// **理由は区別しません。** どれなのかが分かると、総当たりの手がかりになります。
+    ///
+    /// 3 つの経路（記録なし・期限切れ・不一致）は、どれも同じだけ `sha256` を通ります。
+    /// ただし**応答時間の差を消しきれるわけではありません。** 支配しているのは
+    /// DB の往復で、記録が無いときと有るときで待ち時間が違います。
+    /// 気になる場面では `consume_if_valid` だけを入口にしてください。
     pub async fn verify(email: &str, token: &str) -> Result<bool> {
         let Some(row) = DB::table(TABLE).where_("email", email).first().await? else {
             // 記録が無いときも、合っているときと同じだけ計算してから帰る。
@@ -112,14 +117,11 @@ impl PasswordReset {
         let stored: String = row.get("token")?;
         let created_at: String = row.get("created_at")?;
 
-        if Self::expired(&created_at) {
-            return Ok(false);
-        }
+        // 期限の判定は `sha256` の**あと**に置く。先に return すると、
+        // 期限切れの経路だけ計算を飛ばしてしまい、速さで見分けられる。
         let hashed = crypto::to_hex(&crypto::sha256(token.as_bytes()));
-        Ok(crypto::constant_time_eq(
-            hashed.as_bytes(),
-            stored.as_bytes(),
-        ))
+        let same = crypto::constant_time_eq(hashed.as_bytes(), stored.as_bytes());
+        Ok(same && !Self::expired(&created_at))
     }
 
     /// 使い終わったトークンを消す。**照合はしません。**
@@ -299,6 +301,30 @@ mod tests {
             // 残っているのは 1 本だけ。
             let rows = DB::table(TABLE).where_("email", email).get().await.unwrap();
             assert_eq!(rows.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn 期限切れのトークンは偽になる() {
+            let _db = setup().await;
+            let email = "old@example.com";
+            let token = PasswordReset::create(email).await.unwrap();
+            assert!(PasswordReset::verify(email, &token).await.unwrap());
+
+            // 作った時刻を 61 分前に書き換える（期限は 60 分）。
+            let old = time::format_timestamp(time::now_seconds() - 61 * 60);
+            DB::table(TABLE)
+                .where_("email", email)
+                .update(&[("created_at", old.clone().into())])
+                .await
+                .unwrap();
+
+            // 合っているトークンでも、期限切れなら偽。
+            assert!(!PasswordReset::verify(email, &token).await.unwrap());
+            // 合わないトークンも偽（理由は区別しない）。
+            assert!(!PasswordReset::verify(email, "ちがう").await.unwrap());
+            assert!(!PasswordReset::consume_if_valid(email, &token)
+                .await
+                .unwrap());
         }
 
         #[tokio::test]

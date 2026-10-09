@@ -1,12 +1,14 @@
 //! 静的ファイルの配信。
 //!
-//! 探す順番は次のとおりです。最初に見つかったものを返します。
+//! 入口は2つあり、パスで**どちらか一方**に決まります。両方を続けて探すことはしません。
 //!
-//! | 順 | 探す先                                   | いつ                     |
-//! |----|------------------------------------------|--------------------------|
-//! | 1  | `/storage/...` → `storage/app/public/`   | `GET` と `HEAD`          |
-//! | 2  | バイナリに埋め込んだ `public/`           | リリースビルド           |
-//! | 3  | ディスクの `public/`                     | 埋め込みに無いとき       |
+//! | 入口                       | 探す先                                             |
+//! |----------------------------|----------------------------------------------------|
+//! | `/storage/...` で始まる    | `storage/app/public/` だけ                         |
+//! | それ以外                   | 埋め込んだ `public/` → 無ければディスクの `public/` |
+//!
+//! どちらも `GET` と `HEAD` のときだけです。`/storage/x.css` が無くても
+//! `public/storage/x.css` は探しません。
 //!
 //! 埋め込みはリリースビルドのときだけ入ります（`bengara-build` が `PROFILE` を見ます）。
 //! デバッグビルドでは常にディスクを読むので、ファイルを直せばすぐ反映されます。
@@ -37,6 +39,12 @@ pub(crate) const STORAGE_PREFIX: &str = "/storage/";
 /// 名前に中身の印が入ったファイル（`app.abc123.js` など）に長い期限を付けたいときは、
 /// 前段のプロキシで上書きしてください。
 const CACHE_CONTROL: &str = "public, max-age=0, must-revalidate";
+
+/// 静的ファイルに付ける `X-Content-Type-Options`。
+///
+/// `storage/app/public/` はアプリが置いたファイルを配る入口です。種類の取り違えで
+/// `.html` や `.svg` が同じオリジンのスクリプトとして動くのを止めます。
+const NO_SNIFF: &str = "nosniff";
 
 /// 埋め込んだ1本ぶん。
 pub(crate) struct EmbeddedFile {
@@ -115,6 +123,7 @@ fn embedded_response(
     Response::static_bytes(content_type(Path::new(key)), file.body)
         .with_header("etag", file.etag.clone())
         .with_header("cache-control", CACHE_CONTROL)
+        .with_header("x-content-type-options", NO_SNIFF)
 }
 
 /// `storage/app/public/` から探して返す（`/storage/...`）。
@@ -132,7 +141,10 @@ pub(crate) fn serve_storage(
     // `/storage/` だけで来たときは 404。`safe_relative("")` は `index.html` を返すので、
     // そのまま渡すと `storage/app/public/index.html` を配ってしまいます。
     // 「空なら index.html」は `public/`（`GET /`）のための規則です。
-    if rest.is_empty() {
+    //
+    // `/storage//` のように `/` が続くと `rest` が `"/"` になります。先頭の `/` を
+    // 落としてから空かどうかを見ます（落とさないと空判定をすり抜けます）。
+    if rest.trim_start_matches('/').is_empty() {
         return None;
     }
     serve(public_disk, canonical_root, rest, if_none_match, want_body)
@@ -201,7 +213,8 @@ pub(crate) fn serve(
     let response = Response::new(200)
         .with_header("content-type", content_type(&canonical))
         .with_header("etag", etag)
-        .with_header("cache-control", CACHE_CONTROL);
+        .with_header("cache-control", CACHE_CONTROL)
+        .with_header("x-content-type-options", NO_SNIFF);
     if !want_body {
         // 本文を読まないので、長さは自分で知らせる。
         return Some(response.with_header("content-length", metadata.len().to_string()));
@@ -479,6 +492,24 @@ mod tests {
         // `/storage/` は index.html を指さない。`public/` 用の規則を持ち込まない。
         let dir = std::env::temp_dir();
         assert!(serve_storage(&dir, None, STORAGE_PREFIX, None, true).is_none());
+        // `/` が続いても同じ。先頭の `/` を落としてから空かどうかを見る。
+        assert!(serve_storage(&dir, None, "/storage//", None, true).is_none());
+        assert!(serve_storage(&dir, None, "/storage///", None, true).is_none());
+    }
+
+    #[test]
+    fn 静的ファイルにはnosniffが付く() {
+        // 埋め込みから。
+        let res = serve_embedded(files(), "/css/app.css", None).expect("あるはず");
+        assert_eq!(res.header("x-content-type-options"), Some(NO_SNIFF));
+
+        // ディスクから。
+        let dir = temp_dir("nosniff");
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let root = dir.canonicalize().unwrap();
+        let res = serve(&dir, Some(&root), "/a.txt", None, true).expect("あるはず");
+        assert_eq!(res.header("x-content-type-options"), Some(NO_SNIFF));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

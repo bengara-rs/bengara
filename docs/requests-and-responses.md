@@ -176,9 +176,13 @@ return abort_with(404, "記事が見つかりません");
 | `Error::Message`                  | 文字列のエラー               |
 | `Error::Io`                       | `std::io::Error` から変換    |
 | `Error::Json`                     | `serde_json::Error` から変換 |
+| `Error::Validation`               | 入力の検査に落ちた。**422**  |
+| `Error::Other`                    | ほかのエラーを包む。原因をたどれる |
 
 作り方は `Error::msg("...")` と `Error::http(404, "...")` です。
 `io::Error` と `serde_json::Error` からは `From` があるので、`?` で変換されます。
+ほかのエラーを包むときは `Error::other(e)` です。`Error::msg` と違って元のエラーを残すので、
+`APP_DEBUG=true` のエラーページに原因の連鎖が出ます。
 
 `Err` が返ったときは、`Error::Http` ならそのステータスになります。それ以外は 500 です。
 
@@ -190,6 +194,9 @@ return abort_with(404, "記事が見つかりません");
 |--------------------------------------------|-------------------------|
 | ルートが無く、`public/` にもファイルが無い | 404                     |
 | **パスは当たるが、メソッドが違う**         | 405 と `allow` ヘッダー |
+| メソッドが違い、`GET` のルートも無い       | 先に静的ファイルを探す（無ければ 405） |
+
+**末尾の `/` は無視されます。** `/posts/` は `/posts` に当たります（[routing.md](routing.md)）。
 
 `allow` には、そのパスで通るメソッドがアルファベット順に入ります（`allow: GET, HEAD, POST`）。
 `GET` があるときは `HEAD` も並びます（[routing.md](routing.md)）。
@@ -271,6 +278,9 @@ Application::configure()
 - Content-Type は拡張子から決めます。
 - パスの `%xx` は元に戻します。**`+` は空白にしません。**
 - `ETag` と `Cache-Control: public, max-age=0, must-revalidate` を付けます。
+- **`X-Content-Type-Options: nosniff` を付けます。** 中身を見て種類を推測されないように
+  するためです。`storage/app/public/` にはアプリが置いたファイルが入るので、
+  `.html` や `.svg` が同じオリジンでスクリプトとして動くのを防ぎます。
 - `If-None-Match` が合えば **304** を返します（本文は送りません）。
 - `HEAD` ではファイルを読まず、`content-length` だけを返します。
 

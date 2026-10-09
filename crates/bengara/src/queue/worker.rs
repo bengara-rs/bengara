@@ -391,6 +391,20 @@ pub(crate) async fn retry_failed(id: Option<i64>) -> Result<u64> {
     // 分けると、間でプロセスが死んだときに二重投入になります。
     let tx = DB::begin().await?;
     for row in &rows {
+        let failed_id: i64 = row.get("id")?;
+        // **先に消します。** 行はトランザクションの外で読んでいるので、
+        // `queue:retry` を 2 つ同時に流すと同じ行を両方が見ます。先に入れると
+        // `insert` は両方通り、二重投入になります（`delete` だけが 0 件になる）。
+        // 消せた側だけが入れ直せば、通るのは 1 つだけです
+        //（`finish` / `fail` と同じ「先に消す」考え方）。
+        let affected = tx
+            .table(FAILED_TABLE)
+            .where_("id", failed_id)
+            .delete()
+            .await?;
+        if affected != 1 {
+            continue;
+        }
         tx.table(TABLE)
             .insert(&[
                 ("queue", Value::Text(row.get("queue")?)),
@@ -400,11 +414,6 @@ pub(crate) async fn retry_failed(id: Option<i64>) -> Result<u64> {
                 ("available_at", Value::Text(now.clone())),
                 ("created_at", Value::Text(now.clone())),
             ])
-            .await?;
-        let failed_id: i64 = row.get("id")?;
-        tx.table(FAILED_TABLE)
-            .where_("id", failed_id)
-            .delete()
             .await?;
         moved += 1;
     }
@@ -552,5 +561,55 @@ mod tests {
         // 0 や負の値を渡しても、いま予約したものを取り直さない。
         assert!(reclaim_cutoff(now, 0) < time::format_timestamp(now));
         assert!(reclaim_cutoff(now, -5) < time::format_timestamp(now));
+    }
+
+    /// テスト用にキューの表を作る。`sqlite` が無いときは使いません。
+    #[cfg(feature = "sqlite")]
+    async fn 表を作る() {
+        let mut schema = crate::database::Schema::new(crate::database::Driver::Sqlite);
+        crate::queue::Queue::define(&mut schema);
+        for sql in schema.to_sql() {
+            DB::statement(sql, &[]).await.unwrap();
+        }
+    }
+
+    /// 諦めたジョブを 1 本入れて、その id を返す。`sqlite` が無いときは使いません。
+    #[cfg(feature = "sqlite")]
+    async fn 失敗を1本入れる() -> i64 {
+        let now = crate::database::now();
+        DB::table(FAILED_TABLE)
+            .insert_get_id(&[
+                ("queue", Value::Text(DEFAULT_QUEUE.to_string())),
+                ("job", Value::Text("SendWelcome".to_string())),
+                ("payload", Value::Text("{}".to_string())),
+                ("error", Value::Text("わざと失敗".to_string())),
+                ("failed_at", Value::Text(now)),
+            ])
+            .await
+            .unwrap()
+    }
+
+    /// 実際にデータベースをつなぐテストです。
+    ///
+    /// 機能フラグ `sqlite` が無いとつなげないので、そのときは飛ばします。
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 同じ失敗ジョブは二重に入らない() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        let id = 失敗を1本入れる().await;
+
+        // `queue:retry` を 2 つ同時に流した形。行はトランザクションの外で
+        // 読むので、両方が同じ失敗ジョブを見ます。消せた側だけが入れ直すので、
+        // 入るのは 1 本だけです（前は `insert` が両方通っていました）。
+        let (a, b) = tokio::join!(retry_failed(Some(id)), retry_failed(Some(id)));
+        let moved = a.unwrap() + b.unwrap();
+        assert_eq!(moved, 1, "入れ直したのは 1 本だけ");
+        assert_eq!(DB::table(TABLE).count().await.unwrap(), 1, "二重に入らない");
+        assert_eq!(DB::table(FAILED_TABLE).count().await.unwrap(), 0);
+
+        // もう 1 回流しても増えない。
+        assert_eq!(retry_failed(None).await.unwrap(), 0);
+        assert_eq!(DB::table(TABLE).count().await.unwrap(), 1);
     }
 }

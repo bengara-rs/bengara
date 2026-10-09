@@ -106,9 +106,12 @@ pub(crate) fn is_plain_identifier(name: &str) -> bool {
         .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
 }
 
-/// 比べるのに使える演算子の一覧。これ以外は受け付けません。
+/// 列と列を比べるのに使える演算子の一覧。これ以外は受け付けません。
 ///
 /// 大文字小文字は区別しません。語の間の空白はいくつでもかまいません。
+///
+/// **値1つと比べる側では使えないものが混ざっています。** そちらは
+/// [`VALUE_OPERATORS`] を見てください。
 pub(crate) const OPERATORS: &[&str] = &[
     "=",
     "!=",
@@ -130,14 +133,71 @@ pub(crate) const OPERATORS: &[&str] = &[
     "not between",
 ];
 
-/// 演算子として受け付けるか。
-pub(crate) fn is_allowed_operator(operator: &str) -> bool {
-    let normalized = operator
+/// 値1つと比べるのに使える演算子の一覧。
+///
+/// `in` / `between` 系を外しています。値1つでは SQL が成り立たないためです。
+/// `<=>` も外しています。MySQL だけの書き方なので、方言で結果が変わります。
+pub(crate) const VALUE_OPERATORS: &[&str] = &[
+    "=",
+    "!=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "like",
+    "not like",
+    "ilike",
+    "not ilike",
+    "is",
+    "is not",
+];
+
+/// 値を2つ以上とる演算子の一覧。専用のメソッドへ案内するために使います。
+pub(crate) const SET_OPERATORS: &[&str] = &["in", "not in", "between", "not between"];
+
+/// 大文字小文字と空白をそろえる。
+fn normalize_operator(operator: &str) -> String {
+    operator
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase();
-    OPERATORS.contains(&normalized.as_str())
+        .to_ascii_lowercase()
+}
+
+/// 列と列を比べる演算子として受け付けるか。
+pub(crate) fn is_allowed_operator(operator: &str) -> bool {
+    OPERATORS.contains(&normalize_operator(operator).as_str())
+}
+
+/// 値1つと比べる演算子として受け付けるか。
+pub(crate) fn is_allowed_value_operator(operator: &str) -> bool {
+    VALUE_OPERATORS.contains(&normalize_operator(operator).as_str())
+}
+
+/// 値を2つ以上とる演算子か。
+pub(crate) fn is_set_operator(operator: &str) -> bool {
+    SET_OPERATORS.contains(&normalize_operator(operator).as_str())
+}
+
+/// `offset` だけを付けたときに補う `limit`。
+///
+/// `offset` は `limit` が無いと受け付けないデータベースがあるので、
+/// 「上限なし」を表す書き方を足します。方言で違います。
+///
+/// | ドライバ   | 書き方                           |
+/// |------------|----------------------------------|
+/// | PostgreSQL | `limit all`                      |
+/// | MySQL      | `limit 18446744073709551615`     |
+/// | SQLite     | `limit -1`                       |
+///
+/// `limit -1` が通るのは SQLite だけです。MySQL では構文エラーになります。
+pub(crate) fn no_limit(driver: Driver) -> &'static str {
+    match driver {
+        Driver::Postgres => " limit all",
+        Driver::MySql => " limit 18446744073709551615",
+        Driver::Sqlite => " limit -1",
+    }
 }
 
 fn quote_part(driver: Driver, part: &str) -> String {
@@ -226,6 +286,39 @@ mod tests {
         assert!(!is_allowed_operator(""));
         assert!(!is_allowed_operator("= 1 or 1"));
         assert!(!is_allowed_operator("glob"));
+    }
+
+    #[test]
+    fn 値と比べる演算子は一覧が狭い() {
+        // 値1つと比べられるもの。
+        assert!(is_allowed_value_operator("="));
+        assert!(is_allowed_value_operator("NOT LIKE"));
+        assert!(is_allowed_value_operator("is not"));
+        // 値1つでは SQL が成り立たないもの。
+        assert!(!is_allowed_value_operator("in"));
+        assert!(!is_allowed_value_operator("between"));
+        assert!(!is_allowed_value_operator("not between"));
+        // MySQL だけの書き方。
+        assert!(!is_allowed_value_operator("<=>"));
+        // 列と列を比べる側では今までどおり通る。
+        assert!(is_allowed_operator("between"));
+        assert!(is_allowed_operator("<=>"));
+    }
+
+    #[test]
+    fn 値を2つ以上とる演算子が分かる() {
+        assert!(is_set_operator("IN"));
+        assert!(is_set_operator("not  between"));
+        assert!(!is_set_operator("="));
+        assert!(!is_set_operator("like"));
+    }
+
+    #[test]
+    fn 上限なしのlimitは方言で違う() {
+        // `limit -1` が通るのは SQLite だけ。
+        assert_eq!(no_limit(Driver::Sqlite), " limit -1");
+        assert_eq!(no_limit(Driver::MySql), " limit 18446744073709551615");
+        assert_eq!(no_limit(Driver::Postgres), " limit all");
     }
 
     #[test]

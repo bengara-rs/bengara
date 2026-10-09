@@ -76,6 +76,35 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    // 戻り値は捨てられます。黙って捨てると `async fn x() -> Result<()>` のときに
+    // 「期待される型は `()`」という、このマクロが見えないエラーになります。
+    if let syn::ReturnType::Type(_, ty) = &input.sig.output {
+        return syn::Error::new_spanned(
+            ty,
+            "#[bengara::test] を付けた関数は値を返せません。\
+             戻り値の型を書かずに、関数の中で結果を確かめてください",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // 型引数も捨てられます。`Generics` の `params` を見るので、ライフタイムと
+    // const 引数も同じ文で断ります。
+    if !input.sig.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &input.sig.generics,
+            "#[bengara::test] を付けた関数は型引数やライフタイムを取れません",
+        )
+        .to_compile_error()
+        .into();
+    }
+    if let Some(where_clause) = &input.sig.generics.where_clause {
+        return syn::Error::new_spanned(
+            where_clause,
+            "#[bengara::test] を付けた関数に `where` は書けません",
+        )
+        .to_compile_error()
+        .into();
+    }
 
     let attrs = &input.attrs;
     let vis = &input.vis;

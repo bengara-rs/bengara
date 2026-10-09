@@ -112,7 +112,10 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     write_if_missing(root, "public/robots.txt", stub("robots"), &mut report)?;
 
     let env_text = stub("env").replace("{{name}}", &name);
-    write_if_missing(root, ".env", &env_text, &mut report)?;
+    // `.env` には、あとで `key:generate` が `APP_KEY` を書き込む。
+    // 秘密を持つファイルなので、所有者だけが読めるようにする。
+    // `.env.example` は秘密を持たないので、ふつうの権限のままにする。
+    write_secret_if_missing(root, ".env", &env_text, &mut report)?;
     write_if_missing(root, ".env.example", &env_text, &mut report)?;
 
     // アプリの骨組み。
@@ -265,6 +268,43 @@ fn write_if_missing(
     }
     write_file(&path, contents)?;
     report.created.push(relative.to_string());
+    Ok(())
+}
+
+/// 秘密を持つファイルを書く。中身は `write_if_missing` と同じで、権限だけ絞ります。
+fn write_secret_if_missing(
+    root: &Path,
+    relative: &str,
+    contents: &str,
+    report: &mut Report,
+) -> Result<()> {
+    let path = root.join(relative);
+    if path.exists() {
+        report.kept.push(relative.to_string());
+        return Ok(());
+    }
+    write_file(&path, contents)?;
+    restrict_file(&path)?;
+    report.created.push(relative.to_string());
+    Ok(())
+}
+
+/// 所有者だけが読み書きできるようにする（Unix のみ）。
+///
+/// `std::fs::write` だけでは umask まかせ（ふつう 0644）で、共用ホストでは
+/// 同じマシンの他のアカウントから `APP_KEY` が読めます。`storage/` は 0700 に
+/// 絞ってあるので、秘密を持つファイルのほうが緩いのは不釣り合いです。
+///
+/// Windows では何もしません。既定の継承に任せます（`ops::restrict` と同じ方針）。
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::msg(format!("{} の権限を絞れません: {e}", path.display())))
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -542,6 +582,30 @@ fn update_manifest(manifest: &mut CargoToml, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `.env` には `APP_KEY` が入るので、所有者だけが読める権限にする。
+    #[cfg(unix)]
+    #[test]
+    fn 秘密を持つファイルは0600になる() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("bengara-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut report = Report::default();
+        write_secret_if_missing(&root, ".env", "APP_KEY=\n", &mut report).unwrap();
+
+        let mode = std::fs::metadata(root.join(".env"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        assert_eq!(report.created, vec![".env".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn 置き換えてよいmainを見分ける() {

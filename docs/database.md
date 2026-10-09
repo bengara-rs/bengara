@@ -261,6 +261,9 @@ let sum = DB::table("posts").sum::<i64>("views").await?;                // Optio
 
 `paginate` の `total` も同じ数え方です。
 
+`exists()` と `doesnt_exist()` は、**並び順と件数の指定を外して**から数えます。
+有無を見るだけなので、`latest()` が付いていても並べ替えは走りません。
+
 `sum` / `avg` / `min` / `max` は `group_by` と併用できません。
 グループごとの値が欲しいときは、`select` に式を書いて `get()` します。
 
@@ -316,9 +319,13 @@ let changed = DB::table("posts")
 // 削除（返るのは件数）
 let removed = DB::table("posts").where_("id", id).delete().await?;
 
-// 全部消す
+// 全部消す（自動採番も 1 に戻る）
 DB::table("posts").truncate().await?;
 ```
+
+`truncate()` は **採番も戻します。** 消したあとの `insert` は `id = 1` から始まります。
+SQLite には `truncate` 文が無いので、条件なしの `delete` と採番の記録の削除を
+続けて流しています。`truncate table` を持つ方言と同じ結果にそろえるためです。
 
 **条件を書かないと全行が対象です。** Laravel と同じです。
 
@@ -330,6 +337,46 @@ DB::table("posts").truncate().await?;
 let ids: Vec<i64> = DB::table("posts").latest().limit(10).pluck::<i64>("id").await?;
 DB::table("posts").where_in("id", &ids).update(&[("status", "archived".into())]).await?;
 ```
+
+### 数を増やす・減らす
+
+```rust
+// views = views + 1 を 1 文で流す（返るのは件数）
+let changed = DB::table("posts").where_("id", id).increment("views", 1).await?;
+let changed = DB::table("posts").where_("id", id).decrement("stock", 1).await?;
+```
+
+**`update` で数を増やしてはいけません。**
+
+```rust
+// 駄目な書き方
+DB::table("posts").where_("id", id).update(&[("views", (post.views + 1).into())]).await?;
+```
+
+読んだ値に 1 を足して書き戻す形なので、**同時に 2 本来ると片方の分が消えます。**
+`increment` は `set "views" = "views" + ?` を 1 文で流すので消えません。
+
+- `updated_at` は入れません（`update` と同じです）。
+- `join` や `limit` を付けるとエラーです（`update` と同じ理由）。
+- Laravel の「ほかの列も一緒に更新する」引数はありません。
+
+### 入らなかった理由を見分ける
+
+一意制約（`unique`）に当たったかどうかを聞けます。
+
+```rust
+use bengara::database::is_unique_violation;
+
+if let Err(error) = DB::table("users").insert(&[("email", email.into())]).await {
+    if is_unique_violation(&error) {
+        return abort_with(422, "そのメールアドレスは登録済みです");
+    }
+    return Err(error);
+}
+```
+
+**エラーの文を自分で読まないでください。** 文は方言ごとに違います。
+いまはこの 1 つだけです。ほかの種類（外部キー違反など）はまだ見分けられません。
 
 ### 日時
 
@@ -449,7 +496,8 @@ SQL が失敗したときは、文だけを添えて返します。
 | 条件          | `where_` / `where_op` / `or_where` / `or_where_op` / `where_in` / `where_not_in` / `or_where_in` / `where_null` / `where_not_null` / `where_between` / `where_not_between` / `where_like` / `where_column` |
 | 並び・束ね    | `order_by` / `order_by_desc` / `group_by` / `having_op`                                                                                                                           |
 | 結合          | `join` / `left_join`（表名・両側の列名・演算子）                                                                                                                                  |
-| 書き込み      | `insert` / `insert_many` / `insert_get_id_as` / `update` の列名と、`insert_get_id_as` の主キー名                                                                                   |
+| 集計・取り出し | `sum` / `avg` / `min` / `max` / `pluck` / `value` の列名                                                                                                                          |
+| 書き込み      | `insert` / `insert_many` / `insert_get_id_as` / `update` / `increment` / `decrement` の列名と、`insert_get_id_as` の主キー名                                                       |
 
 エラーが出るタイミングは 2 つに分かれます。
 
@@ -464,8 +512,19 @@ SQL が失敗したときは、文だけを添えて返します。
   `"` `;` `(` `-` と空白は Unicode でも英数字ではないので、検査の強さは変わりません。
 - **引用符（`"` と `` ` ``）を含む名前は、式として素通ししません。**
   `""` と ``` `` ``` に逃がしてくくります。引用符を 1 つ混ぜて検査を抜ける道をふさぐためです。
-- 式を書きたいときは `select` / `order_by_raw` / `having_raw` / `where_raw` を使います。
-  **この 4 つは検査しません。** 外から来た文字列を渡さないでください。
+- 式を書きたいときは `select` / `add_select` / `order_by_raw` / `having_raw` / `where_raw` を
+  使います。**この 5 つは検査しません。** 外から来た文字列を渡さないでください。
+
+### 演算子の一覧は 2 つに分かれています
+
+**値と比べる側は狭いです。** `where_op` / `or_where_op` / `having_op` に渡せるのは
+`=` `!=` `<>` `<` `<=` `>` `>=` `like` `not like` `ilike` `not ilike` `is` `is not` だけです。
+
+`in` や `between` を渡すとエラーになります。値 1 つでは SQL が組み立たないからです。
+`where_in` / `where_between` を使ってください。
+
+列と列を比べる側（`where_column` / `join`）は、これに `in` / `between` / `<=>` を加えた
+広い一覧を使います。
 
 ## できないこと・エラーになること
 
@@ -480,6 +539,9 @@ SQL が失敗したときは、文だけを添えて返します。
 | `update` / `delete` に `order_by`                                    | **黙って無視**               | SQL に入らなくても、当たる行が変わりません       |
 | `where_` を付けた `truncate()`                                       | エラー                       | 絞って消すなら `delete()` を使います             |
 | `truncate()` に `join` / `limit` / `offset` / `group_by` / `having` / `distinct` | エラー            | `update` / `delete` と同じです                   |
+| `insert` 系に `where_` / `join` / `limit` など                       | エラー                       | SQL に入らず、書いたつもりの条件が消えます       |
+| `increment` / `decrement` に `join` / `limit` など                   | エラー                       | `update` と同じです                              |
+| `where_op` / `having_op` に `in` / `between` / `<=>`                 | エラー                       | 値 1 つでは組み立ちません。`where_in` などを使います |
 | `where_raw` の `?` の数と値の数が合わない                            | 終端のメソッドでエラー       |                                                  |
 | 使えない文字を含む列名・表名                                         | 終端、または呼んだその場     | 上の「列名と表名は検査します」を参照             |
 | 幅の狭い型に収まらない値を読む                                       | 読み出しでエラー             | `f32` に収まらない小数も同じです                 |

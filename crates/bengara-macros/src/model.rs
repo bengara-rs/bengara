@@ -42,7 +42,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new(
             input.generics.span(),
-            "#[derive(Model)] は型引数のある構造体には使えません",
+            // 見ているのは `generics.params` なので、ライフタイムと const 引数も断ります。
+            "#[derive(Model)] は型引数やライフタイムのある構造体には使えません",
         ));
     }
 
@@ -114,34 +115,31 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         });
 
     // created_at / updated_at があれば、保存のときに今の時刻を入れる。
-    let has_created = used.iter().any(|f| f.column == "created_at");
-    let has_updated = used.iter().any(|f| f.column == "updated_at");
-    let touch = if has_created || has_updated {
-        let created = if has_created {
-            let ident = used
-                .iter()
-                .find(|f| f.column == "created_at")
-                .map(|f| f.ident.clone())
-                .expect("直前に確かめている");
-            quote! {
+    //
+    // 「あるか」と「どれか」を別々に調べると、列名の決め方を変えたときに
+    // 片方だけ直してマクロがパニックします。最初から `find` の結果で分けます。
+    let created = used
+        .iter()
+        .find(|f| f.column == "created_at")
+        .map(|f| f.ident.clone());
+    let updated = used
+        .iter()
+        .find(|f| f.column == "updated_at")
+        .map(|f| f.ident.clone());
+    let touch = if created.is_some() || updated.is_some() {
+        let created = match &created {
+            Some(ident) => quote! {
                 if __creating {
                     self.#ident = ::core::convert::Into::into(
                         ::core::clone::Clone::clone(&__now),
                     );
                 }
-            }
-        } else {
-            quote! {}
+            },
+            None => quote! {},
         };
-        let updated = if has_updated {
-            let ident = used
-                .iter()
-                .find(|f| f.column == "updated_at")
-                .map(|f| f.ident.clone())
-                .expect("直前に確かめている");
-            quote! { self.#ident = ::core::convert::Into::into(__now); }
-        } else {
-            quote! {}
+        let updated = match &updated {
+            Some(ident) => quote! { self.#ident = ::core::convert::Into::into(__now); },
+            None => quote! {},
         };
         quote! {
             fn touch_timestamps(&mut self, __creating: bool) {

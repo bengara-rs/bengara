@@ -142,17 +142,21 @@ public            /opt/myapp/public
 ./myapp storage:init
 ```
 
-作るのは **7 つ**です。
+作るのは **8 つ**です。
 
-| 作るもの                     | 用途                  |
-|------------------------------|-----------------------|
-| `storage/app`                | `Storage` の `local`  |
-| `storage/app/public`         | `Storage` の `public` |
-| `storage/framework`          | 下の 3 つの親         |
-| `storage/framework/cache`    | キャッシュ            |
-| `storage/framework/schedule` | 定期処理の前回時刻    |
-| `storage/framework/sessions` | セッション            |
-| `storage/logs`               | ログ・メールのログ    |
+| 作るもの                     | 用途                            |
+|------------------------------|---------------------------------|
+| `storage/app`                | `Storage` の `local`            |
+| `storage/app/public`         | `Storage` の `public`           |
+| `storage/framework`          | 下の 4 つの親                   |
+| `storage/framework/cache`    | キャッシュ                      |
+| `storage/framework/schedule` | 定期処理の前回時刻              |
+| `storage/framework/serve`    | `serve` が作る実行ファイルの控え |
+| `storage/framework/sessions` | セッション                      |
+| `storage/logs`               | ログ・メールのログ              |
+
+`framework/serve` を使うのは開発中の `serve` だけです。本番では空のままですが、
+一覧を 2 か所に書くとずれるので、ここでまとめて作ります。
 
 | 決めごと           | 内容                                      |
 |--------------------|-------------------------------------------|
@@ -307,8 +311,11 @@ server {
 ### 接続元のアドレスを伝える
 
 前段にプロキシを置くと、本体から見える接続元はプロキシのアドレスになります。
-回数の制限（`throttle`）は接続元のアドレスで数えるので、全員が同じ枠を共有してしまいます。
-そこで `.env` に `TRUSTED_PROXIES` を書きます。
+回数の制限（`throttle`）は、ログインしていない人を **接続元のアドレス**で数えます。
+そのため全員が同じ枠を共有してしまいます。そこで `.env` に `TRUSTED_PROXIES` を書きます。
+
+ログインしている人は利用者の ID で数えるので、この影響を受けません
+（[middleware.md](middleware.md)）。
 
 ```
 TRUSTED_PROXIES=127.0.0.1
@@ -318,7 +325,7 @@ TRUSTED_PROXIES=127.0.0.1
 |------------------|-------------------------------------------------------------|
 | 見るヘッダー     | `X-Forwarded-For` と `X-Real-IP`                            |
 | 見る条件         | **接続元がこの一覧に載っているときだけ**                    |
-| 空のとき（既定） | **どちらのヘッダーも見ません。** 接続元のアドレスで数えます |
+| 空のとき（既定） | **どちらのヘッダーも見ません。** つないできた相手で数えます |
 | 書き方           | IP アドレスをカンマで並べる。`*` で全部を信じる             |
 | 範囲指定（CIDR） | **書けません。** `10.0.0.0/8` のような書き方は使えません    |
 | 読めない値       | 警告を出して無視します                                      |

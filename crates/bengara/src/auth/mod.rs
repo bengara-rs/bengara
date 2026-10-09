@@ -132,6 +132,9 @@ impl<'a> Auth<'a> {
     ///   索引は持ちません。
     /// - 自分で作った `SessionStore` が `destroy_for_user_except` を実装していなければ、
     ///   警告を出して `0` を返します。
+    ///
+    /// **非同期の処理の中では
+    /// [`logout_other_devices_async`](Self::logout_other_devices_async) を使ってください。**
     pub fn logout_other_devices(&self) -> Result<usize> {
         let session = self.session()?;
         let Some(user_id) = self.id() else {
@@ -142,18 +145,60 @@ impl<'a> Auth<'a> {
             .destroy_for_user_except(&user_id, &session.id())
     }
 
+    /// [`logout_other_devices`](Self::logout_other_devices) を裏のスレッドで行う。
+    ///
+    /// **非同期の処理（ハンドラ・ジョブ・コマンドの `async fn`）の中では
+    /// こちらを使ってください。** 同期版は置き場所の中を全部見るので、
+    /// そのあいだ tokio のワーカースレッドを塞ぎます。
+    ///
+    /// ```ignore
+    /// // パスワードを書き換えたあとで
+    /// req.auth().logout_other_devices_async().await?;
+    /// ```
+    pub async fn logout_other_devices_async(&self) -> Result<usize> {
+        let session = self.session()?;
+        let Some(user_id) = self.id() else {
+            return Ok(0);
+        };
+        let store = session.store()?;
+        let keep_id = session.id();
+        crate::support::blocking(move || store.destroy_for_user_except(&user_id, &keep_id)).await?
+    }
+
     /// 同じ利用者のセッションを**全部**切る。消した数を返す。
     ///
     /// このセッションも切れるので、呼んだ本人もログアウトします。
     /// 「全部の端末からログアウト」のボタンに使います。
     ///
     /// 注意は [`logout_other_devices`](Self::logout_other_devices) と同じです。
+    ///
+    /// **非同期の処理の中では
+    /// [`logout_all_devices_async`](Self::logout_all_devices_async) を使ってください。**
     pub fn logout_all_devices(&self) -> Result<usize> {
         let session = self.session()?;
         let Some(user_id) = self.id() else {
             return Ok(0);
         };
         let removed = session.store()?.destroy_for_user(&user_id)?;
+        // いまのセッションは、置き場所から消したうえで Cookie も作り直す。
+        self.logout()?;
+        Ok(removed)
+    }
+
+    /// [`logout_all_devices`](Self::logout_all_devices) を裏のスレッドで行う。
+    ///
+    /// **非同期の処理の中ではこちらを使ってください。**
+    ///
+    /// ```ignore
+    /// let removed = req.auth().logout_all_devices_async().await?;
+    /// ```
+    pub async fn logout_all_devices_async(&self) -> Result<usize> {
+        let session = self.session()?;
+        let Some(user_id) = self.id() else {
+            return Ok(0);
+        };
+        let store = session.store()?;
+        let removed = crate::support::blocking(move || store.destroy_for_user(&user_id)).await??;
         // いまのセッションは、置き場所から消したうえで Cookie も作り直す。
         self.logout()?;
         Ok(removed)
@@ -171,10 +216,27 @@ impl<'a> Auth<'a> {
     /// ```
     ///
     /// 注意は [`logout_other_devices`](Self::logout_other_devices) と同じです。
+    ///
+    /// **非同期の処理の中では [`logout_user_async`](Self::logout_user_async) を
+    /// 使ってください。**
     pub fn logout_user(&self, user_id: impl std::fmt::Display) -> Result<usize> {
         self.session()?
             .store()?
             .destroy_for_user(&user_id.to_string())
+    }
+
+    /// [`logout_user`](Self::logout_user) を裏のスレッドで行う。
+    ///
+    /// **非同期の処理の中ではこちらを使ってください。**
+    ///
+    /// ```ignore
+    /// // パスワードを書き換えたあとで、その人のセッションを全部切る
+    /// req.auth().logout_user_async(user.key()).await?;
+    /// ```
+    pub async fn logout_user_async(&self, user_id: impl std::fmt::Display) -> Result<usize> {
+        let store = self.session()?.store()?;
+        let user_id = user_id.to_string();
+        crate::support::blocking(move || store.destroy_for_user(&user_id)).await?
     }
 
     /// ログイン中の利用者を DB から読む。
@@ -403,6 +465,59 @@ mod tests {
         assert!(store.read("a").unwrap().is_none());
         assert!(store.read("b").unwrap().is_none());
         assert!(store.read("c").unwrap().is_some(), "他の利用者は残る");
+    }
+
+    #[tokio::test]
+    async fn 非同期版も同じ件数を返す() {
+        use crate::session::{MemoryStore, SessionStore};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let data = |user_id: &str| {
+            let mut data = BTreeMap::new();
+            data.insert(AUTH_ID_KEY.to_string(), user_id.to_string());
+            data
+        };
+
+        // ログインしていなければ、同期版と同じく 0。
+        let session = Session::empty();
+        let auth = Auth::new(Some(&session));
+        assert_eq!(auth.logout_other_devices_async().await.unwrap(), 0);
+        assert_eq!(auth.logout_all_devices_async().await.unwrap(), 0);
+
+        // 他の端末だけ切る。
+        let store = Arc::new(MemoryStore::new(60));
+        let session = Session::empty().with_store(store.clone());
+        let auth = Auth::new(Some(&session));
+        auth.login_using_id(7).unwrap();
+        let mine = session.id();
+        store.write(&mine, &data("7")).unwrap();
+        store.write("sameuser", &data("7")).unwrap();
+        store.write("otheruser", &data("8")).unwrap();
+        assert_eq!(auth.logout_other_devices_async().await.unwrap(), 1);
+        assert!(store.read(&mine).unwrap().is_some(), "自分は残る");
+        assert!(store.read("otheruser").unwrap().is_some(), "他の利用者");
+
+        // 全部切ると自分も切れる。
+        assert_eq!(auth.logout_all_devices_async().await.unwrap(), 1);
+        assert!(store.read(&mine).unwrap().is_none());
+        assert!(!auth.check(), "呼んだ本人もログアウトする");
+
+        // 利用者を指定して切る。
+        let store = Arc::new(MemoryStore::new(60));
+        let session = Session::empty().with_store(store.clone());
+        let auth = Auth::new(Some(&session));
+        store.write("a", &data("7")).unwrap();
+        store.write("b", &data("7")).unwrap();
+        store.write("c", &data("8")).unwrap();
+        assert_eq!(auth.logout_user_async(7).await.unwrap(), 2);
+        assert!(store.read("c").unwrap().is_some(), "他の利用者は残る");
+
+        // セッションが無ければ、同期版と同じくエラー。
+        let auth = Auth::new(None);
+        assert!(auth.logout_other_devices_async().await.is_err());
+        assert!(auth.logout_all_devices_async().await.is_err());
+        assert!(auth.logout_user_async(7).await.is_err());
     }
 
     #[cfg(not(feature = "encryption"))]

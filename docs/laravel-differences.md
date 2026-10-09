@@ -57,7 +57,11 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `$request->hasValidSignature()`                     | `has_valid_signature(&req)?`                                                          |
 | ミドルウェア `signed` が自動で止める                | **止まりません。** 自分で確かめて返し方を決めます                                     |
 
-`signed_url()` は `?` `#` と非 ASCII を含むパスを断ります。符号化済みのパスを渡してください。
+`signed_url()` は **URL にそのまま書けない文字**を含むパスを断ります（空白・`?`・`#`・
+`<`・`>`・`\`・非 ASCII など）。符号化済みのパスを渡してください。
+
+**末尾の `/` は無視します。** `/posts` と `/posts/` は同じルートに当たります。
+Laravel は 301 で寄せますが、bengara は転送せずそのまま処理します。
 
 ## コントローラとレスポンス
 
@@ -86,6 +90,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | 落ちると例外 → リダイレクトか JSON       | 落ちると `Error::Validation` → 422。`Accept` で分かれます |
 | `old('title')`                           | `req.session().old("title")`                              |
 | `regex:` / `unique:` / `exists:`         | ありません。`exists()` をクエリで書きます                 |
+| 重なりは `unique:` で止める              | 表の `unique` が砦です。`is_unique_violation` で見分けます |
 | フォームリクエスト（`StorePostRequest`） | ありません                                                |
 
 ## セッションと CSRF
@@ -95,6 +100,8 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `session(['k' => 'v'])`                   | `req.session().put("k", "v")`                              |
 | `session()->flash('k', 'v')`              | `req.session().flash("k", "v")`                            |
 | `SESSION_DRIVER=file`（既定）             | 同じ。`memory` も選べます（テスト用）                      |
+| 毎リクエスト保存して期限を延ばす          | **残りが半分を切ったときだけ**書き直します                 |
+| 同じ鍵の `put` と `flash` は後勝ち        | 同じ。`flash` を先に見ます                                 |
 | Cookie は暗号化される                     | **署名だけ。** 中身はサーバー側に置きます                  |
 | `regenerate()` が CSRF トークンも作り直す | 同じ。ログイン前のトークンはログイン後に使えません         |
 | `@csrf` が隠しフィールドを出す            | テンプレートが無いので `req.csrf_token()` を自分で埋めます |
@@ -115,8 +122,11 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `bootstrap/app.php` の `withExceptions` | `with_exceptions(\|e\| e.render(...))`                    |
 | `throttle:60,1`                         | `Throttle::from_spec("60,1")?` を `alias` に登録します    |
 | 制限はキャッシュで共有される            | **プロセスごとに数えます**（2 プロセスなら上限は約 2 倍） |
-| 数えるのは接続元のアドレス              | 同じ。`X-Forwarded-For` と `X-Real-IP` は下の行の相手だけ |
+| 数えるのは「人かアドレス」               | 同じ。ログイン中はその人、していなければ接続元のアドレス  |
+| 数える単位はルート                      | **ルート名**と組にします。名前が無いときだけパス           |
+| `X-Forwarded-For` を見る                | **下の行の相手からのものだけ**見ます                      |
 | `TrustProxies` ミドルウェア             | 環境変数 `TRUSTED_PROXIES`。範囲指定（CIDR）は書けません  |
+| 転送元は右端から探す                    | 同じ。読めない値は捨てます                                |
 
 ## データベース
 
@@ -129,6 +139,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `->limit(1)->update([...])` が効く                 | **エラーになります。** 黙って全件に当てないためです          |
 | `->groupBy()` ＋ `->count()`                       | **グループの数**を返します                                   |
 | `->groupBy()` ＋ `->sum()` など                    | **併用できません**（エラー）                                 |
+| `->increment('views')`                             | `.increment("views", 1)`（量は必ず書きます）                 |
 | `->paginate(15)` が `?page=` を見る                | `.paginate(15, req.page())`（**引数で渡します**）            |
 | `->get()` が Collection を返す                     | `.get().await?` が `Vec<Row>` を返します                     |
 | `$row->title`                                      | `row.get::<String>("title")?`                                |
@@ -136,7 +147,9 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | MySQL / PostgreSQL / SQLite / SQL Server           | **SQLite だけ**（機能フラグ `sqlite`）                       |
 | 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作ります |
 
-エラーになるのは `update` と `delete` に `join` / `limit` / `offset` を付けたときです。
+`update` / `delete` / `truncate` に `join` / `limit` / `offset` / `group_by` / `having` /
+`distinct` を付けるとエラーです。`order_by` だけは黙って無視します。
+`truncate` に条件（`where_`）を付けるのもエラーです（絞って消すなら `delete()`）。
 
 ## モデルとマイグレーション
 
@@ -167,7 +180,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `Auth::attempt(['email' => .., 'password' => ..])` | `req.auth().attempt::<User>("email", email, password).await?`             |
 | `Auth::user()` / `Auth::id()` / `Auth::check()`    | `req.auth().user::<User>().await?` など。どこからでも読める形はありません |
 | `Auth::logout()`                                   | `req.auth().logout()?`（いまのセッションだけ）                            |
-| `Auth::logoutOtherDevices($password)`              | `req.auth().logout_other_devices()?`。パスワードの確認は自分で行います    |
+| `Auth::logoutOtherDevices($password)`              | `req.auth().logout_other_devices_async().await?`。パスワードの確認は自分で行います |
 | （利用者を指定して切る口は無い）                   | `logout_all_devices()` / `logout_user(id)` があります                     |
 | `auth` ミドルウェア                                | `Authenticate::new()` を `alias("auth", ..)` で登録します                 |
 | `class User extends Authenticatable`               | `#[derive(Model)]` ＋ `impl Authenticatable`                              |
@@ -207,6 +220,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `config/queue.php` の `retry_after`       | `WorkerOptions` と `queue:work --retry-after=`（既定 90 秒）             |
 | `Redis` のキュー・キャッシュ              | ありません。キューは DB、キャッシュはファイルです                        |
 | `->everyMinute()` / `->cron('0 3 * * 1')` | `Every::Minute` などの列挙。cron の式は読みません                        |
+| 間隔は分の頭で判定する                    | 前回から数えます。**30 秒の遅れは許します**（間隔が 1 分以上のとき）     |
 | `schedule:work`                           | ありません。cron から `schedule:run` を 1 分ごとに呼びます               |
 | 前回の実行時刻はキャッシュに置く          | `storage/framework/schedule/` のファイルに置きます                       |
 | イベントクラス＋`EventServiceProvider`    | 名前は文字列。登録は `bootstrap/app.rs` の `with_events`                 |
@@ -218,6 +232,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | 言語ファイルは PHP の配列                 | `resources/lang/<言語>.toml` か `<言語>/<群>.toml`。**ビルド時に読む**   |
 | `trans_choice`（複数形）                  | ありません。鍵を分けます                                                 |
 | `make:command` ＋ `$signature`            | `app/Console/Commands/*.rs` に `DESCRIPTION` と `handle`                 |
+| コマンド名は自分で書く                    | ファイル名から作ります。使える文字は英数字と `_` `-` だけ                |
 
 ## パスを返す関数
 

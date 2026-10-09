@@ -272,6 +272,35 @@ pub(crate) fn test_backend() -> Option<Arc<dyn Backend>> {
     TEST_BACKEND.get().map(Arc::clone)
 }
 
+/// エラーが一意制約違反（unique / primary key の重なり）か。
+///
+/// 同じ値をもう一度入れたときに真になります。エラーの文を `contains` で見るのを
+/// やめるための口です。
+///
+/// ```ignore
+/// use bengara::database::is_unique_violation;
+///
+/// if let Err(error) = DB::table("users").insert(&[("email", email.into())]).await {
+///     if is_unique_violation(&error) {
+///         return Err(Error::http(409, "そのメールアドレスは使われています"));
+///     }
+///     return Err(error);
+/// }
+/// ```
+///
+/// `Error` の列挙に腕は足しません。利用者が書いた `match` を壊さないためです。
+pub fn is_unique_violation(error: &Error) -> bool {
+    #[cfg(feature = "sqlite")]
+    {
+        sqlite::is_unique_violation(error)
+    }
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// クエリをどこへ投げるか。
 #[derive(Clone)]
 pub(crate) enum Source {

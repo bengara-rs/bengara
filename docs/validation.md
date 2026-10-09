@@ -60,11 +60,24 @@ pub async fn store(req: Request) -> Result<Response> {
 | 分類       | 規則                                               |
 |------------|----------------------------------------------------|
 | 必須と省略 | `required`、`nullable`                             |
-| 型         | `integer`、`numeric`、`boolean`                    |
+| 型         | `integer`（`int`）、`numeric`、`boolean`（`bool`） |
 | 形         | `email`、`url`、`alpha`、`alpha_num`、`alpha_dash` |
 | 大きさ     | `min:n`、`max:n`、`between:a,b`、`size:n`          |
 | 値         | `in:a,b,c`、`starts_with:x`、`ends_with:x`         |
 | 項目どうし | `confirmed`、`same:other`、`different:other`       |
+
+`integer` と `boolean` は `int` / `bool` とも書けます。中身は同じです。
+
+### alpha は日本語も通します
+
+`alpha` / `alpha_num` / `alpha_dash` が見るのは「文字かどうか」で、
+**英字だけという意味ではありません。** ひらがな・漢字も通ります。Laravel と同じです。
+
+```rust
+("name", "alpha")     // "田中" は通る
+```
+
+英数字だけに限りたいときは、いまは自分で確かめてください。
 
 ### min / max / between の数え方
 
@@ -78,6 +91,9 @@ pub async fn store(req: Request) -> Result<Response> {
 | `("title", "min:3")`          | 文字数（3 文字以上） |
 
 `size` も同じ決まりです。文字数は見た目の文字で数えます。`あいう` は 3 文字です。
+
+`size` の引数は **0 以上の整数**です。`size:-3` や `size:1.5` のような書き間違いは、
+422 ではなく **500**（開発者向けのエラー）になります。黙って別の意味にしません。
 
 - **数値として読めない値のときは、`min` / `max` / `between` / `size` は何も言いません。**
   `("n", "integer|min:5")` に `abc` を送ると、理由は「整数で入力してください」の 1 件だけです。

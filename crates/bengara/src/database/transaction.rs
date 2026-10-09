@@ -194,6 +194,24 @@ impl Transaction {
     }
 }
 
+impl Drop for Transaction {
+    /// 落とされたら、確定していないので使えなくする。
+    ///
+    /// `tx.table(...)` が作ったクエリビルダは `TxShared` を `Arc` で持つので、
+    /// `Transaction` を落としても中身は生き残ります。
+    /// `let q = DB::begin().await?.table("p");` のように `Transaction` が
+    /// 一時値だと、`q` 経由の書き込みが黙って捨てられていました。
+    ///
+    /// ここで `Poisoned` にすると中身が落ちるので、下回りが巻き戻します。
+    /// 以後のクエリビルダは「使えません」のエラーになります。
+    fn drop(&mut self) {
+        let mut guard = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(&*guard, State::Finished) {
+            *guard = State::Poisoned;
+        }
+    }
+}
+
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Transaction")
@@ -317,6 +335,33 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(message.contains("終わっています"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 落としたトランザクションのクエリは断られる() {
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FakeTx))),
+        };
+        let query = tx.table("posts");
+        // `Transaction` が一時値のときと同じ形。クエリビルダだけが残る。
+        drop(tx);
+        let message = query
+            .insert(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 確定したトランザクションはdropで巻き戻さない() {
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FakeTx))),
+        };
+        let shared = Arc::clone(&tx.shared);
+        tx.commit().await.expect("確定できる");
+        let guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(&*guard, State::Finished), "確定のまま残る");
     }
 
     #[test]

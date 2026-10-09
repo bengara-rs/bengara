@@ -24,7 +24,8 @@ use std::{env, fs};
 
 /// 走査するディレクトリ。
 ///
-/// - `reexport`: 先頭が大文字のファイルから、同じ名前の型を再エクスポートする
+/// - `reexport`: 先頭が大文字のファイルから、同じ名前の型を再エクスポートする。
+///   ただし関数を置く場所（`seeders`・`factories`・`jobs`・`listeners`・`commands`）は除く
 /// - `test_only`: `#[cfg(test)]` を付けて取り込む
 struct Target {
     name: &'static str,
@@ -140,17 +141,21 @@ fn mib(bytes: u64) -> String {
 
 /// ディレクトリの中の1件。`DirEntry` から取れる分を先に持っておきます。
 ///
-/// 後から `is_dir()` や `metadata()` を呼び直すと、そのたびに OS に聞きに行きます。
+/// 後から `is_dir()` を呼び直すと、そのたびに OS に聞きに行きます。
+///
+/// ファイルの大きさは持ちません。使うのは `public/` を埋め込むときだけなので、
+/// ここで取ると `app/` や `tests/` のすべてのファイルで無駄に OS へ聞きに行きます。
 struct Entry {
     path: PathBuf,
     is_dir: bool,
-    /// ファイルの大きさ。ディレクトリのときと、取れなかったときは 0。
-    len: u64,
 }
 
 /// 一覧に入れる1件（マイグレーション・シーダー・ジョブ・コマンド）。
 struct Item {
-    /// 一覧に出る名前（ファイル名そのまま）。
+    /// 一覧に出る名前。並べ替えと名前の重なりの判定もこれで行います。
+    ///
+    /// マイグレーション・シーダー・ジョブはファイル名そのまま、コマンドは
+    /// `cargo artisan` で打つ名前（`SendReport` → `send-report`）です。
     name: String,
     /// クレート直下に置いたときのモジュール名。
     flat: String,
@@ -181,8 +186,8 @@ struct Generator {
     configs: Vec<String>,
     /// `routes/console.rs` が見つかったか。
     has_console: bool,
-    /// プロジェクトのルートを見張ると宣言したか（同じ指定は1回だけ出す）。
-    watched_root: bool,
+    /// `cargo:rerun-if-changed` に出したディレクトリ（テストで確かめるために持ちます）。
+    watched: Vec<PathBuf>,
     /// `database/migrations/` の下で集めたマイグレーション（入れ子も含む）。
     migrations: Vec<Item>,
     /// `database/seeders/` の下で集めたシーダー。
@@ -207,35 +212,43 @@ impl Generator {
     fn run(&mut self, root: &Path) {
         for target in TARGETS {
             let dir = root.join(target.name);
-            if !self.watch(root, &dir) {
+            if !self.watch(&dir) {
                 continue;
             }
+            let Some(module) = self.module_name(target.name, &dir) else {
+                continue;
+            };
             if target.test_only {
                 self.tree.push_str("#[cfg(test)]\n");
             }
-            self.emit_dir(&dir, target.name, target, 0);
+            self.emit_dir(&dir, module, target, 0);
         }
         self.read_lang(root);
         self.read_public(root);
     }
 
-    /// `dir` の変化を見張る。無いときはプロジェクトのルートを1回だけ見張る。
+    /// `dir` の変化を見張る。無いときは見張らず、警告だけ出す。
     ///
     /// 無いディレクトリを `cargo:rerun-if-changed` に出すと、cargo は
-    /// 「常に古い」と見なしてビルドスクリプトを毎回走らせます。かといって
-    /// 何も出さないと、後からそのディレクトリを作っても気づけません。
-    /// そこでルート自身を見張り、ディレクトリが生えたら走り直すようにします。
+    /// 「常に古い」と見なしてビルドスクリプトを毎回走らせます。
+    /// かといって代わりにプロジェクトのルートを見張るのも駄目です。cargo は
+    /// ディレクトリを渡されると**中を再帰的にたどって**いちばん新しい更新時刻を取るので、
+    /// ルートの下の `target/` を毎回見ることになります。`target/` はビルドごとに
+    /// 書き換わるため、避けたかったこと（毎回走る）がそのまま起きます。
+    ///
+    /// そこで、無いディレクトリは見張らずに1行知らせます。後から作ったときは
+    /// `touch build.rs` で作り直してください。
     ///
     /// 戻り値は「そのディレクトリがあったか」です。
-    fn watch(&mut self, root: &Path, dir: &Path) -> bool {
+    fn watch(&mut self, dir: &Path) -> bool {
         if dir.is_dir() {
             self.watch_existing(dir);
             return true;
         }
-        if !self.watched_root {
-            self.watched_root = true;
-            println!("cargo:rerun-if-changed={}", root.display());
-        }
+        warn(&format!(
+            "{} が見つかりませんでした。作った後は `touch build.rs` で作り直してください",
+            dir.display()
+        ));
         false
     }
 
@@ -244,6 +257,7 @@ impl Generator {
     /// ディレクトリ自体の変化（ファイルの追加・削除）を見ます。取り込んだ `.rs` の
     /// 中身の変化は、`#[path]` で取り込んだソースとして rustc 側が追跡します。
     fn watch_existing(&mut self, dir: &Path) {
+        self.watched.push(dir.to_path_buf());
         println!("cargo:rerun-if-changed={}", dir.display());
     }
 
@@ -254,7 +268,7 @@ impl Generator {
     fn read_public(&mut self, root: &Path) {
         let dir = root.join("public");
         // 見張りはデバッグビルドでも出す。release に切り替えたときに集め直せるようにする。
-        if !self.watch(root, &dir) {
+        if !self.watch(&dir) {
             return;
         }
         // PROFILE は cargo がビルドスクリプトに渡す（"debug" か "release"）。
@@ -304,11 +318,13 @@ impl Generator {
                 self.collect_public(&entry.path, &key, total);
                 continue;
             }
-            *total += entry.len;
-            if entry.len > MAX_EMBED_FILE {
+            // 大きさを OS に聞くのはここだけ。埋め込む `public/` のためだけに使います。
+            let len = entry.path.metadata().map_or(0, |m| m.len());
+            *total += len;
+            if len > MAX_EMBED_FILE {
                 warn(&format!(
                     "public/{key} は {} MiB あります。バイナリに埋め込みます",
-                    mib(entry.len)
+                    mib(len)
                 ));
             }
             self.public.push((key, entry.path));
@@ -351,7 +367,7 @@ impl Generator {
     /// **ビルド時に読み込みます。** 実行時にファイルを読まないので、本番に配る必要はありません。
     fn read_lang(&mut self, root: &Path) {
         let dir = root.join("resources/lang");
-        if !self.watch(root, &dir) {
+        if !self.watch(&dir) {
             return;
         }
         let Some(entries) = self.read_dir_sorted(&dir) else {
@@ -363,6 +379,13 @@ impl Generator {
 
         for entry in entries {
             let Some(stem) = file_stem(&entry.path) else {
+                // 言語の名前は生成コードの文字になるので、UTF-8 でないと使えません。
+                if is_toml(&entry.path) {
+                    self.errors.push(format!(
+                        "{} の名前が UTF-8 ではありません",
+                        entry.path.display()
+                    ));
+                }
                 continue;
             };
             if stem.starts_with('.') {
@@ -426,6 +449,11 @@ impl Generator {
                 continue;
             }
             let Some(group) = file_stem(&entry.path) else {
+                // ファイル名が鍵の頭になるので、UTF-8 でないと使えません。
+                self.errors.push(format!(
+                    "{} の名前が UTF-8 ではありません",
+                    entry.path.display()
+                ));
                 continue;
             };
             if group.starts_with('.') {
@@ -463,12 +491,10 @@ impl Generator {
     }
 
     /// 1つのディレクトリを `pub mod ... { ... }` として書き出す。再帰する。
-    fn emit_dir(&mut self, dir: &Path, dir_name: &str, target: &Target, depth: usize) {
-        let module = match self.module_name(dir_name, dir) {
-            Some(m) => m,
-            // 名前にできないディレクトリは、エラーを記録して中身を見ない。
-            None => return,
-        };
+    ///
+    /// `module` は呼ぶ側が作ります。ここで作り直すと同じ変換が二度走り、
+    /// 名前にできないディレクトリでは同じエラーを2回積むことになります。
+    fn emit_dir(&mut self, dir: &Path, module: String, target: &Target, depth: usize) {
         let _ = writeln!(self.tree, "#[allow(unused_imports)] pub mod {module} {{");
         self.stack.push(module);
         // 入れ子のディレクトリも見張る。親だけ見張っても、下にファイルを足したときに
@@ -508,6 +534,13 @@ impl Generator {
         for entry in entries {
             let path = entry.path;
             let Some(stem) = file_stem(&path) else {
+                // 名前が UTF-8 でないと `#[path]` に書けません。`collect_public` と
+                // 同じ文言で知らせます。黙って飛ばすと、置いた人には
+                // 「型が見つからない」としか見えないためです。
+                if is_rust_file(&path) {
+                    self.errors
+                        .push(format!("{} の名前が UTF-8 ではありません", path.display()));
+                }
                 continue;
             };
 
@@ -516,10 +549,12 @@ impl Generator {
                     continue;
                 }
                 let stem = stem.to_string();
-                if let Some(module) = self.module_name(&stem, &path) {
-                    self.check_duplicate(&mut taken, &module, &stem, dir);
-                }
-                self.emit_dir(&path, &stem, target, depth + 1);
+                let Some(module) = self.module_name(&stem, &path) else {
+                    // 名前にできないディレクトリは、エラーを記録して中身を見ない。
+                    continue;
+                };
+                self.check_duplicate(&mut taken, &module, &stem, dir);
+                self.emit_dir(&path, module, target, depth + 1);
                 continue;
             }
 
@@ -599,8 +634,30 @@ impl Generator {
                 collect_upper(&path, stem, "ジョブ", &mut self.jobs, &flat);
             }
             // app/Console/Commands/ の、大文字で始まるファイルは自作コマンド。
+            //
+            // 一覧に入れる名前は**変換後のコマンド名**です。並べ替えと重なりの判定も
+            // その名前で行うので、ここで作ってから入れます。ファイル名で判定すると、
+            // `SendReport.rs` と `Sub/Send_Report.rs` がどちらも `send-report` になるのに
+            // 何も知らせず、後のほうは呼べないままになります。
             if in_commands {
-                collect_upper(&path, stem, "コマンド", &mut self.commands, &flat);
+                if !starts_upper(stem) {
+                    warn(&format!(
+                        "{} は大文字で始まらないので、コマンドの一覧に入りません",
+                        path.display()
+                    ));
+                } else {
+                    match to_command_name(stem) {
+                        Ok(name) => self.commands.push(Item {
+                            name,
+                            flat: flat.clone(),
+                            path: path.clone(),
+                        }),
+                        Err(reason) => self.errors.push(format!(
+                            "{} はコマンドの名前にできません（{reason}）",
+                            path.display()
+                        )),
+                    }
+                }
             }
             // routes/console.rs があれば、定期処理の登録を呼ぶ。
             if target.name == "routes" && depth == 0 && stem == "console" {
@@ -667,10 +724,9 @@ impl Generator {
         }
         if is_exactly(&self.stack, COMMANDS_DIR) {
             let items = std::mem::take(&mut self.commands);
-            // ファイル名を小文字とハイフンにした名前で呼べる。
+            // 名前はファイル名を小文字とハイフンにしたもの。集めたときに作ってあります。
             let list = self.join_items(items, "コマンド", |item| {
-                let flat = &item.flat;
-                let name = to_command_name(&item.name);
+                let (name, flat) = (&item.name, &item.flat);
                 format!(
                     "::bengara::Command {{ name: {name:?}, \
                      description: crate::{flat}::DESCRIPTION, \
@@ -769,21 +825,26 @@ impl Generator {
                     return None;
                 }
             };
-            // 種類と大きさは `DirEntry` から取る。あとで `is_dir()` や
-            // `metadata()` を呼び直すと、そのたびに OS に聞きに行きます。
-            let is_dir = match entry.file_type() {
-                Ok(kind) => kind.is_dir(),
-                Err(_) => entry.path().is_dir(),
+            // 種類は `DirEntry` から取る。あとで `is_dir()` を呼び直すと、
+            // そのたびに OS に聞きに行きます。
+            let file_type = entry.file_type().ok();
+            let is_dir = match file_type {
+                Some(kind) => kind.is_dir(),
+                None => entry.path().is_dir(),
             };
-            let len = if is_dir {
-                0
-            } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
-            };
+            // `file_type()` はリンクを辿りません。ディレクトリへのリンク
+            // （Windows のジャンクションも同じ）は `is_dir` が偽になり、
+            // `.rs` でもないので黙って飛ばされます。辿らないのは循環で落ちないという
+            // 良い面があるのでそのままにして、気づけるように1行知らせます。
+            if file_type.is_some_and(|kind| kind.is_symlink()) {
+                warn(&format!(
+                    "{} はリンクなのでたどりません。中のファイルは取り込まれません",
+                    entry.path().display()
+                ));
+            }
             entries.push(Entry {
                 path: entry.path(),
                 is_dir,
-                len,
             });
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1040,7 +1101,11 @@ fn starts_upper(stem: &str) -> bool {
 }
 
 /// ファイル名をコマンド名にする。`SendReport` → `send-report`。
-fn to_command_name(stem: &str) -> String {
+///
+/// 英数字と `_` `-` 以外の文字が入っていたら断ります。`My Report.rs` を通すと
+/// `my -report` という名前になり、`cargo artisan` の引数は空白で切れているので
+/// 打ちようがありません。`list` には出るのに呼べない、という形になります。
+fn to_command_name(stem: &str) -> Result<String, &'static str> {
     let mut out = String::with_capacity(stem.len() + 2);
     for (i, c) in stem.chars().enumerate() {
         if c.is_ascii_uppercase() {
@@ -1050,11 +1115,16 @@ fn to_command_name(stem: &str) -> String {
             out.push(c.to_ascii_lowercase());
         } else if c == '_' {
             out.push('-');
-        } else {
+        } else if c.is_ascii_alphanumeric() || c == '-' {
             out.push(c);
+        } else {
+            return Err("コマンドのファイル名に使えるのは英数字・`_`・`-` だけです");
         }
     }
-    out
+    if out.is_empty() {
+        return Err("コマンドの名前が空になります");
+    }
+    Ok(out)
 }
 
 fn starts_digit(stem: &str) -> bool {
@@ -1344,16 +1414,111 @@ mod tests {
     }
 
     #[test]
-    fn 置き場所が無いときはルートを1回だけ見張る() {
+    fn 無い置き場所は見張らない() {
         let root = temp_root("missing");
         let mut generator = Generator::default();
         generator.run(&root);
 
         // 無いだけならエラーにしない。生成コードも壊れない。
         assert!(generator.errors.is_empty(), "{:?}", generator.errors);
-        assert!(generator.watched_root);
+        // 1件も `rerun-if-changed` を出さない。無いディレクトリを出すと毎回走り、
+        // 代わりにルートを出しても、cargo が中の `target/` までたどるので毎回走る。
+        assert!(generator.watched.is_empty(), "{:?}", generator.watched);
         let code = generator.finish();
         assert!(code.contains("migrations: || &[]"));
+    }
+
+    #[test]
+    fn あるディレクトリだけを見張る() {
+        let root = temp_root("watch_some");
+        touch(&root.join("app/Models/User.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        // 置いた分は見張る。無いものとルートは出さない。
+        assert!(generator.watched.contains(&root.join("app")));
+        assert!(generator.watched.contains(&root.join("app/Models")));
+        assert!(!generator.watched.contains(&root.to_path_buf()));
+        assert!(!generator.watched.contains(&root.join("config")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 入れ子で同じコマンド名になったら知らせる() {
+        let root = temp_root("dup_command");
+        // ファイル名は違うが、どちらもコマンド名は `send-report` になる。
+        touch(&root.join("app/Console/Commands/SendReport.rs"), "");
+        touch(&root.join("app/Console/Commands/Sub/Send_Report.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(
+            generator
+                .errors
+                .iter()
+                .any(|e| e.contains("コマンド") && e.contains("send-report")),
+            "{:?}",
+            generator.errors
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn コマンド名はファイル名から作る() {
+        assert_eq!(to_command_name("SendReport").unwrap(), "send-report");
+        assert_eq!(to_command_name("Send_Report").unwrap(), "send-report");
+        assert_eq!(to_command_name("Cleanup").unwrap(), "cleanup");
+        // 打ちようのない名前になる文字は断る。
+        assert!(to_command_name("My Report").is_err());
+        assert!(to_command_name("Send.Report").is_err());
+        assert!(to_command_name("日本語").is_err());
+    }
+
+    #[test]
+    fn 打てないコマンド名はコンパイルエラーにする() {
+        let root = temp_root("bad_command");
+        // `My Report` は `my -report` になり、`cargo artisan` では打てない。
+        touch(&root.join("app/Console/Commands/My Report.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(
+            generator
+                .errors
+                .iter()
+                .any(|e| e.contains("コマンドの名前にできません")),
+            "{:?}",
+            generator.errors
+        );
+        let code = generator.finish();
+        assert!(code.contains("compile_error!"));
+        // 打てない名前は一覧にも入らない。
+        assert!(!code.contains("my -report"), "{code}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 名前にできないディレクトリのエラーは1件だけ() {
+        let root = temp_root("bad_dir");
+        touch(&root.join("app/type/Foo.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        let hits = generator
+            .errors
+            .iter()
+            .filter(|e| e.contains("予約語"))
+            .count();
+        assert_eq!(hits, 1, "{:?}", generator.errors);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

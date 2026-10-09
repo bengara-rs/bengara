@@ -41,10 +41,16 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     }
 
     let base = paths::base_path().to_path_buf();
-    let dotenv = env_vars::load_dotenv(&base);
+    // `.env` の読み込みは、ログの購読より先に済ませる（`init_tracing` が
+    // `APP_DEBUG` を見るため）。そのため警告はその場では出せないので、
+    // 一覧で受け取って購読の**後**に流し直す。
+    let (dotenv, warnings) = env_vars::load_dotenv(&base);
     init_tracing();
     if let Some(path) = &dotenv {
         tracing::debug!("{} を読み込みました", path.display());
+    }
+    for warning in warnings {
+        tracing::warn!("{warning}");
     }
 
     // `APP_STORAGE_PATH` は `.env` に書いても効くので、読み込んだ**後**に確かめる。
@@ -76,19 +82,31 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
         None => ("serve", &[] as &[String]),
     };
 
+    // アプリの組み立て（`bootstrap/app.rs`）は、ここで**1回だけ**行う。
+    //
+    // 組み立てのときにイベントの聞く側（`Event::listen`）が固定されるので、
+    // 飛ばすと `queue:work` や自作コマンドの中の `Event::dispatch` が
+    // 何も呼ばずに終わります（決定記録）。`serve` と `route:list` のほかにも
+    // 要るので、`needs_application` で広く真にしてあります。
+    let app = if needs_application(command) {
+        Some(build(factory))
+    } else {
+        None
+    };
+
     match command {
         "serve" => {
             let options = ServeOptions::parse(rest)?;
-            let app = build(factory);
+            let app = app.unwrap_or_else(|| build(factory));
             // 使う絶対パスを出す。設定の間違いはここを見れば分かる。
             crate::ops::log_paths();
             server::serve(app, &options.host, options.port)
         }
         "route:list" => {
-            print_routes(&build(factory));
+            print_routes(&app.unwrap_or_else(|| build(factory)));
             Ok(())
         }
-        "key:generate" => generate_key(),
+        "key:generate" => generate_key(rest),
         "session:gc" => sweep_sessions(),
         "storage:init" => crate::ops::storage_init(),
         "about" => {
@@ -120,6 +138,17 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
             std::process::exit(1);
         }
     }
+}
+
+/// そのコマンドでアプリを組み立てるか。
+///
+/// 組み立てると、ルート・ミドルウェア・**イベントの聞く側**が固定されます。
+/// `Event::dispatch` はどのコマンドからでも呼べることになっているので、
+/// 置き場所が要らないコマンド（`init` / `--version` / `--help` など）を除いて
+/// すべて真にします。`WITHOUT_BASE` と同じ並びを使うのは、置き場所が無ければ
+/// `bootstrap/app.rs` も読めないためです。
+fn needs_application(command: &str) -> bool {
+    !WITHOUT_BASE.contains(&command)
 }
 
 /// `bootstrap/app.rs` を呼んでアプリを固定する。
@@ -182,8 +211,8 @@ fn next_value<'a>(iter: &mut impl Iterator<Item = &'a String>, name: &str) -> Re
 ///
 /// すでにある場合は、`--force` が無いかぎり上書きしません。
 /// 鍵を変えると、いま動いているセッションと署名付き URL が全部無効になるためです。
-fn generate_key() -> Result<()> {
-    let force = std::env::args().any(|a| a == "--force");
+fn generate_key(rest: &[String]) -> Result<()> {
+    let force = parse_force(rest)?;
     let path = paths::base_path().join(".env");
 
     if !path.is_file() {
@@ -194,10 +223,9 @@ fn generate_key() -> Result<()> {
     }
 
     let body = std::fs::read_to_string(&path)?;
-    let line_of = |line: &str| line.trim_start().starts_with("APP_KEY=");
     let already_set = body
         .lines()
-        .any(|line| line_of(line) && line.trim().len() > "APP_KEY=".len());
+        .any(|line| app_key_value(line).is_some_and(|value| !value.trim().is_empty()));
 
     if already_set && !force {
         println!(
@@ -208,33 +236,84 @@ fn generate_key() -> Result<()> {
     }
 
     let key = crate::support::crypto::random_token();
-    let updated = if body.lines().any(line_of) {
-        let mut out: Vec<String> = body
-            .lines()
-            .map(|line| {
-                if line_of(line) {
-                    format!("APP_KEY={key}")
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect();
-        out.push(String::new());
-        out.join("\n")
-    } else {
-        let mut out = body;
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str("APP_KEY=");
-        out.push_str(&key);
-        out.push('\n');
-        out
-    };
-
-    std::fs::write(&path, updated)?;
+    std::fs::write(&path, write_app_key(&body, &key))?;
     println!("APP_KEY を {} に書き込みました。", path.display());
     Ok(())
+}
+
+/// `.env` の中身に `APP_KEY` を入れた文字列を作る。
+///
+/// すでに行があれば差し替え、無ければ末尾に足します。改行は元のままです。
+fn write_app_key(body: &str, key: &str) -> String {
+    let newline = newline_of(body);
+    if body.lines().any(|line| app_key_value(line).is_some()) {
+        let mut out: Vec<String> = body
+            .lines()
+            .map(|line| replace_app_key(line, key))
+            .collect();
+        out.push(String::new());
+        return out.join(newline);
+    }
+    let mut out = body.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(newline);
+    }
+    out.push_str("APP_KEY=");
+    out.push_str(key);
+    out.push_str(newline);
+    out
+}
+
+/// `key:generate` の旗を読む。`--force` だけを受け付けます。
+///
+/// **受け取った引数だけを見ます。** `std::env::args()` を読み直すと、
+/// `--forse` のような打ち間違いが黙って「上書きしない」側に落ちます。
+fn parse_force(rest: &[String]) -> Result<bool> {
+    let mut force = false;
+    for arg in rest {
+        if arg == "--force" {
+            force = true;
+        } else {
+            return Err(crate::Error::msg(format!(
+                "key:generate は `{arg}` を受け付けません（使えるのは --force だけです）"
+            )));
+        }
+    }
+    Ok(force)
+}
+
+/// 書き戻すときの改行を決める。
+///
+/// 元の改行を保ちます。`.gitignore` と `Cargo.toml` の書き換えと同じ方針です。
+/// LF にそろえると、CRLF の `.env` が git の差分で全行変わって見えます。
+fn newline_of(body: &str) -> &'static str {
+    if body.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// `.env` の1行が `APP_KEY` の行なら、その値を返す。
+///
+/// `.env` の読み込みと**同じ前処理**をします（前後の空白と先頭の `export` を外す）。
+/// そろえないと `export APP_KEY=…` を見落とし、末尾に 2 行目を足してしまいます。
+/// 読み込みは先に出てくる値を採るので、鍵は変わらないのに「書き込みました」と出ます。
+fn app_key_value(line: &str) -> Option<&str> {
+    env_vars::strip_export(line.trim()).strip_prefix("APP_KEY=")
+}
+
+/// `APP_KEY` の行なら値を差し替える。そうでなければそのまま返す。
+///
+/// `export ` と行頭の空白は残します。利用者の書き方を変えないためです。
+fn replace_app_key(line: &str, key: &str) -> String {
+    if app_key_value(line).is_none() {
+        return line.to_string();
+    }
+    match line.find("APP_KEY=") {
+        Some(at) => format!("{}APP_KEY={key}", &line[..at]),
+        None => line.to_string(),
+    }
 }
 
 fn sweep_sessions() -> Result<()> {
@@ -489,8 +568,11 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
     crate::auth::install_test_iterations();
 
     let base = paths::base_path().to_path_buf();
-    env_vars::load_dotenv(&base);
+    let (_, warnings) = env_vars::load_dotenv(&base);
     init_tracing();
+    for warning in warnings {
+        tracing::warn!("{warning}");
+    }
     if !config_registry::installed() {
         let mut registry = Registry::new();
         (hooks.configs)(&mut registry);
@@ -509,4 +591,98 @@ static TEST_HOOKS: std::sync::OnceLock<Hooks> = std::sync::OnceLock::new();
 /// テストのときに覚えておいた `Hooks`。
 pub(crate) fn test_hooks() -> Hooks {
     TEST_HOOKS.get().copied().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn イベントの聞く側が要るコマンドは組み立てる() {
+        // `Event::dispatch` はどのコマンドからでも呼べる。組み立てを飛ばすと
+        // 聞く側が登録されず、何も起きずに終わっていた。
+        for command in [
+            "serve",
+            "route:list",
+            "queue:work",
+            "schedule:run",
+            "migrate",
+            "db:seed",
+            "cache:clear",
+            "app:my-command",
+        ] {
+            assert!(needs_application(command), "{command}");
+        }
+        // 置き場所が要らないコマンドは組み立てない。
+        for command in [
+            "init",
+            "--version",
+            "-V",
+            "version",
+            "--help",
+            "-h",
+            "help",
+            "list",
+        ] {
+            assert!(!needs_application(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn 置き場所の要否と組み立ての要否はそろえる() {
+        for command in WITHOUT_BASE {
+            assert!(!needs_application(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn exportつきの鍵の行も見つける() {
+        assert_eq!(app_key_value("APP_KEY=abc"), Some("abc"));
+        assert_eq!(app_key_value("export APP_KEY=abc"), Some("abc"));
+        assert_eq!(app_key_value("export\tAPP_KEY=abc"), Some("abc"));
+        assert_eq!(app_key_value("  APP_KEY=abc"), Some("abc"));
+        assert_eq!(app_key_value("APP_KEY="), Some(""));
+        // コメントと別のキーは触らない。
+        assert_eq!(app_key_value("# APP_KEY=abc"), None);
+        assert_eq!(app_key_value("APP_KEY_OLD=abc"), None);
+    }
+
+    #[test]
+    fn exportつきの行が置き換わる() {
+        // 以前は見落として末尾に2行目を足し、先に出てくる古い値が勝っていた。
+        let body = "APP_NAME=myapp\nexport APP_KEY=old\n";
+        let updated = write_app_key(body, "new");
+        assert_eq!(updated, "APP_NAME=myapp\nexport APP_KEY=new\n");
+        // `APP_KEY` の行は1本だけ。
+        assert_eq!(updated.matches("APP_KEY=").count(), 1);
+    }
+
+    #[test]
+    fn 行が無ければ末尾に足す() {
+        assert_eq!(write_app_key("A=1\n", "new"), "A=1\nAPP_KEY=new\n");
+        // 改行で終わっていない中身にも足せる。
+        assert_eq!(write_app_key("A=1", "new"), "A=1\nAPP_KEY=new\n");
+    }
+
+    #[test]
+    fn crlfのenvはcrlfのまま保つ() {
+        assert_eq!(newline_of("A=1\r\n"), "\r\n");
+        assert_eq!(newline_of("A=1\n"), "\n");
+        let body = "APP_NAME=myapp\r\nAPP_KEY=old\r\n";
+        assert_eq!(
+            write_app_key(body, "new"),
+            "APP_NAME=myapp\r\nAPP_KEY=new\r\n"
+        );
+        // 足すときも元の改行にそろえる。
+        assert_eq!(write_app_key("A=1\r\n", "new"), "A=1\r\nAPP_KEY=new\r\n");
+    }
+
+    #[test]
+    fn 知らない旗はエラーにする() {
+        assert!(!parse_force(&[]).unwrap());
+        assert!(parse_force(&["--force".to_string()]).unwrap());
+        // 打ち間違いが黙って通らないこと。
+        let error = parse_force(&["--forse".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("--forse"), "{error}");
+    }
 }

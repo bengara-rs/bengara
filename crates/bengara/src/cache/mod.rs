@@ -100,11 +100,19 @@ where
 /// 渡せば、狙って同じファイルを指せました**（衝突を探す必要もありません）。
 /// `~` は素通し側では `:` の置換先としてしか出ないので、`:` で始まる鍵も
 /// ハッシュ側に回して、`~` で始まる名前はハッシュだけにしています。
+///
+/// **末尾が `.` の鍵と装置の名前（`nul` など）もハッシュ側に回します。**
+/// Windows は末尾の `.` を黙って落とすので、`post.` と `post` が同じファイルに
+/// なります（`format!("post.{id}")` の `id` が空なら踏めます）。装置の名前は
+/// 書いた中身が捨てられ、`con` は読み戻しで戻ってきません。判定は
+/// `Storage` と同じ [`crate::storage::usable_name`] に任せます（決定記録 #074）。
 pub(crate) fn normalize_key(key: &str) -> String {
     let safe = !key.is_empty()
         && key.len() <= 150
         // `:` 始まりは `~` 始まりになるので、ハッシュとぶつからないよう避ける。
         && !key.starts_with(':')
+        // 末尾が `.` の名前と装置の名前を断る（`.` と `..` もここで外れる）。
+        && crate::storage::usable_name(key).is_ok()
         && key.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b':')
         });
@@ -304,6 +312,33 @@ mod tests {
         assert_ne!(upper, lower);
         // 大文字小文字を無視してもぶつからない。
         assert_ne!(upper.to_ascii_lowercase(), lower.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn 末尾が点の鍵はハッシュにする() {
+        // Windows は末尾の `.` を落とすので、素通しすると `post.` と `post` が
+        // 同じファイルになる（実機で片方がもう片方を上書きした）。
+        let dotted = normalize_key("post.");
+        assert_eq!(dotted.len(), 65, "ハッシュ側に回る");
+        assert_ne!(dotted, normalize_key("post"));
+        assert_eq!(normalize_key("post"), "post");
+        // `.` と `..` も一緒に直る。
+        assert_eq!(normalize_key(".").len(), 65);
+        assert_eq!(normalize_key("..").len(), 65);
+        assert_ne!(normalize_key("."), normalize_key(".."));
+        // 途中の `.` はそのまま。
+        assert_eq!(normalize_key("post.1"), "post.1");
+    }
+
+    #[test]
+    fn 装置の名前の鍵はハッシュにする() {
+        // `nul` は書いた中身が捨てられ、`con` は読み戻しで戻ってこない。
+        for key in ["nul", "con", "COM1", "nul.txt", "aux", "prn", "lpt9"] {
+            assert_eq!(normalize_key(key).len(), 65, "{key}");
+        }
+        // 装置の名前を含むだけの鍵は素通しのまま。
+        assert_eq!(normalize_key("console"), "console");
+        assert_eq!(normalize_key("nul-1"), "nul-1");
     }
 
     #[test]

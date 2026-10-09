@@ -93,7 +93,7 @@ impl Queue {
             return Err(Error::msg("ジョブの名前がありません"));
         }
         let now = crate::support::time::now_seconds();
-        let available_at = crate::support::time::format_timestamp(now + delay_secs as i64);
+        let available_at = available_at(now, delay_secs);
 
         DB::table(TABLE)
             .insert_get_id(&[
@@ -197,10 +197,35 @@ impl Queue {
     }
 }
 
+/// いつから処理できるかを文字列にする。
+///
+/// **あふれさせません。** `delay_secs as i64` だと `u64::MAX` が `-1` になり、
+/// 「ずっと後に実行」と書いたジョブがすぐ実行されます（デバッグビルドでは
+/// 足し算でパニックします）。上限で切り詰めてから飽和加算します
+/// （`cache/store.rs` の `Entry::encode` と同じ形）。
+fn available_at(now: i64, delay_secs: u64) -> String {
+    let delay = i64::try_from(delay_secs).unwrap_or(i64::MAX);
+    crate::support::time::format_timestamp(now.saturating_add(delay))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::database::Driver;
+
+    #[test]
+    fn 遅延秒数はあふれない() {
+        let now = 1_000_000;
+        let soon = available_at(now, 0);
+        // `as i64` だと `u64::MAX` が `-1` になり、すぐ実行されてしまった。
+        assert!(available_at(now, u64::MAX) > soon, "過去にならない");
+        assert!(available_at(now, i64::MAX as u64 + 1) > soon);
+        // 普通の値はそのまま足す。
+        assert_eq!(
+            available_at(now, 60),
+            crate::support::time::format_timestamp(now + 60)
+        );
+    }
 
     #[test]
     fn 表の定義が作れる() {

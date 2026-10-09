@@ -50,6 +50,14 @@ Application::configure()
 
 `SESSION_LIFETIME` は分です（既定 120）。
 
+### 期限は使っている間は延びます
+
+**残りの期限が半分を切ったら、読むだけのリクエストでも期限を延ばします。**
+
+延ばさないと、最後に書き込んだとき（ログインや POST）から数えることになり、
+画面を見て回っているだけの人が突然ログアウトされます。
+毎回書くとディスクに触る回数が増えるので、半分を切ったときだけにしてあります。
+
 - **プロセスを 2 つ以上動かすときは、全プロセスが同じ `storage/` を見るようにしてください。**
 - `memory` はプロセスをまたげません。本番では使えません。
 - 置き場所は `StartSession` に渡したものが、そのリクエストのセッションに結びつきます。
@@ -76,14 +84,18 @@ Windows では設定しません（OS の既定のままです）。
 
 `SessionStore` を実装します。
 
-| メソッド                                 | 既定の実装     |
-|------------------------------------------|----------------|
-| `read` / `write` / `destroy`             | なし。必ず書く |
-| `destroy_for_user(user_id)`              | あり           |
-| `destroy_for_user_except(user_id, keep)` | あり           |
+| メソッド                                 | 既定の実装                   |
+|------------------------------------------|------------------------------|
+| `read` / `write` / `destroy`             | なし。必ず書く               |
+| `touch(id)`                              | あり（`read` して `write`）  |
+| `destroy_for_user(user_id)`              | あり                         |
+| `destroy_for_user_except(user_id, keep)` | あり                         |
 
-- 後ろの 2 つは **実装しなくても壊れません。** 警告を出して 0 を返します。
-- この 2 つを呼ぶのは `Auth::logout_all_devices()` と `logout_other_devices()` です
+- 後ろの 3 つは **実装しなくても壊れません。**
+- `touch` は期限を延ばすために呼ばれます。既定の実装は「読んで、同じ中身で書き直す」です。
+  もっと安く書ける置き場所（DB なら `update` 1 文）では、自分で実装してください。
+- `destroy_for_user` 系を実装していないと、警告を出して 0 を返します。
+  呼ぶのは `Auth::logout_all_devices()` と `logout_other_devices()` です
   （[authentication.md](authentication.md)）。
 - 必要になったときに足してください。利用者で引く方法は置き場所ごとに違います。
 
@@ -99,6 +111,7 @@ pub async fn store(req: Request) -> Result<Response> {
 
 | メソッド               | 中身                                   |
 |------------------------|----------------------------------------|
+| `id()`                 | いまのセッションの ID                  |
 | `get(key)`             | 読む。無ければ `None`                  |
 | `get_or(key, default)` | 読む。無ければ既定値                   |
 | `put(key, value)`      | 入れる。次のリクエストでも読める       |
@@ -112,6 +125,9 @@ pub async fn store(req: Request) -> Result<Response> {
 | `flush()`              | 中身を全部消す                         |
 | `regenerate()`         | ID を作り直す                          |
 | `invalidate()`         | 中身を消して ID も作り直す             |
+
+**同じ鍵に `put` と `flash` の両方を書いたときは、`flash` が勝ちます。**
+`get` も `all` も同じです。後から書いたほうが読めます。
 
 ### flash の寿命
 
@@ -157,9 +173,19 @@ req.session().put("user_id", id);
 StartSession::from_env().with_config(SessionConfig {
     cookie: "myapp_session".into(),
     same_site: SameSite::Strict,
-    ..Default::default()
+    ..SessionConfig::from_env()
 })
 ```
+
+**`..Default::default()` と書かないでください。** 既定値が入るので、
+`.env` の `SESSION_LIFETIME` と `SESSION_DRIVER` が**無かったことになります**。
+`.env` の値を土台にしたいときは `..SessionConfig::from_env()` と書きます。
+
+`with_config` で期限を変えると、**組み込みの置き場所も作り直します。**
+Cookie の期限とサーバー側の期限が食い違わないようにするためです。
+`memory` のときは、それまでに入れた中身が消えます。
+`StartSession::new(自分の置き場所)` で渡したときは作り直せないので、
+食い違っていれば警告が出ます。
 
 ## CSRF
 
@@ -266,6 +292,12 @@ Ok(response.with_cookie(&cookie))
 
 消すときは `Cookie::removal("theme")` です。
 同じ名前を何本も送りたいときは `with_added_header` を使ってください。
+
+**名前と値は自動で逃がします。** `;` や空白を入れても壊れません。
+
+**`with_path` と `with_domain` に渡した値からは、改行・`\0`・`;` を落とします。**
+落としたときは警告が 1 行出ます。設定から来た値に改行が混ざっていると、
+以前は応答全体が 500 になっていました。
 
 ## 気をつけること
 

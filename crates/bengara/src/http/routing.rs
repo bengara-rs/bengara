@@ -335,6 +335,20 @@ impl Routes {
 
     /// メソッドとパスからルートを探す。
     pub(crate) fn find(&self, method: &str, path: &str) -> Matched<'_> {
+        // 登録側は末尾の `/` を落とす（`normalize`）ので、照合側でも落としてから引く。
+        // そうしないと `GET /posts/` が 404 になります。リダイレクトはしません。
+        // `/` 単独は落とさない（それ自体がルート）。
+        if path.len() > 1 && path.ends_with('/') {
+            let trimmed = path.trim_end_matches('/');
+            // 全部 `/` だったときは `/` として引く。
+            let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
+            return self.find_slashless(method, trimmed);
+        }
+        self.find_slashless(method, path)
+    }
+
+    /// 末尾の `/` を落としたパスで探す。
+    fn find_slashless(&self, method: &str, path: &str) -> Matched<'_> {
         if let Some(found) = self.find_exact(method, path) {
             return found;
         }
@@ -548,6 +562,32 @@ mod tests {
         ));
         assert!(matches!(routes.find("GET", "/missing"), Matched::NotFound));
         assert_eq!(routes.names().get("home").map(String::as_str), Some("/"));
+    }
+
+    #[test]
+    fn 末尾のスラッシュは同じルートに当たる() {
+        let defs = collect(|| {
+            Route::get("/posts", ok).name("posts.index");
+            Route::get("/", ok).name("home");
+        });
+        let routes = Routes::build(defs);
+        // 登録側は末尾の `/` を落とすので、照合側でも落としてから引く。
+        assert!(matches!(
+            routes.find("GET", "/posts"),
+            Matched::Found { .. }
+        ));
+        assert!(matches!(
+            routes.find("GET", "/posts/"),
+            Matched::Found { .. }
+        ));
+        match routes.find("GET", "/posts/") {
+            Matched::Found { def, .. } => assert_eq!(def.path, "/posts"),
+            _ => panic!("当たらなかった"),
+        }
+        // `/` 単独は壊れない。
+        assert!(matches!(routes.find("GET", "/"), Matched::Found { .. }));
+        // 無いパスは末尾に `/` が付いても 404 のまま。
+        assert!(matches!(routes.find("GET", "/missing/"), Matched::NotFound));
     }
 
     #[test]

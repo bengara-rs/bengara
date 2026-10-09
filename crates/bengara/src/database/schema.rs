@@ -412,9 +412,11 @@ impl Blueprint {
                     );
                 }
                 if self.mode == Mode::Alter {
+                    // 組み立てからは外しません。外すと列だけが黙って消えた表ができます。
+                    // そのまま流して、実行のときに失敗させます。
                     tracing::warn!(
                         "{}.{} に id() を使っています。alter table add column では \
-                         自動採番の主キーを足せないので、この SQL は流れません",
+                         自動採番の主キーを足せないので、この文は実行のときに失敗します",
                         self.table,
                         column.name
                     );

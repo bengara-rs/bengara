@@ -236,13 +236,13 @@ fn bind<'q>(
 
 /// sqlx の行をまとめて `Row` に直す。
 ///
-/// 列の名前は最初の行から1回だけ作り、行ごとに clone します。
-/// 1行ごとに `to_string()` すると、列の数だけ無駄に確保するためです。
+/// 列の名前は最初の行から1回だけ作り、`Arc` で全部の行に分けます。
+/// 1行ごとに `Vec<String>` を複製すると、列の数だけ無駄に確保するためです。
 fn convert_rows(rows: &[SqliteRow]) -> Result<Vec<Row>> {
     let Some(first) = rows.first() else {
         return Ok(Vec::new());
     };
-    let columns: Vec<String> = first
+    let columns: Arc<[String]> = first
         .columns()
         .iter()
         .map(|column| column.name().to_string())
@@ -251,12 +251,12 @@ fn convert_rows(rows: &[SqliteRow]) -> Result<Vec<Row>> {
 }
 
 /// sqlx の行を `Row` に直す。列の名前は呼ぶ側から受け取ります。
-fn convert_row(row: &SqliteRow, columns: &[String]) -> Result<Row> {
+fn convert_row(row: &SqliteRow, columns: &Arc<[String]>) -> Result<Row> {
     let mut values = Vec::with_capacity(columns.len());
     for (index, name) in columns.iter().enumerate() {
         values.push(convert_value(row, index, name)?);
     }
-    Ok(Row::new(columns.to_vec(), values))
+    Ok(Row::with_columns(Arc::clone(columns), values))
 }
 
 /// 1つの値を `Value` に直す。
@@ -313,7 +313,60 @@ fn try_in_order(row: &SqliteRow, index: usize, name: &str) -> Result<Value> {
 ///
 /// **渡した値は出しません。** 個人情報が混じることがあるためです。
 fn failed(sql: &str, error: sqlx::Error) -> Error {
-    Error::msg(format!("SQL の実行に失敗しました: {error}\n  SQL: {sql}"))
+    Error::other(SqlFailure {
+        sql: sql.to_string(),
+        source: error,
+    })
+}
+
+/// SQL の実行に失敗したときのエラー。
+///
+/// **sqlx のエラーを原因として残します。** 一意制約違反などを種類で見分けるためです。
+/// `Error::msg` に文だけ入れると、残るのは文字列だけになります。
+/// 表に出る文はこれまでと同じです。
+#[derive(Debug)]
+struct SqlFailure {
+    sql: String,
+    source: sqlx::Error,
+}
+
+impl SqlFailure {
+    /// 一意制約（unique / primary key）に当たったか。
+    fn is_unique_violation(&self) -> bool {
+        self.source
+            .as_database_error()
+            .is_some_and(|e| e.is_unique_violation())
+    }
+}
+
+impl std::fmt::Display for SqlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SQL の実行に失敗しました: {}\n  SQL: {}",
+            self.source, self.sql
+        )
+    }
+}
+
+impl std::error::Error for SqlFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// 一意制約違反かどうかを、原因の連鎖から探す。
+///
+/// `Error::Other` に包んだ `SqlFailure` を見つけて、そこから判断します。
+pub(crate) fn is_unique_violation(error: &Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(found) = current {
+        if let Some(failure) = found.downcast_ref::<SqlFailure>() {
+            return failure.is_unique_violation();
+        }
+        current = found.source();
+    }
+    false
 }
 
 #[cfg(test)]

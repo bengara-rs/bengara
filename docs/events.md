@@ -82,6 +82,13 @@ Event::try_dispatch("user.registered", &payload).await?;
 
 誰も聞いていないときは何も起きません。エラーにもなりません。
 
+**どこから呼んでも届きます。** コントローラ・ジョブ・自作コマンド・定期処理のどれでも
+同じです。`bootstrap/app.rs` は、置き場所が要らないコマンド（`init` / `--version` /
+`--help`）以外のすべてで読まれます。
+
+以前は `serve` と `route:list` のときだけ読んでいたので、`queue:work` や自作コマンドの
+中で `dispatch` を呼んでも、**エラーも警告も出さずに何も起きませんでした。**
+
 ```rust
 if Event::has_listeners("user.registered") { /* ... */ }
 Event::listener_count("user.registered");   // 何人聞いているか
@@ -123,7 +130,9 @@ let payload: Payload = bengara::serde_json::from_str(&payload)?;
 
 ## 何をどこでやるか
 
-聞く側はリクエストの中で動きます。 **ここで待つと、画面の応答が遅くなります。**
+聞く側は、知らせた場所でそのまま動きます。
+リクエストの中で知らせたなら、リクエストの中で動きます。
+**ここで待つと、画面の応答が遅くなります。**
 
 | やること                                 | 置き場所               |
 |------------------------------------------|------------------------|

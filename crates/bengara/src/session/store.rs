@@ -30,6 +30,23 @@ pub trait SessionStore: Send + Sync + 'static {
     /// 中身を消す。
     fn destroy(&self, id: &str) -> Result<()>;
 
+    /// 中身を変えずに**期限だけ延ばす**。
+    ///
+    /// 読むだけのリクエスト（GET の画面）でも呼ばれます。延ばさないと、
+    /// 置き場所の期限が「最後に書いたとき」から数えられるので、
+    /// 画面を見て回っていた人が突然ログアウトされます。
+    ///
+    /// **既定は `read` して、同じ中身で `write` し直すだけです。**
+    /// 置き場所が期限を知っているなら、残りが半分を切ったときだけ書く形にして
+    /// ください（`FileStore` と `MemoryStore` はそうしています）。
+    /// 置き場所に無い ID のときは何もしません。
+    fn touch(&self, id: &str) -> Result<()> {
+        if let Some(data) = self.read(id)? {
+            self.write(id, &data)?;
+        }
+        Ok(())
+    }
+
     /// ある利用者のセッションを**全部**消す。消した数を返す。
     ///
     /// 利用者 ID は、セッションの中の `bengara_auth_id`（`Auth::login` が入れる値）です。
@@ -91,6 +108,8 @@ fn is_session_id(name: &str) -> bool {
 pub struct FileStore {
     dir: PathBuf,
     lifetime_secs: u64,
+    /// ディレクトリの権限を直したか（`ensure_dir` が1回だけ呼びます）。
+    restricted: std::sync::Once,
 }
 
 impl FileStore {
@@ -99,6 +118,7 @@ impl FileStore {
         Self {
             dir: dir.into(),
             lifetime_secs,
+            restricted: std::sync::Once::new(),
         }
     }
 
@@ -120,6 +140,11 @@ impl FileStore {
 
     fn ensure_dir(&self) -> Result<()> {
         if self.dir.is_dir() {
+            // 既にあるときも権限を直す。tar の展開などで 0755 のまま置かれると、
+            // ファイルが 0600 でも**ディレクトリが読めるので、
+            // ファイル名＝セッション ID を一覧できてしまいます。**
+            // 書き込みごとに直す意味は無いので、1回だけにします。
+            self.restricted.call_once(|| restrict_dir(&self.dir));
             return Ok(());
         }
         // storage/ そのものが無いなら、作らずに知らせる（決定記録 #023）。
@@ -131,7 +156,7 @@ impl FileStore {
             )));
         }
         std::fs::create_dir_all(&self.dir)?;
-        restrict_dir(&self.dir);
+        self.restricted.call_once(|| restrict_dir(&self.dir));
         Ok(())
     }
 
@@ -250,6 +275,21 @@ impl SessionStore for FileStore {
         }
     }
 
+    fn touch(&self, id: &str) -> Result<()> {
+        let path = self.path_of(id)?;
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let Ok(stored) = serde_json::from_str::<Stored>(&raw) else {
+            // 壊れたファイルは `read` と `sweep` の仕事。ここでは触らない。
+            return Ok(());
+        };
+        if !needs_touch(stored.expires_at, self.lifetime_secs) {
+            return Ok(());
+        }
+        self.write(id, &stored.data)
+    }
+
     fn destroy_for_user(&self, user_id: &str) -> Result<usize> {
         self.destroy_matching(user_id, None)
     }
@@ -257,6 +297,15 @@ impl SessionStore for FileStore {
     fn destroy_for_user_except(&self, user_id: &str, keep_id: &str) -> Result<usize> {
         self.destroy_matching(user_id, Some(keep_id))
     }
+}
+
+/// 期限を延ばし直すか。**残りが半分を切ったときだけ**書きます。
+///
+/// 毎リクエスト書くと、GET の画面を開くたびにファイルを置き換えることになります。
+/// 半分を境にすれば、書く回数は多くても期限の半分に1回で済みます。
+fn needs_touch(expires_at: u64, lifetime_secs: u64) -> bool {
+    let remaining = expires_at.saturating_sub(now());
+    remaining <= lifetime_secs / 2
 }
 
 /// 所有者だけが読み書きできるファイルとして書く。
@@ -350,6 +399,18 @@ impl SessionStore for MemoryStore {
     fn destroy(&self, id: &str) -> Result<()> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.remove(id);
+        Ok(())
+    }
+
+    fn touch(&self, id: &str) -> Result<()> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((expires_at, _)) = entries.get_mut(id) else {
+            return Ok(());
+        };
+        if *expires_at <= now() || !needs_touch(*expires_at, self.lifetime_secs) {
+            return Ok(());
+        }
+        *expires_at = now() + self.lifetime_secs;
         Ok(())
     }
 
@@ -733,6 +794,87 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["abc".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 置き場所のファイルから `expires_at` を読む。
+    fn expires_of(dir: &Path, id: &str) -> u64 {
+        let raw = std::fs::read_to_string(dir.join(id)).unwrap();
+        serde_json::from_str::<Stored>(&raw).unwrap().expires_at
+    }
+
+    #[test]
+    fn 残りが半分を切ったらファイルの期限を延ばす() {
+        let dir = temp_dir("touch-file");
+        let store = FileStore::new(&dir, 60);
+        store.write("abc", &data(&[("a", "1")])).unwrap();
+
+        // 書いた直後は残り 60 秒。半分（30 秒）を切っていないので書かない。
+        let before = expires_of(&dir, "abc");
+        store.touch("abc").unwrap();
+        assert_eq!(expires_of(&dir, "abc"), before, "まだ延ばさない");
+
+        // 残り 10 秒の形に差し替える。
+        let stored = Stored {
+            expires_at: now() + 10,
+            data: data(&[("a", "1")]),
+        };
+        std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
+        store.touch("abc").unwrap();
+        let after = expires_of(&dir, "abc");
+        assert!(after > now() + 50, "期限が延びている");
+        // 中身は変えない。
+        assert_eq!(store.read("abc").unwrap(), Some(data(&[("a", "1")])));
+
+        // 置き場所に無い ID なら何もしない（新しいファイルを作らない）。
+        store.touch("missing").unwrap();
+        assert!(!dir.join("missing").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 残りが半分を切ったらメモリの期限も延ばす() {
+        let store = MemoryStore::new(60);
+        store.write("abc", &data(&[("a", "1")])).unwrap();
+
+        let before = store.entries.lock().unwrap().get("abc").unwrap().0;
+        store.touch("abc").unwrap();
+        assert_eq!(
+            store.entries.lock().unwrap().get("abc").unwrap().0,
+            before,
+            "まだ延ばさない"
+        );
+
+        // 残り 10 秒にする。
+        store.entries.lock().unwrap().get_mut("abc").unwrap().0 = now() + 10;
+        store.touch("abc").unwrap();
+        assert!(
+            store.entries.lock().unwrap().get("abc").unwrap().0 > now() + 50,
+            "期限が延びている"
+        );
+        assert_eq!(store.read("abc").unwrap(), Some(data(&[("a", "1")])));
+
+        // 置き場所に無い ID なら何もしない。
+        store.touch("missing").unwrap();
+        assert!(store.read("missing").unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 既にあるディレクトリの権限も直す() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("perm");
+        // tar の展開などで 0755 のまま置かれた形。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = FileStore::new(&dir, 60);
+        store.write("abc", &data(&[("a", "1")])).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "ディレクトリを他人から読めないようにする");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

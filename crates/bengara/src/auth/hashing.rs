@@ -115,6 +115,8 @@ impl Hash {
     /// 長さの上限はありません（`String` を返すので、断る手段がありません）。
     /// ただし [`check`](Hash::check) は 1024 バイトを超える入力を断るので、
     /// **登録のときに `max:1024` を付けて検査してください。**
+    /// 付け忘れると、その人は二度とログインできません。
+    /// 1024 バイトを超える平文を渡したときは警告をログに出します。
     pub fn make(password: &str) -> String {
         Self::make_with(password, iterations())
     }
@@ -133,6 +135,16 @@ impl Hash {
 
     /// 回数を指定して変える。
     pub fn make_with(password: &str, iterations: u32) -> String {
+        // 上限を超える平文は、作れても二度と照合できない（`check` が断る）。
+        // 戻り値の型を変えられないので、せめて作ったところで警告を出す。
+        if password.len() > MAX_PASSWORD_BYTES {
+            tracing::warn!(
+                "パスワードが長すぎます（{} バイト、上限は {MAX_PASSWORD_BYTES} バイト）。\
+                 この値は `check` が常に偽を返すので、ログインできません。\
+                 登録の検査に `max:{MAX_PASSWORD_BYTES}` を足してください",
+                password.len()
+            );
+        }
         let iterations = iterations.max(1);
         let salt = crypto::random_bytes::<SALT_BYTES>();
         let digest = crypto::pbkdf2_sha256(password.as_bytes(), &salt, iterations);
@@ -398,6 +410,17 @@ mod tests {
         let kana = "あ".repeat(MAX_PASSWORD_BYTES / 3 + 1);
         assert!(kana.len() > MAX_PASSWORD_BYTES);
         assert!(!Hash::check(&kana, &stored));
+    }
+
+    #[test]
+    fn 上限を超える平文でも作れるが照合できない() {
+        // `make` は `String` を返すので断れない。落ちずに値を作り、警告だけ出す。
+        let over = "a".repeat(MAX_PASSWORD_BYTES + 1);
+        let stored = Hash::make_with(&over, FAST);
+        assert!(stored.starts_with("$pbkdf2-sha256$"), "{stored}");
+
+        // 作れてしまうが、`check` は上限で断るので二度と合わない。
+        assert!(!Hash::check(&over, &stored), "登録できてもログインできない");
     }
 
     #[test]

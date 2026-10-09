@@ -209,7 +209,7 @@ impl QueryBuilder {
         }
     }
 
-    /// 比べる演算子として受け付けるか確かめる。
+    /// 列と列を比べる演算子として受け付けるか確かめる。
     fn check_operator(&mut self, place: &str, operator: &str) {
         if !grammar::is_allowed_operator(operator) {
             self.defer(format!(
@@ -217,6 +217,28 @@ impl QueryBuilder {
                 grammar::OPERATORS.join(", ")
             ));
         }
+    }
+
+    /// 値1つと比べる演算子として受け付けるか確かめる。
+    ///
+    /// `in` / `between` 系は値1つでは SQL が成り立ちません。専用のメソッドへ
+    /// 案内します。
+    fn check_value_operator(&mut self, place: &str, operator: &str) {
+        if grammar::is_allowed_value_operator(operator) {
+            return;
+        }
+        if grammar::is_set_operator(operator) {
+            self.defer(format!(
+                "{place} に渡した演算子 `{operator}` は、値1つとは比べられません。\
+                 一覧と比べるときは where_in / where_not_in、\
+                 範囲で絞るときは where_between / where_not_between を使ってください"
+            ));
+            return;
+        }
+        self.defer(format!(
+            "{place} に渡した演算子 `{operator}` は使えません（使えるもの: {}）",
+            grammar::VALUE_OPERATORS.join(", ")
+        ));
     }
 
     /// 生の SQL に書いた `?` の数と、渡した値の数が合っているか確かめる。
@@ -273,7 +295,7 @@ impl QueryBuilder {
     /// 演算子は許可一覧（`=` `!=` `<` `<=` `>` `>=` `like` `is` など）で照合します。
     /// 外れているときは終端メソッドでエラーになります。
     pub fn where_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.check_operator("where_op", operator);
+        self.check_value_operator("where_op", operator);
         self.push_basic("where_op", Glue::And, column, operator, value.into_value())
     }
 
@@ -284,7 +306,7 @@ impl QueryBuilder {
 
     /// `or` でつないで、列と値を演算子で比べる。演算子は許可一覧で照合します。
     pub fn or_where_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.check_operator("or_where_op", operator);
+        self.check_value_operator("or_where_op", operator);
         self.push_basic(
             "or_where_op",
             Glue::Or,
@@ -548,7 +570,7 @@ impl QueryBuilder {
     /// 式で絞りたいときは `having_raw` を使ってください。
     pub fn having_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
         self.check_column("having_op", column);
-        self.check_operator("having_op", operator);
+        self.check_value_operator("having_op", operator);
         self.havings.push(Where::Basic {
             boolean: Glue::And,
             column: column.to_string(),
@@ -756,11 +778,8 @@ impl QueryBuilder {
         if let Some(offset) = self.offset {
             if self.limit.is_none() {
                 // SQLite と MySQL は limit が無いと offset を受け付けない。
-                // PostgreSQL では `limit -1` が構文エラーなので `limit all` を使う。
-                c.sql.push_str(match self.driver {
-                    Driver::Postgres => " limit all",
-                    _ => " limit -1",
-                });
+                // 「上限なし」の書き方は方言で違うので grammar に集めてある。
+                c.sql.push_str(grammar::no_limit(self.driver));
             }
             c.sql.push_str(&format!(" offset {offset}"));
         }
@@ -902,6 +921,20 @@ impl QueryBuilder {
         Ok(())
     }
 
+    /// `insert` 系で使えない指定が付いていないか。
+    ///
+    /// 足す行に条件や結合は効きません。黙って無視すると、絞ったつもりの
+    /// `insert` が通ってしまいます。
+    fn check_insert(&self, what: &str) -> Result<()> {
+        self.check_write(what)?;
+        if !self.wheres.is_empty() {
+            return Err(Error::msg(format!(
+                "{what} では条件が効きません。足す値だけを渡してください"
+            )));
+        }
+        Ok(())
+    }
+
     // ---- 実行 ----
 
     /// 行を取る。
@@ -924,9 +957,13 @@ impl QueryBuilder {
 
     /// 最初の行の、ある列の値を取る。
     ///
-    /// `users.name` のように表名を付けた指定や、別名付きの式も渡せます。
+    /// `users.name` のように表名を付けた指定も渡せます。
     /// 1列だけ取るので、名前ではなく**位置**から読むためです。
+    ///
+    /// 列名は英数字と `_` `.` だけが使えます。式が欲しいときは `select(...)` ＋
+    /// `get()` を使ってください。
     pub async fn value<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
+        ensure_value_column("value", column)?;
         let row = self.clone().select(&[column]).first().await?;
         match row.as_ref().and_then(|row| row.at(0)) {
             Some(value) => T::from_value(value)
@@ -940,7 +977,11 @@ impl QueryBuilder {
     ///
     /// `pluck::<String>("users.name")` のように表名を付けても取れます。
     /// SQLite が返す列名は `name` になりますが、**位置**から読むためです。
+    ///
+    /// 列名は英数字と `_` `.` だけが使えます。式が欲しいときは `select(...)` ＋
+    /// `get()` を使ってください。
     pub async fn pluck<T: FromValue>(&self, column: &str) -> Result<Vec<T>> {
+        ensure_value_column("pluck", column)?;
         let rows = self.clone().select(&[column]).get().await?;
         rows.iter()
             .map(|row| match row.at(0) {
@@ -1025,9 +1066,12 @@ impl QueryBuilder {
     }
 
     /// 1件でもあるか。
+    ///
+    /// 並びと件数の指定は外します。`latest()` を付けた問い合わせでも、
+    /// 並べ替えの手間をかけないためです。
     pub async fn exists(&self) -> Result<bool> {
         let rows = self
-            .clone()
+            .for_aggregate()
             .select(&["1 as bengara_exists"])
             .limit(1)
             .get()
@@ -1095,8 +1139,12 @@ impl QueryBuilder {
             )));
         }
         let quoted = if column == "*" {
+            // `count(*)` と同じ書き方。ここだけ別扱いにする。
             "*".to_string()
         } else {
+            // `quote` は空白や `(` を含む名前を式として素通しする。
+            // 検査しないと列名がそのまま SQL に入る。
+            ensure_value_column(&format!("{function}()"), column)?;
             grammar::quote(self.driver, column)
         };
         let expression = if self.distinct {
@@ -1122,8 +1170,12 @@ impl QueryBuilder {
     ///
     /// **列の名前と並びは最初の行とそろえてください。** ずれているときはエラーにします。
     /// 行ごとに並びを読み替えると、取り違えに気づけないためです。
+    ///
+    /// **`where_` / `join` / `limit` などは使えません。** 組み立てた SQL に入らない
+    /// ので、付いているときはエラーにします。
     pub async fn insert_many(&self, rows: &[Vec<(&str, Value)>]) -> Result<Affected> {
         self.check()?;
+        self.check_insert("insert")?;
         let Some(first) = rows.first() else {
             return Ok(Affected::default());
         };
@@ -1146,6 +1198,7 @@ impl QueryBuilder {
         primary_key: &str,
     ) -> Result<i64> {
         self.check()?;
+        self.check_insert("insert")?;
         if values.is_empty() {
             return Err(Error::msg("insert に渡す列がありません"));
         }
@@ -1243,6 +1296,66 @@ impl QueryBuilder {
         Ok(affected.rows)
     }
 
+    /// 列の値を足す。返るのは変わった件数です。
+    ///
+    /// `views = views + 1` を1文で流します。読んでから書くのと違い、同時に
+    /// 2本来ても片方の `+1` が消えません。
+    ///
+    /// ```ignore
+    /// DB::table("posts").where_("id", id).increment("views", 1).await?;
+    /// ```
+    ///
+    /// 列名は英数字と `_` `.` だけが使えます。`update` と同じく、
+    /// **`updated_at` は自動で入れません。**
+    /// 使えない指定（`join` / `limit` など）は `update` と同じです。
+    pub async fn increment(&self, column: &str, amount: i64) -> Result<u64> {
+        self.step("increment", column, '+', amount).await
+    }
+
+    /// 列の値を引く。中身は `increment` と同じで、符号だけが違います。
+    ///
+    /// ```ignore
+    /// DB::table("posts").where_("id", id).decrement("stock", 1).await?;
+    /// ```
+    pub async fn decrement(&self, column: &str, amount: i64) -> Result<u64> {
+        self.step("decrement", column, '-', amount).await
+    }
+
+    /// `increment` と `decrement` の中身。
+    async fn step(&self, place: &str, column: &str, sign: char, amount: i64) -> Result<u64> {
+        self.check()?;
+        self.check_write(place)?;
+        let (sql, bindings) = self.step_sql(place, column, sign, amount)?;
+        let affected = self.source.execute(&sql, &bindings).await?;
+        Ok(affected.rows)
+    }
+
+    /// `increment` と `decrement` の SQL を組み立てる。
+    fn step_sql(
+        &self,
+        place: &str,
+        column: &str,
+        sign: char,
+        amount: i64,
+    ) -> Result<(String, Vec<Value>)> {
+        ensure_value_column(place, column)?;
+        let quoted = grammar::quote(self.driver, column);
+        let mut c = Compiler::new(self.driver);
+        c.sql.push_str("update ");
+        c.sql.push_str(&grammar::quote(self.driver, &self.table));
+        c.sql.push_str(" set ");
+        c.sql.push_str(&quoted);
+        c.sql.push_str(" = ");
+        c.sql.push_str(&quoted);
+        c.sql.push(' ');
+        c.sql.push(sign);
+        c.sql.push(' ');
+        // 増やす量もプレースホルダで渡す。SQL に埋め込まない。
+        c.push_value(Value::Int(amount));
+        self.compile_wheres(&mut c);
+        Ok((c.sql, c.bindings))
+    }
+
     /// 条件に当てはまる行を消す。返るのは消した件数です。
     ///
     /// **`join` / `limit` / `offset` / `group_by` / `having` / `distinct` は
@@ -1270,15 +1383,29 @@ impl QueryBuilder {
                 "truncate では条件が効きません。delete() を使ってください",
             ));
         }
-        // SQLite に truncate は無い。条件なしの delete と同じ。
-        let sql = match self.driver {
-            Driver::Sqlite => format!("delete from {}", grammar::quote(self.driver, &self.table)),
-            _ => format!(
-                "truncate table {}",
-                grammar::quote(self.driver, &self.table)
-            ),
-        };
-        self.source.execute(&sql, &[]).await?;
+        match self.driver {
+            // SQLite に truncate は無い。条件なしの delete と同じ。
+            // ただし delete だけでは `sqlite_sequence` が残り、採番が戻らない。
+            // MySQL / PostgreSQL の truncate は戻すので、2文に分けてそろえる。
+            Driver::Sqlite => {
+                // `sqlite_sequence` は autoincrement の表が1つも無いと存在しない。
+                // その失敗はエラーにしない。
+                let reset = "delete from sqlite_sequence where name = ?";
+                let _ = self
+                    .source
+                    .execute(reset, &[Value::Text(self.table.clone())])
+                    .await;
+                let sql = format!("delete from {}", grammar::quote(self.driver, &self.table));
+                self.source.execute(&sql, &[]).await?;
+            }
+            _ => {
+                let sql = format!(
+                    "truncate table {}",
+                    grammar::quote(self.driver, &self.table)
+                );
+                self.source.execute(&sql, &[]).await?;
+            }
+        }
         Ok(())
     }
 
@@ -1318,6 +1445,23 @@ fn ensure_column(place: &str, column: &str) -> Result<()> {
     }
     Err(Error::msg(format!(
         "{place} に渡した列名 `{column}` は使えません。英数字と `_` `.` だけが使えます"
+    )))
+}
+
+/// 値を1つ取り出す所の列名を確かめる。
+///
+/// `sum` / `avg` / `min` / `max` / `pluck` / `value` / `increment` / `decrement`
+/// はここを通します。`grammar::quote` は空白や `(` を含む名前を式として素通しする
+/// ので、検査しないと列名がそのまま SQL に入ります。
+///
+/// 式を書きたいときの逃げ道は `select(...)` ＋ `get()` です。
+fn ensure_value_column(place: &str, column: &str) -> Result<()> {
+    if grammar::is_plain_identifier(column) {
+        return Ok(());
+    }
+    Err(Error::msg(format!(
+        "{place} に渡した列名 `{column}` は使えません。英数字と `_` `.` だけが使えます。\
+         式を書きたいときは select(...) に書いて get() してください"
     )))
 }
 
@@ -1722,13 +1866,26 @@ mod tests {
     }
 
     #[test]
-    fn postgres_では_offset_だけでも通る形にする() {
-        let query = QueryBuilder {
-            driver: Driver::Postgres,
-            ..builder()
-        };
-        let (sql, _) = query.offset(5).to_sql();
-        assert_eq!(sql, "select * from \"posts\" limit all offset 5");
+    fn offset_だけのときの_limit_は方言ごとに変わる() {
+        // `limit -1` が通るのは SQLite だけ。MySQL は構文エラーになる。
+        for (driver, expected) in [
+            (Driver::Sqlite, "select * from \"posts\" limit -1 offset 5"),
+            (
+                Driver::MySql,
+                "select * from `posts` limit 18446744073709551615 offset 5",
+            ),
+            (
+                Driver::Postgres,
+                "select * from \"posts\" limit all offset 5",
+            ),
+        ] {
+            let query = QueryBuilder {
+                driver,
+                ..builder()
+            };
+            let (sql, _) = query.offset(5).to_sql();
+            assert_eq!(sql, expected, "{driver}");
+        }
     }
 
     #[tokio::test]
@@ -1889,5 +2046,300 @@ mod tests {
         assert_eq!(empty.from(), None);
         assert_eq!(empty.to(), None);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn 集計の列名も検査する() {
+        // `quote` は空白や `(` を含む名前を式として素通しするので、
+        // 検査しないと列名がそのまま SQL に入る。
+        for danger in ["views from users --", "views) , (select 1", "views desc"] {
+            for function in ["sum", "avg", "min", "max"] {
+                let message = builder()
+                    .aggregate_sql(function, danger)
+                    .expect_err("断られる")
+                    .to_string();
+                assert!(message.contains("使えません"), "{message}");
+                assert!(message.contains(danger), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn 表名付きの列と米印は集計で通る() {
+        let (sql, _) = builder().aggregate_sql("sum", "posts.views").expect("通る");
+        assert_eq!(
+            sql,
+            "select sum(\"posts\".\"views\") as bengara_aggregate from \"posts\""
+        );
+
+        let (sql, _) = builder().aggregate_sql("count", "*").expect("通る");
+        assert_eq!(sql, "select count(*) as bengara_aggregate from \"posts\"");
+    }
+
+    #[tokio::test]
+    async fn pluckとvalueの列名も検査する() {
+        let danger = "name from users --";
+        let message = builder()
+            .pluck::<String>(danger)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+        assert!(message.contains("select"), "{message}");
+
+        let message = builder()
+            .value::<String>(danger)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+    }
+
+    #[test]
+    fn 値1つと比べられない演算子は案内付きで断る() {
+        for operator in ["between", "not between", "in", "not in"] {
+            for query in [
+                builder().where_op("views", operator, 1),
+                builder().or_where_op("views", operator, 1),
+                builder()
+                    .group_by(&["author_id"])
+                    .having_op("total", operator, 1),
+            ] {
+                let message = query.check().expect_err("断られる").to_string();
+                assert!(message.contains("値1つとは比べられません"), "{message}");
+                assert!(message.contains("where_in"), "{message}");
+                assert!(message.contains("where_between"), "{message}");
+            }
+        }
+        // MySQL だけの書き方も値と比べる側では断る。
+        let message = builder()
+            .where_op("views", "<=>", 1)
+            .check()
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+        // 列と列を比べる側は今までどおり通る。
+        builder()
+            .where_column("a", "between", "b")
+            .check()
+            .expect("列と列の比較はこれまでどおり");
+    }
+
+    #[tokio::test]
+    async fn 条件や結合を付けたinsertは断る() {
+        let values = [("title", Value::Text("x".into()))];
+        let message = builder()
+            .where_("status", "draft")
+            .insert(&values)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("条件が効きません"), "{message}");
+
+        let message = builder()
+            .join("c", "c.post_id", "=", "posts.id")
+            .insert(&values)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("join"), "{message}");
+
+        let message = builder()
+            .where_("id", 1)
+            .insert_get_id(&values)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("条件が効きません"), "{message}");
+    }
+
+    #[test]
+    fn 増減のsqlは列を自分に足す形() {
+        let (sql, bindings) = builder()
+            .where_("id", 1)
+            .step_sql("increment", "views", '+', 1)
+            .expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "update \"posts\" set \"views\" = \"views\" + ? where \"id\" = ?"
+        );
+        assert_eq!(bindings, vec![Value::Int(1), Value::Int(1)]);
+
+        let (sql, _) = builder()
+            .step_sql("decrement", "stock", '-', 3)
+            .expect("組み立てられる");
+        assert_eq!(sql, "update \"posts\" set \"stock\" = \"stock\" - ?");
+
+        // 列名は検査する。
+        let message = builder()
+            .step_sql("increment", "views = 0, title", '+', 1)
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 結合を付けた増減は断る() {
+        let message = builder()
+            .join("c", "c.post_id", "=", "posts.id")
+            .increment("views", 1)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("join"), "{message}");
+
+        let message = builder()
+            .limit(1)
+            .decrement("views", 1)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("limit"), "{message}");
+    }
+
+    #[test]
+    fn existsは並びと件数を外す() {
+        // 並べ替えても1件あるかは変わらない。手間だけが増える。
+        let query = builder().where_("status", "published").latest().limit(10);
+        let (sql, _) = query
+            .for_aggregate()
+            .select(&["1 as bengara_exists"])
+            .limit(1)
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select 1 as bengara_exists from \"posts\" where \"status\" = ? limit 1"
+        );
+        assert!(!sql.contains("order by"), "{sql}");
+    }
+
+    // ---- 実際の SQLite を使うテスト ----
+
+    /// メモリ上の SQLite に `posts` を用意して、トランザクションから使う。
+    ///
+    /// `QueryBuilder` は `Source` を通すので、接続を直接は渡せません。
+    /// トランザクションから作ると、置き場所の設定に触らずに試せます。
+    #[cfg(feature = "sqlite")]
+    async fn live() -> super::super::Transaction {
+        use super::super::{ConnectionConfig, Schema, Transaction};
+
+        let backend = super::super::sqlite::connect(&ConnectionConfig::sqlite("test", ":memory:"))
+            .await
+            .expect("メモリ上の SQLite につながる");
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.create("posts", |t| {
+            t.id();
+            t.string("title").unique();
+            t.integer("views").default(0);
+        });
+        for sql in schema.into_statements() {
+            backend.execute(&sql, &[]).await.expect("表が作れる");
+        }
+        Transaction::start(backend).await.expect("始められる")
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn truncateの後は採番が1から始まる() {
+        let tx = live().await;
+        let posts = tx.table("posts");
+        let id = posts
+            .insert_get_id(&[("title", Value::Text("1本目".into()))])
+            .await
+            .expect("入る");
+        assert_eq!(id, 1);
+        let id = posts
+            .insert_get_id(&[("title", Value::Text("2本目".into()))])
+            .await
+            .expect("入る");
+        assert_eq!(id, 2);
+
+        posts.truncate().await.expect("空にできる");
+
+        // `sqlite_sequence` を消さないと 3 になる。
+        let id = posts
+            .insert_get_id(&[("title", Value::Text("やり直し".into()))])
+            .await
+            .expect("入る");
+        assert_eq!(id, 1, "truncate の後は 1 から");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn incrementは原子的に増やす() {
+        let tx = live().await;
+        let posts = tx.table("posts");
+        posts
+            .insert(&[("title", Value::Text("やきそば".into()))])
+            .await
+            .expect("入る");
+        posts
+            .insert(&[("title", Value::Text("たこやき".into()))])
+            .await
+            .expect("入る");
+
+        let one = tx.table("posts").where_("id", 1);
+        assert_eq!(one.increment("views", 1).await.expect("増える"), 1);
+        assert_eq!(one.increment("views", 1).await.expect("増える"), 1);
+        assert_eq!(
+            one.value::<i64>("views").await.expect("読める"),
+            Some(2),
+            "2回掛けたら 2 増える"
+        );
+        // 条件を付けていない行は変わらない。
+        assert_eq!(
+            tx.table("posts")
+                .where_("id", 2)
+                .value::<i64>("views")
+                .await
+                .expect("読める"),
+            Some(0)
+        );
+
+        // 条件なしは全件に当たる。
+        assert_eq!(
+            tx.table("posts")
+                .increment("views", 10)
+                .await
+                .expect("増える"),
+            2
+        );
+        assert_eq!(
+            tx.table("posts")
+                .where_("id", 2)
+                .value::<i64>("views")
+                .await
+                .expect("読める"),
+            Some(10)
+        );
+
+        // decrement は引く。
+        assert_eq!(one.decrement("views", 5).await.expect("減る"), 1);
+        assert_eq!(one.value::<i64>("views").await.expect("読める"), Some(7));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 一意制約違反を種類で見分けられる() {
+        use super::super::is_unique_violation;
+
+        let tx = live().await;
+        let posts = tx.table("posts");
+        let values = [("title", Value::Text("やきそば".into()))];
+        posts.insert(&values).await.expect("1本目は入る");
+
+        let error = posts.insert(&values).await.expect_err("2本目は断られる");
+        assert!(is_unique_violation(&error), "{error}");
+
+        // 列が無いだけのエラーは偽。
+        let error = posts
+            .insert(&[("nope", Value::Int(1))])
+            .await
+            .expect_err("無い列は断られる");
+        assert!(!is_unique_violation(&error), "{error}");
+
+        // 組み立てのエラー（接続より手前）も偽。
+        let error = Error::msg("ただのメッセージ");
+        assert!(!is_unique_violation(&error));
     }
 }

@@ -87,6 +87,10 @@ let real: PathBuf = disk.path("logo.png")?;         // 実際の場所
 
 `files` が返すのは **ディスクからの相対パス**です。下のディレクトリまで全部見ます。
 
+- **シンボリックリンク（Windows のジャンクション）はたどりません。** 飛ばします。
+  たどると、親を指すリンクが 1 つあるだけで再帰が止まらなくなります。
+- 深さの上限は 32 です。
+
 ```rust
 Storage::default_disk()?.files("notes").await?;
 // => ["notes/memo.txt", "notes/2026/01.txt"]

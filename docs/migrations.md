@@ -222,8 +222,8 @@ pub fn up(schema: &mut Schema) {
 | `pub fn up` / `pub fn down` が無い                 | コンパイルエラー                     | 両方必要です                                       |
 | 列の型を変える `change()`                          | **ありません**                       | SQLite が苦手なためです                            |
 | `t.id()` に `nullable()` / `default()` / `unique()`| 無視して警告                         | 型名ひとつで書くので、置く場所がありません         |
-| `schema.table(..)` の中の `t.id()` / `t.increments`| 警告が出て、その文は流れません       | `alter table add column` では自動採番を足せません |
-| `t.foreign(col)` に `.on(表名)` が無い             | 警告が出て、その外部キーは流れません | 指す先が決まりません                               |
+| `schema.table(..)` の中の `t.id()` / `t.increments`| 警告が出て、**その文は実行時に失敗します** | `alter table add column` では自動採番を足せません |
+| `t.foreign(col)` に `.on(表名)` が無い             | 警告が出て、**その文は実行時に失敗します** | 指す先が決まりません                         |
 
 ## 関連
 
