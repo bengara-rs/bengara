@@ -558,32 +558,50 @@ fn parse_level(raw: &str) -> Option<tracing::Level> {
     }
 }
 
-/// テストから使う初期化。`#[bengara::test]` が1回だけ呼びます。
+/// テストから使う初期化。**何度呼んでも、中身が走るのは 1 回だけ**です。
+///
+/// `#[bengara::test]` が付いたテストは**1 件ごとに**ここを呼びます。`Once` で囲うのは
+/// `env_vars::load_dotenv` が `std::env::set_var` を呼ぶからです。テストは複数の
+/// スレッドで同時に走るので、別のテストが `env()` で `std::env::var` を読んでいる間に
+/// 書き込むと未定義動作になります（`setenv`/`getenv` はスレッド安全ではありません。
+/// Rust 2024 で `set_var` が unsafe になったのはこのためです）。
+/// 中で呼ぶ他の処理（`install_test_mailer` など）はそれぞれ二重呼び出しに備えていましたが、
+/// `load_dotenv` だけが無防備でした。
+///
+/// **この関数は `bengara` の単体テストから呼んではいけません。** 言語の表・埋め込んだ
+/// `public/`・設定の一覧を `OnceLock` でプロセス全体に固定するので、1 回呼ぶだけで
+/// 同じテストバイナリの他のテストを壊します（以前、ここを呼ぶテストを足したら
+/// `lang::tests` が 6 件落ちました。空の言語表が先に固定され、`lang` 側の
+/// `TABLE.set` が無視されたためです）。動きの確認はアプリ側の `#[bengara::test]`
+/// が全件この道を通ることで足ります。
 pub(crate) fn boot_for_tests(hooks: Hooks) {
-    // メールはテストでは送らず、溜めるだけにする（`.env` を読む前に決める）。
-    crate::mail::install_test_mailer();
-    // パスワードのハッシュの回数を下げるのは **`.env` を読む前**に決める。
-    // `.env` の値まで尊重すると、開発用に下げた値（や上げた値）でテストが走り、
-    // 1 件ごとに数秒かかってしまう。環境変数で明示したときだけ従う。
-    crate::auth::install_test_iterations();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // メールはテストでは送らず、溜めるだけにする（`.env` を読む前に決める）。
+        crate::mail::install_test_mailer();
+        // パスワードのハッシュの回数を下げるのは **`.env` を読む前**に決める。
+        // `.env` の値まで尊重すると、開発用に下げた値（や上げた値）でテストが走り、
+        // 1 件ごとに数秒かかってしまう。環境変数で明示したときだけ従う。
+        crate::auth::install_test_iterations();
 
-    let base = paths::base_path().to_path_buf();
-    let (_, warnings) = env_vars::load_dotenv(&base);
-    init_tracing();
-    for warning in warnings {
-        tracing::warn!("{warning}");
-    }
-    if !config_registry::installed() {
-        let mut registry = Registry::new();
-        (hooks.configs)(&mut registry);
-        config_registry::install(registry);
-    }
-    // 言語の表を固定する。
-    crate::lang::install((hooks.lang)());
-    // 埋め込んだ public/ を固定する。以後は読むだけ。
-    crate::http::statics::install_embedded((hooks.public)());
-    // マイグレーションの一覧を、あとで `refresh_database()` から使えるようにしておく。
-    let _ = TEST_HOOKS.set(hooks);
+        let base = paths::base_path().to_path_buf();
+        let (_, warnings) = env_vars::load_dotenv(&base);
+        init_tracing();
+        for warning in warnings {
+            tracing::warn!("{warning}");
+        }
+        if !config_registry::installed() {
+            let mut registry = Registry::new();
+            (hooks.configs)(&mut registry);
+            config_registry::install(registry);
+        }
+        // 言語の表を固定する。
+        crate::lang::install((hooks.lang)());
+        // 埋め込んだ public/ を固定する。以後は読むだけ。
+        crate::http::statics::install_embedded((hooks.public)());
+        // マイグレーションの一覧を、あとで `refresh_database()` から使えるようにしておく。
+        let _ = TEST_HOOKS.set(hooks);
+    });
 }
 
 static TEST_HOOKS: std::sync::OnceLock<Hooks> = std::sync::OnceLock::new();

@@ -114,6 +114,13 @@ impl Application {
 
         // ミドルウェアとハンドラのパニックを1リクエストに閉じ込める。
         // 並びの一番外で包むので、共通ミドルウェアの中で起きたものも 500 になります。
+        //
+        // この形は意図したものです（決定記録 #008）。`catch_unwind` に替えると
+        // `UnwindSafe` の扱いが広く波及するので、ここは変えません。
+        //
+        // **制限**: クライアントが切断すると、axum 側の処理は落ちますが、ここで
+        // 切り出したタスクは走り続けます。そのタスクは停止処理の追跡から外れるので、
+        // 終了を待ってもらえません（停止の上限時間まで走り、そこで打ち切られます）。
         let response = match tokio::spawn(future).await {
             // `Next::run` は必ず `Ok` を返します（エラーはその中でレスポンスに変わります）。
             // ここの `Err` には来ませんが、型を合わせるために同じ関数を通します。
@@ -125,15 +132,16 @@ impl Application {
             }
         };
 
-        if is_head {
+        let response = if is_head {
             // 本文を空にする**前**に、元の長さを Content-Length にしておく。
             // HEAD は「GET と同じヘッダーで、本文だけが無いもの」です。
-            // 204 と 304 は長さを付けてはいけないので、そのときだけ付けません。
+            // 本文を持てない状態（1xx・204・304）は長さを付けてはいけないので、
+            // そのときだけ付けません。
             //
             // すでに長さが付いているときは、そのまま残します。静的ファイルの配信は
             // HEAD のときファイルを読まずに長さだけを入れるので、ここで数え直すと
             // 0 で上書きしてしまいます。
-            let response = if matches!(response.status(), 204 | 304)
+            let response = if crate::http::response::body_forbidden(response.status())
                 || response.header("content-length").is_some()
             {
                 response
@@ -144,7 +152,15 @@ impl Application {
             response.with_body(Vec::new())
         } else {
             response
-        }
+        };
+
+        // 本文を持てない状態（1xx・204・304）では、本文と種類・長さの申告を落とす。
+        //
+        // `error_response` は自分で落としますが、利用者が
+        // `Response::new(204).with_body(..)` のように**自分で組んだ**応答はそのまま来ます。
+        // 本文が付いた 204 は HTTP として正しくなく、枠組みの長さが相手と食い違います。
+        // 全部の応答が通るここで落とします。
+        crate::http::response::without_forbidden_body(response)
     }
 
     /// 最内側のハンドラを決める（ルート本体・405・静的ファイル・404）。
@@ -240,13 +256,16 @@ impl Application {
     /// （`/storage/...` なら置き場所だけ、それ以外は埋め込み → ディスク）。
     async fn serve_static(&self, req: &Request) -> Option<Response> {
         if matches!(req.method(), "GET" | "HEAD") {
-            let path = req.path().to_string();
+            // 振り分けの前に1回だけ正規化する。続いた `/` をまとめ、`%xx` を戻します。
+            // 以前は生のパスで `/storage/` を判定していたので、`//storage/x.css` と
+            // `/%73torage/x.css` が `public/` 側の枝に入っていました。
+            let path = crate::http::statics::normalize_path(req.path());
             let if_none_match = req.header("if-none-match").map(str::to_string);
             // HEAD は本文を返さないので、ファイルを読まずに長さだけ知らせる。
             let want_body = req.method() != "HEAD";
 
             // 1. `/storage/...` は storage/app/public/ から。
-            if path.starts_with(crate::http::statics::STORAGE_PREFIX) {
+            if crate::http::statics::is_storage_path(&path) {
                 let dir = self.inner.storage_public_dir.clone();
                 let root = self.inner.storage_public_canonical.clone();
                 let found = tokio::task::spawn_blocking(move || {
@@ -673,5 +692,32 @@ mod tests {
             Some("2"),
             "`ok` の 2 バイト"
         );
+    }
+
+    #[tokio::test]
+    async fn 自分で組んだ204の本文も落とす() {
+        // `error_response` を通らない道でも落とすこと。
+        // 本文が付いた 204 は HTTP として正しくなく、枠組みの長さが食い違う。
+        async fn no_content() -> AppResult<Response> {
+            Ok(Response::new(204)
+                .with_header("content-type", "text/plain")
+                .with_body("消えるはず"))
+        }
+
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/", no_content);
+                })
+            })
+            .create();
+
+        for method in ["GET", "HEAD"] {
+            let response = app.handle(Request::new(method, "/")).await;
+            assert_eq!(response.status(), 204, "{method}");
+            assert!(response.body().is_empty(), "{method}: 本文は付けない");
+            assert_eq!(response.header("content-type"), None, "{method}");
+            assert_eq!(response.header("content-length"), None, "{method}");
+        }
     }
 }

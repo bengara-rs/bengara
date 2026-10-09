@@ -40,6 +40,11 @@ pub trait SessionStore: Send + Sync + 'static {
     /// 置き場所が期限を知っているなら、残りが半分を切ったときだけ書く形にして
     /// ください（`FileStore` と `MemoryStore` はそうしています）。
     /// 置き場所に無い ID のときは何もしません。
+    ///
+    /// **期限切れを延命してはいけません。** 残りが 0 秒のものは「残りが半分を切った」
+    /// にも当たるので、期限を確かめずに書き直すと、切れたセッションに満額の寿命を
+    /// 与え直すことになります（`FileStore` が実際にそうなっていました）。
+    /// 既定の実装は `read` が期限切れを捨てるので、ここは守れています。
     fn touch(&self, id: &str) -> Result<()> {
         if let Some(data) = self.read(id)? {
             self.write(id, &data)?;
@@ -284,6 +289,12 @@ impl SessionStore for FileStore {
             // 壊れたファイルは `read` と `sweep` の仕事。ここでは触らない。
             return Ok(());
         };
+        // 期限切れは延命しない。`needs_touch` だけを見ていたころは、
+        // 残り 0 秒が「半分を切った」に当たり、満額の寿命を与え直していた。
+        // `MemoryStore::touch` には最初からこの確認がある。
+        if stored.expires_at <= now() {
+            return Ok(());
+        }
         if !needs_touch(stored.expires_at, self.lifetime_secs) {
             return Ok(());
         }
@@ -830,6 +841,36 @@ mod tests {
         // 置き場所に無い ID なら何もしない（新しいファイルを作らない）。
         store.touch("missing").unwrap();
         assert!(!dir.join("missing").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 期限切れのファイルは延命しない() {
+        // `needs_touch` だけを見ていたころは、残り 0 秒が「半分を切った」に
+        // 当たり、期限切れのセッションに満額の寿命を与え直していた。
+        let dir = temp_dir("touch-expired");
+        let store = FileStore::new(&dir, 60);
+        let stored = Stored {
+            expires_at: now().saturating_sub(10),
+            data: data(&[("a", "1")]),
+        };
+        std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
+
+        store.touch("abc").unwrap();
+        assert!(
+            expires_of(&dir, "abc") <= now(),
+            "期限は延びない: {}",
+            expires_of(&dir, "abc")
+        );
+        assert!(store.read("abc").unwrap().is_none(), "読めば消える");
+
+        // メモリの置き場所も同じ（こちらには最初から確認があった）。
+        let store = MemoryStore::new(60);
+        store.write("abc", &data(&[("a", "1")])).unwrap();
+        store.entries.lock().unwrap().get_mut("abc").unwrap().0 = now().saturating_sub(10);
+        store.touch("abc").unwrap();
+        assert!(store.read("abc").unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

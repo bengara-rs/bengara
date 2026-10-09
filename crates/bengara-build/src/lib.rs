@@ -75,6 +75,13 @@ const MAX_EMBED_FILE: u64 = 8 * 1024 * 1024;
 /// `public/` の合計がこれを超えるときは警告を出す（32 MiB）。
 const MAX_EMBED_TOTAL: u64 = 32 * 1024 * 1024;
 
+/// どこまで深く潜るか。これより深いディレクトリは見ません。
+///
+/// 上限が無いと、深い木でスタックを使い切って**パニック**します。このクレートは
+/// パニックしない決まりなので、超えたら `cargo:warning` で知らせて打ち切ります。
+/// 考え方は `bengara` の `storage.rs` と同じです。
+const MAX_DEPTH: usize = 32;
+
 /// マイグレーションの置き場所（**モジュール名**で書きます）。
 const MIGRATIONS_DIR: &[&str] = &["database", "migrations"];
 /// シーダーの置き場所。
@@ -278,7 +285,7 @@ impl Generator {
 
         // 大きくなりすぎたら気づけるようにする。止めはしない。
         let mut total: u64 = 0;
-        self.collect_public(&dir, "", &mut total);
+        self.collect_public(&dir, "", &mut total, 0);
         if total > MAX_EMBED_TOTAL {
             warn(&format!(
                 "public/ の合計が {} MiB あります。バイナリがその分大きくなります",
@@ -291,7 +298,15 @@ impl Generator {
     ///
     /// ファイルごとの `cargo:rerun-if-changed` は出しません。中身は生成コードの
     /// `include_bytes!` で取り込むので、rustc 側が追跡します（`public/` の指定とも重複します）。
-    fn collect_public(&mut self, dir: &Path, prefix: &str, total: &mut u64) {
+    fn collect_public(&mut self, dir: &Path, prefix: &str, total: &mut u64, depth: usize) {
+        // 深すぎるところは見ない。上限が無いとスタックを使い切ってパニックする。
+        if depth >= MAX_DEPTH {
+            warn(&format!(
+                "{} は {MAX_DEPTH} 段より深いので配信しません。ディレクトリを浅くしてください",
+                dir.display()
+            ));
+            return;
+        }
         let Some(entries) = self.read_dir_sorted(dir) else {
             return;
         };
@@ -315,7 +330,7 @@ impl Generator {
             };
             if entry.is_dir {
                 self.watch_existing(&entry.path);
-                self.collect_public(&entry.path, &key, total);
+                self.collect_public(&entry.path, &key, total, depth + 1);
                 continue;
             }
             // 大きさを OS に聞くのはここだけ。埋め込む `public/` のためだけに使います。
@@ -495,6 +510,16 @@ impl Generator {
     /// `module` は呼ぶ側が作ります。ここで作り直すと同じ変換が二度走り、
     /// 名前にできないディレクトリでは同じエラーを2回積むことになります。
     fn emit_dir(&mut self, dir: &Path, module: String, target: &Target, depth: usize) {
+        // 深すぎるところは見ない。上限が無いとスタックを使い切ってパニックする。
+        // ここで何も書かずに戻れば、生成コードは形を崩さない（ディレクトリは
+        // 入れ子の `mod` しか生まないので、親の側に書きかけは残らない）。
+        if depth >= MAX_DEPTH {
+            warn(&format!(
+                "{} は {MAX_DEPTH} 段より深いので見ません。ディレクトリを浅くしてください",
+                dir.display()
+            ));
+            return;
+        }
         let _ = writeln!(self.tree, "#[allow(unused_imports)] pub mod {module} {{");
         self.stack.push(module);
         // 入れ子のディレクトリも見張る。親だけ見張っても、下にファイルを足したときに
@@ -571,6 +596,19 @@ impl Generator {
                         path.display()
                     ));
                 }
+                continue;
+            }
+            // `User.old.rs` や `Copy of User.rs` は、コンパイルするつもりの無い控えです。
+            // 以前はこれを取り込もうとして、語幹が Rust の識別子にならないので
+            // `compile_error!` になり、置いただけで `cargo build` が全部止まっていました
+            // （`init` が作る `.gitignore` もこの形は拾いません）。
+            // 隠しファイルは `skip_file` が先に黙って外すので、ここには来ません。
+            if !is_source_name(stem) {
+                warn(&format!(
+                    "{} は取り込みません。`.` や空白が入った名前は Rust の名前にできないので、\
+                     控えのファイルと見なします",
+                    path.display()
+                ));
                 continue;
             }
             let Some(module) = self.module_name(stem, &path) else {
@@ -1042,6 +1080,19 @@ fn is_toml(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "toml")
 }
 
+/// 取り込む気のあるソースの名前か。
+///
+/// `.` と空白が入っていたら「控え」と見ます（`User.old.rs`・`Copy of User.rs`）。
+/// どちらも Rust の名前にできないので、取り込もうとすると必ずエラーになります。
+/// 利用者がコンパイルするつもりの無いファイルでビルドを止めないため、
+/// ここで外して `cargo:warning` だけ出します。
+///
+/// 名前が壊れている `.rs`（非 UTF-8 など）は、今までどおり `compile_error!` で止めます。
+/// あちらは「置いたのに取り込まれない」では済まない間違いだからです。
+fn is_source_name(stem: &str) -> bool {
+    !stem.contains('.') && !stem.chars().any(char::is_whitespace)
+}
+
 /// 取り込まないファイル。隠しファイルと、Rust の慣習で意味を持つ名前。
 fn skip_file(stem: &str) -> bool {
     stem.starts_with('.') || stem == "mod" || stem == "main" || stem == "lib"
@@ -1105,6 +1156,9 @@ fn starts_upper(stem: &str) -> bool {
 /// 英数字と `_` `-` 以外の文字が入っていたら断ります。`My Report.rs` を通すと
 /// `my -report` という名前になり、`cargo artisan` の引数は空白で切れているので
 /// 打ちようがありません。`list` には出るのに呼べない、という形になります。
+///
+/// 空白と `.` の入ったファイルは `is_source_name` が先に控えとして外すので、
+/// ここまで来るのは念のための備えです。
 fn to_command_name(stem: &str) -> Result<String, &'static str> {
     let mut out = String::with_capacity(stem.len() + 2);
     for (i, c) in stem.chars().enumerate() {
@@ -1369,6 +1423,64 @@ mod tests {
     }
 
     #[test]
+    fn 控えのファイルはビルドを止めない() {
+        // 以前は `User.old` が大文字始まりなので型の再エクスポートの対象になり、
+        // 識別子にできないので `compile_error!` になっていた。置いただけで
+        // `cargo build` が全部止まっていた。
+        let root = temp_root("backup");
+        touch(&root.join("app/Models/User.rs"), "pub struct User;");
+        touch(&root.join("app/Models/User.old.rs"), "pub struct User;");
+        touch(&root.join("app/Models/Copy of User.rs"), "pub struct User;");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let code = generator.finish();
+        // 本物だけを取り込む。控えは取り込まない。
+        assert!(code.contains("User.rs"));
+        assert!(!code.contains("User.old.rs"));
+        assert!(!code.contains("Copy of User.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 控えかどうかは点と空白で見分ける() {
+        assert!(is_source_name("User"));
+        assert!(is_source_name("home_controller"));
+        // `-` はモジュール名にできるので控えとは見ない（型名に使えないのは別の話）。
+        assert!(is_source_name("My-Model"));
+        assert!(!is_source_name("User.old"));
+        assert!(!is_source_name("Copy of User"));
+        assert!(!is_source_name("User backup"));
+    }
+
+    #[test]
+    fn 深すぎるディレクトリは打ち切る() {
+        // 上限が無いとスタックを使い切ってパニックする。このクレートは
+        // パニックしない決まりなので、警告で知らせて打ち切る。
+        let root = temp_root("deep");
+        let mut dir = root.join("app");
+        for i in 0..(MAX_DEPTH + 3) {
+            dir = dir.join(format!("D{i}"));
+        }
+        touch(&dir.join("Deep.rs"), "pub struct Deep;");
+        // 浅いところのファイルは取り込む。
+        touch(&root.join("app/Models/User.rs"), "pub struct User;");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let code = generator.finish();
+        assert!(code.contains("User.rs"));
+        assert!(!code.contains("Deep.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn 平らな名前は連番も登録する() {
         let mut generator = Generator::default();
         generator.stack.push("app".to_string());
@@ -1479,26 +1591,24 @@ mod tests {
     }
 
     #[test]
-    fn 打てないコマンド名はコンパイルエラーにする() {
-        let root = temp_root("bad_command");
+    fn 空白の入ったコマンドのファイルは控えとして飛ばす() {
         // `My Report` は `my -report` になり、`cargo artisan` では打てない。
+        // 以前はここで `compile_error!` にしていたが、空白や `.` の入った名前は
+        // 控えのファイル（`Copy of ...`）のことが多く、置いただけでビルドが全部
+        // 止まるのが困る。警告だけ出して飛ばす。
+        let root = temp_root("bad_command");
         touch(&root.join("app/Console/Commands/My Report.rs"), "");
+        touch(&root.join("app/Console/Commands/SendReport.rs"), "");
 
         let mut generator = Generator::default();
         generator.run(&root);
 
-        assert!(
-            generator
-                .errors
-                .iter()
-                .any(|e| e.contains("コマンドの名前にできません")),
-            "{:?}",
-            generator.errors
-        );
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
         let code = generator.finish();
-        assert!(code.contains("compile_error!"));
-        // 打てない名前は一覧にも入らない。
+        assert!(!code.contains("compile_error!"), "{code}");
+        // 打てない名前は一覧に入らない。打てる名前はそのまま入る。
         assert!(!code.contains("my -report"), "{code}");
+        assert!(code.contains("send-report"), "{code}");
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -23,7 +23,7 @@ pub use middleware::Authenticate;
 pub use reset::PasswordReset;
 
 pub(crate) use hashing::install_test_iterations;
-pub(crate) use middleware::INTENDED_KEY;
+pub(crate) use middleware::{is_internal_path, INTENDED_KEY};
 
 use crate::database::Model;
 use crate::error::{Error, Result};

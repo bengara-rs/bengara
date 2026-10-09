@@ -427,7 +427,15 @@ impl Request {
     ///
     /// 落ちると `Error::Validation` になり、422 と理由の一覧が返ります。
     /// 戻り値には**検査した項目だけ**が入ります。
-    /// 落ちたとき、セッションがあれば入力を覚えておきます（`session.old("title")` で読めます）。
+    /// 落ちたとき、**置き場所から読めたセッション**があれば入力を覚えておきます
+    /// （`session.old("title")` で読めます）。
+    ///
+    /// 値は前後の空白を落としてから検査します（Laravel の `TrimStrings` と同じ）。
+    ///
+    /// Cookie を持たない相手には覚えません。覚えると `flash` が保存を要求するので、
+    /// **壊れた本文を投げるだけでセッションのファイルが1つできます。**
+    /// CSRF の確認を外した口に投げ続けると、ファイルが限りなく増えました。
+    /// 「無いページではセッションを配らない」という判断と同じ理由です。
     pub fn validate(&self, rules: &[(&str, &str)]) -> Result<crate::validation::Validated> {
         let input = crate::validation::Input::new(self.input_pairs().to_vec());
         match crate::validation::validate(&input, rules) {
@@ -435,7 +443,9 @@ impl Request {
             Err(e) => {
                 // 覚え直させる入力は、ここだけで作る。`redact` を通さない道を作らない。
                 if let Some(session) = self.try_session() {
-                    session.flash_input(&redact(self.input_pairs()));
+                    if session.was_loaded() {
+                        session.flash_input(&redact(self.input_pairs()));
+                    }
                 }
                 Err(e)
             }
@@ -446,6 +456,8 @@ impl Request {
 /// セッションに残してはいけない語。
 ///
 /// 名前を `_` `-` `.` 空白と**大文字の境目**で区切り、1語ずつ突き合わせます。
+/// 語の**末尾の数字は落として**から突き合わせるので、一覧には数字を付けずに入れます
+/// （`password1` は `password` として当たります）。
 /// `api_key` や `private_key` は `key` の語で当たるので、一覧には1語ずつ入れます。
 const SENSITIVE: &[&str] = &[
     "password",
@@ -485,9 +497,17 @@ fn redact(pairs: &[(String, String)]) -> Vec<(String, String)> {
 /// 黙って落ちていました。再表示したフォームで住所欄だけが空に戻る、という
 /// 原因の分かりにくい不具合になります。
 ///
+/// **語の末尾の数字は落として**突き合わせます。語の単位だけで見ていたころは、
+/// `password1` `password2` `pass2` `token2` `otp1` がどの語にも当たらず、
+/// 検査に落ちた入力が**平文でセッションのファイルに残っていました。**
+/// `password1` / `password2` の組はパスワード変更フォームでよくある形で、
+/// 1 回検査に落ちるだけで両方がディスクに残ります。
+/// 落とすのは末尾だけなので、`keyword` や `shipping_address` は今までどおり残ります。
+///
 /// アクセスログでクエリの値を伏せるときも、同じ判定を使います。
 pub(crate) fn is_sensitive(name: &str) -> bool {
     for_each_word(name, |word| {
+        let word = word.trim_end_matches(|c: char| c.is_ascii_digit());
         SENSITIVE
             .iter()
             .any(|known| word.eq_ignore_ascii_case(known))
@@ -753,6 +773,63 @@ mod tests {
         ] {
             assert!(is_sensitive(name), "{name} は残してはいけない");
         }
+    }
+
+    #[test]
+    fn 数字で終わる名前も伏せる() {
+        // 語の単位だけで見ていたころは、数字で終わる名前が1語になるので
+        // どれも素通りし、平文でセッションのファイルに残っていた。
+        // `password1` / `password2` はパスワード変更フォームでよくある形。
+        for name in [
+            "password1",
+            "password2",
+            "pass2",
+            "token2",
+            "otp1",
+            "apiKey2",
+            "PASSWORD1",
+            "secret_key2",
+            "card1",
+        ] {
+            assert!(is_sensitive(name), "{name} は残してはいけない");
+        }
+        // 末尾の数字を落としても、普通の項目は残る。
+        for name in ["keyword", "shipping_address", "address1", "line2", "item_1"] {
+            assert!(!is_sensitive(name), "{name} は残してよい");
+        }
+
+        let pairs = vec![
+            ("title".to_string(), "のこる".to_string()),
+            ("password1".to_string(), "きえる".to_string()),
+            ("password2".to_string(), "きえる".to_string()),
+        ];
+        assert_eq!(
+            redact(&pairs),
+            vec![("title".to_string(), "のこる".to_string())]
+        );
+    }
+
+    #[test]
+    fn 読めていないセッションには旧入力を覚えない() {
+        // Cookie を持たない相手が壊れた本文を投げるだけで、セッションの
+        // ファイルが1つできてしまう（`flash` が保存を要求するため）。
+        let mut req = Request::new("post", "/api/posts").with_query("title=");
+        let session = crate::session::Session::empty();
+        req.set_session(session.clone());
+        assert!(req.validate(&[("title", "required")]).is_err());
+        assert!(session.old("title").is_none(), "覚えない");
+        assert!(!session.should_save(), "セッションを保存させない");
+    }
+
+    #[test]
+    fn 読めたセッションには旧入力を覚える() {
+        // 画面を使っている人には、今までどおり `old()` が働く。
+        let mut req = Request::new("post", "/posts").with_query("title=&body=本文");
+        let session = crate::session::Session::empty().mark_loaded();
+        req.set_session(session.clone());
+        assert!(req.validate(&[("title", "required")]).is_err());
+        assert_eq!(session.old("body").as_deref(), Some("本文"));
+        assert!(session.should_save());
     }
 
     #[test]

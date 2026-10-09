@@ -39,6 +39,12 @@ impl From<PlainType> for ColumnType {
 enum PlainType {
     Integer,
     BigInteger,
+    /// ほかの表の `id()` を指す整数。
+    ///
+    /// `BigInteger` と分けてあります。MySQL の `id()` は `bigint unsigned` なのに
+    /// `bigint`（符号付き）の列から外部キーを張ると ERROR 3780 で断られたためです。
+    /// SQLite と PostgreSQL では通るので、MySQL でしか気づけませんでした。
+    ForeignId,
     /// 長さ付きの文字列。
     Str(u32),
     Text,
@@ -162,8 +168,10 @@ impl Blueprint {
     }
 
     /// ほかの表を指す整数の列（`post_id` など）。
+    ///
+    /// Laravel の `foreignId()` と同じで符号なしです。`big_integer()` は符号付きのまま。
     pub fn foreign_id(&mut self, name: &str) -> ColumnDefinition<'_> {
-        self.push(name, PlainType::BigInteger)
+        self.push(name, PlainType::ForeignId)
     }
 
     /// 文字列（255 文字）。
@@ -264,7 +272,17 @@ impl Blueprint {
     }
 
     /// 複合主キー。
+    ///
+    /// 2 回呼ぶと置き換えます。以前は 1 回目が黙って消えていたので警告を出します。
     pub fn primary(&mut self, columns: &[&str]) {
+        if !self.primary.is_empty() {
+            tracing::warn!(
+                "{} の primary() を 2 回以上呼んでいます。\
+                 複合主キーは 1 回で指定してください。前の指定（{}）を置き換えます",
+                self.table,
+                self.primary.join(", ")
+            );
+        }
         self.primary = columns.iter().map(|c| (*c).to_string()).collect();
     }
 
@@ -351,6 +369,39 @@ impl Blueprint {
             })
             .collect();
         statements.extend(self.index_statements());
+
+        // 以前はここで `self.foreigns` と `self.primary` を読んでいませんでした。
+        // 成功を報告して、制約だけ無い表ができていました。
+        if !self.primary.is_empty() {
+            // 移植できる書き方がありません。`id()` を alter で使ったときと同じ扱いです。
+            tracing::warn!(
+                "{} の primary() は alter table では使えません。\
+                 後から主キーは足せないので、表を作り直してください（{}）",
+                self.table,
+                self.primary.join(", ")
+            );
+        }
+        if self.driver == Driver::Sqlite && !self.foreigns.is_empty() {
+            // SQLite の `alter table` に `add constraint` がありません。
+            // 流せない SQL になるので、ここでは出しません。
+            tracing::warn!(
+                "{} の foreign() は SQLite では使えません。\
+                 SQLite では後から外部キーを足せません。表を作り直してください",
+                self.table
+            );
+        } else {
+            for foreign in &self.foreigns {
+                statements.push(format!(
+                    "alter table {} add constraint {} {}",
+                    grammar::quote(driver, &self.table),
+                    grammar::quote(
+                        driver,
+                        &self.constraint_name(std::slice::from_ref(&foreign.column), "foreign")
+                    ),
+                    self.foreign_sql(foreign)
+                ));
+            }
+        }
         statements
     }
 
@@ -405,12 +456,48 @@ impl Blueprint {
 
     /// 索引の名前。ドライバで変えません。
     fn index_name(&self, columns: &[String], unique: bool) -> String {
-        format!(
-            "{}_{}_{}",
-            self.table,
-            columns.join("_"),
-            if unique { "unique" } else { "index" }
-        )
+        self.constraint_name(columns, index_suffix(unique))
+    }
+
+    /// 索引と外部キーに付ける名前を、重ならない形で作る。
+    ///
+    /// 短くて重なりが無いときは、これまでと同じ `{表}_{列を "_" で連結}_{種類}` のままです。
+    /// 既存のマイグレーションが作った名前を変えないためです。
+    ///
+    /// 名前が重なると 2 本目の `create index` が落ちます。以前こう壊れました。
+    ///
+    /// - `index(&["b_c"])` と `index(&["b", "c"])` がどちらも `a_b_c_index` になった。
+    /// - 長い複合索引同士が、サーバー側で切られた後に同じ名前になった。
+    ///
+    /// どちらかに当たるときは、列の並びから作ったハッシュを後ろに付けます。
+    fn constraint_name(&self, columns: &[String], suffix: &str) -> String {
+        let base = base_constraint_name(&self.table, columns, suffix);
+        if base.len() <= MAX_NAME_LEN && !self.name_is_ambiguous(&base, columns) {
+            return base;
+        }
+        hashed_constraint_name(&base, columns)
+    }
+
+    /// 同じ名前になる別の列の並びが、この表の組み立ての中にあるか。
+    fn name_is_ambiguous(&self, base: &str, columns: &[String]) -> bool {
+        self.constraint_targets()
+            .into_iter()
+            .any(|(other, suffix)| {
+                other != columns && base_constraint_name(&self.table, &other, suffix) == base
+            })
+    }
+
+    /// 名前を付けるものを「列の一覧」と「種類」の組で並べる。重なりを見るために使います。
+    fn constraint_targets(&self) -> Vec<(Vec<String>, &'static str)> {
+        let mut out: Vec<(Vec<String>, &'static str)> = self
+            .index_targets()
+            .into_iter()
+            .map(|(columns, unique)| (columns, index_suffix(unique)))
+            .collect();
+        for foreign in &self.foreigns {
+            out.push((vec![foreign.column.clone()], "foreign"));
+        }
+        out
     }
 
     fn index_sql(&self, columns: &[String], unique: bool) -> String {
@@ -512,14 +599,36 @@ impl Blueprint {
             grammar::quote(driver, &foreign.references)
         );
         if let Some(action) = &foreign.on_delete {
+            self.warn_unknown_action(&foreign.column, "on_delete", action);
             sql.push_str(" on delete ");
             sql.push_str(action);
         }
         if let Some(action) = &foreign.on_update {
+            self.warn_unknown_action(&foreign.column, "on_update", action);
             sql.push_str(" on update ");
             sql.push_str(action);
         }
         sql
+    }
+
+    /// 知らない動きが書かれていたら知らせる。
+    ///
+    /// `on_delete` / `on_update` は名前から raw だと分かりません。`"set-null"` のような
+    /// 打ち間違いが、migrate を流したときの分かりにくいエラーになっていました。
+    ///
+    /// SQL からは外しません。外すと、動きだけが黙って消えた外部キーができます。
+    /// `Result` を返せない組み立てなので、警告にしてあります（`id()` の無効な指定と同じ方針）。
+    fn warn_unknown_action(&self, column: &str, method: &str, action: &str) {
+        if is_allowed_foreign_action(action) {
+            return;
+        }
+        tracing::warn!(
+            "{}.{} の {method}(\"{action}\") は知らない動きです。\
+             使えるのは {} です。この文は実行のときに失敗するかもしれません",
+            self.table,
+            column,
+            FOREIGN_ACTIONS.join(" / ")
+        );
     }
 }
 
@@ -659,7 +768,10 @@ impl Schema {
         );
     }
 
-    /// 表を変える。足せるのは列と索引だけです。
+    /// 表を変える。足せるのは列と索引と外部キーだけです。
+    ///
+    /// 外部キーは SQLite では足せません（`alter table` に `add constraint` がない）。
+    /// 主キーはどのデータベースでも足せません。どちらも組み立てのときに警告を出します。
     pub fn table(&mut self, table: &str, build: impl FnOnce(&mut Blueprint)) {
         self.run(table, Mode::Alter, build);
     }
@@ -718,6 +830,77 @@ impl Schema {
     }
 }
 
+/// `on_delete` / `on_update` に書ける動き。
+const FOREIGN_ACTIONS: [&str; 5] = [
+    "cascade",
+    "set null",
+    "set default",
+    "restrict",
+    "no action",
+];
+
+/// 外部キーの動きとして受け付けるか。大文字小文字と空白はそろえて見ます。
+fn is_allowed_foreign_action(action: &str) -> bool {
+    let normalized = action
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    FOREIGN_ACTIONS.contains(&normalized.as_str())
+}
+
+/// 索引や外部キーの名前の長さの上限。
+///
+/// PostgreSQL が 63 バイト、MySQL が 64 バイトです。短いほうに合わせます。
+/// 超えた分はサーバー側で切られるので、切られた後に名前が重なります。
+const MAX_NAME_LEN: usize = 63;
+
+/// 索引の名前の末尾。
+fn index_suffix(unique: bool) -> &'static str {
+    if unique {
+        "unique"
+    } else {
+        "index"
+    }
+}
+
+/// これまでと同じ作り方の名前。
+fn base_constraint_name(table: &str, columns: &[String], suffix: &str) -> String {
+    format!("{table}_{}_{suffix}", columns.join("_"))
+}
+
+/// 重なるときの名前。列の並びから作ったハッシュを後ろに付けます。
+fn hashed_constraint_name(base: &str, columns: &[String]) -> String {
+    // 単位区切り（\u{1f}）でつなぐ。列名に入らない文字なので、
+    // `["b_c"]` と `["b", "c"]` が別のハッシュになります。
+    let seed = format!("{base}\u{1e}{}", columns.join("\u{1f}"));
+    let tail = format!("_{:08x}", fnv1a(&seed));
+    let head = truncate_bytes(base, MAX_NAME_LEN - tail.len());
+    format!("{head}{tail}")
+}
+
+/// 文字の境目を守って、指定のバイト数までに縮める。
+fn truncate_bytes(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// FNV-1a（32 ビット）。依存を増やさないためにここで書いています。
+fn fnv1a(text: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 /// 自動採番の主キーの書き方。
 fn auto_increment_sql(driver: Driver) -> &'static str {
     match driver {
@@ -734,6 +917,10 @@ fn type_sql(driver: Driver, kind: &PlainType) -> String {
         (_, PlainType::Integer) => "integer".into(),
         (Driver::Sqlite, PlainType::BigInteger) => "integer".into(),
         (_, PlainType::BigInteger) => "bigint".into(),
+        // `id()` と符号をそろえる。MySQL は符号の違う列への外部キーを断るため。
+        (Driver::Sqlite, PlainType::ForeignId) => "integer".into(),
+        (Driver::MySql, PlainType::ForeignId) => "bigint unsigned".into(),
+        (Driver::Postgres, PlainType::ForeignId) => "bigint".into(),
         (_, PlainType::Str(length)) => format!("varchar({length})"),
         (_, PlainType::Text) => "text".into(),
         (Driver::Sqlite, PlainType::Boolean) => "boolean".into(),
@@ -741,7 +928,21 @@ fn type_sql(driver: Driver, kind: &PlainType) -> String {
         (Driver::Postgres, PlainType::Boolean) => "boolean".into(),
         (Driver::Sqlite, PlainType::Float) => "real".into(),
         (Driver::Sqlite, PlainType::Double) => "real".into(),
-        (_, PlainType::Float) => "float".into(),
+        // MySQL の `float` は 4 バイトなので、同じコードでも MySQL だけ桁が落ちていた。
+        // `0.1234567890123` が `0.12345679` になる。
+        //
+        // ここは **Laravel の MySQL の既定から意図的に外しています**。
+        // Laravel は精度を渡さないと `float`（4 バイト）を書きます。bengara では次の
+        // 2 つの事情があるので、精度 53 を付けて 8 バイトにそろえます。
+        // MySQL は精度 25〜53 の `float(p)` を `double`（8 バイト）として扱います。
+        //
+        // - `Value::Float` は常に `f64`。4 バイトの列に入れると黙って桁が落ちる。
+        // - bengara は「同じコードが同じ結果になる」を優先している
+        //   （`decimal` の末尾 0 をドライバ間でそろえるのと同じ方針）。
+        //
+        // 4 バイトの列が要るときは `raw_column(列, "float")` で書けます。
+        (Driver::MySql, PlainType::Float) => "float(53)".into(),
+        (_, PlainType::Float) => "double precision".into(),
         (_, PlainType::Double) => "double precision".into(),
         (_, PlainType::Decimal(total, places)) => format!("numeric({total}, {places})"),
         // PostgreSQL では日付と JSON も `text` にします。
@@ -1073,6 +1274,208 @@ mod tests {
             assert_eq!(statements.len(), 2, "{driver}: {statements:?}");
             assert!(statements[1].starts_with("create index"), "{driver}");
         }
+    }
+
+    #[test]
+    fn foreign_id_は_id_と符号をそろえる() {
+        // MySQL は符号の違う列への外部キーを ERROR 3780 で断る。
+        // 以前は `bigint`（符号付き）だったので、MySQL でだけ外部キーが張れなかった。
+        let expected = [
+            (Driver::Sqlite, r#""post_id" integer not null"#),
+            (Driver::MySql, "`post_id` bigint unsigned not null"),
+            (Driver::Postgres, r#""post_id" bigint not null"#),
+        ];
+        for (driver, want) in expected {
+            let mut schema = Schema::new(driver);
+            schema.create("comments", |t| {
+                t.id();
+                t.foreign_id("post_id");
+            });
+            let sql = &schema.to_sql()[0];
+            assert!(sql.contains(want), "{driver}: {sql}");
+        }
+
+        // `big_integer()` は符号付きのまま。
+        let mut schema = Schema::new(Driver::MySql);
+        schema.create("t", |t| {
+            t.big_integer("n");
+        });
+        assert!(schema.to_sql()[0].contains("`n` bigint not null"));
+    }
+
+    #[test]
+    fn 表を変えるときも外部キーを出す() {
+        // 以前は `add column` と索引だけを出していた。
+        // 成功を報告して、外部キーだけ無い表ができていた。
+        for driver in [Driver::MySql, Driver::Postgres] {
+            let mut schema = Schema::new(driver);
+            schema.table("comments", |t| {
+                t.foreign_id("post_id");
+                t.foreign("post_id")
+                    .on("posts")
+                    .on_delete("cascade")
+                    .on_update("restrict");
+            });
+            let sql = schema.to_sql();
+            assert_eq!(sql.len(), 2, "{driver}: {sql:?}");
+            assert!(sql[0].starts_with("alter table"), "{driver}: {sql:?}");
+            assert!(
+                sql[1].contains("add constraint")
+                    && sql[1].contains("comments_post_id_foreign")
+                    && sql[1].contains("foreign key")
+                    && sql[1].contains("on delete cascade")
+                    && sql[1].contains("on update restrict"),
+                "{driver}: {}",
+                sql[1]
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_では後から外部キーを足さない() {
+        // SQLite の `alter table` に `add constraint` が無い。警告だけ出して SQL は出さない。
+        let mut schema = sqlite();
+        schema.table("comments", |t| {
+            t.foreign_id("post_id");
+            t.foreign("post_id").on("posts");
+        });
+        let sql = schema.to_sql();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(!sql[0].contains("foreign key"), "{sql:?}");
+    }
+
+    #[test]
+    fn 表を変えるときの主キーは_sql_にしない() {
+        // 後から主キーは足せない。警告だけ出す。
+        let mut schema = sqlite();
+        schema.table("posts", |t| {
+            t.string("slug");
+            t.primary(&["slug"]);
+        });
+        let sql = schema.to_sql();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(!sql[0].contains("primary key"), "{sql:?}");
+    }
+
+    #[test]
+    fn float_はどのドライバでも_8_バイトになる() {
+        // 以前は MySQL だけ 4 バイトの `float` で、`0.1234567890123` が落ちていた。
+        // `Value::Float` は常に f64 なので、どのドライバでも 8 バイトにそろえる。
+        // Laravel の MySQL の既定（`float` = 4 バイト）からは意図的に外している。
+        // MySQL は精度 25〜53 の `float(p)` を double（8 バイト）として扱う。
+        let expected = [
+            (Driver::Sqlite, r#""v" real not null"#),
+            (Driver::MySql, "`v` float(53) not null"),
+            (Driver::Postgres, r#""v" double precision not null"#),
+        ];
+        for (driver, want) in expected {
+            let mut schema = Schema::new(driver);
+            schema.create("t", |t| {
+                t.float("v");
+            });
+            assert!(schema.to_sql()[0].contains(want), "{driver}");
+        }
+
+        // `double()` は今までどおり。
+        let mut schema = Schema::new(Driver::MySql);
+        schema.create("t", |t| {
+            t.double("v");
+        });
+        assert!(schema.to_sql()[0].contains("`v` double precision not null"));
+    }
+
+    #[test]
+    fn 重なる索引名にはハッシュを付ける() {
+        // `index(&["b_c"])` と `index(&["b", "c"])` がどちらも `a_b_c_index` になり、
+        // 2 本目の `create index` が落ちていた。
+        let mut schema = sqlite();
+        schema.create("a", |t| {
+            t.string("b_c");
+            t.string("b");
+            t.string("c");
+            t.index(&["b_c"]);
+            t.index(&["b", "c"]);
+        });
+        let sql = schema.to_sql();
+        let names: Vec<&str> = sql[1..]
+            .iter()
+            .map(|s| s.split('"').nth(1).unwrap())
+            .collect();
+        assert_eq!(names.len(), 2, "{sql:?}");
+        assert_ne!(names[0], names[1], "{sql:?}");
+        for name in &names {
+            assert!(name.starts_with("a_b_c_index_"), "{name}");
+        }
+    }
+
+    #[test]
+    fn 短い索引名は今までと同じ() {
+        // 既存のマイグレーションが作った名前を変えないため。
+        let mut schema = sqlite();
+        schema.create("users", |t| {
+            t.string("email").unique();
+            t.string("name").index();
+            t.index(&["name", "email"]);
+            t.unique(&["name"]);
+        });
+        let sql = schema.to_sql().join("\n");
+        assert!(sql.contains(r#""users_name_index""#), "{sql}");
+        assert!(sql.contains(r#""users_name_email_index""#), "{sql}");
+        assert!(sql.contains(r#""users_name_unique""#), "{sql}");
+    }
+
+    #[test]
+    fn 長い索引名は上限の中で別の名前になる() {
+        // 63 バイトを超えるとサーバー側で切られる。切られた後に重なっていた。
+        let long = "c".repeat(40);
+        let other = "d".repeat(40);
+        let mut schema = sqlite();
+        schema.create("very_long_table_name_for_testing", |t| {
+            t.index(&[long.as_str()]);
+            t.index(&[other.as_str()]);
+        });
+        let sql = schema.to_sql();
+        let names: Vec<&str> = sql[1..]
+            .iter()
+            .map(|s| s.split('"').nth(1).unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1]);
+        for name in &names {
+            assert!(name.len() <= MAX_NAME_LEN, "{} 文字: {name}", name.len());
+        }
+    }
+
+    #[test]
+    fn 知らない_on_delete_でも_sql_は出す() {
+        // 外すと、動きだけが黙って消えた外部キーができる。警告だけ出して SQL は出す。
+        let mut schema = sqlite();
+        schema.create("comments", |t| {
+            t.foreign_id("post_id");
+            t.foreign("post_id").on("posts").on_delete("set-null");
+        });
+        assert!(schema.to_sql()[0].contains("on delete set-null"));
+
+        // 大文字と余った空白は通る。
+        assert!(is_allowed_foreign_action("SET   NULL"));
+        assert!(is_allowed_foreign_action("no action"));
+        assert!(!is_allowed_foreign_action("set-null"));
+        assert!(!is_allowed_foreign_action("drop"));
+    }
+
+    #[test]
+    fn primary_を_2_回呼ぶと後のが残る() {
+        // 置き換える動きは変えていない。警告だけ足した。
+        let mut schema = sqlite();
+        schema.create("t", |t| {
+            t.string("a");
+            t.string("b");
+            t.primary(&["a"]);
+            t.primary(&["b"]);
+        });
+        let sql = &schema.to_sql()[0];
+        assert!(sql.contains(r#"primary key ("b")"#), "{sql}");
+        assert!(!sql.contains(r#"primary key ("a")"#), "{sql}");
     }
 
     #[test]

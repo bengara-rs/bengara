@@ -168,17 +168,39 @@ impl Throttle {
         // **残すのは制限に近い鍵（`count` の多いもの）です。** 以前は期限の新しい順に
         // 残していたので、鍵を大量に作った相手の分が守られ、先に上限へ達していた
         // `/login` の鍵が落ちて数え直しになっていました（攻撃者に有利）。
-        let mut keys: Vec<(u32, Instant, String)> = buckets
+        //
+        // 全体は並べ替えません。以前は最大2万件を鍵ごと clone して
+        // `sort_unstable_by` に掛け、その間ずっと `buckets` の錠を握っていました
+        // （回数制限のかかる全リクエストがこの錠を取ります）。
+        // いま採るのは「`MAX_BUCKETS` 番目だけを確定させて、その境目で振り分ける」形です。
+        // 鍵は clone せず、並べ替えの材料（`count` と `resets_at`）だけを集めます。
+        // **どれを残すかの方針は同じ**です（`count` の多い順、同数なら `resets_at` の遠い順）。
+        let order = |a: &(u32, Instant), b: &(u32, Instant)| b.0.cmp(&a.0).then(b.1.cmp(&a.1));
+        let mut ranks: Vec<(u32, Instant)> = buckets
             .map
-            .iter()
-            .map(|(key, bucket)| (bucket.count, bucket.resets_at, key.clone()))
+            .values()
+            .map(|bucket| (bucket.count, bucket.resets_at))
             .collect();
-        // 多い順。同じなら期限の遠いほうを残す。
-        keys.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        let dropped = keys.len().saturating_sub(MAX_BUCKETS);
-        for (_, _, key) in keys.into_iter().skip(MAX_BUCKETS) {
-            buckets.map.remove(&key);
-        }
+        let border = *ranks.select_nth_unstable_by(MAX_BUCKETS, order).1;
+        // 境目と同じ値の鍵は、残せる数だけ残す（同じ値が境目にまたがるため）。
+        let stronger = ranks[..MAX_BUCKETS]
+            .iter()
+            .filter(|rank| order(rank, &border) == std::cmp::Ordering::Less)
+            .count();
+        let mut allowance = MAX_BUCKETS - stronger;
+        let before = buckets.map.len();
+        buckets.map.retain(|_, bucket| {
+            match order(&(bucket.count, bucket.resets_at), &border) {
+                // 境目より強い（制限に近い）。必ず残す。
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal if allowance > 0 => {
+                    allowance -= 1;
+                    true
+                }
+                _ => false,
+            }
+        });
+        let dropped = before - buckets.map.len();
         if dropped > 0 && !self.evicted.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 "数え方の置き場所が {MAX_BUCKETS} 件を超えたので、{dropped} 件を落としました。\
@@ -721,5 +743,79 @@ mod tests {
         let _ = throttle.hit("trigger", sweeping);
         let count = throttle.buckets.lock().unwrap().map.len();
         assert!(count <= MAX_BUCKETS + 1, "天井を守っている（残り {count}）");
+    }
+
+    #[test]
+    fn 天井で落とすとき制限に近い鍵を残す() {
+        // 全体を並べ替えない形にしたので、残す方針が変わっていないかを確かめる。
+        // `count` の多い鍵（制限に近いもの）が残ること。以前ここを期限の新しい順に
+        // していたので、鍵を大量に作った相手の分が守られていました（攻撃者に有利）。
+        let throttle = Throttle::new(u32::MAX, Duration::from_secs(60));
+        let now = Instant::now();
+
+        {
+            let mut buckets = throttle.buckets.lock().unwrap();
+            // 制限に近い鍵を少しだけ。
+            for i in 0..10 {
+                buckets.map.insert(
+                    format!("hot-{i}"),
+                    Bucket {
+                        count: 100,
+                        resets_at: now + Duration::from_secs(10),
+                    },
+                );
+            }
+            // 1回しか叩いていない鍵を、天井を超えるまで。
+            for i in 0..(MAX_BUCKETS + 500) {
+                buckets.map.insert(
+                    format!("cold-{i}"),
+                    Bucket {
+                        count: 1,
+                        // 期限は `hot` より遠い。期限で残すと `hot` が落ちる。
+                        resets_at: now + Duration::from_secs(50),
+                    },
+                );
+            }
+        }
+
+        let mut buckets = throttle.buckets.lock().unwrap();
+        throttle.evict(&mut buckets, now);
+        assert_eq!(buckets.map.len(), MAX_BUCKETS, "天井ぴったりまで落とす");
+        for i in 0..10 {
+            assert!(
+                buckets.map.contains_key(&format!("hot-{i}")),
+                "制限に近い hot-{i} は残る"
+            );
+        }
+    }
+
+    #[test]
+    fn 同じcountなら期限の遠いほうを残す() {
+        let throttle = Throttle::new(u32::MAX, Duration::from_secs(60));
+        let now = Instant::now();
+
+        {
+            let mut buckets = throttle.buckets.lock().unwrap();
+            // どれも `count` は同じ。期限だけが違う。
+            for i in 0..(MAX_BUCKETS + 100) {
+                buckets.map.insert(
+                    format!("key-{i}"),
+                    Bucket {
+                        count: 5,
+                        // i が大きいほど期限が遠い。
+                        resets_at: now + Duration::from_secs(10 + i as u64),
+                    },
+                );
+            }
+        }
+
+        let mut buckets = throttle.buckets.lock().unwrap();
+        throttle.evict(&mut buckets, now);
+        assert_eq!(buckets.map.len(), MAX_BUCKETS);
+        // 期限が最も近い（i の小さい）ものが落ちる。
+        assert!(!buckets.map.contains_key("key-0"));
+        assert!(buckets
+            .map
+            .contains_key(&format!("key-{}", MAX_BUCKETS + 99)));
     }
 }

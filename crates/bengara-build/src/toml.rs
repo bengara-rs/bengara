@@ -25,6 +25,12 @@ pub(crate) fn parse(text: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     let mut section = String::new();
 
+    // Windows のメモ帳や「UTF-8 with BOM」で保存すると、先頭に BOM が付く。
+    // 残すと1行目が `\u{feff}[messages]` になり、`[` で始まらないので
+    // 「1 行目: `鍵 = "値"` の形ではありません」という見当違いのエラーになっていた。
+    // `.env` を読む側（`env_vars.rs`）と同じやり方で外す。
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
     for (index, raw) in text.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_comment(raw).trim();
@@ -276,6 +282,22 @@ mod tests {
         assert!(!is_key("\"a.b\""));
         assert!(!is_key("a b"));
         assert!(!is_key("日本語"));
+    }
+
+    #[test]
+    fn 先頭のbomは外す() {
+        // 以前は BOM が残り、1行目が `\u{feff}[messages]` になって
+        // 「`鍵 = "値"` の形ではありません」という見当違いのエラーになっていた。
+        let pairs = parse("\u{feff}[messages]\nwelcome = \"ようこそ\"\n").unwrap();
+        assert_eq!(
+            pairs,
+            vec![("messages.welcome".to_string(), "ようこそ".to_string())]
+        );
+        // 節の外の鍵でも同じ。
+        let pairs = parse("\u{feff}title = \"題名\"\n").unwrap();
+        assert_eq!(pairs, vec![("title".to_string(), "題名".to_string())]);
+        // BOM だけのファイルは空の一覧。
+        assert!(parse("\u{feff}").unwrap().is_empty());
     }
 
     #[test]

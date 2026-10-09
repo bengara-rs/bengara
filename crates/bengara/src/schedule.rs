@@ -169,20 +169,35 @@ const DUE_SLACK_SECS: i64 = 30;
 ///
 /// 間隔が 1 分以上のときは [`DUE_SLACK_SECS`] だけ早くても動かします。
 /// `Every::Seconds(n)` には許容を付けません（秒を指定した意図を崩さないため）。
+///
+/// **前回が未来なら動かします。** 時計が一時的に先へ飛ぶと（NTP の補正、
+/// スナップショットからの復元、RTC の狂ったコンテナ）未来の時刻が書かれます。
+/// 差だけを見ていたころは、時計が直った後に差が大きな負の値になり、
+/// そのタスクが二度と動きませんでした。ログも出ないので、`Every::Day` の
+/// 掃除が止まっても気づけませんでした。
 pub(crate) fn is_due(last_run: Option<i64>, every: Every, now: i64) -> bool {
     match last_run {
         // 1 度も動いていなければ動かす。
         None => true,
+        Some(last) if last > now => {
+            tracing::warn!(
+                "前回の時刻 {last} がいま {now} より後です（時計がずれています）。動かします"
+            );
+            true
+        }
         Some(last) => {
-            let seconds = every.seconds();
+            // `as i64` だと `Every::Seconds(u64::MAX)` が `-1` になり、
+            // 「ほぼ動かない」つもりが毎回動いていました。あふれは上限で
+            // 切り詰めます（`queue/mod.rs` の `available_at` と同じ形）。
+            let seconds = i64::try_from(every.seconds()).unwrap_or(i64::MAX);
             // 秒を指定したものは、秒のまま守る。
             let exact = matches!(every, Every::Seconds(_)) || seconds < 60;
             let need = if exact {
-                seconds as i64
+                seconds
             } else {
-                seconds as i64 - DUE_SLACK_SECS
+                seconds.saturating_sub(DUE_SLACK_SECS)
             };
-            now - last >= need
+            now.saturating_sub(last) >= need
         }
     }
 }
@@ -224,12 +239,34 @@ fn read_last_run(dir: &Path, task: &Task) -> Option<i64> {
 /// 名前に改行が入ると 2 行目が名前の続きになり、読み戻しが必ず `None` に
 /// なります。`is_due(None, ..)` は真なので、`Every::Day` のタスクが黙って
 /// 毎分走っていました。ファイルの中身は内部の形なので、公開 API は変わりません。
+///
+/// **一時ファイルに書いてから置き換えます。** `std::fs::write` は truncate
+/// してから書くので原子的ではありません。途中で落ちると 0 バイトか途中までの
+/// ファイルが残り、`read_last_run` が `None` を返して毎分走り出しました。
+/// 改行を潰して直した形が、書き込みの非原子性で開き直っていました。
+/// 作りは `cache/store.rs` の `FileCache::put` にそろえます。
 fn write_last_run(dir: &Path, task: &Task, now: i64) -> Result<()> {
     let path = dir.join(task.state_file());
     let name = task.name.replace(['\n', '\r'], " ");
-    std::fs::write(&path, format!("{name}\n{now}\n"))?;
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 一時ファイルの名前は、覚えるファイル（SHA-256 の16進）とぶつからない
+    // ように印を入れる。プロセス番号と連番で、同時に走っても重ならない。
+    let temp = dir.join(format!(
+        "{}+tmp.{}.{seq}",
+        task.state_file(),
+        std::process::id()
+    ));
+    std::fs::write(&temp, format!("{name}\n{now}\n"))?;
+    if let Err(e) = std::fs::rename(&temp, &path) {
+        // 置き換えに失敗したら、書きかけを残さない。
+        let _ = std::fs::remove_file(&temp);
+        return Err(Error::Io(e));
+    }
     Ok(())
 }
+
+/// 一時ファイルの名前が重ならないようにする連番。
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 錠ファイルを置くディレクトリの名前。
 ///
@@ -419,6 +456,34 @@ mod tests {
     }
 
     #[test]
+    fn 前回が未来なら動かす() {
+        let now = 100_000;
+        // 時計が先に飛んで未来の時刻が書かれた形。差だけを見ていたころは、
+        // 差が大きな負の値になってそのタスクが二度と動かなかった。
+        assert!(is_due(Some(now + 1), Every::Day, now));
+        assert!(is_due(Some(now + 86_400 * 365), Every::Hour, now));
+        assert!(is_due(Some(i64::MAX), Every::Day, now));
+        // 前回がちょうど今なら、間隔を守る。
+        assert!(!is_due(Some(now), Every::Day, now));
+    }
+
+    #[test]
+    fn 秒の指定はあふれない() {
+        let now = 100_000;
+        // `seconds as i64` だと `u64::MAX` が `-1` になり、
+        // 「ほぼ動かない」つもりが毎回動いていた。
+        assert!(!is_due(Some(now), Every::Seconds(u64::MAX), now));
+        assert!(!is_due(Some(0), Every::Seconds(u64::MAX), now));
+        assert!(!is_due(
+            Some(1),
+            Every::Seconds(i64::MAX as u64 + 1),
+            i64::MAX
+        ));
+        // 前回が i64::MIN でも引き算であふれない。
+        assert!(is_due(Some(i64::MIN), Every::Day, now));
+    }
+
+    #[test]
     fn 登録できる() {
         let mut schedule = Schedule::new();
         assert!(schedule.is_empty());
@@ -497,6 +562,32 @@ mod tests {
         // 1 行目は名前（改行は空白に潰す）、2 行目が時刻。
         let raw = std::fs::read_to_string(dir.join(schedule.tasks()[0].state_file())).unwrap();
         assert_eq!(raw.lines().next(), Some("1行目 2行目"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 時刻は一時ファイル経由で置き換える() {
+        let dir = temp_dir("atomic");
+        let mut schedule = Schedule::new();
+        schedule.job("1日ごとの処理", Every::Day, || async { Ok(()) });
+        let task = &schedule.tasks()[0];
+
+        // 途中で落ちた形（0 バイト）。読み戻しは `None` になり毎分走る。
+        std::fs::write(dir.join(task.state_file()), "").unwrap();
+        assert!(read_last_run(&dir, task).is_none());
+
+        write_last_run(&dir, task, 1_700_000_000).unwrap();
+        assert_eq!(read_last_run(&dir, task), Some(1_700_000_000));
+
+        // 書きかけ（`+tmp`）が残らない。残ると掃除されずに溜まる。
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| *name != task.state_file())
+            .collect();
+        assert!(left.is_empty(), "残っている: {left:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

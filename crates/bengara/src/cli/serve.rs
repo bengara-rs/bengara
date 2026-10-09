@@ -81,7 +81,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
     );
 
     let mut generation: u32 = 0;
-    let mut child: Option<Child> = None;
+    let mut child: Option<Running> = None;
     let mut watched = snapshot(root);
 
     match build(root, &name) {
@@ -105,7 +105,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
 
         // 本体が自分で終わっていたら知らせる（ポートが使われているときなど）。
         if let Some(running) = child.as_mut() {
-            if let Ok(Some(status)) = running.try_wait() {
+            if let Some(status) = running.finished() {
                 if status.success() {
                     println!("本体が終了しました。ファイルを変更すると、もう一度起動します。");
                 } else {
@@ -231,7 +231,7 @@ fn start(
     prefix: &str,
     generation: u32,
     args: &[String],
-) -> Result<Child> {
+) -> Result<Running> {
     let extension = exe.extension().and_then(|e| e.to_str()).unwrap_or("");
     let file_name = if extension.is_empty() {
         format!("{prefix}{generation}")
@@ -257,23 +257,47 @@ fn start(
 
     command
         .spawn()
+        .map(Running)
         .map_err(|e| Error::msg(format!("{} を起動できません: {e}", destination.display())))
 }
 
-/// 動いている本体を止める。
+/// 動いている本体。**`Drop` で必ず止めます。**
 ///
-/// **即座に止めます**（SIGKILL / TerminateProcess）。処理中のリクエストは待ちません。
-/// `APP_SHUTDOWN_TIMEOUT` の猶予を確かめたいときは、本体を直接動かしてください。
-fn stop(child: &mut Option<Child>) {
-    let Some(mut running) = child.take() else {
-        return;
-    };
-    if let Err(e) = running.kill() {
-        // `artisan` は tracing の購読を立てないので、eprintln! で出す。
-        // すでに終わっていた場合はここに来ないので、来たときは知らせる価値がある。
-        eprintln!("本体を止められませんでした: {e}");
+/// 以前は `Child` を変数で持つだけだったので、`serve` がパニックしたときに
+/// 本体が生き残り、`APP_PORT` を握り続けていました。次の `cargo artisan serve` が
+/// 「address in use」で落ち、古いビルドが動いたままになります。
+///
+/// **届かない場合**: `artisan` を `kill -9`（Windows なら強制終了）したときは
+/// `Drop` も走りません。Ctrl+C はコンソール越しに子にも届くので、普通はそちらで止まります。
+struct Running(Child);
+
+impl Running {
+    /// 本体が自分で終わっていれば、その終わり方を返す。
+    fn finished(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.try_wait().ok().flatten()
     }
-    let _ = running.wait();
+}
+
+impl Drop for Running {
+    /// **即座に止めます**（SIGKILL / TerminateProcess）。処理中のリクエストは待ちません。
+    /// `APP_SHUTDOWN_TIMEOUT` の猶予を確かめたいときは、本体を直接動かしてください。
+    fn drop(&mut self) {
+        // すでに終わっていれば何もしない（終了コードを拾い終えている）。
+        if matches!(self.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Err(e) = self.0.kill() {
+            // `artisan` は tracing の購読を立てないので、eprintln! で出す。
+            eprintln!("本体を止められませんでした: {e}");
+        }
+        // 後片付けを待つ。待たないと、Windows ではコピーした exe を消せない。
+        let _ = self.0.wait();
+    }
+}
+
+/// 動いている本体を止める。中身を落とすと `Drop` が止めます。
+fn stop(child: &mut Option<Running>) {
+    drop(child.take());
 }
 
 /// 残っているコピーを消す（できる範囲で）。
@@ -560,6 +584,67 @@ mod tests {
         ] {
             assert!(!is_watched_file(Path::new(name)), "{name} を見張っています");
         }
+    }
+
+    /// 止めるための子プロセス。すぐには終わらないものを使う。
+    fn sleeper() -> Command {
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("cmd");
+            // `timeout` は入力の口が要るので使えない。`ping` はどの Windows にもある。
+            command.args(["/C", "ping -n 30 127.0.0.1"]);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
+    #[test]
+    fn 本体は手放すだけで止まる() {
+        use std::io::Read;
+
+        // 以前は `Child` を変数で持つだけだったので、`serve` がパニックすると
+        // 本体が生き残り、ポートを握り続けていた。
+        let mut child = sleeper()
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("子プロセスを起動できません");
+        // 書き手（子）が居なくなるとパイプは EOF になる。止まったかの手がかりに使う。
+        let mut pipe = child.stdout.take().expect("パイプが取れません");
+        let mut running = Some(Running(child));
+
+        stop(&mut running);
+        assert!(running.is_none());
+
+        let reader = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+        });
+        for _ in 0..200 {
+            if reader.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reader.is_finished(), "子プロセスが生き残っています");
+        reader.join().expect("読み取りのスレッドが落ちました");
+    }
+
+    #[test]
+    fn すでに終わった本体を手放しても何も言わない() {
+        // 終了コードを拾った後の `Drop` で、要らない警告を出さない。
+        let mut command = Command::new(if cfg!(windows) { "cmd" } else { "true" });
+        if cfg!(windows) {
+            command.args(["/C", "exit 0"]);
+        }
+        let spawned = command.spawn().expect("子プロセスを起動できません");
+        let mut running = Running(spawned);
+        let _ = running.0.wait();
+        drop(running);
     }
 
     #[test]

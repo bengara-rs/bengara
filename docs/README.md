@@ -71,5 +71,5 @@ bengara を使う人のための資料です。フレームワークの紹介は
 | ページ                                           | 内容             |
 |--------------------------------------------------|------------------|
 | [laravel-differences.md](laravel-differences.md) | Laravel と違う点 |
-| [backlog.md](backlog.md)                         | まだ無いもの     |
+| [backlog.md](backlog.md)                         | まだ無いものと、分かっている制限 |
 | [decisions.md](decisions.md)                     | 設計判断の記録   |

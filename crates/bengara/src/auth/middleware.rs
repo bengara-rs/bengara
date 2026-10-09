@@ -24,8 +24,19 @@ pub(crate) const INTENDED_KEY: &str = "bengara_auth_intended";
 /// ログイン後の戻り先として覚えてよいかを決めます。`//evil.example` は
 /// 「プロトコル相対 URL」で、転送先に使うと**外のサイト**へ飛ばせます。
 /// `Location: //evil.example` はブラウザが `https://evil.example` と読むためです。
-fn is_internal_path(path: &str) -> bool {
-    path.starts_with('/') && !path.starts_with("//")
+///
+/// `/` で始まることだけを見ていたころは `/\evil.example` を通していました。
+/// ブラウザはパスの中の `\` を `/` に直すので、これは `//evil.example` と同じ意味です。
+/// タブや改行も URL から取り除かれるため、`/<タブ>/evil.example` が同じ形になります。
+/// どちらも断ります。
+pub(crate) fn is_internal_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    if path.contains('\\') || path.bytes().any(|b| b.is_ascii_control()) {
+        return false;
+    }
+    !rest.starts_with('/')
 }
 
 /// ログイン必須にするミドルウェア。
@@ -137,6 +148,18 @@ mod tests {
         // プロトコル相対 URL は外のサイトを指せる。
         assert!(!is_internal_path("//evil.example"));
         assert!(!is_internal_path("//evil.example/login"));
+        // `\` はブラウザが `/` に直すので、これも外のサイトを指せる。
+        assert!(!is_internal_path("/\\evil.example"));
+        assert!(!is_internal_path("/\\evil.example/login"));
+        assert!(!is_internal_path("/\\/evil.example"));
+        assert!(
+            !is_internal_path("/path/\\evil.example"),
+            "途中の `\\` も断る"
+        );
+        // タブや改行は URL から取り除かれるので、`//` の形になる。
+        assert!(!is_internal_path("/\t/evil.example"));
+        assert!(!is_internal_path("/\n/evil.example"));
+        assert!(!is_internal_path("/\r/evil.example"));
         // 絶対 URL も断る。
         assert!(!is_internal_path("https://evil.example"));
         // `/` で始まらないものも断る。

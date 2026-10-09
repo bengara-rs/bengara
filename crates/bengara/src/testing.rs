@@ -518,7 +518,13 @@ where
     Fut: Future<Output = ()>,
 {
     kernel_impl::boot_for_tests(hooks);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    // 1 スレッドのランタイムにします。テスト 1 件ごとに作るので、
+    // 複数スレッドだとコアの数だけスレッドを生成して捨てることになります
+    // （16 コアで 100 件なら 1,600 本前後）。
+    // テスト本体は呼び出し元のスレッドの `block_on` が回すので、
+    // `HOLDS_DATABASE` などのスレッドローカルの札はそのまま働きます。
+    // `tokio::spawn` も `spawn_blocking` も 1 スレッドのランタイムで動きます。
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("テスト用のランタイムを作れません");

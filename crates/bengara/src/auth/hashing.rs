@@ -8,6 +8,7 @@
 //! assert!(Hash::check("ひみつ", &stored));
 //! ```
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use crate::error::Result;
@@ -183,6 +184,8 @@ impl Hash {
             );
             return false;
         }
+        // 空回しが同じだけ計算できるよう、実際に保存されていた回数を覚えておく。
+        LAST_SEEN_ITERATIONS.store(parsed.iterations, Ordering::Relaxed);
         let digest = crypto::pbkdf2_sha256(password.as_bytes(), &parsed.salt, parsed.iterations);
         crypto::constant_time_eq(&digest, &parsed.digest)
     }
@@ -203,6 +206,10 @@ impl Hash {
     /// 保存してある値を作り直したほうがよいか。
     ///
     /// 回数の設定を上げたあと、ログインのついでに作り直すのに使います。
+    ///
+    /// **回数を上げたら、必ず作り直してください。** 作り直さないかぎり、
+    /// 保存されている値は古い回数のままです。古い回数が混ざっているあいだは、
+    /// 空回し（[`waste_time`](Hash::waste_time)）もその回数に合わせます。
     pub fn needs_rehash(hashed: &str) -> bool {
         match Parsed::parse(hashed) {
             Some(parsed) => parsed.iterations < iterations(),
@@ -225,8 +232,36 @@ impl Hash {
     /// 入力の長さで差が出る処理（入口の `sha256`、長さの上限の判定）が
     /// 登録済みの側にだけ効き、登録の有無が時間差で分かってしまいます。
     /// 比べる相手だけが固定のダミーです。
+    ///
+    /// **回数は「最後に照合した値に書いてあった回数」を使います。**
+    /// いまの設定（`iterations()`）で計算していたころは、`HASH_ITERATIONS` を
+    /// 上げて再ハッシュしていない間だけ空回しのほうが重くなり、
+    /// 1 リクエストで利用者の有無が分かりました
+    /// （120,000 回で 0.23 秒、600,000 回で 1.15 秒）。
     pub(crate) fn waste_time(password: &str) {
-        let _ = Hash::check(password, &dummy_hash(iterations()));
+        let _ = Hash::check(password, &dummy_hash(dummy_iterations()));
+    }
+}
+
+/// 最後に照合した値に書いてあった繰り返し回数。0 は「まだ読んでいない」。
+///
+/// 見つかった側の `check` は**保存されている**回数で計算します。
+/// 空回しをそれに合わせるため、読めた回数をここに覚えます。
+static LAST_SEEN_ITERATIONS: AtomicU32 = AtomicU32::new(0);
+
+/// 空回しに使う回数。まだ何も読んでいなければ、いまの設定にそろえます。
+fn dummy_iterations() -> u32 {
+    dummy_iterations_from(LAST_SEEN_ITERATIONS.load(Ordering::Relaxed))
+}
+
+/// 覚えている回数から、空回しに使う回数を決める。
+///
+/// 覚えている値を引数にして、テストから確かめられる形にしています
+/// （静的な値はテストが並んで走ると書き換わります）。
+fn dummy_iterations_from(last_seen: u32) -> u32 {
+    match last_seen {
+        0 => iterations(),
+        found => found,
     }
 }
 
@@ -377,6 +412,33 @@ mod tests {
         install_test_iterations();
         Hash::waste_time("ひみつの言葉");
         Hash::waste_time("ひみつの言葉");
+    }
+
+    #[test]
+    fn 空回しは保存されている回数に合わせる() {
+        // いまの設定で計算していたころは、`HASH_ITERATIONS` を上げて
+        // 再ハッシュしていない間だけ空回しのほうが重くなり、
+        // 1 リクエストで利用者の有無が時間差で分かった。
+        install_test_iterations();
+
+        // 覚えている回数をそのまま使う。
+        assert_eq!(dummy_iterations_from(37), 37);
+        // まだ何も読んでいなければ、いまの設定にそろえる。
+        assert_eq!(dummy_iterations_from(0), iterations());
+
+        // 照合すると、保存されていた回数を覚える。
+        // 値そのものは、ほかのテストが並んで走ると書き換わるので見ません。
+        let stored = Hash::make_with("ひみつ", 37);
+        assert!(Hash::check("ひみつ", &stored));
+        assert_ne!(
+            LAST_SEEN_ITERATIONS.load(Ordering::Relaxed),
+            0,
+            "読めた回数を覚える"
+        );
+
+        // 空回しも、その回数で計算できる形になっている。
+        assert!(Parsed::parse(&dummy_hash(dummy_iterations())).is_some());
+        Hash::waste_time("ひみつ");
     }
 
     #[test]

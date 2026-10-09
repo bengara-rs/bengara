@@ -1,6 +1,7 @@
 //! セッションを読み書きするミドルウェアと、CSRF の確認。
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Session, SessionStore};
 use crate::error::{Error, Result};
@@ -60,6 +61,19 @@ impl SessionConfig {
 /// ```ignore
 /// .with_middleware(|m| m.append(StartSession::file()))
 /// ```
+///
+/// # 同じセッションのリクエストは直列になります
+///
+/// 1本のリクエストは、置き場所から読んだ中身を**マップごと**書き戻します。
+/// 読みと書きのあいだに錠が無いと後勝ちになり、同時に来た2本のうち
+/// 片方が入れた値が消えます。新しいセッションに画面と XHR が同時に来ると、
+/// それぞれが**別の CSRF トークン**を作り、画面に埋め込んだほうが負けて、
+/// 次の POST が 419 になりました。
+///
+/// そこで **ID ごとに錠を取り、読み込みから保存までを押さえます。**
+/// 同じセッション ID のリクエストは順番に処理されます（Laravel も
+/// セッションのファイルを錠で押さえます）。別のセッションどうしは待ちません。
+/// 長くかかるハンドラは、同じ利用者の次のリクエストを待たせます。
 pub struct StartSession {
     store: Arc<dyn SessionStore>,
     config: SessionConfig,
@@ -191,6 +205,17 @@ impl Middleware for StartSession {
             // 毎リクエスト配り続けないための目印です。
             let mut loaded = false;
 
+            // 1.5. 同じ ID のリクエストを直列にする錠を取る。
+            //
+            // **読み込みから保存までを押さえます。** 押さえないと、同時に来た2本が
+            // それぞれマップ全体を読んで書き戻すので後勝ちになり、片方の値が消えます。
+            // 新しく作る ID（Cookie が無い・読めなかったとき）は誰とも重ならないので、
+            // Cookie から読めた ID のときだけ取ります。
+            let id_lock = match &incoming {
+                Some(id) => Some(IdLock::acquire(id).await),
+                None => None,
+            };
+
             // 2. 置き場所から中身を読む。
             let session = match incoming {
                 Some(id) => {
@@ -205,7 +230,7 @@ impl Middleware for StartSession {
                         Some(stored) => {
                             loaded = true;
                             let (data, old_flash) = Session::split_flash(stored);
-                            Session::new(id, data, old_flash)
+                            Session::new(id, data, old_flash).mark_loaded()
                         }
                         // ID はあるが中身が無い（期限切れなど）。同じ ID で作り直さない。
                         None => Session::empty(),
@@ -288,6 +313,10 @@ impl Middleware for StartSession {
                 }
             }
 
+            // 4.9. 錠を放す。保存も期限の延長も終わっているので、
+            // Cookie を組み立てるあいだ押さえておく必要はありません。
+            drop(id_lock);
+
             // 5. Cookie を返す。
             //
             // 保存したときと、**置き場所から実際に読めたとき**（期限を延ばす）だけです。
@@ -304,6 +333,58 @@ impl Middleware for StartSession {
             }
             Ok(response)
         })
+    }
+}
+
+/// セッション ID ごとの錠を覚えておく地図。
+///
+/// 中の `std::sync::Mutex` は**地図を触るあいだだけ**持ちます（`await` を越えません）。
+/// 待つのは中身の `tokio::sync::Mutex` のほうです。tokio の錠を待つあいだは
+/// ワーカースレッドを塞がないので、同じセッションの2本目が来ても他の人は止まりません。
+fn id_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 1つのセッション ID を押さえている間だけ生きる錠。
+///
+/// 落ちるときに、待っている人がいなければ地図から片付けます。
+/// 片付けないと、セッション ID の数だけ組が残り続けます。
+struct IdLock {
+    id: String,
+    /// 落とす順を決めたいので `Option` にしています（[`Drop`] を参照）。
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl IdLock {
+    /// その ID の錠を取る。すでに誰かが持っていれば、放されるまで待ちます。
+    async fn acquire(id: &str) -> Self {
+        let lock = {
+            let mut map = id_locks().lock().unwrap_or_else(|e| e.into_inner());
+            map.entry(id.to_string()).or_default().clone()
+        };
+        // 地図の錠はここで放してある。`await` を越えて持たない。
+        let guard = lock.lock_owned().await;
+        Self {
+            id: id.to_string(),
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for IdLock {
+    fn drop(&mut self) {
+        // **先に錠を放します。** 放す前に数えると、自分が持っているぶんで
+        // 必ず 2 以上になり、いつまでも片付けられません。
+        self.guard = None;
+        let mut map = id_locks().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(found) = map.get(&self.id) {
+            // 地図のぶんだけなら、待っている人はいない。
+            // 待っている人は地図の錠を取ってから複製するので、ここで数え漏らしません。
+            if Arc::strong_count(found) == 1 {
+                map.remove(&self.id);
+            }
+        }
     }
 }
 
@@ -819,6 +900,39 @@ mod tests {
             (Err(_), Err(_)) => {}
             _ => panic!("鍵の判定が揺れた"),
         }
+    }
+
+    #[tokio::test]
+    async fn 同じidの錠は順番に取れる() {
+        // 読み込みから保存までを押さえないと、同時に来た2本が
+        // それぞれマップ全体を書き戻して後勝ちになり、片方の値が消える。
+        let id = format!("test-{}", crypto::random_token());
+
+        let first = IdLock::acquire(&id).await;
+        // 同じ ID は待たされる（錠を持っているあいだは取れない）。
+        let waiting = {
+            let id = id.clone();
+            tokio::spawn(async move { IdLock::acquire(&id).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "放すまで取れない");
+
+        // 別の ID は待たない。
+        let other = IdLock::acquire(&format!("other-{}", crypto::random_token())).await;
+        drop(other);
+
+        drop(first);
+        let second = waiting.await.expect("待っていたほうが取れる");
+        drop(second);
+
+        // 使い終わった錠は地図に残さない。
+        assert!(
+            !id_locks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&id),
+            "片付ける"
+        );
     }
 
     #[test]

@@ -44,6 +44,13 @@ pub struct Session {
     /// （テストが並んで走るときなど）に別のアプリの置き場所を触ってしまうため、
     /// **リクエストに結びつけて持ち歩きます。**
     store: Option<Arc<dyn SessionStore>>,
+    /// 置き場所から**実際に読めた**セッションか。`StartSession` が入れます。
+    ///
+    /// 偽のときは、このリクエストで新しく作ったセッションです。
+    /// `Request::validate()` が「落ちた入力を覚えるか」を決めるのに使います。
+    /// 読めていない相手に覚えさせると、Cookie を持たない相手が壊れた本文を
+    /// 投げるだけでセッションのファイルが1つできます。
+    loaded: bool,
 }
 
 struct Inner {
@@ -74,12 +81,26 @@ impl Session {
                 flushed: false,
             })),
             store: None,
+            loaded: false,
         }
     }
 
     /// 空のセッションを作る（初めて来た人）。
     pub(crate) fn empty() -> Self {
         Self::new(new_id(), Data::new(), Data::new())
+    }
+
+    /// 「置き場所から読めた」目印を付ける。`StartSession` が呼びます。
+    pub(crate) fn mark_loaded(mut self) -> Self {
+        self.loaded = true;
+        self
+    }
+
+    /// 置き場所から読めたセッションか。
+    ///
+    /// 偽のときは、このリクエストで新しく作ったセッションです。
+    pub(crate) fn was_loaded(&self) -> bool {
+        self.loaded
     }
 
     /// 置き場所を結びつける。`StartSession` が呼びます。
@@ -234,8 +255,16 @@ impl Session {
     ///
     /// 覚えてあるのは自分のサイトの中を指すパスだけです（`Authenticate` が選びます）。
     /// 覚えていなければ `None` を返すので、呼ぶ側で既定の行き先を決めてください。
+    ///
+    /// **読み出しのときにもう一度確かめます。** 入れるときだけ見ていると、
+    /// 置き場所の値が別の経路で書かれた場合に外のサイトへ飛ばせます。
     pub fn intended(&self) -> Option<String> {
-        self.pull(crate::auth::INTENDED_KEY)
+        let found = self.pull(crate::auth::INTENDED_KEY)?;
+        if crate::auth::is_internal_path(&found) {
+            return Some(found);
+        }
+        tracing::warn!("セッションに入っていた戻り先が自分のサイトの中を指していません");
+        None
     }
 
     /// 前のリクエストの入力を読む。
@@ -481,6 +510,28 @@ mod tests {
         s.put(crate::auth::INTENDED_KEY, "/profile?page=2");
         assert_eq!(s.intended().as_deref(), Some("/profile?page=2"));
         assert!(s.intended().is_none(), "読むと消える");
+    }
+
+    #[test]
+    fn 外を指す戻り先は読み出しのときも断る() {
+        // 入れるときだけ見ていると、置き場所の値が別の経路で書かれたときに
+        // ログイン後に外のサイトへ飛ばせる。
+        for bad in ["//evil.example", "/\\evil.example", "https://evil.example"] {
+            let s = session();
+            s.put(crate::auth::INTENDED_KEY, bad);
+            assert!(s.intended().is_none(), "`{bad}` は断るはず");
+            assert!(
+                s.get(crate::auth::INTENDED_KEY).is_none(),
+                "断っても消しておく"
+            );
+        }
+    }
+
+    #[test]
+    fn 置き場所から読めたかを覚えている() {
+        // 読めていないセッションには、落ちた入力を覚えさせない。
+        assert!(!Session::empty().was_loaded());
+        assert!(Session::empty().mark_loaded().was_loaded());
     }
 
     #[test]

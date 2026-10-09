@@ -76,15 +76,30 @@ impl Drop for Borrowed<'_> {
     fn drop(&mut self) {
         let raw = self.raw.take();
         let mut guard = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = match raw {
-            // 問い合わせが終わって中身が戻ってきた。次の問い合わせに使える。
-            Some(raw) if self.done => State::Ready(raw),
-            // 途中で落とされた。どこまで進んだか分からないので、もう使わない。
-            // ここで `raw` を落とすので、下回りが巻き戻します。
-            Some(_) => State::Poisoned,
+        match raw {
+            // 問い合わせが終わって中身が戻ってきた。
+            //
+            // **借りたときの `Busy` のままなら**、次の問い合わせに使える。
+            // 以前はいまの状態を見ずに `Ready` を入れていたので、問い合わせ中に
+            // `Transaction` が落ちて `Poisoned` になった後、その問い合わせが
+            // 終わると `Ready` に戻っていました。生き残ったクエリビルダから
+            // 書けてしまい、最後の `Arc` が落ちる時に黙って巻き戻ります。
+            //
+            // `Poisoned` と `Finished` はそのまま保ちます。ここで `raw` を
+            // 落とすので、下回りが巻き戻します。
+            Some(raw) => {
+                if matches!(&*guard, State::Busy) {
+                    *guard = if self.done {
+                        State::Ready(raw)
+                    } else {
+                        // 途中で落とされた。どこまで進んだか分からないので、もう使わない。
+                        State::Poisoned
+                    };
+                }
+            }
             // `commit` か `rollback` が持って行った。
-            None => State::Finished,
-        };
+            None => *guard = State::Finished,
+        }
     }
 }
 
@@ -223,6 +238,7 @@ impl std::fmt::Debug for Transaction {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Waker};
 
     use super::super::backend::DbFuture;
@@ -279,6 +295,57 @@ mod tests {
         ) -> DbFuture<'a, Affected> {
             Box::pin(async {
                 std::future::pending::<()>().await;
+                Ok(Affected::default())
+            })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 合図を待つ中身。問い合わせの途中で `Transaction` を落とすために使います。
+    struct GatedTx {
+        gate: Arc<AtomicBool>,
+    }
+
+    impl GatedTx {
+        /// 合図が出るまで待つ。
+        fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
+            let gate = Arc::clone(&self.gate);
+            async move {
+                while !gate.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    impl RawTx for GatedTx {
+        fn fetch_all<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Vec<Row>> {
+            let wait = self.wait();
+            Box::pin(async move {
+                wait.await;
+                Ok(Vec::new())
+            })
+        }
+
+        fn execute<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Affected> {
+            let wait = self.wait();
+            Box::pin(async move {
+                wait.await;
                 Ok(Affected::default())
             })
         }
@@ -379,5 +446,42 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(message.contains("中断"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 問い合わせ中に落とした後は使えないままになる() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(GatedTx {
+                gate: Arc::clone(&gate),
+            }))),
+        };
+        let shared = Arc::clone(&tx.shared);
+        let query = tx.table("posts");
+
+        // 問い合わせを別のタスクで走らせる。
+        let running = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move { shared.fetch_all("select 1", &[]).await })
+        };
+        // 問い合わせが始まる（`Busy` になる）まで待つ。
+        while is_ready(&shared) {
+            tokio::task::yield_now().await;
+        }
+
+        // ここで `Transaction` が落ちると `Poisoned` になる。
+        drop(tx);
+        // その後に問い合わせが終わる。
+        gate.store(true, Ordering::SeqCst);
+        running.await.expect("走り切る").expect("読める");
+
+        // 以前はここで `Ready` に戻り、生き残ったクエリビルダから書けていた。
+        let message = query
+            .insert(&[("title", Value::Text("x".into()))])
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+        assert!(!is_ready(&shared), "使えない状態のまま");
     }
 }

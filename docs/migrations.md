@@ -111,6 +111,14 @@ $ cargo artisan migrate:status
 **MySQL と PostgreSQL では型名が変わります。** PostgreSQL では日付と JSON が
 `text` 列になります。一覧は [database.md](database.md) の「ドライバの違い」にあります。
 
+気をつけるのは次の 2 つです。
+
+- `t.foreign_id(列)` は、`t.id()` と符号がそろう型になります
+  （MySQL は `bigint unsigned`、PostgreSQL は `bigint`）。そのまま外部キーを張れます。
+- `t.float(列)` と `t.double(列)` は、**どのドライバでも 8 バイト**です
+  （MySQL は `float(53)`、PostgreSQL は `double precision`）。
+  4 バイトの列が要るときは `t.raw_column(列, "float")` と書きます。
+
 ## 列に付ける指定
 
 続けて書けます。
@@ -160,16 +168,44 @@ schema.create("comments", |t| {
 | `.on_delete("cascade")` / `.cascade_on_delete()` | 元の行が消えたときの動き   |
 | `.on_update("restrict")`                         | 元の行が変わったときの動き |
 
+`t.primary(&[..])` を 2 回呼ぶと警告が出ます。後の指定で置き換わります。
+
+### 外部キーの動き
+
+`on_delete` と `on_update` に渡せるのは、次の 5 つだけです。
+
+`cascade` / `set null` / `set default` / `restrict` / `no action`
+
+大文字小文字と語の間の空白は、そろえてから見ます。
+外れた値は SQL には出ますが、**警告が出ます。** 打ち間違いに気づけるようにしてあります。
+
+### 索引と外部キーの名前
+
+名前は自動で付きます。形は `{表}_{列を _ でつないだもの}_{index|unique|foreign}` です
+（`posts_status_index`・`comments_post_id_foreign` のような形）。
+
+| とき                     | 付く名前                                |
+|--------------------------|-----------------------------------------|
+| ふつう                   | 上の形のまま                            |
+| 同じ名前が 2 つできるとき | 末尾に 8 桁の 16 進を足して分けます     |
+| 63 バイトを超えるとき    | 縮めて、末尾に 8 桁の 16 進を足します   |
+
+63 バイトは PostgreSQL の名前の上限です。超えるとサーバ側で切られて、名前が重なります。
+
+外部キーに名前が付くのは、**後から足すとき**だけです（下の「表を変える」）。
+表を作るときは `create table` の中に書くので、名前はデータベースが決めます。
+
 索引は `create index ...` という別の文になります。
-名前は自動で付きます（`posts_status_index` のような形）。
+MySQL で `create_if_not_exists` を使ったときだけ、表の定義の中に書きます。
 
 ## 表を変える
 
 ```rust
 pub fn up(schema: &mut Schema) {
     schema.table("posts", |t| {
-        t.string("slug").nullable();   // 列を足す
-        t.index(&["slug"]);            // 索引を足す
+        t.string("slug").nullable();                            // 列を足す
+        t.index(&["slug"]);                                     // 索引を足す
+        t.foreign("user_id").on("users").cascade_on_delete();   // 外部キーを足す
     });
 }
 
@@ -178,9 +214,19 @@ pub fn down(schema: &mut Schema) {
 }
 ```
 
-**できるのは「列を足す」「索引を足す」までです。**
+**できるのは「列を足す」「索引を足す」「外部キーを足す」までです。**
 
-列の型を変えたいときは、新しい表を作って移し替えてください。
+| 足すもの   | どうなるか                                                  |
+|------------|-------------------------------------------------------------|
+| 列         | `alter table add column`                                    |
+| 索引       | `create index`                                              |
+| 外部キー   | `alter table add constraint {表}_{列}_foreign`              |
+| 複合主キー | **足せません。** 警告だけが出ます                           |
+
+**SQLite では後から外部キーを足せません。** `alter table add constraint` が無いためです。
+警告が出て、SQL は出しません。足したいときは表を作り直してください。
+
+列の型を変えたいときも、新しい表を作って移し替えてください。
 
 ## そのほかの操作
 
@@ -227,6 +273,10 @@ pub fn up(schema: &mut Schema) {
 | `t.id()` に `nullable()` / `default()` / `unique()`| 無視して警告                         | 型名ひとつで書くので、置く場所がありません         |
 | `schema.table(..)` の中の `t.id()` / `t.increments`| 警告が出て、**その文は実行時に失敗します** | `alter table add column` では自動採番を足せません |
 | `t.foreign(col)` に `.on(表名)` が無い             | 警告が出て、**その文は実行時に失敗します** | 指す先が決まりません                         |
+| `schema.table(..)` の中の `t.primary(&[..])`       | 警告が出て、**何も足しません**       | 後から主キーを足す書き方が、3 つのドライバでそろえられません |
+| SQLite で `schema.table(..)` の中の `t.foreign(..)`| 警告が出て、**何も足しません**       | `alter table add constraint` がありません          |
+| `t.primary(&[..])` を 2 回呼ぶ                     | 警告。後の指定で置き換わります       | 複合主キーは 1 回で書きます                        |
+| `on_delete` / `on_update` に一覧外の値             | 警告。SQL には出ます                 | 打ち間違いに気づけるようにしてあります             |
 
 ## 関連
 

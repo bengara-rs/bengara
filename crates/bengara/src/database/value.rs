@@ -193,7 +193,7 @@ impl FromValue for i64 {
         match value {
             Value::Int(v) => Ok(*v),
             Value::Bool(v) => Ok(i64::from(*v)),
-            Value::Float(v) => Ok(*v as i64),
+            Value::Float(v) => float_to_i64(*v),
             Value::Text(v) => v
                 .trim()
                 .parse()
@@ -201,6 +201,21 @@ impl FromValue for i64 {
             other => mismatch(other, "整数"),
         }
     }
+}
+
+/// 小数を整数に直す。範囲の外は断ります。
+///
+/// 以前は飽和キャストだったので、`NaN` が黙って `0` になり、大きすぎる値は
+/// `i64::MAX` に張り付いていました。`f32` の範囲外チェックと同じ形にそろえます。
+fn float_to_i64(v: f64) -> Result<i64> {
+    if !v.is_finite() {
+        return Err(Error::msg(format!("{v} は整数に直せません")));
+    }
+    // `i64::MAX as f64` は 2^63 に丸め上がるので、上の境目は `>=` で見る。
+    if v < i64::MIN as f64 || v >= i64::MAX as f64 {
+        return Err(Error::msg(format!("{v} は i64 に収まりません")));
+    }
+    Ok(v as i64)
 }
 
 /// `i64` から幅の狭い整数へ読み替える実装を、型ごとに作る。
@@ -333,16 +348,82 @@ impl<T: FromValue> FromValue for Option<T> {
 /// ```
 /// 列の名前は `Arc` で共有します。同じ問い合わせの行はすべて同じ名前なので、
 /// 行ごとに `Vec<String>` を複製すると、1万行×20列で20万回の確保になります。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 列が多いときは、名前から位置を引く表も `Arc` で共有します。
+/// 以前は `get("列")` ごとに列名を順に比べていたので、30列1万行の
+/// `#[derive(Model)]` で450万回の文字列比較になっていました。
+#[derive(Debug, Clone)]
 pub struct Row {
     columns: Arc<[String]>,
+    /// 列名から位置を引く表。列が少ないときは `None`（下の `column_index` を参照）。
+    index: Option<Arc<ColumnIndex>>,
     values: Vec<Value>,
+}
+
+/// 列名から位置を引く表。
+type ColumnIndex = std::collections::HashMap<String, usize>;
+
+/// 表を作る列の数の下限。これ以下なら順に比べます。
+///
+/// 数列しかないときは、ハッシュを1回計算するより `==` を並べたほうが速いためです。
+///
+/// 表を作るのは `column_index`（下回りから行を受け取るときだけ）なので、
+/// 機能フラグが無いビルドでは使いません。`#[cfg]` を外すと
+/// `cargo clippy -p bengara --no-default-features` が「使われていない」で落ちます。
+#[cfg(feature = "database")]
+const INDEX_FROM: usize = 9;
+
+/// 列名から位置を引く表を、1つの問い合わせにつき1回だけ作る。
+///
+/// `with_columns` は行ごとに呼ばれるので、直前に作った表を覚えておいて使い回します。
+/// 覚えるときは `Arc` ごと持つので、番地が別の列名に使い回されることはありません
+/// （`Arc::ptr_eq` で同じ割り当てだと確かめられます）。
+#[cfg(feature = "database")]
+fn column_index(columns: &Arc<[String]>) -> Option<Arc<ColumnIndex>> {
+    use std::cell::RefCell;
+
+    /// 直前に作った（列名, 表）の組。
+    type Last = Option<(Arc<[String]>, Arc<ColumnIndex>)>;
+
+    thread_local! {
+        static LAST: RefCell<Last> = const { RefCell::new(None) };
+    }
+
+    if columns.len() < INDEX_FROM {
+        return None;
+    }
+    LAST.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some((names, index)) = slot.as_ref() {
+            if Arc::ptr_eq(names, columns) {
+                return Some(Arc::clone(index));
+            }
+        }
+        let mut map = ColumnIndex::with_capacity(columns.len());
+        for (position, name) in columns.iter().enumerate() {
+            // 同じ名前が2つあるときは左を採る。順に比べていた頃と同じ。
+            map.entry(name.clone()).or_insert(position);
+        }
+        let index = Arc::new(map);
+        *slot = Some((Arc::clone(columns), Arc::clone(&index)));
+        Some(index)
+    })
+}
+
+/// 列の名前と値が同じなら同じ行とみなす。
+///
+/// 位置の表は列の名前から決まるだけなので、見ません。
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns == other.columns && self.values == other.values
+    }
 }
 
 impl Default for Row {
     fn default() -> Self {
         Self {
             columns: Arc::from(Vec::new()),
+            index: None,
             values: Vec::new(),
         }
     }
@@ -350,9 +431,12 @@ impl Default for Row {
 
 impl Row {
     /// 列の名前と値から作る。下回りのドライバが使います。
+    ///
+    /// 単発の1行なので、位置の表は作りません。
     pub fn new(columns: Vec<String>, values: Vec<Value>) -> Self {
         Self {
             columns: Arc::from(columns),
+            index: None,
             values,
         }
     }
@@ -362,7 +446,12 @@ impl Row {
     /// 呼ぶのは下回りのドライバだけなので、ドライバを1つも入れないときは出番がありません。
     #[cfg(feature = "database")]
     pub(crate) fn with_columns(columns: Arc<[String]>, values: Vec<Value>) -> Self {
-        Self { columns, values }
+        let index = column_index(&columns);
+        Self {
+            columns,
+            index,
+            values,
+        }
     }
 
     /// 列の値を型で取り出す。列が無い・型が合わないときはエラー。
@@ -383,8 +472,12 @@ impl Row {
 
     /// 列の値をそのまま借りる。
     pub fn value(&self, column: &str) -> Option<&Value> {
-        let index = self.columns.iter().position(|c| c == column)?;
-        self.values.get(index)
+        let position = match &self.index {
+            Some(index) => *index.get(column)?,
+            // 列が少ないときは表を作っていない。順に比べる。
+            None => self.columns.iter().position(|c| c == column)?,
+        };
+        self.values.get(position)
     }
 
     /// 左から数えた位置で値を借りる。
@@ -543,5 +636,65 @@ mod tests {
         let error = i8::from_value(&Value::Int(1000)).unwrap_err().to_string();
         assert!(error.contains("i8"), "{error}");
         assert!(u8::from_value(&Value::Int(-1)).is_err());
+    }
+
+    #[test]
+    fn 整数に直せない小数は断る() {
+        // 以前は飽和キャストだったので、NaN が黙って 0 になっていた。
+        let error = i64::from_value(&Value::Float(f64::NAN))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("整数に直せません"), "{error}");
+        assert!(i64::from_value(&Value::Float(f64::INFINITY)).is_err());
+        assert!(i64::from_value(&Value::Float(f64::NEG_INFINITY)).is_err());
+
+        // 範囲の外は、入らない型の名前を添えて断る。
+        let error = i64::from_value(&Value::Float(1e30))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("i64"), "{error}");
+        assert!(i64::from_value(&Value::Float(-1e30)).is_err());
+
+        // 幅の狭い整数も、同じエラーが通って出る。
+        assert!(i32::from_value(&Value::Float(f64::NAN)).is_err());
+
+        // 普通の小数はこれまでどおり読める。
+        assert_eq!(i64::from_value(&Value::Float(2.9)).unwrap(), 2);
+        assert_eq!(i64::from_value(&Value::Float(-2.9)).unwrap(), -2);
+    }
+
+    #[cfg(feature = "database")]
+    #[test]
+    fn 列が多い行も位置の表で読める() {
+        // 列が多いときは名前から位置を引く表を作る。読める値は変わらないこと。
+        let names: Vec<String> = (0..30).map(|i| format!("c{i}")).collect();
+        let columns: Arc<[String]> = Arc::from(names);
+        let values: Vec<Value> = (0..30).map(Value::Int).collect();
+
+        // 同じ問い合わせの行は、列名の `Arc` を共有する。
+        let first = Row::with_columns(Arc::clone(&columns), values.clone());
+        let second = Row::with_columns(Arc::clone(&columns), values);
+        for i in 0..30 {
+            assert_eq!(first.get::<i64>(&format!("c{i}")).unwrap(), i);
+            assert_eq!(second.get::<i64>(&format!("c{i}")).unwrap(), i);
+        }
+        assert!(first.get::<i64>("none").is_err());
+        assert_eq!(first, second);
+
+        // 列名が別の問い合わせに変わっても、前の表を使い回さない。
+        let other: Arc<[String]> = Arc::from((0..30).map(|i| format!("d{i}")).collect::<Vec<_>>());
+        let row = Row::with_columns(other, (0..30).map(|i| Value::Int(i + 100)).collect());
+        assert_eq!(row.get::<i64>("d5").unwrap(), 105);
+        assert_eq!(row.try_get::<i64>("c5"), None);
+    }
+
+    #[cfg(feature = "database")]
+    #[test]
+    fn 同じ名前の列は左を採る() {
+        // 順に比べていた頃と同じ。表を作る側でも左を採ること。
+        let mut names: Vec<String> = (0..30).map(|i| format!("c{i}")).collect();
+        names[20] = "c0".to_string();
+        let row = Row::with_columns(Arc::from(names), (0..30).map(Value::Int).collect());
+        assert_eq!(row.get::<i64>("c0").unwrap(), 0);
     }
 }

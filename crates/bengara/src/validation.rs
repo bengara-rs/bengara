@@ -10,6 +10,19 @@
 //! ```
 //!
 //! 失敗すると `Error::Validation` になり、422 と、どの項目がなぜ駄目かの JSON を返します。
+//!
+//! # 値の前後の空白は落とします
+//!
+//! 検査する前に、値の前後の空白を落とします（Laravel の `TrimStrings` と同じ）。
+//! `age=" 5 "` は `5` として検査し、通った値も `5` で返ります。
+//! 落とさないと、同じフォームが Laravel では通り、こちらでは 422 になります。
+//! 間の空白はそのままです（`"a b"` は `"a b"`）。
+//!
+//! **落とさない項目が3つあります。** `current_password`・`password`・
+//! `password_confirmation` です（Laravel の `TrimStrings` の `$except` と同じ）。
+//! パスワードの前後の空白は本人が意図して入れていることがあり、落とすと
+//! 資格情報を黙って書き換えてしまいます。`password` の `min:8` / `max:72` は、
+//! 前後の空白も数えた長さで測ります。これも Laravel と同じです。
 
 use std::collections::BTreeMap;
 
@@ -19,6 +32,10 @@ use crate::error::{Error, Result};
 ///
 /// 中身は検査した項目だけです。規則を書かなかった項目は入りません。
 /// 「要求した物しか入っていない」状態にして、入力をそのまま保存する事故を防ぎます。
+///
+/// **値は前後の空白を落とした形で入ります**（Laravel の `TrimStrings` と同じ）。
+/// ただし `current_password`・`password`・`password_confirmation` は
+/// 送られてきたままです。
 #[derive(Debug, Clone, Default)]
 pub struct Validated {
     values: BTreeMap<String, String>,
@@ -177,10 +194,16 @@ impl Rule {
             None => (raw.trim(), None),
         };
 
+        // **有限の数だけを通します。** Rust の `parse::<f64>()` は `nan` と `inf` を
+        // 読めるので、素のままだと `max:nan` が通り、比較が全部 false になって
+        // **何も検査しなくなります**（`max:255` が黙って無制限になる形）。
+        // 規則の書き間違いなので、引数忘れと同じ扱いで 500 にします。
         let number = |what: &str| -> Result<f64> {
-            arg.and_then(|a| a.parse::<f64>().ok()).ok_or_else(|| {
-                Error::msg(format!("規則 `{what}` には数値が要ります（例: {what}:10）"))
-            })
+            arg.and_then(|a| a.parse::<f64>().ok())
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| {
+                    Error::msg(format!("規則 `{what}` には数値が要ります（例: {what}:10）"))
+                })
         };
         let text = |what: &str| -> Result<String> {
             arg.map(str::to_string)
@@ -221,14 +244,19 @@ impl Rule {
                 let (lo, hi) = raw.split_once(',').ok_or_else(|| {
                     Error::msg("規則 `between` は between:1,10 の形で書いてください")
                 })?;
+                // 2 つの引数も `min` / `max` と同じで、有限の数だけを通します。
                 let lo = lo
                     .trim()
                     .parse::<f64>()
-                    .map_err(|_| Error::msg("規則 `between` の下限が数値ではありません"))?;
+                    .ok()
+                    .filter(|n| n.is_finite())
+                    .ok_or_else(|| Error::msg("規則 `between` の下限が数値ではありません"))?;
                 let hi = hi
                     .trim()
                     .parse::<f64>()
-                    .map_err(|_| Error::msg("規則 `between` の上限が数値ではありません"))?;
+                    .ok()
+                    .filter(|n| n.is_finite())
+                    .ok_or_else(|| Error::msg("規則 `between` の上限が数値ではありません"))?;
                 if lo > hi {
                     return Err(Error::msg("規則 `between` の下限が上限より大きいです"));
                 }
@@ -262,12 +290,41 @@ pub(crate) struct Input {
     values: BTreeMap<String, String>,
 }
 
+/// 前後の空白を**落とさない**項目の名前。
+///
+/// Laravel の `TrimStrings` の `$except` と同じ 3 つです。
+/// パスワードの前後の空白は本人が意図して入れていることがあり、
+/// 落とすと資格情報を黙って書き換えてしまいます。
+///
+/// **`http/request.rs` の `SENSITIVE` とは別の一覧です。** あちらは
+/// `token` や `key` も含みますが、トークンは空白を落としても困りません。
+/// 混ぜると意味が変わるので、分けたままにしてください。
+const NO_TRIM: &[&str] = &["current_password", "password", "password_confirmation"];
+
+/// その名前の値の空白を落とすか。
+fn should_trim(field: &str) -> bool {
+    !NO_TRIM.contains(&field)
+}
+
 impl Input {
+    /// 入力を受け取る。**値の前後の空白はここで落とします。**
+    ///
+    /// Laravel が `TrimStrings` を標準で通すのと同じ形です。落とさないと、
+    /// `age=" 5 "` が `integer` で落ち、`email="a@b.com "` が空白の確認で落ちます。
+    /// 同じフォームが Laravel では通り、こちらでは 422 になっていました。
+    /// 検査を通った値（`Validated`）も、空白を落とした形で返ります。
+    ///
+    /// **パスワードの類いは落としません**（[`NO_TRIM`] の 3 つ）。
+    /// そのため `password` の `min:8` / `max:72` は、前後の空白も 1 文字として
+    /// 数えた長さで測ります。Laravel も同じです。
     pub(crate) fn new(pairs: Vec<(String, String)>) -> Self {
         let mut values = BTreeMap::new();
         for (k, v) in pairs {
             // 同じ名前が何度も来たら最初を残す。後勝ちだと上書きで意図を変えられる。
-            values.entry(k).or_insert(v);
+            let trim = should_trim(&k);
+            values
+                .entry(k)
+                .or_insert_with(|| if trim { v.trim().to_string() } else { v });
         }
         Self { values }
     }
@@ -290,8 +347,10 @@ pub(crate) fn validate(input: &Input, rules: &[(&str, &str)]) -> Result<Validate
             .collect::<Result<_>>()?;
 
         let raw = input.get(field);
+        // 値は `Input::new` で前後の空白を落としてある。
+        // 以前はここだけ `trim()` していたので、`age=" 5 "` が `integer` で落ちた。
         let value = raw.unwrap_or("");
-        let is_blank = value.trim().is_empty();
+        let is_blank = value.is_empty();
         let nullable = parsed.contains(&Rule::Nullable);
         let required = parsed.contains(&Rule::Required);
 
@@ -878,6 +937,102 @@ mod tests {
             validate(&i, &[("n", "between:10,1")]).is_err(),
             "下限 > 上限"
         );
+    }
+
+    #[test]
+    fn 引数の非有限な値は開発者向けのエラーになる() {
+        // `parse::<f64>()` は `nan` / `inf` を読めるので、素のままだと
+        // `max:nan` が通り、比較が全部 false になって**何も検査しなくなる**。
+        let i = input(&[("n", "999999")]);
+        for bad in [
+            "max:nan",
+            "min:nan",
+            "max:inf",
+            "min:-inf",
+            "max:infinity",
+            "max:1e400",
+            "between:nan,10",
+            "between:1,inf",
+            "size:nan",
+        ] {
+            let error = validate(&i, &[("n", bad)]).unwrap_err();
+            assert!(
+                !matches!(error, Error::Validation(_)),
+                "`{bad}` は 422 にせず 500 にする: {error}"
+            );
+        }
+
+        // まともな書き方は今までどおり通る。
+        assert!(validate(&input(&[("n", "5")]), &[("n", "max:10")]).is_ok());
+        assert!(validate(&input(&[("n", "5")]), &[("n", "between:1,10")]).is_ok());
+    }
+
+    #[test]
+    fn 値の前後の空白は落とす() {
+        // Laravel は `TrimStrings` を標準で通す。落とさないと、同じフォームが
+        // 向こうで通ってこちらで 422 になっていた。
+        let ok = validate(&input(&[("age", " 5 ")]), &[("age", "integer")]).unwrap();
+        assert_eq!(ok.get("age"), "5", "通った値も空白を落とす");
+
+        let ok = validate(
+            &input(&[("email", " a@b.com ")]),
+            &[("email", "required|email")],
+        )
+        .unwrap();
+        assert_eq!(ok.get("email"), "a@b.com");
+
+        // 間の空白はそのまま。
+        let ok = validate(&input(&[("s", " a b ")]), &[("s", "required")]).unwrap();
+        assert_eq!(ok.get("s"), "a b");
+
+        // 文字数も落としたあとで数える。
+        assert!(errors_of(&input(&[("s", " ab ")]), &[("s", "size:4")]).has("s"));
+        assert!(errors_of(&input(&[("s", " ab ")]), &[("s", "size:2")]).is_empty());
+    }
+
+    #[test]
+    fn パスワードの空白は落とさない() {
+        // Laravel の `TrimStrings` も、この 3 つは `$except` に入れている。
+        // 前後の空白は本人が意図して入れていることがあり、落とすと
+        // 資格情報を黙って書き換えてしまう。
+        for field in ["current_password", "password", "password_confirmation"] {
+            let ok = validate(&input(&[(field, " ひみつ ")]), &[(field, "required")]).unwrap();
+            assert_eq!(ok.get(field), " ひみつ ", "{field} はそのまま");
+        }
+
+        // 確認の一致も、送られてきたままで比べる。
+        let i = input(&[
+            ("password", " ひみつ "),
+            ("password_confirmation", " ひみつ "),
+        ]);
+        assert!(errors_of(&i, &[("password", "confirmed")]).is_empty());
+
+        // 長さは前後の空白も数える（Laravel と同じ）。
+        let ok = validate(
+            &input(&[("password", " 1234567 ")]),
+            &[("password", "required|min:8|max:72")],
+        )
+        .unwrap();
+        assert_eq!(ok.get("password"), " 1234567 ", "9 文字として通る");
+        assert!(
+            errors_of(
+                &input(&[("password", "1234567")]),
+                &[("password", "required|min:8|max:72")]
+            )
+            .has("password"),
+            "空白が無ければ 7 文字で落ちる"
+        );
+
+        // ほかの項目は従来どおり落とす。
+        let ok = validate(&input(&[("age", " 5 ")]), &[("age", "integer")]).unwrap();
+        assert_eq!(ok.get("age"), "5");
+        // 似た名前は落とす対象外にしない（一覧は完全一致）。
+        let ok = validate(
+            &input(&[("password1", " x ")]),
+            &[("password1", "required")],
+        )
+        .unwrap();
+        assert_eq!(ok.get("password1"), "x");
     }
 
     #[test]

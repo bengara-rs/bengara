@@ -84,10 +84,7 @@ Event::try_dispatch("user.registered", &payload).await?;
 
 **どこから呼んでも届きます。** コントローラ・ジョブ・自作コマンド・定期処理のどれでも
 同じです。`bootstrap/app.rs` は、置き場所が要らないコマンド（`init` / `--version` /
-`--help`）以外のすべてで読まれます。
-
-以前は `serve` と `route:list` のときだけ読んでいたので、`queue:work` や自作コマンドの
-中で `dispatch` を呼んでも、**エラーも警告も出さずに何も起きませんでした。**
+`--help` など）以外のすべてで読まれます。
 
 ```rust
 if Event::has_listeners("user.registered") { /* ... */ }

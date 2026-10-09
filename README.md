@@ -87,7 +87,8 @@ impl HomeController {
 | Redis                      | キャッシュはファイル、キューは DB です      |
 | Argon2 / bcrypt            | パスワードの変換は PBKDF2 です              |
 | Windows のサービス停止要求 | Ctrl+C とコンソールを閉じる操作には応えます |
-| macOS / Linux での確認     | 確かめているのは Windows 10 だけです        |
+| ファイルのアップロード     | ありません（multipart は未実装）            |
+| macOS / Linux での確認     | **未確認です。** 確かめているのは Windows 10 だけです |
 
 一覧は [docs/backlog.md](docs/backlog.md) にまとめてあります。
 

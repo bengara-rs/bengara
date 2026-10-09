@@ -247,10 +247,29 @@ fn early_error(error: Error, wants_json: bool) -> axum::response::Response {
 }
 
 /// `bengara` のレスポンスを axum の形に変える。
+///
+/// ヘッダーは**1本ずつ**積みます。以前はまとめて積んでいたので、1本でも
+/// 組み立てられないと応答のヘッダーが全部消え、素の 500 になっていました
+/// （直前にセッションが付けた `Set-Cookie` まで失われました）。
+/// いまは組み立てに失敗したヘッダーだけを飛ばします。
 fn into_axum(response: Response) -> axum::response::Response {
-    let mut builder = axum::http::Response::builder().status(response.status());
+    let mut headers = axum::http::HeaderMap::with_capacity(response.headers().len());
     for (name, value) in response.headers() {
-        builder = builder.header(name, value);
+        let Ok(header_name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+            tracing::warn!("ヘッダーの名前 {name} が使えないので、この1本を飛ばします");
+            continue;
+        };
+        let Ok(header_value) = axum::http::HeaderValue::from_str(value) else {
+            tracing::warn!("ヘッダー {name} の値が使えないので、この1本を飛ばします");
+            continue;
+        };
+        // `set-cookie` のように同じ名前を何本も送るので `append`。
+        headers.append(header_name, header_value);
+    }
+
+    let mut builder = axum::http::Response::builder().status(response.status());
+    if let Some(slot) = builder.headers_mut() {
+        *slot = headers;
     }
     // 本文は所有ごと渡す。`Cow::Borrowed`（埋め込んだ `public/`）はコピーされない。
     let body = match response.into_body() {
@@ -260,7 +279,7 @@ fn into_axum(response: Response) -> axum::response::Response {
     match builder.body(body) {
         Ok(response) => response,
         Err(e) => {
-            // ヘッダーの値が HTTP として不正だったときの保険。
+            // 最後の保険。ヘッダーは1本ずつ検査済みなので、ここには来ないはずです。
             tracing::error!("レスポンスを組み立てられませんでした: {e}");
             axum::http::Response::builder()
                 .status(500)
@@ -402,6 +421,44 @@ mod tests {
 
         let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(display_addr(local), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn 組み立てられないヘッダーだけを飛ばす() {
+        // 以前は1本でも駄目だと応答のヘッダーを全部捨てていました。
+        // 値は `with_header` が先に検査するので、ここでは名前が不正な1本で確かめます。
+        let response = Response::text("ok")
+            .with_added_header("set-cookie", "session=abc")
+            .with_added_header("x dame", "1") // 名前に空白。HeaderName にできない
+            .with_added_header("x-ok", "1");
+        let axum_response = into_axum(response);
+
+        assert_eq!(axum_response.status(), 200);
+        let headers = axum_response.headers();
+        assert_eq!(
+            headers.get("set-cookie").map(|v| v.as_bytes()),
+            Some(&b"session=abc"[..]),
+            "Set-Cookie は残る"
+        );
+        assert_eq!(headers.get("x-ok").map(|v| v.as_bytes()), Some(&b"1"[..]));
+        assert_eq!(
+            headers.len(),
+            3,
+            "残るのは良い3本だけ（content-type・set-cookie・x-ok）。駄目な1本だけ飛ばす"
+        );
+        assert!(headers.get("content-type").is_some());
+    }
+
+    #[test]
+    fn 同じ名前のヘッダーは何本でも渡る() {
+        let response = Response::text("ok")
+            .with_added_header("set-cookie", "a=1")
+            .with_added_header("set-cookie", "b=2");
+        let axum_response = into_axum(response);
+        assert_eq!(
+            axum_response.headers().get_all("set-cookie").iter().count(),
+            2
+        );
     }
 
     #[test]

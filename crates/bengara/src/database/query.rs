@@ -132,6 +132,20 @@ pub struct QueryBuilder {
     offset: Option<u64>,
 }
 
+/// 終端メソッドが差し替える所だけを持つ形。
+///
+/// `select` の SQL は、取る列・重なり・並び・件数だけが場面で変わります。
+/// 以前は `first()` や `count()` がビルダー全体を `clone()` してから
+/// 差し替えていました。1行取るだけで条件と値まで複製するので、ここだけ
+/// 借りて組み立てます。**組み立てる SQL は clone していた頃と同じです。**
+struct Shape<'a> {
+    columns: &'a [String],
+    distinct: bool,
+    orders: &'a [Order],
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
 impl std::fmt::Debug for QueryBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (sql, bindings) = self.to_sql();
@@ -566,8 +580,19 @@ impl QueryBuilder {
 
     /// 束ねた結果を絞る。
     ///
+    /// **渡せるのは実在の列だけです。** `select` に書いた別名
+    /// （`count(*) as total` の `total`）は渡せません。PostgreSQL は `having` で
+    /// select の別名を解決しないので、`column "total" does not exist` になります。
+    /// SQLite と MySQL では通るので、気づかないまま移すと落ちます。
+    ///
+    /// 集計の結果で絞るときは `having_raw` を使ってください。
+    ///
+    /// ```ignore
+    /// // 別名ではなく式をそのまま書く。
+    /// .group_by(&["author_id"]).having_raw("count(*) > ?", &[2.into()])
+    /// ```
+    ///
     /// 列名は英数字と `_` `.` だけ、演算子は許可一覧で照合します。
-    /// 式で絞りたいときは `having_raw` を使ってください。
     pub fn having_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
         self.check_column("having_op", column);
         self.check_value_operator("having_op", operator);
@@ -686,15 +711,41 @@ impl QueryBuilder {
     /// その場合は終端メソッド（`get` など）がエラーになります。
     /// 組み立てのときに見つけた間違い（使えない列名など）も、ここでは出ません。
     pub fn to_sql(&self) -> (String, Vec<Value>) {
+        self.select_sql(&self.shape())
+    }
+
+    /// 組み立てたままの形。
+    fn shape(&self) -> Shape<'_> {
+        Shape {
+            columns: &self.columns,
+            distinct: self.distinct,
+            orders: &self.orders,
+            limit: self.limit,
+            offset: self.offset,
+        }
+    }
+
+    /// 並びと件数の指定を外した形。集計はこの形で組み立てます。
+    fn aggregate_shape(&self) -> Shape<'_> {
+        Shape {
+            orders: &[],
+            limit: None,
+            offset: None,
+            ..self.shape()
+        }
+    }
+
+    /// `select` の SQL を組み立てる。差し替える所は `Shape` から取ります。
+    fn select_sql(&self, shape: &Shape<'_>) -> (String, Vec<Value>) {
         let mut c = Compiler::new(self.driver);
         c.sql.push_str("select ");
-        if self.distinct {
+        if shape.distinct {
             c.sql.push_str("distinct ");
         }
-        if self.columns.is_empty() {
+        if shape.columns.is_empty() {
             c.sql.push('*');
         } else {
-            let columns: Vec<String> = self
+            let columns: Vec<String> = shape
                 .columns
                 .iter()
                 .map(|col| grammar::quote(self.driver, col))
@@ -706,8 +757,8 @@ impl QueryBuilder {
         self.compile_joins(&mut c);
         self.compile_wheres(&mut c);
         self.compile_groups(&mut c);
-        self.compile_orders(&mut c);
-        self.compile_limit(&mut c);
+        self.compile_orders(&mut c, shape.orders);
+        self.compile_limit(&mut c, shape.limit, shape.offset);
         (c.sql, c.bindings)
     }
 
@@ -750,12 +801,11 @@ impl QueryBuilder {
         }
     }
 
-    fn compile_orders(&self, c: &mut Compiler) {
-        if self.orders.is_empty() {
+    fn compile_orders(&self, c: &mut Compiler, orders: &[Order]) {
+        if orders.is_empty() {
             return;
         }
-        let orders: Vec<String> = self
-            .orders
+        let orders: Vec<String> = orders
             .iter()
             .map(|order| match order {
                 Order::Column { column, desc } => format!(
@@ -770,13 +820,13 @@ impl QueryBuilder {
         c.sql.push_str(&orders.join(", "));
     }
 
-    fn compile_limit(&self, c: &mut Compiler) {
+    fn compile_limit(&self, c: &mut Compiler, limit: Option<u64>, offset: Option<u64>) {
         // 件数は数値なので、そのまま置いても安全。
-        if let Some(limit) = self.limit {
+        if let Some(limit) = limit {
             c.sql.push_str(&format!(" limit {limit}"));
         }
-        if let Some(offset) = self.offset {
-            if self.limit.is_none() {
+        if let Some(offset) = offset {
+            if limit.is_none() {
                 // SQLite と MySQL は limit が無いと offset を受け付けない。
                 // 「上限なし」の書き方は方言で違うので grammar に集めてある。
                 c.sql.push_str(grammar::no_limit(self.driver));
@@ -946,11 +996,19 @@ impl QueryBuilder {
 
     /// 最初の1行を取る。
     pub async fn first(&self) -> Result<Option<Row>> {
-        let rows = self.clone().limit(1).get().await?;
+        self.check()?;
+        let (sql, bindings) = self.select_sql(&Shape {
+            limit: Some(1),
+            ..self.shape()
+        });
+        let rows = self.source.fetch_all(&sql, &bindings).await?;
         Ok(rows.into_iter().next())
     }
 
     /// 主キー（`id`）で1行取る。
+    ///
+    /// 条件を1つ足すので、ここだけはビルダーを複製します。
+    /// 以前は `first()` も複製していたので、2回複製していました。
     pub async fn find(&self, id: impl IntoValue) -> Result<Option<Row>> {
         self.clone().where_("id", id.into_value()).first().await
     }
@@ -964,7 +1022,15 @@ impl QueryBuilder {
     /// `get()` を使ってください。
     pub async fn value<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
         ensure_value_column("value", column)?;
-        let row = self.clone().select(&[column]).first().await?;
+        self.check()?;
+        let columns = vec![column.to_string()];
+        let (sql, bindings) = self.select_sql(&Shape {
+            columns: &columns,
+            limit: Some(1),
+            ..self.shape()
+        });
+        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        let row = rows.into_iter().next();
         match row.as_ref().and_then(|row| row.at(0)) {
             Some(value) => T::from_value(value)
                 .map(Some)
@@ -982,7 +1048,13 @@ impl QueryBuilder {
     /// `get()` を使ってください。
     pub async fn pluck<T: FromValue>(&self, column: &str) -> Result<Vec<T>> {
         ensure_value_column("pluck", column)?;
-        let rows = self.clone().select(&[column]).get().await?;
+        self.check()?;
+        let columns = vec![column.to_string()];
+        let (sql, bindings) = self.select_sql(&Shape {
+            columns: &columns,
+            ..self.shape()
+        });
+        let rows = self.source.fetch_all(&sql, &bindings).await?;
         rows.iter()
             .map(|row| match row.at(0) {
                 Some(value) => T::from_value(value)
@@ -996,9 +1068,12 @@ impl QueryBuilder {
     ///
     /// `group_by` が付いているときは**グループの数**を返します。
     /// `distinct()` が付いているときは重なりを除いて数えます。
+    ///
+    /// **`distinct()` を付けたときは `select` で列を1つ指定してください。**
+    /// 数える列が決まらないと断ります（理由は `count_sql` にあります）。
     pub async fn count(&self) -> Result<i64> {
         self.check()?;
-        let (sql, bindings) = self.count_sql();
+        let (sql, bindings) = self.count_sql()?;
         let rows = self.source.fetch_all(&sql, &bindings).await?;
         match rows.first().and_then(|row| row.at(0)) {
             None | Some(Value::Null) => Ok(0),
@@ -1011,20 +1086,26 @@ impl QueryBuilder {
     /// `group_by` と `distinct` で形が変わります。そのまま `count(*)` を足すと、
     /// `group_by` ではグループごとの件数（＝最初のグループの件数）になり、
     /// `distinct` では重なりを除かない件数になります。
-    fn count_sql(&self) -> (String, Vec<Value>) {
+    fn count_sql(&self) -> Result<(String, Vec<Value>)> {
         if !self.groups.is_empty() {
             // 束ねた結果の「行の数」を数えたいので、副問い合わせの外から数える。
-            return self.sub_count_sql();
+            return Ok(self.sub_count_sql());
         }
         if self.distinct {
             // 数える列が1つに決まるなら `count(distinct 列)`。
-            // 決まらない（指定なし・複数・式）ときは副問い合わせで数える。
-            return match self.distinct_count_column() {
-                Some(column) => self.plain_count_sql(&format!("count(distinct {column})")),
-                None => self.sub_count_sql(),
+            let Some(column) = self.distinct_count_column() else {
+                // 決まらない（指定なし・複数・式）ときは断る。
+                // 派生表で数えると、MySQL は列名が重なってエラー 1060 になります
+                // （`join` を併用したとき）。SQL を出さずに書き方を伝えます。
+                return Err(Error::msg(
+                    "distinct() を付けた問い合わせの件数は、数える列が1つに決まらないと\
+                     数えられません。select で列を1つ指定してください\
+                     （例: select(&[\"author_id\"])）",
+                ));
             };
+            return Ok(self.plain_count_sql(&format!("count(distinct {column})")));
         }
-        self.plain_count_sql("count(*)")
+        Ok(self.plain_count_sql("count(*)"))
     }
 
     /// `count(distinct …)` に使える列。1列だけ指定されているときだけ決まります。
@@ -1038,27 +1119,32 @@ impl QueryBuilder {
         Some(grammar::quote(self.driver, column))
     }
 
-    /// 並びと件数の指定を外した問い合わせ。集計はこの形で組み立てます。
-    fn for_aggregate(&self) -> Self {
-        let mut query = self.clone();
-        query.orders.clear();
-        query.limit = None;
-        query.offset = None;
-        query
-    }
-
     /// 集計の式を1つだけ取る形。
     fn plain_count_sql(&self, expression: &str) -> (String, Vec<Value>) {
-        let mut query = self.for_aggregate();
-        // 重なりは `count(distinct …)` の側で見るので、ここでは外す。
-        query.distinct = false;
-        query.columns = vec![format!("{expression} as bengara_aggregate")];
-        query.to_sql()
+        let columns = vec![format!("{expression} as bengara_aggregate")];
+        self.select_sql(&Shape {
+            columns: &columns,
+            // 重なりは `count(distinct …)` の側で見るので、ここでは外す。
+            distinct: false,
+            ..self.aggregate_shape()
+        })
     }
 
-    /// 副問い合わせの外から数える形。
+    /// 副問い合わせの外からグループの数を数える形。
+    ///
+    /// **内側の列は `1` に固定します。** 以前は組み立てたままの列を入れていたので、
+    /// 指定が無いと `select *` になりました。PostgreSQL は
+    /// `column "t.id" must appear in the GROUP BY clause`、MySQL は既定の
+    /// `ONLY_FULL_GROUP_BY` でエラー 1055 になり、SQLite だけが通る形でした。
     fn sub_count_sql(&self) -> (String, Vec<Value>) {
-        let (inner, bindings) = self.for_aggregate().to_sql();
+        let columns = vec!["1 as bengara_group".to_string()];
+        let (inner, bindings) = self.select_sql(&Shape {
+            columns: &columns,
+            // 内側の中身は見ないので、重なりを除く意味がない。
+            // 除くとグループが1行に潰れて、数が合わなくなります。
+            distinct: false,
+            ..self.aggregate_shape()
+        });
         (
             format!("select count(*) as bengara_aggregate from ({inner}) as bengara_sub"),
             bindings,
@@ -1070,13 +1156,20 @@ impl QueryBuilder {
     /// 並びと件数の指定は外します。`latest()` を付けた問い合わせでも、
     /// 並べ替えの手間をかけないためです。
     pub async fn exists(&self) -> Result<bool> {
-        let rows = self
-            .for_aggregate()
-            .select(&["1 as bengara_exists"])
-            .limit(1)
-            .get()
-            .await?;
+        self.check()?;
+        let (sql, bindings) = self.exists_sql();
+        let rows = self.source.fetch_all(&sql, &bindings).await?;
         Ok(!rows.is_empty())
+    }
+
+    /// `exists` の SQL を組み立てる。
+    fn exists_sql(&self) -> (String, Vec<Value>) {
+        let columns = vec!["1 as bengara_exists".to_string()];
+        self.select_sql(&Shape {
+            columns: &columns,
+            limit: Some(1),
+            ..self.aggregate_shape()
+        })
     }
 
     /// 1件も無いか。
@@ -1153,11 +1246,13 @@ impl QueryBuilder {
         } else {
             format!("{function}({quoted}) as bengara_aggregate")
         };
-        let mut query = self.for_aggregate();
-        // 重なりは集計の式の中で見るので、ここでは外す。
-        query.distinct = false;
-        query.columns = vec![expression];
-        Ok(query.to_sql())
+        let columns = vec![expression];
+        Ok(self.select_sql(&Shape {
+            columns: &columns,
+            // 重なりは集計の式の中で見るので、ここでは外す。
+            distinct: false,
+            ..self.aggregate_shape()
+        }))
     }
 
     /// 1行足す。
@@ -1191,7 +1286,25 @@ impl QueryBuilder {
         self.insert_get_id_as(values, "id").await
     }
 
-    /// 1行足して、指定した主キーの値を返す。
+    /// 1行足して、採番された主キーの値を返す。
+    ///
+    /// **`primary_key` を見るのは PostgreSQL だけです。** ドライバごとに返るものが
+    /// 違います。
+    ///
+    /// | ドライバ   | 返るもの                             | `primary_key` の使い道 |
+    /// |------------|--------------------------------------|------------------------|
+    /// | PostgreSQL | `returning` が返した指定の列の値     | 列名として SQL に入る  |
+    /// | SQLite     | 直前に入れた行の rowid               | 検査だけ               |
+    /// | MySQL      | `last_insert_id()`                   | 検査だけ               |
+    ///
+    /// SQLite の `integer primary key` は rowid の別名なので、名前が `id` でなくても
+    /// 正しい値が返ります。MySQL の `last_insert_id()` も、`auto_increment` の列の
+    /// 名前に関係なく、その列に採番された値を返します。
+    ///
+    /// **外れるのは、自動採番でない列を `primary_key` に渡したときです。**
+    /// その場合、SQLite と MySQL は指定とは別の値（rowid や 0）を返します。
+    /// 名前だけでは見分けられないので（`id` 以外でも普通に正しい）、
+    /// 警告は出しません。毎回の `insert` で鳴って雑音になるためです。
     pub async fn insert_get_id_as(
         &self,
         values: &[(&str, Value)],
@@ -1417,7 +1530,13 @@ impl QueryBuilder {
         let per_page = per_page.max(1);
         let page = page.max(1);
         let total = self.count().await?;
-        let data = self.clone().for_page(page, per_page).get().await?;
+        // `count()` が `check()` を通している。ここでは組み立てるだけ。
+        let (sql, bindings) = self.select_sql(&Shape {
+            limit: Some(per_page),
+            offset: Some((page - 1) * per_page),
+            ..self.shape()
+        });
+        let data = self.source.fetch_all(&sql, &bindings).await?;
         Ok(Paginator {
             data,
             total,
@@ -1663,17 +1782,19 @@ mod tests {
 
     #[test]
     fn 結合と束ねと絞り込み() {
+        // 集計の結果で絞るときは having_raw。select の別名（total）は
+        // PostgreSQL の having で解決されないので、having_op には渡さない。
         let (sql, bindings) = builder()
             .select(&["posts.id", "count(*) as total"])
             .join("comments", "comments.post_id", "=", "posts.id")
             .group_by(&["posts.id"])
-            .having_op("total", ">", 2)
+            .having_raw("count(*) > ?", &[Value::Int(2)])
             .to_sql();
         assert_eq!(
             sql,
             "select \"posts\".\"id\", count(*) as total from \"posts\" \
              inner join \"comments\" on \"comments\".\"post_id\" = \"posts\".\"id\" \
-             group by \"posts\".\"id\" having \"total\" > ?"
+             group by \"posts\".\"id\" having count(*) > ?"
         );
         assert_eq!(bindings, vec![Value::Int(2)]);
     }
@@ -1779,7 +1900,7 @@ mod tests {
         for query in [
             builder().where_op("id", danger, 1),
             builder().or_where_op("id", danger, 1),
-            builder().having_op("total", danger, 1),
+            builder().having_op("views", danger, 1),
             builder().where_column("a", danger, "b"),
         ] {
             let message = query.check().expect_err("断られる").to_string();
@@ -1793,7 +1914,7 @@ mod tests {
             .order_by("created_at")
             .order_by_desc("users.id")
             .group_by(&["post_id"])
-            .having_op("total", ">=", 2)
+            .having_op("views", ">=", 2)
             .where_op("views", "<", 10)
             .where_op("title", "NOT LIKE", "%x%")
             .where_column("a", "=", "b");
@@ -1813,41 +1934,73 @@ mod tests {
 
     #[test]
     fn 束ねたときの件数はグループの数を数える() {
+        // 内側の列は 1 に固定する。`select *` のままだと PostgreSQL は
+        // 「group by に無い列」、MySQL は ONLY_FULL_GROUP_BY で断る。
         let (sql, bindings) = builder()
             .where_("status", "published")
             .group_by(&["post_id"])
-            .count_sql();
+            .count_sql()
+            .expect("組み立てられる");
         assert_eq!(
             sql,
             "select count(*) as bengara_aggregate from (\
-             select * from \"posts\" where \"status\" = ? group by \"post_id\"\
+             select 1 as bengara_group from \"posts\" where \"status\" = ? group by \"post_id\"\
              ) as bengara_sub"
         );
         assert_eq!(bindings, vec![Value::Text("published".into())]);
+
+        // 結合を併用しても、内側に列が出ないので名前が重ならない。
+        let (sql, _) = builder()
+            .join("comments", "comments.post_id", "=", "posts.id")
+            .group_by(&["posts.id"])
+            .count_sql()
+            .expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "select count(*) as bengara_aggregate from (\
+             select 1 as bengara_group from \"posts\" \
+             inner join \"comments\" on \"comments\".\"post_id\" = \"posts\".\"id\" \
+             group by \"posts\".\"id\"\
+             ) as bengara_sub"
+        );
     }
 
     #[test]
     fn 重なりを除いた件数を数える() {
         // 列が1つに決まるときは count(distinct 列)。
-        let (sql, _) = builder().distinct().select(&["author_id"]).count_sql();
+        let (sql, _) = builder()
+            .distinct()
+            .select(&["author_id"])
+            .count_sql()
+            .expect("組み立てられる");
         assert_eq!(
             sql,
             "select count(distinct \"author_id\") as bengara_aggregate from \"posts\""
         );
+    }
 
-        // 決まらないときは副問い合わせ。
-        let (sql, _) = builder().distinct().count_sql();
-        assert_eq!(
-            sql,
-            "select count(*) as bengara_aggregate from (\
-             select distinct * from \"posts\"\
-             ) as bengara_sub"
-        );
+    #[test]
+    fn 数える列が決まらないdistinctは断る() {
+        // 以前は派生表で数えていた。MySQL は join した列名が重なってエラー 1060。
+        for query in [
+            builder().distinct(),
+            builder().distinct().select(&["id", "author_id"]),
+            builder()
+                .distinct()
+                .join("comments", "comments.post_id", "=", "posts.id"),
+        ] {
+            let message = query.count_sql().expect_err("断られる").to_string();
+            assert!(message.contains("select で列を1つ"), "{message}");
+        }
     }
 
     #[test]
     fn 条件なしの件数はそのまま数える() {
-        let (sql, _) = builder().latest().limit(10).count_sql();
+        let (sql, _) = builder()
+            .latest()
+            .limit(10)
+            .count_sql()
+            .expect("組み立てられる");
         assert_eq!(sql, "select count(*) as bengara_aggregate from \"posts\"");
     }
 
@@ -1967,7 +2120,7 @@ mod tests {
     #[test]
     fn group_byなしのhavingは断る() {
         let message = builder()
-            .having_op("total", ">", 1)
+            .having_op("views", ">", 1)
             .check()
             .expect_err("断られる")
             .to_string();
@@ -1980,7 +2133,7 @@ mod tests {
         assert!(message.contains("group_by が必要"), "{message}");
         builder()
             .group_by(&["post_id"])
-            .having_op("total", ">", 1)
+            .having_op("views", ">", 1)
             .check()
             .expect("束ねていれば通る");
     }
@@ -2103,7 +2256,7 @@ mod tests {
                 builder().or_where_op("views", operator, 1),
                 builder()
                     .group_by(&["author_id"])
-                    .having_op("total", operator, 1),
+                    .having_op("views", operator, 1),
             ] {
                 let message = query.check().expect_err("断られる").to_string();
                 assert!(message.contains("値1つとは比べられません"), "{message}");
@@ -2201,16 +2354,49 @@ mod tests {
     fn existsは並びと件数を外す() {
         // 並べ替えても1件あるかは変わらない。手間だけが増える。
         let query = builder().where_("status", "published").latest().limit(10);
-        let (sql, _) = query
-            .for_aggregate()
-            .select(&["1 as bengara_exists"])
-            .limit(1)
-            .to_sql();
+        let (sql, _) = query.exists_sql();
         assert_eq!(
             sql,
             "select 1 as bengara_exists from \"posts\" where \"status\" = ? limit 1"
         );
         assert!(!sql.contains("order by"), "{sql}");
+    }
+
+    #[test]
+    fn 終端メソッドの_sql_は複製していた頃と同じ() {
+        // ビルダーを clone せずに組み立てるようにした。SQL は変えないこと。
+        let query = builder().where_("status", "published").latest();
+
+        let (sql, bindings) = query.select_sql(&Shape {
+            limit: Some(1),
+            ..query.shape()
+        });
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"status\" = ? \
+             order by \"created_at\" desc limit 1"
+        );
+        assert_eq!(bindings, vec![Value::Text("published".into())]);
+
+        // value / pluck は列を1つに差し替える。
+        let columns = vec!["title".to_string()];
+        let (sql, _) = query.select_sql(&Shape {
+            columns: &columns,
+            ..query.shape()
+        });
+        assert_eq!(
+            sql,
+            "select \"title\" from \"posts\" where \"status\" = ? order by \"created_at\" desc"
+        );
+
+        // paginate は件数だけ差し替える。for_page と同じ形になること。
+        let (sql, _) = query.select_sql(&Shape {
+            limit: Some(15),
+            offset: Some(30),
+            ..query.shape()
+        });
+        let (expected, _) = query.clone().for_page(3, 15).to_sql();
+        assert_eq!(sql, expected);
     }
 
     // ---- 実際の SQLite を使うテスト ----

@@ -10,6 +10,11 @@
 //! どちらも `GET` と `HEAD` のときだけです。`/storage/x.css` が無くても
 //! `public/storage/x.css` は探しません。
 //!
+//! 振り分けの**前に** `normalize_path` を1回だけ通します。以前は生のパスで
+//! `/storage/` を判定していたので、`//storage/x.css` と `/%73torage/x.css` が
+//! `public/` 側の枝に入り、`public/storage/x.css` を返していました
+//! （上の「どちらか一方」が守れていませんでした）。
+//!
 //! 埋め込みはリリースビルドのときだけ入ります（`bengara-build` が `PROFILE` を見ます）。
 //! デバッグビルドでは常にディスクを読むので、ファイルを直せばすぐ反映されます。
 //!
@@ -31,6 +36,44 @@ use crate::http::Response;
 
 /// `/storage/...` で配信する頭のパス。
 pub(crate) const STORAGE_PREFIX: &str = "/storage/";
+
+/// 振り分けの前に、リクエストのパスを1回だけ正規化する。
+///
+/// やることは2つです。
+///
+/// 1. 続いた `/` をまとめ、空の区切りを落とす（`//storage/x` → `/storage/x`）。
+/// 2. `%xx` を元に戻す（`/%73torage/x` → `/storage/x`）。
+///
+/// 以前はここを通さず、`/storage/` の判定を**生のパス**で行い、その後の探索だけが
+/// 復号していました。そのため2つの入口の振り分けと、実際に探す先が食い違いました。
+/// 正規化した形で判定も探索も行うので、食い違いが起きません。
+///
+/// `+` は空白にしません。`+` が空白なのはフォームの規則で、URL のパスには
+/// 当てはまりません。末尾の `/` は落ちます（`/storage/` は `/storage` になり、
+/// どちらも 404 です）。
+pub(crate) fn normalize_path(request_path: &str) -> String {
+    let decoded = super::percent::decode_strict(request_path);
+    let mut out = String::with_capacity(decoded.len() + 1);
+    for part in decoded.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        out.push('/');
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// `/storage/...` の入口か。**正規化したパス**で判定します。
+///
+/// `/storage` だけのときも storage 側に入れます。ここで `public/` 側へ落とすと、
+/// `public/storage` を探してしまい、2つの入口が混ざります（storage 側で 404）。
+pub(crate) fn is_storage_path(path: &str) -> bool {
+    path.starts_with(STORAGE_PREFIX) || path == STORAGE_PREFIX.trim_end_matches('/')
+}
 
 /// 静的ファイルに付ける `Cache-Control`。
 ///
@@ -188,7 +231,11 @@ pub(crate) fn serve(
     if path.is_dir() {
         path.push("index.html");
     }
-    let metadata = std::fs::metadata(&path).ok()?;
+    // ファイルは**1回だけ開く**。情報も中身も同じハンドルから採ります。
+    // 以前は metadata → canonicalize → read と開き直していたので、その間に
+    // 書き換わると古い ETag や、本文と合わない Content-Length を返しました。
+    let mut file = std::fs::File::open(&path).ok()?;
+    let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
         return None;
     }
@@ -219,7 +266,9 @@ pub(crate) fn serve(
         // 本文を読まないので、長さは自分で知らせる。
         return Some(response.with_header("content-length", metadata.len().to_string()));
     }
-    let body = std::fs::read(&canonical).ok()?;
+    // 開いたままのハンドルから読む。ETag と同じ中身であることが保証されます。
+    let mut body = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    std::io::Read::read_to_end(&mut file, &mut body).ok()?;
     Some(response.with_body(body))
 }
 
@@ -273,20 +322,22 @@ fn etag_matches(header: Option<&str>, etag: &str) -> bool {
 }
 
 /// リクエストのパスを、`public/` の下から出られない相対パスに直す。
+///
+/// 渡すのは `normalize_path` を通したパスです。**ここでは復号しません**。
+/// 2回復号すると `%2520` が空白になり、二重の復号になります。
 fn safe_relative(request_path: &str) -> Option<PathBuf> {
-    // `+` は空白にしません。`+` が空白なのはフォームの規則で、URL のパスには当てはまりません。
-    let decoded = super::percent::decode_strict(request_path.trim_start_matches('/'));
+    let decoded = request_path.trim_start_matches('/');
     if decoded.contains('\0') {
         return None;
     }
     // `/` は `public/index.html` を指す。
     let decoded = if decoded.is_empty() {
-        "index.html".to_string()
+        "index.html"
     } else {
         decoded
     };
     let mut out = PathBuf::new();
-    for component in Path::new(&decoded).components() {
+    for component in Path::new(decoded).components() {
         match component {
             Component::Normal(part) => out.push(part),
             // `..`、`/`、`C:` などは受け付けない。
@@ -514,9 +565,68 @@ mod tests {
 
     #[test]
     fn パスのプラスは空白にしない() {
-        assert_eq!(safe_relative("/a+b.css"), Some(PathBuf::from("a+b.css")));
+        assert_eq!(normalize_path("/a+b.css"), "/a+b.css");
+        assert_eq!(
+            safe_relative(&normalize_path("/a+b.css")),
+            Some(PathBuf::from("a+b.css"))
+        );
         // `%20` は空白に戻る（こちらはパスでも同じ）。
-        assert_eq!(safe_relative("/a%20b.css"), Some(PathBuf::from("a b.css")));
+        assert_eq!(normalize_path("/a%20b.css"), "/a b.css");
+        assert_eq!(
+            safe_relative(&normalize_path("/a%20b.css")),
+            Some(PathBuf::from("a b.css"))
+        );
+    }
+
+    #[test]
+    fn パスを1回だけ正規化する() {
+        // 続いた `/` はまとまる。
+        assert_eq!(normalize_path("//storage/x.css"), "/storage/x.css");
+        assert_eq!(normalize_path("/a//b///c.css"), "/a/b/c.css");
+        // `%xx` は元に戻る。
+        assert_eq!(normalize_path("/%73torage/x.css"), "/storage/x.css");
+        // 末尾の `/` は落ちる。
+        assert_eq!(normalize_path("/storage/"), "/storage");
+        assert_eq!(normalize_path("/storage///"), "/storage");
+        // `/` はそのまま（`public/index.html` を指す）。
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path(""), "/");
+    }
+
+    #[test]
+    fn 正規化すれば2つの入口は混ざらない() {
+        // 以前は生のパスで判定していたので、`//storage/` と `/%73torage/` が
+        // `public/` 側の枝に入り、`public/storage/x.css` を返していました。
+        assert!(is_storage_path(&normalize_path("/storage/x.css")));
+        assert!(is_storage_path(&normalize_path("//storage/x.css")));
+        assert!(is_storage_path(&normalize_path("/%73torage/x.css")));
+        // `/storage` だけのときも storage 側（そこで 404）。`public/storage` は探さない。
+        assert!(is_storage_path(&normalize_path("/storage/")));
+        assert!(is_storage_path(&normalize_path("/storage")));
+        // 関係ないパスは `public/` 側。
+        assert!(!is_storage_path(&normalize_path("/css/app.css")));
+        assert!(!is_storage_path(&normalize_path("/storageroom/x.css")));
+    }
+
+    #[test]
+    fn 正規化したstorageのパスは404のまま() {
+        let dir = std::env::temp_dir();
+        for raw in ["/storage/", "/storage//", "/storage///", "/storage"] {
+            let path = normalize_path(raw);
+            assert!(is_storage_path(&path), "{raw} は storage 側");
+            assert!(
+                serve_storage(&dir, None, &path, None, true).is_none(),
+                "{raw} は 404"
+            );
+        }
+    }
+
+    #[test]
+    fn 正規化したパスを2回復号しない() {
+        // `%2520` は `%20` に戻るだけ。空白にはしない（二重の復号を避ける）。
+        let path = normalize_path("/a%2520b.css");
+        assert_eq!(path, "/a%20b.css");
+        assert_eq!(safe_relative(&path), Some(PathBuf::from("a%20b.css")));
     }
 
     #[test]
@@ -553,6 +663,23 @@ mod tests {
         let again = serve(&dir, Some(&root), "/a.txt", Some(&etag), true).expect("あるはず");
         assert_eq!(again.status(), 304);
         assert!(again.body().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ディスクの配信はetagと本文を同じハンドルから採る() {
+        // 以前は metadata と read でファイルを2回開いていたので、その間に
+        // 書き換わると ETag と本文の長さが食い違いました。
+        let dir = temp_dir("onefd");
+        std::fs::write(dir.join("a.txt"), "0123456789").unwrap();
+        let root = dir.canonicalize().unwrap();
+
+        let res = serve(&dir, Some(&root), "/a.txt", None, true).expect("あるはず");
+        let etag = res.header("etag").expect("etag が付く").to_string();
+        // ETag の頭は長さ（16進）。本文の長さと必ずそろう。
+        let head = format!("W/\"{:x}-", res.body().len());
+        assert!(etag.starts_with(&head), "{etag} が {head} で始まらない");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

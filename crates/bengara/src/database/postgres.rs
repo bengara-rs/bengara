@@ -597,4 +597,178 @@ mod tests {
         assert!(!names.contains(&parent.to_string()), "{names:?}");
         assert!(!names.contains(&child.to_string()), "{names:?}");
     }
+
+    /// `Schema` で組み立てた外部キーが、本物の PostgreSQL で張れること。
+    ///
+    /// PostgreSQL では以前から通っていましたが、MySQL だけが符号の違いで
+    /// 断っていました（`mysql.rs` の同じ名前のテストを参照）。
+    /// 3 つのドライバで同じ `Schema` が通ることを、どちらの側からも確かめます。
+    #[tokio::test]
+    async fn スキーマで作った外部キーが張れる() {
+        let Some(db) = db().await else { return };
+        let parent = "bengara_fk_parent";
+        let child = "bengara_fk_child";
+        for table in [child, parent] {
+            db.execute(&format!("drop table if exists \"{table}\" cascade"), &[])
+                .await
+                .unwrap();
+        }
+
+        fresh(&db, parent, |t| {
+            t.id();
+            t.string("name");
+        })
+        .await;
+
+        let mut schema = Schema::new(Driver::Postgres);
+        schema.create(child, |t| {
+            t.id();
+            t.foreign_id("parent_id");
+            t.foreign("parent_id").on(parent).cascade_on_delete();
+        });
+        for sql in schema.into_statements() {
+            db.execute(&sql, &[])
+                .await
+                .expect("外部キー込みで表が作れる");
+        }
+
+        db.execute(
+            &format!("insert into \"{parent}\" (\"name\") values ($1)"),
+            &["親".into()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            &format!("insert into \"{child}\" (\"parent_id\") values (1)"),
+            &[],
+        )
+        .await
+        .expect("親がいる子は入る");
+        assert!(
+            db.execute(
+                &format!("insert into \"{child}\" (\"parent_id\") values (999)"),
+                &[],
+            )
+            .await
+            .is_err(),
+            "外部キーが効いていません"
+        );
+        db.execute(&format!("delete from \"{parent}\" where \"id\" = 1"), &[])
+            .await
+            .unwrap();
+        let rows = db
+            .fetch_all(&format!("select count(*) as n from \"{child}\""), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get::<i64>("n").unwrap(),
+            0,
+            "親と一緒に消えていません"
+        );
+
+        for table in [child, parent] {
+            db.execute(&format!("drop table if exists \"{table}\" cascade"), &[])
+                .await
+                .unwrap();
+        }
+    }
+
+    /// `Schema::table()` が出す「後から外部キーを足す」文が、本物の PostgreSQL で通ること。
+    ///
+    /// `create table` の中に書くのとは**別の経路**（`alter table … add constraint …`）で、
+    /// 新しく SQL を出すようにした所です。組み立てのテストだけでは、
+    /// 本物のサーバが受け付けるかどうかが分かりません。
+    #[tokio::test]
+    async fn 表を変えて外部キーを足せる() {
+        let Some(db) = db().await else { return };
+        let parent = "bengara_alter_parent";
+        let child = "bengara_alter_child";
+        for table in [child, parent] {
+            db.execute(&format!("drop table if exists \"{table}\" cascade"), &[])
+                .await
+                .unwrap();
+        }
+
+        fresh(&db, parent, |t| {
+            t.id();
+        })
+        .await;
+        fresh(&db, child, |t| {
+            t.id();
+        })
+        .await;
+
+        let mut schema = Schema::new(Driver::Postgres);
+        schema.table(child, |t| {
+            t.foreign_id("parent_id").default(0);
+            t.foreign("parent_id").on(parent).cascade_on_delete();
+        });
+        let statements = schema.into_statements();
+        assert!(
+            statements.iter().any(|sql| sql.contains("add constraint")),
+            "外部キーの文が出ていません: {statements:?}"
+        );
+        for sql in statements {
+            db.execute(&sql, &[]).await.expect("後から外部キーを足せる");
+        }
+
+        db.execute(&format!("insert into \"{parent}\" default values"), &[])
+            .await
+            .unwrap();
+        assert!(
+            db.execute(
+                &format!("insert into \"{child}\" (\"parent_id\") values (999)"),
+                &[],
+            )
+            .await
+            .is_err(),
+            "後から足した外部キーが効いていません"
+        );
+
+        for table in [child, parent] {
+            db.execute(&format!("drop table if exists \"{table}\" cascade"), &[])
+                .await
+                .unwrap();
+        }
+    }
+
+    /// 束ねた件数を数える形を、本物の PostgreSQL が受け付けること。
+    ///
+    /// `query.rs` の `sub_count_sql` が出す形をそのまま書いています。
+    /// **形を変えたらこのテストも直してください。**
+    ///
+    /// 以前は内側が `select *` だったので、PostgreSQL は
+    /// 「column "…id" must appear in the GROUP BY clause」で断っていました。
+    #[tokio::test]
+    async fn 束ねたときの件数を数える形を受け付ける() {
+        let Some(db) = db().await else { return };
+        let table = "bengara_group_count";
+        fresh(&db, table, |t| {
+            t.id();
+            t.string("status");
+        })
+        .await;
+        for status in ["draft", "draft", "published"] {
+            db.execute(
+                &format!("insert into \"{table}\" (\"status\") values ($1)"),
+                &[status.into()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let sql = format!(
+            "select count(*) as bengara_aggregate from \
+             (select 1 as bengara_group from \"{table}\" group by \"status\") as bengara_sub"
+        );
+        let rows = db
+            .fetch_all(&sql, &[])
+            .await
+            .expect("束ねた件数を数えられる");
+        assert_eq!(
+            rows[0].get::<i64>("bengara_aggregate").unwrap(),
+            2,
+            "数えるのは行の数ではなくグループの数です"
+        );
+    }
 }

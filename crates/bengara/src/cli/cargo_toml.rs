@@ -62,7 +62,7 @@ impl CargoToml {
     /// 値の後ろのコメントは落とします（`name = "myapp" # 開発用` → `myapp`）。
     pub(crate) fn value_in(&self, section: &str, key: &str) -> Option<String> {
         let range = self.section_range(section)?;
-        for line in &self.lines[range] {
+        for line in self.plain_lines(range) {
             if key_of(line).is_some_and(|k| k == key) {
                 return value_of(line);
             }
@@ -94,8 +94,8 @@ impl CargoToml {
         };
         // `rust-version.workspace = true` のような、キーの後ろにドットが続く形も見る。
         let dotted = format!("{key}.");
-        self.lines[range]
-            .iter()
+        self.plain_lines(range)
+            .into_iter()
             .any(|line| key_of(line).is_some_and(|k| k == key || k.starts_with(&dotted)))
     }
 
@@ -103,9 +103,11 @@ impl CargoToml {
     ///
     /// 空白と引用符の書き方の違いは無視します（`path="main.rs"` も `path = 'main.rs'` も同じ）。
     pub(crate) fn has_path(&self, file: &str) -> bool {
-        self.lines.iter().any(|line| {
-            key_of(line).is_some_and(|k| k == "path") && value_of(line).as_deref() == Some(file)
-        })
+        self.plain_lines(0..self.lines.len())
+            .into_iter()
+            .any(|line| {
+                key_of(line).is_some_and(|k| k == "path") && value_of(line).as_deref() == Some(file)
+            })
     }
 
     /// 節の最後に行を足す。節が無ければ作る。
@@ -156,17 +158,184 @@ impl CargoToml {
         self.changed = true;
     }
 
-    /// 節の中身（ヘッダー行の次から、次のヘッダー行まで）。
+    /// 節の中身（見出し行の次から、次の見出し行まで）。
+    ///
+    /// 見出しと認めるのは、**行全体が `[...]` の形**で、複数行文字列の中でも
+    /// 配列リテラルの中でもない行だけです。以前は「trim 後が `[` で始まる行」で
+    /// 区切っていたので、次の `[note] see docs` を節の終わりと見なしていました。
+    ///
+    /// ```toml
+    /// description = """
+    /// [note] see docs
+    /// """
+    /// default-run = "myapp"
+    /// ```
+    ///
+    /// その結果 `has_key("package", "default-run")` が偽になり、`init` が
+    /// `default-run` を二重に足して cargo が拒否していました。
     fn section_range(&self, section: &str) -> Option<std::ops::Range<usize>> {
+        let kinds = self.classify();
         let header = format!("[{section}]");
-        let start = self.lines.iter().position(|l| l.trim() == header)? + 1;
-        let end = self.lines[start..]
+        let start = kinds
             .iter()
-            .position(|l| l.trim_start().starts_with('['))
+            .position(|kind| matches!(kind, LineKind::Header(found) if *found == header))?
+            + 1;
+        let end = kinds[start..]
+            .iter()
+            .position(|kind| matches!(kind, LineKind::Header(_)))
             .map(|i| start + i)
             .unwrap_or(self.lines.len());
         Some(start..end)
     }
+
+    /// その範囲のうち、`key = value` として読める行だけ。
+    ///
+    /// 複数行文字列の中の行と、閉じていない `[` の中の行（配列リテラルの続き）は
+    /// 外します。中に `a = 1` のような形が入っていても、キーとして読まないためです。
+    fn plain_lines(&self, range: std::ops::Range<usize>) -> Vec<&String> {
+        let kinds = self.classify();
+        self.lines[range.clone()]
+            .iter()
+            .zip(&kinds[range])
+            .filter(|(_, kind)| matches!(kind, LineKind::Plain))
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// 1行ずつ、見出し・ふつうの行・続きの行に分ける。
+    fn classify(&self) -> Vec<LineKind> {
+        let mut out = Vec::with_capacity(self.lines.len());
+        let mut scan = Scan::default();
+        for line in &self.lines {
+            // 種類は**行の頭の状態**で決める。その行を読み進めるのは後。
+            let kind = if scan.inside() {
+                LineKind::Inside
+            } else if let Some(header) = header_text(line) {
+                LineKind::Header(header)
+            } else {
+                LineKind::Plain
+            };
+            scan.feed(line);
+            out.push(kind);
+        }
+        out
+    }
+}
+
+/// 行の種類。
+#[derive(Debug, PartialEq, Eq)]
+enum LineKind {
+    /// 行全体が `[...]` の見出し（`[package]`・`[[bin]]`）。かっこを含む文字を持ちます。
+    Header(String),
+    /// 節の中のふつうの行。
+    Plain,
+    /// 複数行文字列の中、または閉じていない `[` の中。
+    Inside,
+}
+
+/// 行全体が `[...]` の形なら、その文字（行末のコメントを落としたもの）を返す。
+fn header_text(line: &str) -> Option<String> {
+    let trimmed = strip_comment(line).trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('[') && trimmed.ends_with(']') {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// 上から1行ずつ読むときの状態。
+#[derive(Default)]
+struct Scan {
+    /// 複数行文字列の中なら、その閉じ記号（`"""` か `'''`）。
+    multiline: Option<&'static str>,
+    /// 閉じていない `[` の数。
+    depth: usize,
+}
+
+impl Scan {
+    /// いま、行の中身を読む対象にしない状態か。
+    fn inside(&self) -> bool {
+        self.multiline.is_some() || self.depth > 0
+    }
+
+    /// 1行ぶん読み進める。
+    ///
+    /// 作りは `strip_comment` と同じです（引用符の中は中身として飛ばし、外の `#` で打ち切る）。
+    /// 違いは、複数行文字列（`"""` と `'''`）と角かっこの深さも数える点です。
+    fn feed(&mut self, line: &str) {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+
+        // 複数行文字列の続き。閉じ記号が出るまでは何も数えない。
+        if let Some(close) = self.multiline {
+            let Some(found) = find_from(bytes, close.as_bytes(), 0) else {
+                return;
+            };
+            self.multiline = None;
+            i = found + close.len();
+        }
+
+        while i < bytes.len() {
+            match bytes[i] {
+                // 引用符の外の `#` から後ろはコメント。
+                b'#' => return,
+                b'[' => {
+                    self.depth += 1;
+                    i += 1;
+                }
+                b']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    i += 1;
+                }
+                quote @ (b'"' | b'\'') => {
+                    let triple: &'static str = if quote == b'"' { "\"\"\"" } else { "'''" };
+                    if bytes[i..].starts_with(triple.as_bytes()) {
+                        match find_from(bytes, triple.as_bytes(), i + triple.len()) {
+                            // 同じ行で閉じている。
+                            Some(found) => i = found + triple.len(),
+                            None => {
+                                self.multiline = Some(triple);
+                                return;
+                            }
+                        }
+                    } else {
+                        i = skip_string(bytes, i);
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+    }
+}
+
+/// 1行の中の文字列を飛ばす。`start` は開きの引用符の位置。
+///
+/// 戻すのは閉じの引用符の次の位置です。閉じていなければ行末を返します。
+fn skip_string(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        // 二重引用符の中の `\` は、次の1文字を打ち消す。
+        if quote == b'"' && bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// `from` から後ろで `needle` が最初に出る位置。
+fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from >= haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|position| position + from)
 }
 
 /// `key = value` の `key`。コメント行と空行は `None`。
@@ -313,6 +482,81 @@ mod tests {
         // コメント行は数えない。
         let d = doc("# path = \"main.rs\"\n");
         assert!(!d.has_path("main.rs"));
+    }
+
+    #[test]
+    fn 複数行文字列の中の角かっこは節の境目にしない() {
+        // 以前は `[note] see docs` を境目と見なし、`default-run` を見落としていた。
+        // その結果 init が同じキーを2回書き、cargo が拒否していた。
+        let d = doc(concat!(
+            "[package]\n",
+            "name = \"myapp\"\n",
+            "description = \"\"\"\n",
+            "[note] see docs\n",
+            "\"\"\"\n",
+            "default-run = \"myapp\"\n",
+            "\n",
+            "[dependencies]\n",
+            "bengara = \"0.1\"\n",
+        ));
+        assert!(d.has_key("package", "default-run"));
+        assert!(d.has_key("package", "description"));
+        assert_eq!(d.package_name().as_deref(), Some("myapp"));
+        // 文字列の中の行はキーとして読まない。
+        assert!(!d.has_key("package", "[note] see docs"));
+        assert!(d.has_section("dependencies"));
+        assert!(d.has_key("dependencies", "bengara"));
+    }
+
+    #[test]
+    fn 入れ子の配列の中には挿入しない() {
+        // 以前は `[\"a\"],` の行を節の終わりと見なし、配列リテラルの中に行を入れて
+        // ファイルを壊していた。
+        let mut d = doc(concat!(
+            "[package]\n",
+            "name = \"myapp\"\n",
+            "foo = [\n",
+            "  [\"a\"],\n",
+            "  [\"b\"],\n",
+            "]\n",
+        ));
+        assert!(!d.has_key("package", "default-run"));
+        d.add_line("package", "default-run = \"myapp\"");
+        assert_eq!(
+            d.lines.join("\n"),
+            concat!(
+                "[package]\n",
+                "name = \"myapp\"\n",
+                "foo = [\n",
+                "  [\"a\"],\n",
+                "  [\"b\"],\n",
+                "]\n",
+                "default-run = \"myapp\""
+            )
+        );
+    }
+
+    #[test]
+    fn 見出しは行全体が角かっこの形のときだけ() {
+        // 値の中の `[` では区切らない。
+        let d = doc("[package]\nname = \"a[b]c\"\nversion = \"0.1.0\"\n");
+        assert!(d.has_key("package", "version"));
+        // 行末のコメントが付いた見出しも見出しとして読む。
+        let d = doc("[package] # 中身\nname = \"myapp\"\n");
+        assert_eq!(d.package_name().as_deref(), Some("myapp"));
+        // `[[bin]]` も境目になる。
+        let d = doc("[package]\nname = \"myapp\"\n\n[[bin]]\nname = \"artisan\"\n");
+        assert!(!d.has_key("package", "path"));
+        assert!(d.has_section("package"));
+    }
+
+    #[test]
+    fn 一行で閉じた複数行文字列は状態を残さない() {
+        let d = doc("[package]\nname = \"\"\"myapp\"\"\"\nversion = \"0.1.0\"\n");
+        assert!(d.has_key("package", "version"));
+        // 単引用符の三連も同じ。
+        let d = doc("[package]\nname = '''myapp'''\nversion = \"0.1.0\"\n");
+        assert!(d.has_key("package", "version"));
     }
 
     #[test]

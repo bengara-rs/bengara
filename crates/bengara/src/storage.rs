@@ -188,6 +188,11 @@ impl Storage {
     // ---- 置き場所を指定したとき ----
 
     /// 文字列を書く。
+    ///
+    /// **原子的ではありません。** 書いている途中でプロセスが落ちると、
+    /// 切れたファイルが残ります（Laravel の `put` も同じです）。
+    /// 途中の中身を読まれたくないときは、別の名前に書いてから自分で
+    /// 置き換えてください。
     pub async fn write(&self, path: &str, contents: Vec<u8>) -> Result<()> {
         let full = self.absolute(path)?;
         crate::support::blocking(move || {
@@ -328,6 +333,18 @@ pub(crate) fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
     if part.ends_with(' ') || part.ends_with('.') {
         return Err("末尾が空白か `.` です");
     }
+    // Windows がファイル名に使えない記号。断っていなかったころ、
+    // `Storage::put("notes/a?b.txt", ..)` は Linux で成功し、Windows では
+    // `Err(InvalidInput)` になりました。この関数の方針が防ぎたかった形です。
+    // `:` は入れません。キャッシュの鍵が `:` を使い、`Storage` 側は
+    // `absolute` が別に断っています。
+    if part.contains(['<', '>', '"', '|', '?', '*']) {
+        return Err("Windows で使えない記号（`< > \" | ? *`）が入っています");
+    }
+    // 制御文字も同じです。Linux では名前に使えますが Windows では使えません。
+    if part.chars().any(|c| c <= '\x1f') {
+        return Err("制御文字が入っています");
+    }
     Ok(())
 }
 
@@ -352,6 +369,11 @@ fn collect_files(dir: &Path, base: &Path, out: &mut Vec<String>) -> Result<()> {
 /// `is_dir()` より軽いです。
 fn collect_files_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize) -> Result<()> {
     if depth >= MAX_DEPTH {
+        // 黙って打ち切ると、一覧に出ないファイルがある理由が分かりません。
+        tracing::warn!(
+            "{} は深さ {MAX_DEPTH} を超えたので一覧から飛ばします",
+            dir.display()
+        );
         return Ok(());
     }
     let entries = match std::fs::read_dir(dir) {
@@ -372,7 +394,16 @@ fn collect_files_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize
             continue;
         }
         if let Ok(relative) = path.strip_prefix(base) {
-            out.push(relative.to_string_lossy().replace('\\', "/"));
+            // **`to_string_lossy` は使いません。** Linux では非 UTF-8 の名前が
+            // 作れます。置き換え文字（U+FFFD）入りの文字列を返すと、それを
+            // `read` や `delete` に渡しても見つかりません。飛ばして知らせます。
+            match relative.to_str() {
+                Some(text) => out.push(text.replace('\\', "/")),
+                None => tracing::warn!(
+                    "{} は UTF-8 でない名前なので一覧から飛ばします",
+                    relative.display()
+                ),
+            }
         }
     }
     Ok(())
@@ -451,6 +482,43 @@ mod tests {
         // 先頭や途中の空白・`.` は通す。
         assert!(disk.absolute("a b.txt").is_ok());
         assert!(disk.absolute(" a.txt").is_ok());
+    }
+
+    #[test]
+    fn windowsで使えない記号は断る() {
+        let disk = disk("symbols");
+        // 断っていなかったころ、`Storage::put("notes/a?b.txt", ..)` は
+        // Linux で成功し、Windows では `Err(InvalidInput)` になった。
+        for bad in [
+            "a?b.txt",
+            "notes/a*b.txt",
+            "a<b.txt",
+            "a>b.txt",
+            "a\"b.txt",
+            "a|b.txt",
+            "notes/*/a.txt",
+            // 制御文字。Linux では名前に使えるが Windows では使えない。
+            "a\nb.txt",
+            "a\tb.txt",
+            "a\u{0}b.txt",
+            "a\u{1f}b.txt",
+        ] {
+            let error = disk.absolute(bad).unwrap_err().to_string();
+            assert!(error.contains("使えない名前"), "{bad:?}: {error}");
+        }
+
+        // 普通の名前はそのまま通る。`:` は別の理由（置き場所の外）で断る。
+        for ok in ["a-b.txt", "a_b.txt", "日本語.txt", "a b.txt", "a!b.txt"] {
+            assert!(disk.absolute(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn キャッシュの鍵で使う記号は断らない() {
+        // `cache/mod.rs` の `normalize_key` も `usable_name` を使う。
+        // `:` を断ると、`user:1` のような鍵がハッシュ側に回ってしまう。
+        assert!(usable_name("user:1").is_ok());
+        assert!(usable_name("a.b-c_1").is_ok());
     }
 
     #[test]

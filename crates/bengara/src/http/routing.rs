@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, Result};
 use crate::http::handler::{Erased, ErasedHandler, Handler};
@@ -399,11 +399,23 @@ impl Routes {
     }
 }
 
-static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
+/// 名前付きルートの一覧。**後から組み立てた `Application` で上書きします。**
+///
+/// 以前は `OnceLock` でした。2 つ目以降の `Application` を黙って無視するので、
+/// `#[bengara::test]` のテストは 2 件目から 1 件目のルート表を見ていました。
+/// 実行順によって `route()` が別のアプリの URL を返したり、
+/// 「登録されていません」になったりします。
+///
+/// 読む側（`route()`）はリクエストのたびに通ります。`RwLock` の読みは原子的な
+/// 加算 1 回で、`fill` が返す `String` の確保より軽いので、ここは `RwLock` で足ります。
+static NAMES: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
 
 /// 名前付きルートの一覧を、どこからでも引けるようにする。
+///
+/// 2 回目以降は**上書き**します。テストは 1 件ごとに `Application` を組み立てるためです。
 pub(crate) fn install_names(names: HashMap<String, String>) {
-    let _ = NAMES.set(names);
+    let mut slot = NAMES.write().unwrap_or_else(|e| e.into_inner());
+    *slot = Some(names);
 }
 
 /// 名前付きルートの URL を引く。
@@ -420,9 +432,13 @@ pub fn route(name: &str) -> Result<String> {
 /// ```ignore
 /// let url = route_with("posts.show", &[("post", "12")])?;
 /// ```
+///
+/// パスに出てこない引数は、Laravel と同じように**クエリ文字列として足します**。
+/// `route_with("posts.index", &[("page", "2")])` は `/posts?page=2` になります。
 pub fn route_with(name: &str, params: &[(&str, &str)]) -> Result<String> {
-    let names = NAMES
-        .get()
+    let slot = NAMES.read().unwrap_or_else(|e| e.into_inner());
+    let names = slot
+        .as_ref()
         .ok_or_else(|| Error::msg("ルートがまだ組み立てられていません"))?;
     let pattern = names
         .get(name)
@@ -431,8 +447,19 @@ pub fn route_with(name: &str, params: &[(&str, &str)]) -> Result<String> {
 }
 
 /// `/posts/{post}` の `{post}` を値で置き換える。
+///
+/// パスに出てこなかった引数はクエリ文字列として後ろに足します。**Laravel と同じ**です。
+/// 以前は黙って捨てていたので、名前を打ち間違えた引数がどこにも現れませんでした。
+///
+/// `{` は必ずパス引数の始まりとして読みます。`{{` と書いて `{` そのものを表すことは
+/// できません。以前は `{{post}}` を `{post` という名前の引数として読み、
+/// 「パス引数 `{post` が足りません」という分かりにくいエラーになっていました。
+/// Laravel のルートのパスにも `{` をそのまま書く書き方は無いので、逃がし方は作らず、
+/// 理由の分かるエラーで知らせます。
 fn fill(pattern: &str, params: &[(&str, &str)]) -> Result<String> {
     let mut out = String::with_capacity(pattern.len());
+    // パスに埋めた引数の名前。残りをクエリ文字列に回すために覚えます。
+    let mut filled: Vec<&str> = Vec::new();
     let mut rest = pattern;
     while let Some(start) = rest.find('{') {
         out.push_str(&rest[..start]);
@@ -443,7 +470,18 @@ fn fill(pattern: &str, params: &[(&str, &str)]) -> Result<String> {
             )));
         };
         let name = &after[..end];
+        if name.contains('{') {
+            return Err(Error::msg(format!(
+                "ルート `{pattern}` に `{{` が続いています。\
+                 `{{` は必ずパス引数の始まりとして読むので、そのままの `{{` は書けません"
+            )));
+        }
         let key = name.trim_start_matches('*');
+        if key.is_empty() {
+            return Err(Error::msg(format!(
+                "ルート `{pattern}` のパス引数の名前が空です"
+            )));
+        }
         let value = params
             .iter()
             .find(|(k, _)| *k == key)
@@ -453,12 +491,29 @@ fn fill(pattern: &str, params: &[(&str, &str)]) -> Result<String> {
                     "ルート `{pattern}` のパス引数 `{key}` が足りません"
                 ))
             })?;
+        filled.push(key);
         // `{*path}` は複数のセグメントを表すので `/` を残す。
         out.push_str(&encode_segment(value, name.starts_with('*')));
         rest = &after[end + 1..];
     }
     out.push_str(rest);
+    append_query(&mut out, params, &filled);
     Ok(out)
+}
+
+/// パスに出てこなかった引数を、クエリ文字列として足す。
+///
+/// 並びは渡された順のままです。逃がす文字の規則は `http/percent.rs` にあり、
+/// 署名の組み立て（`http/url.rs`）と**同じ関数**を使います。
+fn append_query(out: &mut String, params: &[(&str, &str)], filled: &[&str]) {
+    let mut first = true;
+    for (key, value) in params.iter().filter(|(k, _)| !filled.contains(k)) {
+        out.push(if first { '?' } else { '&' });
+        first = false;
+        out.push_str(&super::percent::encode(key, super::percent::unreserved));
+        out.push('=');
+        out.push_str(&super::percent::encode(value, super::percent::unreserved));
+    }
 }
 
 /// パス引数の値を、1セグメント分としてパーセントエンコードする。
@@ -487,6 +542,54 @@ mod tests {
         assert_eq!(normalize("posts"), "/posts");
         assert_eq!(normalize("/posts/"), "/posts");
         assert_eq!(normalize("  /posts  "), "/posts");
+    }
+
+    #[test]
+    fn ルート名の表は後から入れたもので上書きする() {
+        // 以前は `OnceLock` で、2 つ目以降の `Application` を黙って無視していた。
+        // テストは 1 件ごとに組み立てるので、2 件目から 1 件目の表を見ていた。
+        //
+        // このテストはプロセス全体の表を差し替えます。`route()` を読む単体テストは
+        // ここだけなので、他のテストには影響しません。足すときは気をつけてください。
+        let mut first = HashMap::new();
+        first.insert("home".to_string(), "/".to_string());
+        install_names(first);
+        assert_eq!(route("home").unwrap(), "/");
+
+        let mut second = HashMap::new();
+        second.insert("about".to_string(), "/about".to_string());
+        install_names(second);
+        assert_eq!(route("about").unwrap(), "/about");
+        // 前の表はもう見ない。
+        assert!(route("home").is_err());
+    }
+
+    #[test]
+    fn 余ったパス引数はクエリ文字列にする() {
+        // Laravel と同じ。以前は黙って捨てていたので、打ち間違えに気づけなかった。
+        assert_eq!(fill("/posts", &[("page", "2")]).unwrap(), "/posts?page=2");
+        assert_eq!(
+            fill(
+                "/posts/{post}",
+                &[("post", "12"), ("page", "2"), ("q", "あ")]
+            )
+            .unwrap(),
+            "/posts/12?page=2&q=%E3%81%82"
+        );
+        // 埋めた引数はクエリに重ねない。
+        assert_eq!(
+            fill("/posts/{post}", &[("post", "12")]).unwrap(),
+            "/posts/12"
+        );
+    }
+
+    #[test]
+    fn 二重の波かっこは理由の分かるエラーにする() {
+        // 以前は `{post` という名前の引数として読み、必ず「足りません」になっていた。
+        let error = fill("/posts/{{post}}", &[("post", "12")]).unwrap_err();
+        assert!(error.to_string().contains("`{`"), "{error}");
+        // 名前が空のときも知らせる。
+        assert!(fill("/posts/{}", &[]).is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{Job, DEFAULT_QUEUE, FAILED_TABLE, TABLE};
-use crate::database::{QueryBuilder, Value, DB};
+use crate::database::{QueryBuilder, Row, Value, DB};
 use crate::error::Result;
 use crate::support::time;
 
@@ -163,7 +163,14 @@ enum Reservation {
 /// 目印（`reserved_at`）が `retry_after` 秒より古いものも取り直します。
 /// ワーカーが強制終了・電源断で死ぬと目印が残ったままになるためです。
 /// 取り直したときは `attempts` を +1 して、同じジョブを永久に回し続けないようにします。
-async fn reserve(queue: &str, retry_after: i64) -> Result<Reservation> {
+///
+/// **`tries` に達した行は予約せずに `failed_jobs` へ移します。** 諦める判定が
+/// [`fail`] だけだったころ、ワーカープロセスごと落とすジョブ（OOM kill・
+/// SIGKILL）は `fail` を通らず、`attempts` が `tries` を超えてもずっと
+/// 回収され続けました。`failed_jobs` に入らないので `queue:failed` にも出ず、
+/// 取り出しは `order_by("id") limit 1` なので、そのジョブ 1 件でキュー全体が
+/// 止まりました。
+async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservation> {
     let now_secs = time::now_seconds();
     let now = time::format_timestamp(now_secs);
     let cutoff = reclaim_cutoff(now_secs, retry_after);
@@ -183,10 +190,17 @@ async fn reserve(queue: &str, retry_after: i64) -> Result<Reservation> {
     let id: i64 = row.get("id")?;
     let reserved_at: Option<String> = row.get("reserved_at")?;
     let was_stale = reserved_at.is_some();
-    let attempts = next_attempts(
-        reserved_at.as_deref(),
-        row.get::<i64>("attempts")?.max(0) as u32,
-    );
+    let done = row.get::<i64>("attempts")?.max(0) as u32;
+    let attempts = next_attempts(reserved_at.as_deref(), done);
+
+    // 回収しようとした行が、もう `tries` ぶん試されていたら諦める。
+    // ここで止めないと、ワーカーごと落とすジョブが永久に回り続けます。
+    // `Options.tries == 0` は `commands.rs` が弾くので、無制限はありません。
+    if let (true, Some(reserved_at)) = (done >= tries, reserved_at.as_deref()) {
+        give_up_stale(&row, id, reserved_at, done).await?;
+        // 自分は予約していないので、待たずに次の 1 件を見る。
+        return Ok(Reservation::Lost);
+    }
 
     let affected = reclaimable(DB::table(TABLE).where_("id", id), &cutoff)
         .update(&[
@@ -214,6 +228,49 @@ async fn reserve(queue: &str, retry_after: i64) -> Result<Reservation> {
         queue: row.get("queue")?,
         reserved_at: now,
     }))
+}
+
+/// 回収しようとした行を、予約せずに `failed_jobs` へ移す。
+///
+/// ワーカープロセスごと落とすジョブ（OOM kill・SIGKILL・`panic = "abort"`）は
+/// [`fail`] を通りません。以前はこの形で `attempts` が `tries` を超えても
+/// 回収され続け、`queue:failed` にも出ないまま、そのジョブ 1 件でキュー全体が
+/// 止まりました。
+///
+/// `fail` と同じ「**先に消して、1 件だった側だけ入れる**」形です。0 件なら
+/// 別のワーカーが先に動かしたので、`failed_jobs` にも入れません。
+async fn give_up_stale(row: &Row, id: i64, reserved_at: &str, attempts: u32) -> Result<()> {
+    let error = format!(
+        "{attempts} 回試しましたが、ワーカーが応答しなくなったため諦めました\
+         （処理の途中でワーカープロセスが落ちています）"
+    );
+    // 入れるのと消すのを 1 つのトランザクションにする。
+    let tx = DB::begin().await?;
+    let affected = tx
+        .table(TABLE)
+        .where_("id", id)
+        .where_("reserved_at", reserved_at.to_string())
+        .delete()
+        .await?;
+    if affected == 0 {
+        tx.commit().await?;
+        return Ok(());
+    }
+    tx.table(FAILED_TABLE)
+        .insert(&[
+            ("queue", Value::Text(row.get("queue")?)),
+            ("job", Value::Text(row.get("job")?)),
+            ("payload", Value::Text(row.get("payload")?)),
+            ("error", Value::Text(error)),
+            ("failed_at", Value::Text(crate::database::now())),
+        ])
+        .await?;
+    tx.commit().await?;
+    tracing::warn!(
+        "ジョブ #{id} は {attempts} 回で諦めました（ワーカーが応答しなくなりました）。\
+         queue:failed で見られます"
+    );
+    Ok(())
 }
 
 /// 成功したので消す。
@@ -310,7 +367,7 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
             return Ok(());
         }
 
-        let reserved = match reserve(&options.queue, options.retry_after).await? {
+        let reserved = match reserve(&options.queue, options.retry_after, options.tries).await? {
             Reservation::Taken(reserved) => reserved,
             // 競り合いに負けただけなので待たない。
             Reservation::Lost => continue,
@@ -610,6 +667,88 @@ mod tests {
 
         // もう 1 回流しても増えない。
         assert_eq!(retry_failed(None).await.unwrap(), 0);
+        assert_eq!(DB::table(TABLE).count().await.unwrap(), 1);
+    }
+
+    /// 処理中の目印が残ったままのジョブを 1 本入れて、その id を返す。
+    #[cfg(feature = "sqlite")]
+    async fn 放置されたジョブを入れる(attempts: i64) -> i64 {
+        let now = crate::database::now();
+        // 目印は `retry_after` より十分古くする（＝回収の対象）。
+        let old = time::format_timestamp(time::now_seconds() - 1_000);
+        DB::table(TABLE)
+            .insert_get_id(&[
+                ("queue", Value::Text(DEFAULT_QUEUE.to_string())),
+                ("job", Value::Text("SendWelcome".to_string())),
+                ("payload", Value::Text("{}".to_string())),
+                ("attempts", Value::Int(attempts)),
+                ("available_at", Value::Text(now.clone())),
+                ("reserved_at", Value::Text(old)),
+                ("created_at", Value::Text(now)),
+            ])
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn ワーカーごと落ちたジョブは諦める() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        // 3 回ぶん試したあと、ワーカーごと落ちて目印が残ったままの行。
+        放置されたジョブを入れる(3).await;
+
+        // 以前はここで予約し直し、`attempts` が `tries` を超えても回収され
+        // 続けました。`order_by("id") limit 1` なので、この 1 件で
+        // キュー全体が止まりました。
+        let taken = reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
+            .await
+            .unwrap();
+        assert!(matches!(taken, Reservation::Lost), "予約しない");
+        assert_eq!(
+            DB::table(TABLE).count().await.unwrap(),
+            0,
+            "キューから消える"
+        );
+        assert_eq!(DB::table(FAILED_TABLE).count().await.unwrap(), 1);
+
+        // `queue:failed` に出るので、何が起きたか分かる。
+        let failed = failed_list().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].3.contains("ワーカーが応答しなくなった"),
+            "{}",
+            failed[0].3
+        );
+
+        // 詰まりが解けて、次は空になる。
+        assert!(matches!(
+            reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
+                .await
+                .unwrap(),
+            Reservation::Empty
+        ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 回数が残っていれば取り直す() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        let id = 放置されたジョブを入れる(1).await;
+
+        // `tries` に届いていない行は、今までどおり取り直す（`attempts` は +1）。
+        match reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
+            .await
+            .unwrap()
+        {
+            Reservation::Taken(reserved) => {
+                assert_eq!(reserved.id, id);
+                assert_eq!(reserved.attempts, 2);
+            }
+            _ => panic!("取り直すはずです"),
+        }
+        assert_eq!(DB::table(FAILED_TABLE).count().await.unwrap(), 0);
         assert_eq!(DB::table(TABLE).count().await.unwrap(), 1);
     }
 }

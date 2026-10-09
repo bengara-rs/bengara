@@ -19,9 +19,11 @@ pub struct Response {
 
 impl Response {
     /// ステータスだけを決めた空のレスポンス。
+    ///
+    /// HTTP として使える範囲（100〜599）の外は、警告して 500 にします。
     pub fn new(status: u16) -> Self {
         Self {
-            status,
+            status: normalize_status(status),
             headers: Vec::new(),
             body: Cow::Borrowed(&[]),
         }
@@ -72,8 +74,10 @@ impl Response {
     }
 
     /// ステータスを変える。
+    ///
+    /// HTTP として使える範囲（100〜599）の外は、警告して 500 にします。
     pub fn with_status(mut self, status: u16) -> Self {
-        self.status = status;
+        self.status = normalize_status(status);
         self
     }
 
@@ -81,19 +85,31 @@ impl Response {
     ///
     /// Laravel の `header()` と同じ既定です。同じ名前を何本も送りたいときは
     /// `with_added_header` を使ってください。
+    ///
+    /// 値に使えない文字（改行など）が入っていたときは、**その1本だけ**落とします。
     pub fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
         // 照合は確保せずに行い、格納する名前は小文字にそろえる。
         self.headers
             .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
-        self.headers.push((name.to_ascii_lowercase(), value.into()));
+        let value = value.into();
+        if !header_value_ok(name, &value) {
+            return self;
+        }
+        self.headers.push((name.to_ascii_lowercase(), value));
         self
     }
 
     /// ヘッダーを**足す**。同じ名前がすでにあっても消しません。
     ///
     /// `set-cookie` のように、同じ名前を何本も送る必要があるときに使います。
+    ///
+    /// 値に使えない文字（改行など）が入っていたときは、**その1本だけ**落とします。
     pub fn with_added_header(mut self, name: &str, value: impl Into<String>) -> Self {
-        self.headers.push((name.to_ascii_lowercase(), value.into()));
+        let value = value.into();
+        if !header_value_ok(name, &value) {
+            return self;
+        }
+        self.headers.push((name.to_ascii_lowercase(), value));
         self
     }
 
@@ -145,6 +161,59 @@ impl Response {
     }
 }
 
+/// ヘッダーの値として使えるか。使えないときは1行だけ残して偽を返します。
+///
+/// 改行・復帰・NUL とその他の制御文字が入っていると `HeaderValue` を作れません。
+/// 以前はそれが応答の組み立て全体を失敗させ、**ヘッダーを全部捨てた素の 500** に
+/// なっていました。直前にセッションが付けた `Set-Cookie` まで消えていたので、
+/// ログインや CSRF トークンの更新が失われました
+/// （`redirect().to(req.input("next"))` に `?next=/a%0Ab` が来ると起きました）。
+/// 黙って落とすので、落としたときだけ1行だけ残します。`Cookie` の属性
+/// （`cookie::sanitize_attribute`）と同じやり方です。
+fn header_value_ok(name: &str, value: &str) -> bool {
+    // 水平タブだけは HTTP でも値に使えるので通す。
+    if !value.chars().any(|c| c.is_control() && c != '\t') {
+        return true;
+    }
+    tracing::warn!("ヘッダー {name} の値に使えない文字があったので落としました");
+    false
+}
+
+/// HTTP として使えるステータスに直す。範囲（100〜599）の外は 500 に寄せます。
+///
+/// `abort(1000)` や `Response::new(0)` をそのまま通すと、応答を組み立てられずに
+/// ヘッダーごと失われていました。入口で丸めます。
+fn normalize_status(status: u16) -> u16 {
+    if (100..=599).contains(&status) {
+        return status;
+    }
+    tracing::warn!("ステータス {status} は HTTP の範囲外なので 500 にします");
+    500
+}
+
+/// 本文を持てないステータスか（1xx・204・304）。
+pub(crate) fn body_forbidden(status: u16) -> bool {
+    matches!(status, 100..=199 | 204 | 304)
+}
+
+/// 本文を持てないステータスなら、本文と種類・長さの申告を落とす。
+///
+/// 以前は `abort(204)` や `abort(304)` でも HTML / JSON の本文を作っていたので、
+/// 本文を持てない応答に本文が付き、枠組みの長さが相手と食い違っていました。
+///
+/// エラーの道（`error_response`）と、`Application::handle` の最後の両方から呼びます。
+/// 利用者が `Response::new(204).with_body(..)` と自分で組んだ応答も落とすためです。
+pub(crate) fn without_forbidden_body(mut response: Response) -> Response {
+    if !body_forbidden(response.status) {
+        return response;
+    }
+    response.body = Cow::Borrowed(&[]);
+    response.headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("content-type") && !name.eq_ignore_ascii_case("content-length")
+    });
+    response
+}
+
 /// `text/plain` のレスポンスを作る。
 pub fn text(body: impl Into<String>) -> Result<Response> {
     Ok(Response::text(body))
@@ -166,6 +235,11 @@ pub fn json<T: Serialize>(value: &T) -> Result<Response> {
 /// redirect().to("/login")
 /// redirect().route("home")
 /// ```
+///
+/// 行き先に**外から来た文字列**（`req.input("next")` など）を渡すときは、
+/// `to` がエラーを返しうることに注意してください。`?` で上に返せば
+/// 普段のエラーの道を通るので、直前のミドルウェアが付けた `Set-Cookie` は
+/// 残ったまま 500 になります。
 #[derive(Debug, Clone, Copy)]
 pub struct Redirect {
     status: u16,
@@ -190,8 +264,23 @@ impl Redirect {
     }
 
     /// パスへリダイレクトする。
+    ///
+    /// 行き先に `Location` ヘッダーとして使えない文字（改行などの制御文字）が
+    /// 入っていたら**エラーにします**。`?next=/a%0Ab` のように外から来た文字列を
+    /// そのまま渡すと起きます。
+    ///
+    /// ここで落とすのは、`Location` の無い 302 を返さないためです。それだと
+    /// ブラウザは何も表示せず、白い画面になって原因を追いにくくなります。
+    /// エラーにすれば普段のエラーの道を通るので、直前のミドルウェアが付けた
+    /// `Set-Cookie` は残ったまま 500 になります。
     pub fn to(self, path: impl Into<String>) -> Result<Response> {
-        Ok(Response::new(self.status).with_header("location", path.into()))
+        let path = path.into();
+        if path.chars().any(|c| c.is_control()) {
+            return Err(Error::msg(
+                "転送先に使えない文字が入っています（改行などの制御文字は Location ヘッダーに入れられません）",
+            ));
+        }
+        Ok(Response::new(self.status).with_header("location", path))
     }
 
     /// 名前付きルートへリダイレクトする。
@@ -259,7 +348,12 @@ impl RenderOptions {
 /// エラーをレスポンスに変える。
 ///
 /// `wants_json` なら JSON、そうでなければ HTML の画面を返します。
+/// 本文を持てないステータス（1xx・204・304）では、本文を付けません。
 pub(crate) fn error_response(error: &Error, options: RenderOptions) -> Response {
+    without_forbidden_body(build_error_response(error, options))
+}
+
+fn build_error_response(error: &Error, options: RenderOptions) -> Response {
     // まず、利用者が差し替えた見せ方を試す。
     if let Some(exceptions) = &options.exceptions {
         if let Some(response) = exceptions.apply(error) {
@@ -436,6 +530,123 @@ mod tests {
     fn abortはエラーになる() {
         let err = abort::<Response>(403).unwrap_err();
         assert_eq!(err.status(), 403);
+    }
+
+    #[test]
+    fn 転送先に使えない文字があればエラーにする() {
+        // `?next=/a%0Ab` のように、復号で本物の改行ができたときの形。
+        // `Location` の無い 302（白い画面）を返さないよう、入口で落とす。
+        for bad in ["/a\nb", "/a\rb", "/a\0b", "/a\tb", "/a\u{1}b"] {
+            let err = redirect().to(bad).unwrap_err();
+            assert_eq!(err.status(), 500, "{bad:?}");
+            assert!(
+                err.to_string().contains("転送先に使えない文字"),
+                "何が悪いか分かる文面にする: {err}"
+            );
+        }
+        // 普通の行き先はそのまま通る。
+        let res = redirect().to("/a b.html?x=1#y").unwrap();
+        assert_eq!(res.header("location"), Some("/a b.html?x=1#y"));
+    }
+
+    #[test]
+    fn 転送先のエラーでもset_cookieは残る() {
+        // ミドルウェアが付けた `Set-Cookie` を持つ応答を、エラーの道で作り直す。
+        // 以前は `Location` の組み立てに失敗すると、ヘッダーごと捨てられていました。
+        let error = redirect().to("/a\nb").unwrap_err();
+        let response = error_response(&error, RenderOptions::new(false, false))
+            .with_cookie(&crate::http::cookie::Cookie::new("session", "abc"));
+
+        assert_eq!(response.status(), 500, "302 ではなく 500 で返る");
+        assert!(
+            response
+                .header("set-cookie")
+                .is_some_and(|v| v.starts_with("session=abc")),
+            "Set-Cookie は残る"
+        );
+        assert_eq!(response.header("location"), None);
+        assert!(!response.body().is_empty(), "500 の画面が出る");
+    }
+
+    #[test]
+    fn ヘッダーの値が不正なら1本だけ落とす() {
+        // `?next=/a%0Ab` のように、復号で本物の改行ができたときの形。
+        let res = Response::text("x")
+            .with_cookie(&crate::http::cookie::Cookie::new("session", "abc"))
+            .with_header("location", "/a\nb");
+        assert_eq!(res.header("location"), None, "改行の入った1本は落とす");
+        assert!(
+            res.header("set-cookie").is_some(),
+            "直前の Set-Cookie は残る"
+        );
+        assert_eq!(
+            res.header("content-type"),
+            Some("text/plain; charset=utf-8"),
+            "他のヘッダーも残る"
+        );
+
+        // 復帰・NUL・その他の制御文字も同じ。
+        for bad in ["a\rb", "a\0b", "a\u{7f}b", "a\u{1}b"] {
+            assert_eq!(
+                Response::text("x").with_header("x-a", bad).header("x-a"),
+                None
+            );
+        }
+        // 水平タブは HTTP でも値に使えるので通す。
+        assert_eq!(
+            Response::text("x").with_header("x-a", "a\tb").header("x-a"),
+            Some("a\tb")
+        );
+
+        // `with_added_header` も同じ。良い1本は残る。
+        let res = Response::text("x")
+            .with_added_header("set-cookie", "a=1")
+            .with_added_header("set-cookie", "b=\n2");
+        assert_eq!(
+            res.headers()
+                .iter()
+                .filter(|(k, _)| k == "set-cookie")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn 範囲外のステータスは500に寄せる() {
+        // `abort(1000)` や `Response::new(0)` でも応答は組み立てられる。
+        assert_eq!(Response::new(0).status(), 500);
+        assert_eq!(Response::new(1000).status(), 500);
+        assert_eq!(Response::text("x").with_status(600).status(), 500);
+        // 使える範囲はそのまま。
+        assert_eq!(Response::new(100).status(), 100);
+        assert_eq!(Response::new(599).status(), 599);
+        assert_eq!(Response::new(204).status(), 204);
+    }
+
+    #[test]
+    fn 本文を持てない状態では本文を付けない() {
+        for status in [100, 199, 204, 304] {
+            let error = Error::Http {
+                status,
+                message: String::new(),
+            };
+            // HTML と JSON の両方。
+            for wants_json in [false, true] {
+                let res = error_response(&error, RenderOptions::new(false, wants_json));
+                assert_eq!(res.status(), status);
+                assert!(res.body().is_empty(), "{status} に本文は付けない");
+                assert_eq!(res.header("content-type"), None, "{status}");
+                assert_eq!(res.header("content-length"), None, "{status}");
+            }
+        }
+        // 本文を持てる状態では、これまでどおり本文を作る。
+        let error = Error::Http {
+            status: 404,
+            message: String::new(),
+        };
+        let res = error_response(&error, RenderOptions::new(false, false));
+        assert!(!res.body().is_empty());
+        assert!(res.header("content-type").is_some());
     }
 
     #[test]

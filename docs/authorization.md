@@ -138,11 +138,21 @@ client
     .assert_ok();
 
 // 他人の記事を直そうとすると 403。
+// POST 以外には `post_with_csrf` が無いので、トークンは自分で付けます。
+let token = client.csrf_token("/csrf-token").await;
 client
-    .send("PUT", "/api/my/articles/1", b"title=x".to_vec(), &[FORM])
+    .send(
+        "PUT",
+        "/api/my/articles/1",
+        b"title=x".to_vec(),
+        &[FORM, ("x-csrf-token", &token)],
+    )
     .await
     .assert_status(403);
 ```
+
+**`VerifyCsrfToken` を掛けているルートでは、トークンを忘れると 419 になります。**
+403 を確かめたいのに 419 が返るときは、ここを疑ってください（[session.md](session.md)）。
 
 ## Laravel との違い
 

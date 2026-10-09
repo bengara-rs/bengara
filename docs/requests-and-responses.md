@@ -19,21 +19,42 @@ impl PostController {
 
 `Request` から読めるものの一覧です。
 
-| 分類     | メソッド                                                          |
-|----------|-------------------------------------------------------------------|
-| 基本     | `method()` `path()` `query_string()` `full_path()` `route_name()` |
-| ルート   | `route_matched()`                                                 |
-| 接続元   | `ip()`                                                            |
-| パス引数 | `param(name)` `param_as::<T>(name)` `params()`                    |
-| クエリ   | `query(key)` `query_all()`                                        |
-| ヘッダ   | `header(name)` `headers()`                                        |
-| 入力     | `input(key)` `input_all()` `form(key)` `form_all()`               |
-| 本文     | `body()` `body_text()` `json::<T>()`                              |
+| 分類       | メソッド                                                          |
+|------------|-------------------------------------------------------------------|
+| 基本       | `method()` `path()` `query_string()` `full_path()` `route_name()` |
+| ルート     | `route_matched()`                                                 |
+| 接続元     | `ip()`                                                            |
+| パス引数   | `param(name)` `param_as::<T>(name)` `params()`                    |
+| クエリ     | `query(key)` `query_all()` `page()`                               |
+| ヘッダ     | `header(name)` `headers()`                                        |
+| Cookie     | `cookie(name)` `cookies()`                                        |
+| 入力       | `input(key)` `input_all()` `form(key)` `form_all()`               |
+| 本文       | `body()` `body_text()` `json::<T>()`                              |
+| 検査       | `validate(rules)`                                                 |
+| セッション | `session()` `try_session()` `csrf_token()`                        |
+| ログイン   | `auth()`                                                          |
+| モデル     | `model::<T>(param)`                                               |
 
 ```rust
-let page: u32 = req.query("page").and_then(|v| v.parse().ok()).unwrap_or(1);
 let body: MyInput = req.json()?;
+let post = req.model::<Post>("post").await?;          // 無ければ 404
+let input = req.validate(&[("title", "required")])?;  // 落ちれば 422
 ```
+
+このうち、一言添えておくものです。
+
+| メソッド                      | 中身                                                     |
+|-------------------------------|----------------------------------------------------------|
+| `page()`                      | `?page=2` の番号。無い・読めない・0 なら 1               |
+| `cookie(name)` / `cookies()`  | 届いた Cookie（[session.md](session.md)）                |
+| `validate(rules)`             | 入力の検査（[validation.md](validation.md)）             |
+| `session()` / `try_session()` | セッション（[session.md](session.md)）                   |
+| `csrf_token()`                | フォームに入れるトークン（[session.md](session.md)）     |
+| `auth()`                      | ログインの状態（[authentication.md](authentication.md)） |
+| `model::<T>(param)`           | パス引数の値でモデルを 1 件読む。無ければ 404            |
+
+**`session()` と `csrf_token()` は、`StartSession` を登録していないとパニックします。**
+登録し忘れにすぐ気づくためです。無くてもよい場面では `try_session()` を使ってください。
 
 読むときの決まりごとは 4 つです。
 
@@ -143,6 +164,22 @@ Response::text("ok")
 
 名前の大文字小文字は区別しません（内部で小文字にそろえます）。
 
+決まりごとが 2 つあります。
+
+- **ステータスは 100〜599 だけです。** 範囲の外（`abort(1000)` や `Response::new(0)`）は
+  警告を出して **500** にします。
+- **ヘッダーの値に改行などの制御文字が入っていると、その 1 本だけを落とします。**
+  警告が 1 行出ます。ほかのヘッダーと本文はそのまま返ります。
+  水平タブだけは値に使えるので通ります。
+
+### 本文を持てないステータス
+
+**本文を持てないステータス（1xx・204・304）では、本文を付けません。**
+`content-type` と `content-length` も付きません。HTTP がそれらを禁じているためです。
+
+`abort(204)` のようにエラーから来た応答も、`Response::new(204).with_body(..)` と
+自分で組んだ応答も、同じように落とします。
+
 ### 読む
 
 `status()` `header(name)` `headers()` `body()` `body_text()`
@@ -158,6 +195,20 @@ redirect().to("/other").with_status(303)
 ```
 
 どれも `Result<Response>` を返します。
+
+### 行き先に使えない文字
+
+**行き先に改行などの制御文字が入っていると、エラーを返します。**
+`Location` ヘッダーに入れられないためです。`route` / `route_with` も同じです。
+
+```rust
+redirect().to(req.input("next").unwrap_or_default())?   // 外から来た値は落ちうる
+```
+
+- `?` で上に返せば、普段のエラーの道を通って **500** になります。
+- そのとき、**直前のミドルウェアが付けた `Set-Cookie` は残ります。**
+  セッションの Cookie や CSRF トークンが消えません。
+- 外から来た文字列を行き先にするときは、このエラーを受ける用意をしてください。
 
 ## 中断する（abort）
 
@@ -209,6 +260,7 @@ return abort_with(404, "記事が見つかりません");
 `GET` のルートは `HEAD` にも応答します。本文は空になりますが、ヘッダーは `GET` と同じです。
 
 - **`Content-Length` が付きます。** 中身は `GET` で返るはずの長さです。
+- 本文を持てないステータス（1xx・204・304）のときだけ付きません。
 - 自分で `HEAD` のルートを書く必要はありません。
 
 ## HTML で返るか JSON で返るか
@@ -269,14 +321,30 @@ Application::configure()
 - デバッグビルドでは常にディスクを読みます。ファイルを直せばすぐ反映されます。
 - `/storage/` で始まるパスは `public/` を探しません。逆も同じです。
 
+### 振り分けはパスを整えてから
+
+**どちらの入口かを決める前に、パスを 1 回だけ整えます。** やることは 2 つです。
+
+| やること              | 例                                       |
+|-----------------------|------------------------------------------|
+| 続いた `/` をまとめる | `//storage/x.css` → `/storage/x.css`     |
+| `%xx` を元に戻す      | `/%73torage/x.css` → `/storage/x.css`    |
+
+整えた形で振り分けます。**`/storage` に化ける書き方で `public/storage/` を
+見ることはできません。** 「2 つの入口はどちらか一方」が書き方に関係なく守られます。
+
+- **`%xx` を戻すのは 1 回だけです。** `%2520` は空白になりません。
+  `%20` という名前のファイルを指します。
+- **`+` は空白にしません。** `/a+b.css` は `public/a+b.css` を指します。
+
 決まりごと:
 
 - ディレクトリなら `index.html` を返します。
-- **`/storage/` だけで来たときは 404 です。** 置き場所の `index.html` は配信しません。
+- **`/storage/` と `/storage` だけで来たときは 404 です。**
+  置き場所の `index.html` は配信しません。
 - `..` や絶対パスは受け付けません。
 - シンボリックリンクで `public/` の外に出ていないかを確かめます。
 - Content-Type は拡張子から決めます。
-- パスの `%xx` は元に戻します。**`+` は空白にしません。**
 - `ETag` と `Cache-Control: public, max-age=0, must-revalidate` を付けます。
 - **`X-Content-Type-Options: nosniff` を付けます。** 中身を見て種類を推測されないように
   するためです。`storage/app/public/` にはアプリが置いたファイルが入るので、
@@ -299,6 +367,11 @@ Application::configure()
   ディスクの ETag は更新時刻を秒で見るためです。差し替え直後に古いものが
   返ることがあるので、本番では名前にハッシュを付けたファイル名を使ってください。
 - 長く持たせたい（`max-age=31536000` など）ときは、前段のプロキシで上書きしてください。
+
+## 制限
+
+**クライアントが接続を切っても、そのリクエストの処理は走り続けます。**
+その処理は停止処理の待ち合わせから外れ、停止の上限時間で打ち切られます。
 
 ## ログ
 

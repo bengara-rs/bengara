@@ -105,6 +105,10 @@ pub trait Model: Sized + Send + Sync + 'static {
 
     /// 保存する。新しい行なら足し、そうでなければ更新します。
     ///
+    /// **当てはまる行が無いときはエラーです。** 更新のつもりで呼んで1件も当たらない
+    /// のは、消えた行・推測した主キー・並行削除のどれかです。
+    /// 以前は警告だけで `Ok` を返していたので、書き込みが静かに失われていました。
+    ///
     /// **既定の接続を使います。** トランザクションの中で保存したいときは
     /// [`save_using(&tx)`](Model::save_using) を使ってください。
     /// `save()` のままだと、保存はトランザクションの外に出ます。
@@ -178,6 +182,18 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
     if creating {
         let id = query.insert_get_id_as(&attributes, T::PRIMARY_KEY).await?;
         model.set_key(Value::Int(id));
+        if model.is_new() {
+            // `set_key` が値を入れられなかった（主キーの型に収まらないなど）。
+            // 主キーが空のままなので、もう一度 `save()` すると2行目が入ります。
+            // `u8` を主キーにして 256 行目を入れると、以前はそこで静かに重複していました。
+            return Err(Error::msg(format!(
+                "採番された主キー {id} を {}.{} に入れられませんでした（入った値: `{}`）。\
+                 主キーの型を、採番された値が収まる型（`i64` など）にしてください",
+                std::any::type_name::<T>(),
+                T::PRIMARY_KEY,
+                model.key()
+            )));
+        }
     } else {
         let key = model.key();
         let affected = query
@@ -185,13 +201,14 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
             .update(&attributes)
             .await?;
         if affected == 0 {
-            // 当てはまる行が無かった。消えた行を保存しようとしていることが多い。
-            // 黙って成功に見せると気づけないので知らせる。
-            tracing::warn!(
-                "{}.{} = {key} の行が無いので、save() は何も更新しませんでした",
+            // 当てはまる行が無かった。消えた行・推測した主キー・並行削除のどれか。
+            // 以前は警告だけで `Ok` を返していたので、書き込みが静かに失われていました。
+            return Err(Error::msg(format!(
+                "{}.{} = {key} の行が無いので保存できませんでした。\
+                 消えた行を保存しようとしていないか、主キーの値を確かめてください",
                 T::TABLE,
                 T::PRIMARY_KEY
-            );
+            )));
         }
     }
     Ok(())
@@ -220,6 +237,9 @@ async fn fresh_from<T: Model>(model: &T, source: Source) -> Result<Option<T>> {
 ///
 /// `insert` が返した主キーを入れられなかったときに知らせます。
 /// 黙って既定値で上書きしないためです。
+///
+/// 入らなかったことは `save()` が後から見つけてエラーにします
+/// （主キーが空のままだと、次の `save()` が2行目を入れてしまうため）。
 #[doc(hidden)]
 pub fn warn_key_not_set(table: &str, column: &str, error: &dyn std::fmt::Display) {
     tracing::warn!("{table}.{column} に insert の戻り値を入れられませんでした: {error}");
@@ -394,6 +414,10 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// 束ねた結果を絞る。`group_by` と一緒に使ってください。
+    ///
+    /// **渡せるのは実在の列だけです。** `select` に書いた別名は渡せません
+    /// （[`QueryBuilder::having_op`] を参照）。集計の結果で絞るときは
+    /// `having_raw` を使ってください。
     pub fn having_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
         self.map(|q| q.having_op(column, operator, value))
     }
@@ -648,6 +672,62 @@ mod tests {
         }
     }
 
+    /// 決まった結果だけを返す接続。件数と採番された ID を自由に決められます。
+    struct Fixed(Affected);
+
+    impl Backend for Fixed {
+        fn driver(&self) -> Driver {
+            Driver::Sqlite
+        }
+
+        fn fetch_all<'a>(&'a self, _sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Vec<Row>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(&'a self, _sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Affected> {
+            let affected = self.0;
+            Box::pin(async move { Ok(affected) })
+        }
+
+        fn begin(&self) -> DbFuture<'_, Box<dyn RawTx>> {
+            let affected = self.0;
+            Box::pin(async move { Ok(Box::new(FixedTx(affected)) as Box<dyn RawTx>) })
+        }
+
+        fn table_names(&self) -> DbFuture<'_, Vec<String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    struct FixedTx(Affected);
+
+    impl RawTx for FixedTx {
+        fn fetch_all<'a>(&'a mut self, _sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Vec<Row>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(&'a mut self, _sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Affected> {
+            let affected = self.0;
+            Box::pin(async move { Ok(affected) })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 決まった結果を返す接続から、トランザクションを始める。
+    async fn fixed(affected: Affected) -> Transaction {
+        let backend: Arc<dyn Backend> = Arc::new(Fixed(affected));
+        Transaction::start(backend)
+            .await
+            .expect("トランザクションが始まる")
+    }
+
     /// 覚える接続と、そこから始めたトランザクションを用意する。
     async fn spy() -> (Arc<Spy>, Transaction) {
         let found = Arc::new(Spy::default());
@@ -685,6 +765,40 @@ mod tests {
 
         fn set_key(&mut self, value: Value) {
             self.id = i64::from_value(&value).unwrap_or(0);
+        }
+    }
+
+    /// 主キーが1バイトのモデル。採番された値が入らない場合を試します。
+    struct Tiny {
+        id: u8,
+        title: String,
+    }
+
+    impl Model for Tiny {
+        const TABLE: &'static str = "tiny";
+        const PRIMARY_KEY: &'static str = "id";
+        const COLUMNS: &'static [&'static str] = &["id", "title"];
+
+        fn from_row(row: &Row) -> Result<Self> {
+            Ok(Self {
+                id: row.get("id")?,
+                title: row.get("title")?,
+            })
+        }
+
+        fn attributes(&self) -> Vec<(&'static str, Value)> {
+            vec![("title", Value::Text(self.title.clone()))]
+        }
+
+        fn key(&self) -> Value {
+            Value::Int(i64::from(self.id))
+        }
+
+        fn set_key(&mut self, value: Value) {
+            // `#[derive(Model)]` が生成するのと同じ形。読めないときは値を変えない。
+            if let Ok(id) = u8::from_value(&value) {
+                self.id = id;
+            }
         }
     }
 
@@ -802,5 +916,64 @@ mod tests {
             sent.contains("select * from \"posts\" where \"id\" = ?"),
             "{sent}"
         );
+    }
+
+    #[tokio::test]
+    async fn 行が無い更新はエラーになる() {
+        let tx = fixed(Affected {
+            rows: 0,
+            last_insert_id: None,
+        })
+        .await;
+        let mut post = Post {
+            id: 3,
+            title: "やきそば".into(),
+        };
+        // 以前は警告だけで Ok を返していたので、書き込みが静かに失われていた。
+        let message = post
+            .save_using(&tx)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("posts.id = 3"), "{message}");
+        assert!(message.contains("保存できませんでした"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 採番された主キーが入らないときはエラーになる() {
+        let tx = fixed(Affected {
+            rows: 1,
+            last_insert_id: Some(300),
+        })
+        .await;
+        let mut tiny = Tiny {
+            id: 0,
+            title: "やきそば".into(),
+        };
+        // 以前は警告だけで Ok を返していたので、もう一度 save() すると2行目が入っていた。
+        let message = tiny
+            .save_using(&tx)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("300"), "{message}");
+        assert!(message.contains("Tiny"), "{message}");
+        assert!(tiny.is_new(), "主キーは入っていないまま");
+    }
+
+    #[tokio::test]
+    async fn 入る主キーならこれまでどおり保存できる() {
+        let tx = fixed(Affected {
+            rows: 1,
+            last_insert_id: Some(7),
+        })
+        .await;
+        let mut tiny = Tiny {
+            id: 0,
+            title: "やきそば".into(),
+        };
+        tiny.save_using(&tx).await.expect("保存できる");
+        assert_eq!(tiny.id, 7);
+        assert!(!tiny.is_new());
     }
 }

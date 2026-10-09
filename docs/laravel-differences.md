@@ -49,6 +49,7 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `/posts/{post}`                                     | 同じ。末尾の全取りは `/files/{*path}`                                                 |
 | `route('posts.show', $post)`                        | `route_with("posts.show", &[("post", "12")])?` を使います                             |
 | 可変長引数が使える                                  | ありません。引数はスライスで渡します                                                  |
+| パスに無い引数はクエリになる                        | 同じ。`route_with("posts.index", &[("page", "2")])` は `/posts?page=2`                |
 | `route()` はパス引数をそのまま置く                  | **パーセント符号化します。** `/` も `%2F` になります                                  |
 | `Route::group` / `prefix`                           | `Route::prefix("admin").group(...)`。`name` の点は自分で書きます                      |
 | `Route::middleware(...)`                            | `Route::get(...).middleware("admin")` と後ろに付けます                                |
@@ -75,6 +76,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `view("welcome")`              | **テンプレートはありません。** `html(...)` か JSON を返します                            |
 | `response()->json($data)`      | `json(&data)` — `Result<Response>`                                                       |
 | `redirect('/login')`           | `redirect().to("/login")` — `Result<Response>`                                           |
+| 行き先の文字は検査しない       | **制御文字（改行など）が入っていると `Err` を返します**                                  |
 | `abort(403)`                   | `return abort(403);` と書きます                                                          |
 | 例外を投げる                   | `Err` を返します。`Error::Http` ならそのステータスです                                   |
 
@@ -85,6 +87,8 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `$request->input('title')`               | `req.input("title")` — `Option<String>`                   |
 | `$request->validate([...])`              | `req.validate(&[("title", "required\|max:255")])?`        |
 | 規則は配列でも文字列でも書ける           | **文字列だけ**です                                        |
+| `TrimStrings` が値の前後の空白を落とす   | 同じ。除くのも同じ 3 つ（下の節）                         |
+| 空白を落とすのは全部の入力               | **検査する値だけ**です。`req.input()` は落としません      |
 | `min` / `max` / `between` の決め方       | 同じ。`numeric` か `integer` が付いた項目だけ値で比べます |
 | 空文字の扱い                             | 同じ。飛ばすのは未送信のときと `nullable` のときだけです  |
 | 落ちると例外 → リダイレクトか JSON       | 落ちると `Error::Validation` → 422。`Accept` で分かれます |
@@ -92,6 +96,13 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `regex:` / `unique:` / `exists:`         | ありません。`exists()` をクエリで書きます                 |
 | 重なりは `unique:` で止める              | 表の `unique` が砦です。`is_unique_violation` で見分けます |
 | フォームリクエスト（`StorePostRequest`） | ありません                                                |
+
+検査に渡る値は、前後の空白を落とします（Laravel の `TrimStrings` と同じ）。
+`age=" 5 "` は `5` として検査し、通った値も `5` で返ります。
+
+**落とさない項目は 3 つです。** `current_password`・`password`・`password_confirmation`
+です。Laravel の `$except` と同じ 3 つなので、`password` の `min:8` は前後の空白も
+数えた長さで測ります。
 
 ## セッションと CSRF
 
@@ -147,6 +158,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | MySQL / PostgreSQL / SQLite / SQL Server           | **SQL Server 以外**（機能フラグ `sqlite` / `mysql` / `postgres`） |
 | `$table->timestamp('at')` が PostgreSQL で `timestamp`  | PostgreSQL では **`text` 列**になります（日時は文字列のため）  |
 | `decimal` の値が文字列で返る                       | MySQL / PostgreSQL では `Value::Text`。末尾の 0 は落ちます    |
+| MySQL の `$table->float()` は 4 バイト             | **どのドライバでも 8 バイト**です（MySQL は `float(53)`）     |
 | `charset` / `collation` の指定                      | **ありません。** サーバの既定に従います                       |
 | 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作ります |
 
@@ -164,6 +176,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `$post->comments` で自動的に読む           | `post.comments().get().await?`（遅延ロードはありません）          |
 | `with('comments')` でまとめ読み            | `where_in` で 2 回に分けます                                      |
 | `Post::create([...])`                      | 構造体を作って `post.save().await?`                               |
+| `save()` が 0 件の更新でも成功を返す       | **`Err` になります。** 書き込みが静かに消えないようにしています    |
 | `DB::transaction` の中で `$model->save()`  | `post.save_using(&tx).await?` を使います                          |
 | `$casts` で型を変える                      | 構造体の宣言がそのまま型です                                      |
 | `Post::factory()->count(3)->create()`      | `database/factories/` のただの関数                                |

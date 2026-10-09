@@ -43,6 +43,14 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
+    // 年に上限が無かったころ、`99999999999999-01-01` が
+    // `days * 86_400` の桁あふれでデバッグビルドではパニックし、
+    // リリースでは巻き戻って過去の秒になりました。`PasswordReset::expired`
+    // が**期限切れにならない**判定を返しえたので、範囲外は読めない扱いにします。
+    // 上限は `format_timestamp` が出す `{year:04}` に合わせます。
+    if !(1..=9999).contains(&year) {
+        return None;
+    }
     // 日の上限は月（とうるう年）で変わる。31 で通すと、`2026-02-31` が
     // `2026-03-03` として読めてしまう。
     if date_parts.next().is_some() || !(1..=12).contains(&month) {
@@ -195,6 +203,29 @@ mod tests {
             "2026-01-01T",
         ] {
             assert_eq!(parse_timestamp(broken), None, "{broken}");
+        }
+    }
+
+    #[test]
+    fn 年の範囲を外れた値はnoneになる() {
+        // 上限が無かったころ、デバッグビルドでは掛け算の桁あふれでパニックし、
+        // リリースでは巻き戻って `PasswordReset::expired` が期限切れを
+        // 見落としえました。
+        for broken in [
+            "99999999999999-01-01",
+            "9999999999999999999999-01-01",
+            "10000-01-01",
+            "0000-01-01",
+        ] {
+            assert_eq!(parse_timestamp(broken), None, "{broken}");
+        }
+        // 範囲の端は読める。
+        assert!(parse_timestamp("0001-01-01").is_some());
+        assert!(parse_timestamp("9999-12-31 23:59:59").is_some());
+        // `format_timestamp` が出す形は必ず読み戻せる。
+        for seconds in [-62_135_596_800_i64, 253_402_300_799] {
+            let text = format_timestamp(seconds);
+            assert_eq!(parse_timestamp(&text), Some(seconds), "{text}");
         }
     }
 
