@@ -147,20 +147,16 @@ impl RawTx for PgTx {
     fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
         Box::pin(async move {
             let this = *self;
-            this.tx
-                .commit()
-                .await
-                .map_err(|e| Error::msg(format!("トランザクションを確定できません: {e}")))
+            // `SqlFailure` に包む。`is_unique_violation()` が見るのは原因の連鎖だけで、
+            // `Error::msg` では種類が分からなくなるためです（遅延制約で実際に当たります）。
+            this.tx.commit().await.map_err(|e| failed("commit", e))
         })
     }
 
     fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
         Box::pin(async move {
             let this = *self;
-            this.tx
-                .rollback()
-                .await
-                .map_err(|e| Error::msg(format!("トランザクションを巻き戻せません: {e}")))
+            this.tx.rollback().await.map_err(|e| failed("rollback", e))
         })
     }
 }
@@ -178,6 +174,25 @@ fn affected(result: &PgQueryResult) -> Affected {
 }
 
 /// 値をプレースホルダへ渡す。
+///
+/// `Value` の腕と PostgreSQL の型は 1 対 1 で渡します。腕を増やすと公開 API が
+/// 壊れるので、列の型に合わせた渡し方はしません。
+///
+/// **`decimal`（`numeric`）の列は、読みと書きで形が違います。**
+/// 組み立ての時点で列の型が分からないため、ここでそろえる手がありません。
+///
+/// | 向き | 形                                                                  |
+/// |------|---------------------------------------------------------------------|
+/// | 読む | `Value::Text`（桁を落とさないため。`convert_value` の `NUMERIC`）   |
+/// | 書く | `Value::Float` / `Value::Int` で渡す                                |
+///
+/// 読んだ `Value::Text` をそのまま `insert` / `update` に渡すと、PostgreSQL が
+/// `column "x" is of type numeric but expression is of type text` で断ります。
+/// MySQL と SQLite は通すので、SQLite で開発している間は気づけません。
+///
+/// 桁を落とさずに書きたいときは、`DB::statement`（または `Transaction::statement`）で
+/// `$1::numeric` を自分で書いてください。**ビルダーの `*_raw` には書けません**
+/// （PostgreSQL では `$` を断ります。番号が衝突するためです）。
 fn bind<'q>(
     mut query: sqlx::query::Query<'q, Postgres, PgArguments>,
     bindings: &'q [Value],
@@ -238,6 +253,15 @@ fn convert_value(row: &PgRow, index: usize, name: &str) -> Result<Value> {
         "FLOAT8" => read::<f64>(row, index, name).map(Value::Float),
         // `numeric` は桁を落とさないよう文字列で渡します。
         // `t.decimal()` が作る列なので、読めないままにはできません。
+        //
+        // **読むと `Value::Text`、書くときは数**という非対称です（決定記録 #103 は
+        // 読む側だけを決めています）。この `Value::Text` をそのまま `insert` /
+        // `update` に渡すと、PostgreSQL が
+        // `column "x" is of type numeric but expression is of type text` で断ります。
+        // 書くときは `Value::Float` / `Value::Int` で渡してください。桁を落とさずに
+        // 書きたいときは `DB::statement` で `$1::numeric` を自分で書きます
+        // （ビルダーの `*_raw` は PostgreSQL で `$` を断ります）。
+        // 詳しくは [`bind`] の説明にあります。
         "NUMERIC" => read::<sqlx::types::BigDecimal>(row, index, name)
             .map(|v| Value::Text(super::decimal::normalize(&v.to_string()))),
         // `CHAR` は `char(n)`（bpchar）です。1バイトの内部型は `"CHAR"` という

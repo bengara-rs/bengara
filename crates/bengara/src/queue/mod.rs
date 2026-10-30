@@ -197,15 +197,30 @@ impl Queue {
     }
 }
 
+/// `available_at` に入れてよい一番後の時刻（`9999-12-31 23:59:59`）。
+///
+/// **4 桁の年までで止めます。** 取り出しの条件（`available_at <= now`）は
+/// 文字列の大小比較です。`format_timestamp` は年を 4 桁で詰めるので、
+/// 5 桁の年は `"11480-.."` のようになり、`"2026-.."` より小さい文字列に
+/// なります。`Queue::later(.., 300_000_000_000)` のように遅延が極端に
+/// 大きいジョブが、次の `queue:work` でいきなり実行されていました。
+///
+/// この値は `support/time.rs` が読み戻せる上限と同じです。
+const MAX_AVAILABLE_AT: i64 = 253_402_300_799;
+
 /// いつから処理できるかを文字列にする。
 ///
 /// **あふれさせません。** `delay_secs as i64` だと `u64::MAX` が `-1` になり、
 /// 「ずっと後に実行」と書いたジョブがすぐ実行されます（デバッグビルドでは
 /// 足し算でパニックします）。上限で切り詰めてから飽和加算します
 /// （`cache/store.rs` の `Entry::encode` と同じ形）。
+///
+/// 飽和の先は [`MAX_AVAILABLE_AT`] です。`i64::MAX` まで許すと、年が 5 桁に
+/// なって文字列の比較が逆転します。
 fn available_at(now: i64, delay_secs: u64) -> String {
     let delay = i64::try_from(delay_secs).unwrap_or(i64::MAX);
-    crate::support::time::format_timestamp(now.saturating_add(delay))
+    let at = now.saturating_add(delay).min(MAX_AVAILABLE_AT);
+    crate::support::time::format_timestamp(at)
 }
 
 #[cfg(test)]
@@ -225,6 +240,20 @@ mod tests {
             available_at(now, 60),
             crate::support::time::format_timestamp(now + 60)
         );
+    }
+
+    #[test]
+    fn 遅延が大きくても年は4桁に収まる() {
+        let now = 1_700_000_000;
+        let soon = available_at(now, 0);
+        // 取り出しは文字列の大小比較。`i64::MAX` まで許したころは年が 5 桁に
+        // なり、`"11480-.." <= "2026-.."` が真で、ずっと先のジョブが
+        // 次の `queue:work` でいきなり実行されていた。
+        let far = available_at(now, 300_000_000_000);
+        assert!(far > soon, "先の時刻として比較できる: {far}");
+        assert_eq!(far, "9999-12-31 23:59:59");
+        // どれだけ大きくしても同じ上限で止まる。
+        assert_eq!(available_at(now, u64::MAX), far);
     }
 
     #[test]

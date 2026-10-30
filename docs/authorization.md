@@ -76,6 +76,17 @@ pub async fn update(req: Request) -> Result<Response> {
 3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。
 **止まる順番も、この並びのとおり**です（401 → 404 → 403）。
 
+### 呼ばないと効きません
+
+**ポリシーはただの関数です。呼び忘れても、何も起きません。**
+コンパイルも通り、警告も出ません。**書いただけでは誰も止まりません。**
+
+- 書いたポリシーの一覧と、呼んでいる場所を突き合わせてください。
+  とくに `view` のような「見てよいか」は呼び忘れやすく、
+  忘れると**下書きが誰にでも見えます。**
+- 見せてはいけないものを隠すときは、403 ではなく **404** を返す形も考えてください。
+  403 だと「そこに何かある」ことが伝わります。
+
 | 関数                               | すること                                           |
 |------------------------------------|----------------------------------------------------|
 | `authorize(bool)`                  | 偽なら 403。本文は「この操作は許可されていません」 |
@@ -120,20 +131,12 @@ async fn 他人の記事は直せない() {
 }
 ```
 
-画面ごしに確かめるなら、ログインしてから叩きます。
-`client` は `#[bengara::test]` が用意する `TestClient` です。
+画面ごしに確かめるなら、ログインしてから叩きます（[testing.md](testing.md)）。
 
 ```rust
-// 送るヘッダーは自分で組み立てます。bengara は定数を用意していません。
-const FORM: (&str, &str) = ("content-type", "application/x-www-form-urlencoded");
-
-// ボブでログインする（Cookie が client に残ります）。
+// ボブでログインする（Cookie が client に残ります）
 client
-    .post_with_csrf(
-        "/api/login",
-        "email=bob@example.com&password=password123",
-        "/csrf-token",
-    )
+    .post_with_csrf("/api/login", "email=bob@example.com&password=password123", "/csrf-token")
     .await
     .assert_ok();
 
@@ -141,12 +144,9 @@ client
 // POST 以外には `post_with_csrf` が無いので、トークンは自分で付けます。
 let token = client.csrf_token("/csrf-token").await;
 client
-    .send(
-        "PUT",
-        "/api/my/articles/1",
-        b"title=x".to_vec(),
-        &[FORM, ("x-csrf-token", &token)],
-    )
+    .send("PUT", "/api/my/articles/1", b"title=x".to_vec(),
+          &[("content-type", "application/x-www-form-urlencoded"),
+            ("x-csrf-token", &token)])
     .await
     .assert_status(403);
 ```
@@ -171,6 +171,7 @@ client
 | 判定は同期の関数にする   | DB を引きたくなったら、呼ぶ側で先に引いてから渡してください    |
 | 先にログインを確かめる   | `user_or_fail()` を先に呼べば 401 が先に返ります               |
 | 判定を忘れないようにする | ルートを足したら、対になるテスト（他人で 403）も足してください |
+| 読む側の判定も呼ぶ       | `view` を呼び忘れると、下書きが誰にでも見えます                 |
 
 ## 関連
 

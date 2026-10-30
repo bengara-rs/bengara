@@ -30,6 +30,30 @@ pub trait Model: Sized + Send + Sync + 'static {
     /// 列の名前の一覧（主キーを含む）。
     const COLUMNS: &'static [&'static str];
 
+    /// 主キーが整数の列か。`#[derive(Model)]` は整数の主キー専用なので、既定は真です。
+    ///
+    /// 真のとき、`find` などに渡された**整数に読める文字列**は整数として束縛します。
+    /// パス引数やセッションの ID は文字列で届くためです。PostgreSQL は
+    /// `bigint = text` を断るので、文字列のまま渡すと `operator does not exist` に
+    /// なります（SQLite と MySQL は暗黙に変換するので気づけません）。
+    ///
+    /// 文字列の主キーを自分で実装するときは `false` にしてください。
+    /// `"123"` のような値をそのまま文字列として探せるようになります。
+    const INTEGER_KEY: bool = true;
+
+    /// 主キーの列に渡す値を、主キーの型に合わせて直す。
+    ///
+    /// `INTEGER_KEY` が真なら、整数に読める文字列を `Value::Int` にします。
+    /// それ以外はそのまま返します。
+    fn key_value(value: impl IntoValue) -> Value {
+        let value = value.into_value();
+        if Self::INTEGER_KEY {
+            super::normalize_key(value)
+        } else {
+            value
+        }
+    }
+
     /// 行から作る。
     fn from_row(row: &Row) -> Result<Self>;
 
@@ -81,9 +105,12 @@ pub trait Model: Sized + Send + Sync + 'static {
     }
 
     /// 主キーで1件取る。
+    ///
+    /// 整数に読める文字列（パス引数など）は整数として探します（[`Model::key_value`]）。
     fn find<V: IntoValue + Send>(
         id: V,
     ) -> impl std::future::Future<Output = Result<Option<Self>>> + Send {
+        let id = Self::key_value(id);
         async move { Self::query().where_(Self::PRIMARY_KEY, id).first().await }
     }
 
@@ -104,6 +131,29 @@ pub trait Model: Sized + Send + Sync + 'static {
     }
 
     /// 保存する。新しい行なら足し、そうでなければ更新します。
+    ///
+    /// # 更新のときは**全列**を書き戻します
+    ///
+    /// 変えたのが1つの項目だけでも、構造体が持っている値を全部書きます
+    /// （`created_at` だけは作ったときの値を保ちます）。
+    /// そのため、**読んでから保存するまでの間に他の人が動かした列は巻き戻ります。**
+    ///
+    /// ```ignore
+    /// // 題名だけ変えたいのに、読んだときの views も一緒に書き戻る。
+    /// let mut post = Post::find_or_fail(id).await?;
+    /// post.title = "新しい題名".into();
+    /// post.save().await?;                       // ← views が戻る
+    ///
+    /// // 動く列がある表では、変える列だけを指定する。
+    /// DB::table("posts")
+    ///     .where_("id", id)
+    ///     .update(&[("title", "新しい題名".into())])
+    ///     .await?;
+    /// ```
+    ///
+    /// 変えたい項目を数えられるなら、クエリビルダの `update` を使ってください。
+    /// どの列が「他の人も動かす列」かは枠組みから分からないので、ここでは
+    /// 何が変わったかを追いません。
     ///
     /// **当てはまる行が無いときはエラーです。** 更新のつもりで呼んで1件も当たらない
     /// のは、消えた行・推測した主キー・並行削除のどれかです。
@@ -183,8 +233,21 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
         let id = query.insert_get_id_as(&attributes, T::PRIMARY_KEY).await?;
         model.set_key(Value::Int(id));
         if model.is_new() {
-            // `set_key` が値を入れられなかった（主キーの型に収まらないなど）。
             // 主キーが空のままなので、もう一度 `save()` すると2行目が入ります。
+            // 止める理由は同じですが、**原因は2つあって文を分けます。**
+            if id == 0 {
+                // 採番そのものが返っていない。MySQL は `auto_increment` を持たない表で
+                // `last_insert_id()` が 0 を返します。行はもう入っているので、
+                // 「入れられなかった」と言うと実態と食い違います。
+                return Err(Error::msg(format!(
+                    "{}.{} に採番された値が返りませんでした（行は入っています）。\
+                     主キーが自動採番か確かめてください。自分で主キーを決める表では、\
+                     値を入れてから `save()` を呼んでください",
+                    T::TABLE,
+                    T::PRIMARY_KEY
+                )));
+            }
+            // `set_key` が値を入れられなかった（主キーの型に収まらない）。
             // `u8` を主キーにして 256 行目を入れると、以前はそこで静かに重複していました。
             return Err(Error::msg(format!(
                 "採番された主キー {id} を {}.{} に入れられませんでした（入った値: `{}`）。\
@@ -195,10 +258,24 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
             )));
         }
     } else {
-        let key = model.key();
+        let key = T::key_value(model.key());
+        // `created_at` は作ったときの値を保つ。全列を書き戻す作りなので、
+        // 読み直さずに作った構造体（`created_at` が空）を保存すると、
+        // 以前は `created_at = ''` で上書きされていた。
+        let updating: Vec<(&'static str, Value)> = attributes
+            .iter()
+            .filter(|(name, _)| *name != "created_at")
+            .cloned()
+            .collect();
+        // `created_at` しか無い表では、外すと更新する列が無くなる。そのときは全部書く。
+        let updating = if updating.is_empty() {
+            attributes
+        } else {
+            updating
+        };
         let affected = query
             .where_(T::PRIMARY_KEY, key.clone())
-            .update(&attributes)
+            .update(&updating)
             .await?;
         if affected == 0 {
             // 当てはまる行が無かった。消えた行・推測した主キー・並行削除のどれか。
@@ -220,7 +297,7 @@ async fn delete_from<T: Model>(model: &T, source: Source) -> Result<u64> {
         return Ok(0);
     }
     QueryBuilder::new(source, T::TABLE)
-        .where_(T::PRIMARY_KEY, model.key())
+        .where_(T::PRIMARY_KEY, T::key_value(model.key()))
         .delete()
         .await
 }
@@ -228,7 +305,7 @@ async fn delete_from<T: Model>(model: &T, source: Source) -> Result<u64> {
 /// `fresh()` と `fresh_using()` の中身。
 async fn fresh_from<T: Model>(model: &T, source: Source) -> Result<Option<T>> {
     ModelQuery::<T>::new(source)
-        .where_(T::PRIMARY_KEY, model.key())
+        .where_(T::PRIMARY_KEY, T::key_value(model.key()))
         .first()
         .await
 }
@@ -500,6 +577,27 @@ impl<T: Model> ModelQuery<T> {
     /// 最初の1件。
     pub async fn first(&self) -> Result<Option<T>> {
         match self.inner.first().await? {
+            Some(row) => T::from_row(&row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// 条件に加えて主キーで絞り、1件取る。
+    ///
+    /// `QueryBuilder::find` と違い、列名は `id` 固定ではなく主キーの名前を使います。
+    /// 整数に読める文字列は整数として探します（[`Model::key_value`]）。
+    ///
+    /// ```ignore
+    /// let post = Post::query().where_("status", "published").find(id).await?;
+    /// ```
+    pub async fn find(&self, id: impl IntoValue) -> Result<Option<T>> {
+        let row = self
+            .inner
+            .clone()
+            .where_(T::PRIMARY_KEY, T::key_value(id))
+            .first()
+            .await?;
+        match row {
             Some(row) => T::from_row(&row).map(Some),
             None => Ok(None),
         }
@@ -800,6 +898,150 @@ mod tests {
                 self.id = id;
             }
         }
+    }
+
+    /// `created_at` / `updated_at` を持つモデル。更新で `created_at` を書き戻さないことを試します。
+    struct Stamped {
+        id: i64,
+        title: String,
+        created_at: String,
+        updated_at: String,
+    }
+
+    impl Model for Stamped {
+        const TABLE: &'static str = "stamped";
+        const PRIMARY_KEY: &'static str = "id";
+        const COLUMNS: &'static [&'static str] = &["id", "title", "created_at", "updated_at"];
+
+        fn from_row(row: &Row) -> Result<Self> {
+            Ok(Self {
+                id: row.get("id")?,
+                title: row.get("title")?,
+                created_at: row.get("created_at")?,
+                updated_at: row.get("updated_at")?,
+            })
+        }
+
+        fn attributes(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("title", Value::Text(self.title.clone())),
+                ("created_at", Value::Text(self.created_at.clone())),
+                ("updated_at", Value::Text(self.updated_at.clone())),
+            ]
+        }
+
+        fn key(&self) -> Value {
+            Value::Int(self.id)
+        }
+
+        fn set_key(&mut self, value: Value) {
+            self.id = i64::from_value(&value).unwrap_or(0);
+        }
+    }
+
+    /// 文字列の主キーを自分で実装したモデル。整数に直さないことを試します。
+    struct Coded {
+        code: String,
+        title: String,
+    }
+
+    impl Model for Coded {
+        const TABLE: &'static str = "coded";
+        const PRIMARY_KEY: &'static str = "code";
+        const COLUMNS: &'static [&'static str] = &["code", "title"];
+        const INTEGER_KEY: bool = false;
+
+        fn from_row(row: &Row) -> Result<Self> {
+            Ok(Self {
+                code: row.get("code")?,
+                title: row.get("title")?,
+            })
+        }
+
+        fn attributes(&self) -> Vec<(&'static str, Value)> {
+            vec![("title", Value::Text(self.title.clone()))]
+        }
+
+        fn key(&self) -> Value {
+            Value::Text(self.code.clone())
+        }
+
+        fn set_key(&mut self, value: Value) {
+            self.code = String::from_value(&value).unwrap_or_default();
+        }
+    }
+
+    #[test]
+    fn 整数の主キーには文字列の_id_を整数で渡す() {
+        // パス引数は文字列で届く。PostgreSQL は bigint = text を断る。
+        assert_eq!(Post::key_value("12"), Value::Int(12));
+        assert_eq!(Post::key_value(12), Value::Int(12));
+        assert_eq!(Post::key_value("abc"), Value::Text("abc".into()));
+        // 文字列の主キーは、数字だけでも文字列のまま。
+        assert_eq!(Coded::key_value("12"), Value::Text("12".into()));
+    }
+
+    #[test]
+    fn find_は主キーの名前で絞る() {
+        // ModelQuery::find は `id` 固定ではなく PRIMARY_KEY を使う。
+        let query = Coded::query().where_("title", "x");
+        let (sql, _) = query
+            .inner
+            .clone()
+            .where_(Coded::PRIMARY_KEY, Coded::key_value("a1"))
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"coded\" where \"title\" = ? and \"code\" = ?"
+        );
+    }
+
+    #[tokio::test]
+    async fn 更新では_created_at_を書き戻さない() {
+        let (found, tx) = spy().await;
+        let mut row = Stamped {
+            id: 3,
+            title: "やきそば".into(),
+            // 読み直さずに作った構造体。以前はこの空文字で上書きしていた。
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        row.save_using(&tx).await.expect("更新できる");
+        let sent = joined(&found.tx);
+        assert!(
+            sent.contains(
+                "update \"stamped\" set \"title\" = ?, \"updated_at\" = ? where \"id\" = ?"
+            ),
+            "{sent}"
+        );
+        assert!(!sent.contains("\"created_at\" = ?"), "{sent}");
+
+        // 新しい行では入れる。
+        let mut fresh = Stamped {
+            id: 0,
+            title: "たこやき".into(),
+            created_at: "2026-10-29 00:00:00".into(),
+            updated_at: "2026-10-29 00:00:00".into(),
+        };
+        fresh.save_using(&tx).await.expect("保存できる");
+        let sent = joined(&found.tx);
+        assert!(
+            sent.contains("insert into \"stamped\" (\"title\", \"created_at\", \"updated_at\")"),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn 文字列の主キーの更新は文字列のまま束縛する() {
+        let (found, tx) = spy().await;
+        let mut coded = Coded {
+            code: "007".into(),
+            title: "x".into(),
+        };
+        coded.save_using(&tx).await.expect("更新できる");
+        assert!(joined(&found.tx).contains("where \"code\" = ?"));
+        // 束縛した値は文字列のまま（Spy は値を覚えないので、key_value で確かめる）。
+        assert_eq!(Coded::key_value(coded.key()), Value::Text("007".into()));
     }
 
     #[test]

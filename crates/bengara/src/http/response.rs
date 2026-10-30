@@ -87,14 +87,18 @@ impl Response {
     /// `with_added_header` を使ってください。
     ///
     /// 値に使えない文字（改行など）が入っていたときは、**その1本だけ**落とします。
+    /// すでに入っている値は残ります（渡した値を入れないだけです）。
     pub fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
-        // 照合は確保せずに行い、格納する名前は小文字にそろえる。
-        self.headers
-            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         let value = value.into();
+        // 検査は消す**前**に行う。後にすると、使えない値を渡しただけで、
+        // 元から入っていた正しい値まで失われます
+        // （`Response::text("x").with_header("content-type", "a\nb")` で種類が消えた）。
         if !header_value_ok(name, &value) {
             return self;
         }
+        // 照合は確保せずに行い、格納する名前は小文字にそろえる。
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         self.headers.push((name.to_ascii_lowercase(), value));
         self
     }
@@ -496,6 +500,22 @@ mod tests {
                 .filter(|(k, _)| k == "set-cookie")
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn 使えない値を渡しても元の値は残る() {
+        // 以前は消してから検査していたので、元の `content-type` まで失われていた。
+        let r = Response::text("x").with_header("content-type", "a\nb");
+        assert_eq!(r.header("content-type"), Some("text/plain; charset=utf-8"));
+        // 足す側も、入れないだけで元の値は触らない。
+        let r = Response::text("x").with_added_header("content-type", "a\nb");
+        assert_eq!(
+            r.headers()
+                .iter()
+                .filter(|(k, _)| k == "content-type")
+                .count(),
+            1
         );
     }
 

@@ -96,42 +96,58 @@ impl Default for DatabaseConfig {
     ///
     /// `DB_DATABASE` の既定値は、SQLite では `database/database.sqlite`、
     /// MySQL と PostgreSQL では `bengara` です。
+    ///
+    /// 接続は `init` が作る `config/database.rs` と同じ 4 本（`sqlite` / `mysql` /
+    /// `mariadb` / `pgsql`）を作ります。`DB_CONNECTION` がその 4 つに無い名前のときは、
+    /// その名前の接続を 1 本足します（ドライバは名前から読み、読めなければ SQLite）。
+    ///
+    /// `DB_URL` は既定の接続にだけ効きます。ほかの接続にまで同じ接続文字列を
+    /// 入れると、`DB::connection("mysql")` が PostgreSQL の URL を持つことになるためです。
     fn default() -> Self {
         let default: String = crate::env("DB_CONNECTION", "sqlite");
-        // 名前が読めないときは SQLite とみなします。本当のエラーは接続のときに出ます。
-        let driver = Driver::parse(&default).unwrap_or(Driver::Sqlite);
-        let connection = match driver {
-            Driver::Sqlite => ConnectionConfig::sqlite(
-                default.clone(),
-                crate::env::<String>("DB_DATABASE", "database/database.sqlite"),
-            ),
-            Driver::MySql => ConnectionConfig::mysql(
-                default.clone(),
-                crate::env::<String>("DB_DATABASE", "bengara"),
-            ),
-            Driver::Postgres => ConnectionConfig::postgres(
-                default.clone(),
-                crate::env::<String>("DB_DATABASE", "bengara"),
-            ),
-        };
+        let file: String = crate::env("DB_DATABASE", "database/database.sqlite");
+        let name: String = crate::env("DB_DATABASE", "bengara");
+        let mut connections = vec![
+            ConnectionConfig::sqlite("sqlite", file),
+            from_env(ConnectionConfig::mysql("mysql", name.clone())),
+            from_env(ConnectionConfig::mysql("mariadb", name.clone())),
+            from_env(ConnectionConfig::postgres("pgsql", name.clone())),
+        ];
+        if !connections.iter().any(|c| c.name == default) {
+            // 名前が読めないときは SQLite とみなします。本当のエラーは接続のときに出ます。
+            let extra = match Driver::parse(&default).unwrap_or(Driver::Sqlite) {
+                Driver::Sqlite => ConnectionConfig::sqlite(
+                    default.clone(),
+                    crate::env::<String>("DB_DATABASE", "database/database.sqlite"),
+                ),
+                Driver::MySql => from_env(ConnectionConfig::mysql(default.clone(), name)),
+                Driver::Postgres => from_env(ConnectionConfig::postgres(default.clone(), name)),
+            };
+            connections.push(extra);
+        }
+        let url: String = crate::env("DB_URL", "");
+        let max: u32 = crate::env("DB_MAX_CONNECTIONS", 5u32);
+        for connection in &mut connections {
+            connection.max_connections = max.max(1);
+            if connection.name == default && !url.is_empty() {
+                connection.url = url.clone();
+            }
+        }
         Self {
-            connections: vec![from_env(connection)],
+            connections,
             default,
         }
     }
 }
 
-/// 環境変数で接続の細かいところを上書きする。
+/// 環境変数でつなぎ先と資格情報を上書きする。
 ///
 /// 空の文字列と 0 は「指定なし」として無視します（[`ConnectionConfig::host`] ほか）。
-/// SQLite では host / port / username / password を見ないので、入っていても害はありません。
 fn from_env(base: ConnectionConfig) -> ConnectionConfig {
     base.host(crate::env::<String>("DB_HOST", ""))
         .port(crate::env::<u16>("DB_PORT", 0u16))
         .username(crate::env::<String>("DB_USERNAME", ""))
         .password(crate::env::<String>("DB_PASSWORD", ""))
-        .url(crate::env::<String>("DB_URL", ""))
-        .max_connections(crate::env::<u32>("DB_MAX_CONNECTIONS", 5u32))
 }
 
 impl DatabaseConfig {
@@ -290,13 +306,33 @@ impl ConnectionConfig {
 
     /// メモリの上のデータベースか。
     ///
-    /// `:memory:` を指したときは真になります。接続は1本に固定されます。
+    /// 真になるのは次の 2 とおりです。接続は1本に固定されます。
     ///
-    /// 見るのは `:memory:` だけです。`memory` という語を含むだけの
+    /// | 形                                             | 例                                           |
+    /// |------------------------------------------------|----------------------------------------------|
+    /// | `:memory:` を含む                              | `:memory:` / `sqlite::memory:`               |
+    /// | 接続文字列のクエリに `mode=memory` がある      | `sqlite://file:app?mode=memory&cache=shared` |
+    ///
+    /// 見るのはこの 2 つだけです。`memory` という語を含むだけの
     /// ファイル名（`data/memory_2026.db` など）を取り違えないためです。
     pub fn is_memory(&self) -> bool {
-        self.database.contains(":memory:") || self.url.contains(":memory:")
+        self.database.contains(":memory:")
+            || self.url.contains(":memory:")
+            || has_memory_mode(&self.url)
     }
+}
+
+/// 接続文字列のクエリの部分に `mode=memory` があるか。
+///
+/// `sqlite://file:app?mode=memory&cache=shared` の形を拾います。
+/// 見るのは `?` より後ろだけなので、ファイル名は取り違えません。
+fn has_memory_mode(url: &str) -> bool {
+    let Some((_, query)) = url.split_once('?') else {
+        return false;
+    };
+    query
+        .split('&')
+        .any(|pair| pair.trim().eq_ignore_ascii_case("mode=memory"))
 }
 
 /// 設定を読み出す。`config/database.rs` が無ければ既定値を使います。
@@ -437,14 +473,84 @@ pub(crate) async fn connect_for_tests() -> Result<()> {
         }
         name
     };
+    // 接続文字列で書いている人は、host / user / password をそちらに持っている。
+    // 捨てると既定の `127.0.0.1` と `root` / `postgres` に落ちて、別の DB を向く。
+    // データベース名の部分だけをテスト用に差し替える。SQLite は URL がファイルを
+    // 指すだけなので、これまでどおり `database` で置き換える。
+    let url = if base.driver == Driver::Sqlite || base.url.is_empty() {
+        String::new()
+    } else {
+        replace_url_database(&base.url, &database)
+    };
     let settings = ConnectionConfig {
         database,
-        url: String::new(),
+        url,
         ..base
     };
     let created = connect(&settings).await?;
     let _ = TEST_BACKEND.set(created);
     Ok(())
+}
+
+/// 接続文字列のデータベース名（パスの部分）だけを差し替える。
+///
+/// `mysql://u:p@host:3306/app?ssl-mode=required` の `app` を `name` にします。
+/// 認証情報・ホスト・ポート・クエリはそのまま残します。
+/// `://` が無い文字列は接続文字列と見なさず、そのまま返します。
+fn replace_url_database(url: &str, name: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (before_query, query) = match rest.find(['?', '#']) {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    let authority = before_query
+        .split_once('/')
+        .map_or(before_query, |(authority, _)| authority);
+    format!("{scheme}://{authority}/{name}{query}")
+}
+
+/// 主キーの列に渡す値を、列の型に合わせて直す。
+///
+/// 整数に読める文字列（パス引数・セッションの ID）は `Value::Int` にします。
+/// PostgreSQL は `bigint = text` を断るので、文字列のまま渡すと
+/// `operator does not exist` になります。SQLite と MySQL は暗黙に変換するので、
+/// そちらでは気づけません。
+///
+/// 整数に読めない文字列はそのまま返します。外から来た文字列をモデルの主キーに
+/// 渡すときは、この関数ではなく [`Model::key_value`] を通してください。
+/// 文字列の主キーを自分で実装したモデル（`INTEGER_KEY = false`）にはそちらだけが対応します。
+pub(crate) fn normalize_key(value: Value) -> Value {
+    match value {
+        Value::Text(text) => match text.trim().parse::<i64>() {
+            Ok(number) => Value::Int(number),
+            Err(_) => Value::Text(text),
+        },
+        other => other,
+    }
+}
+
+/// 利用者が直接書いた SQL を、投げる前にそろえる。
+///
+/// `?` の数と値の数を確かめ、PostgreSQL では `?` を `$1` `$2` … に振り直します。
+/// `DB::select` / `DB::statement` / `Transaction::select` / `statement` が通ります。
+/// クエリビルダが組み立てた SQL は、組み立ての時点で済んでいるのでここを通りません。
+///
+/// PostgreSQL で最初から `$1` と書いてあるときはそのまま通します。
+pub(crate) fn prepare_raw_sql(driver: Driver, sql: &str, bindings: &[Value]) -> Result<String> {
+    let holes = grammar::count_placeholders(sql);
+    if holes != bindings.len() {
+        if driver == Driver::Postgres && holes == 0 && sql.contains('$') {
+            return Ok(sql.to_string());
+        }
+        return Err(Error::msg(format!(
+            "SQL に書いた `?` の数（{holes}）と、渡した値の数（{}）が合っていません。\
+             `?` は値の置き場所としてのみ使えます",
+            bindings.len()
+        )));
+    }
+    Ok(grammar::number_placeholders(driver, sql, 0))
 }
 
 /// テスト用の接続が入っているか。
@@ -492,24 +598,38 @@ pub(crate) enum Source {
     Tx(Arc<transaction::TxShared>),
 }
 
+/// プールへ投げるときの、SQL の組み立てに使うドライバを決める。
+///
+/// `test` にテスト用の接続のドライバが入っていれば、**そちらを最優先**します。
+/// 設定を見るのは、テスト用の接続が無いときだけです。
+fn pool_driver(test: Option<Driver>, name: Option<&str>) -> Result<Driver> {
+    if let Some(driver) = test {
+        return Ok(driver);
+    }
+    let config = database_config();
+    let name = name.unwrap_or(config.default.as_str());
+    config.get(name).map(|c| c.driver).ok_or_else(|| {
+        Error::msg(format!(
+            "`{name}` という接続は設定にありません（ある接続: {}）",
+            config.names().join(", ")
+        ))
+    })
+}
+
 impl Source {
     /// SQL の組み立てに使うドライバ。接続はしません。
+    ///
+    /// テスト用の接続が入っているときは、そちらのドライバを返します。
+    /// `backend()` は接続名を無視してテスト用の 1 本に投げるので、設定の側を見ると
+    /// SQL だけ別の書き方で組み立ててしまいます。SQLite のテストで
+    /// `DB::connection("pgsql")` と書くと、`$1` の SQL を SQLite に投げる形です。
     pub(crate) fn driver(&self) -> Result<Driver> {
+        // 投げ先（`target()`）と同じ決め方にそろえる。
+        let test = TEST_BACKEND.get().map(|found| found.driver());
         match self {
             Source::Tx(shared) => Ok(shared.driver()),
-            Source::Default | Source::Named(_) => {
-                let config = database_config();
-                let name = match self {
-                    Source::Named(name) => name.as_str(),
-                    _ => config.default.as_str(),
-                };
-                config.get(name).map(|c| c.driver).ok_or_else(|| {
-                    Error::msg(format!(
-                        "`{name}` という接続は設定にありません（ある接続: {}）",
-                        config.names().join(", ")
-                    ))
-                })
-            }
+            Source::Default => pool_driver(test, None),
+            Source::Named(name) => pool_driver(test, Some(name.as_str())),
         }
     }
 
@@ -563,13 +683,23 @@ impl DB {
     }
 
     /// SQL を直接投げて行を受け取る。
+    ///
+    /// 値の置き場所は `?` で書きます。PostgreSQL でも `?` のままでよく、
+    /// 投げる前に `$1` `$2` … へ振り直します。`?` の数と値の数が合わないときは
+    /// エラーです。
     pub async fn select(sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
-        Source::Default.fetch_all(sql, bindings).await
+        let source = Source::Default;
+        let sql = prepare_raw_sql(source.driver()?, sql, bindings)?;
+        source.fetch_all(&sql, bindings).await
     }
 
     /// SQL を直接投げる（`insert` / `update` / `delete` / DDL）。
+    ///
+    /// 値の置き場所の決まりは [`DB::select`] と同じです。
     pub async fn statement(sql: &str, bindings: &[Value]) -> Result<Affected> {
-        Source::Default.execute(sql, bindings).await
+        let source = Source::Default;
+        let sql = prepare_raw_sql(source.driver()?, sql, bindings)?;
+        source.execute(&sql, bindings).await
     }
 
     /// トランザクションを始める。
@@ -606,18 +736,18 @@ impl ConnectionRef {
         QueryBuilder::new(Source::Named(self.name.clone()), table)
     }
 
-    /// SQL を直接投げて行を受け取る。
+    /// SQL を直接投げて行を受け取る。値の置き場所の決まりは [`DB::select`] と同じです。
     pub async fn select(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
-        Source::Named(self.name.clone())
-            .fetch_all(sql, bindings)
-            .await
+        let source = Source::Named(self.name.clone());
+        let sql = prepare_raw_sql(source.driver()?, sql, bindings)?;
+        source.fetch_all(&sql, bindings).await
     }
 
-    /// SQL を直接投げる。
+    /// SQL を直接投げる。値の置き場所の決まりは [`DB::select`] と同じです。
     pub async fn statement(&self, sql: &str, bindings: &[Value]) -> Result<Affected> {
-        Source::Named(self.name.clone())
-            .execute(sql, bindings)
-            .await
+        let source = Source::Named(self.name.clone());
+        let sql = prepare_raw_sql(source.driver()?, sql, bindings)?;
+        source.execute(&sql, bindings).await
     }
 
     /// トランザクションを始める。
@@ -667,10 +797,76 @@ mod tests {
     }
 
     #[test]
-    fn 無い接続はnoneになる() {
+    fn 既定の設定はinitの雛形と同じ4本を持つ() {
+        // `config/database.rs` を置かなくても、`DB::connection("mysql")` が引けること。
         let config = DatabaseConfig::default();
-        assert!(config.get("mysql").is_none());
-        assert_eq!(config.names(), vec!["sqlite"]);
+        assert_eq!(config.names(), vec!["sqlite", "mysql", "mariadb", "pgsql"]);
+        assert_eq!(config.get("mysql").unwrap().driver, Driver::MySql);
+        assert_eq!(config.get("mariadb").unwrap().driver, Driver::MySql);
+        assert_eq!(config.get("pgsql").unwrap().driver, Driver::Postgres);
+        assert_eq!(config.get("pgsql").unwrap().port, 5432);
+        assert!(config.get("oracle").is_none());
+    }
+
+    #[test]
+    fn 接続文字列はデータベース名だけ差し替える() {
+        assert_eq!(
+            replace_url_database("mysql://u:p@dbhost:3307/app", "app_test"),
+            "mysql://u:p@dbhost:3307/app_test"
+        );
+        // クエリは残す。
+        assert_eq!(
+            replace_url_database("postgres://u:p@h/app?sslmode=require", "t"),
+            "postgres://u:p@h/t?sslmode=require"
+        );
+        // パスが無ければ足す。
+        assert_eq!(replace_url_database("postgres://h", "t"), "postgres://h/t");
+        // 接続文字列でないものは触らない。
+        assert_eq!(replace_url_database("not a url", "t"), "not a url");
+    }
+
+    #[test]
+    fn 整数に読める主キーは整数に直す() {
+        // パス引数とセッションの ID は文字列で届く。PostgreSQL は bigint = text を断る。
+        let text = |s: &str| Value::Text(s.to_string());
+        assert_eq!(normalize_key(text("12")), Value::Int(12));
+        assert_eq!(normalize_key(text(" 7 ")), Value::Int(7));
+        assert_eq!(normalize_key(text("-3")), Value::Int(-3));
+        // 読めないものと、文字列以外はそのまま。
+        assert_eq!(normalize_key(text("abc")), text("abc"));
+        assert_eq!(normalize_key(text("12abc")), text("12abc"));
+        assert_eq!(normalize_key(text("")), text(""));
+        assert_eq!(normalize_key(Value::Int(5)), Value::Int(5));
+        assert_eq!(normalize_key(Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn 生のsqlはpostgresで番号に直し数も確かめる() {
+        let bindings = [Value::Int(1), Value::Int(2)];
+        assert_eq!(
+            prepare_raw_sql(
+                Driver::Postgres,
+                "select * from t where a = ? and b = ?",
+                &bindings
+            )
+            .unwrap(),
+            "select * from t where a = $1 and b = $2"
+        );
+        assert_eq!(
+            prepare_raw_sql(Driver::Sqlite, "select ? , ?", &bindings).unwrap(),
+            "select ? , ?"
+        );
+        // 最初から `$1` と書いてあるときは、そのまま通す。
+        assert_eq!(
+            prepare_raw_sql(Driver::Postgres, "select $1, $2", &bindings).unwrap(),
+            "select $1, $2"
+        );
+        // 数が合わなければ断る。
+        let error = prepare_raw_sql(Driver::Sqlite, "select ?", &bindings)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("合っていません"), "{error}");
+        assert!(prepare_raw_sql(Driver::Postgres, "select 1", &bindings).is_err());
     }
 
     #[test]
@@ -690,12 +886,56 @@ mod tests {
             .url("sqlite::memory:")
             .is_memory());
 
+        // `mode=memory` の形もメモリ上。接続が5本に増えると、
+        // `create table` の後で `no such table` になることがある。
+        assert!(ConnectionConfig::sqlite("main", "x")
+            .url("sqlite://file:x?mode=memory&cache=shared")
+            .is_memory());
+        assert!(ConnectionConfig::sqlite("main", "x")
+            .url("sqlite://file:x?cache=shared&MODE=Memory")
+            .is_memory());
+
         // `memory` という語を含むだけのファイル名は、メモリ上ではない。
         // 取り違えると接続1本・WAL なしになってしまう。
         assert!(!ConnectionConfig::sqlite("main", "data/memory_2026.db").is_memory());
         assert!(!ConnectionConfig::sqlite("main", "x")
             .url("sqlite://data/memory_2026.db")
             .is_memory());
+        // `?` より前に書いてあるだけのものは拾わない。
+        assert!(!ConnectionConfig::sqlite("main", "x")
+            .url("sqlite://data/mode=memory.db")
+            .is_memory());
+        assert!(!ConnectionConfig::sqlite("main", "x")
+            .url("sqlite://file:x?mode=rwc")
+            .is_memory());
+    }
+
+    #[test]
+    fn テスト用の接続が入っていれば接続名より優先する() {
+        // `backend()` は接続名を無視してテスト用の1本に投げる。
+        // SQL の組み立ても同じドライバにそろえないと、`$1` の SQL を SQLite に投げる。
+        assert_eq!(
+            pool_driver(Some(Driver::Sqlite), Some("pgsql")).unwrap(),
+            Driver::Sqlite
+        );
+        assert_eq!(
+            pool_driver(Some(Driver::Sqlite), None).unwrap(),
+            Driver::Sqlite
+        );
+        // 設定に無い名前でも、テスト用の接続が入っていれば通る（投げ先も同じ1本）。
+        assert_eq!(
+            pool_driver(Some(Driver::Postgres), Some("typo")).unwrap(),
+            Driver::Postgres
+        );
+        // テスト用の接続が無いときは、これまでどおり設定を見る。
+        assert_eq!(
+            pool_driver(None, Some("pgsql")).unwrap(),
+            Driver::Postgres,
+            "設定の pgsql は PostgreSQL"
+        );
+        assert_eq!(pool_driver(None, None).unwrap(), Driver::Sqlite);
+        let error = pool_driver(None, Some("typo")).unwrap_err().to_string();
+        assert!(error.contains("設定にありません"), "{error}");
     }
 
     #[test]

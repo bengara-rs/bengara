@@ -43,9 +43,14 @@ pub struct Request {
 
 impl Request {
     /// 中身を指定して作る（テストと内部用）。
+    ///
+    /// メソッドは**受け取ったまま**持ちます。HTTP のメソッドは大文字小文字を
+    /// 区別するので、ここで大文字にそろえてはいけません。そろえていたころは
+    /// `get /x HTTP/1.1` が `GET` として照合され、ハンドラまで通っていました
+    /// （本来は 405）。いまは `get` がどのメソッドにも当たらず 405 になります。
     pub(crate) fn new(method: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
-            method: method.into().to_ascii_uppercase(),
+            method: method.into(),
             path: path.into(),
             query: String::new(),
             headers: Vec::new(),
@@ -116,7 +121,8 @@ impl Request {
     /// 登録し忘れに実行時すぐ気づけるようにするためです。
     pub fn session(&self) -> &crate::session::Session {
         self.session.as_ref().expect(
-            "セッションが用意されていません。bootstrap/app.rs の with_middleware で \n             StartSession を登録してください",
+            "セッションが用意されていません。bootstrap/app.rs の with_middleware で \
+             StartSession を登録してください",
         )
     }
 
@@ -149,8 +155,10 @@ impl Request {
                 "パス引数 `{{{param}}}` がありません。ルートの書き方を確かめてください"
             ))
         })?;
+        // パス引数は文字列で届く。整数の主キーなら整数に直して束縛する
+        // （PostgreSQL は `bigint = text` を断る。`Model::key_value` を参照）。
         T::query()
-            .where_(T::PRIMARY_KEY, value)
+            .where_(T::PRIMARY_KEY, T::key_value(value))
             .first()
             .await?
             .ok_or_else(|| Error::http(404, format!("{} が見つかりません", T::TABLE)))
@@ -165,7 +173,10 @@ impl Request {
         crate::session::csrf_token(self.session())
     }
 
-    /// HTTP メソッド（大文字）。
+    /// HTTP メソッド。
+    ///
+    /// 届いた文字列のままです。**大文字小文字は直しません**（HTTP のメソッドは
+    /// 大文字小文字を区別します）。正しいリクエストなら `GET` のように大文字です。
     pub fn method(&self) -> &str {
         &self.method
     }
@@ -243,13 +254,17 @@ impl Request {
 
     /// ページ番号（`?page=2`）。無い・読めない・0 のときは 1 になります。
     ///
+    /// 上限は `u32::MAX`（約 43 億ページ）です。それより大きい値はこの上限に丸めます。
+    /// `paginate` は `(page - 1) * per_page` を計算するので、`u64` の端の値を
+    /// そのまま通すと桁あふれになります。
+    ///
     /// ページ分けに渡します。Laravel は暗黙にこの値を見ますが、bengara では
     /// `paginate(15, req.page())` のように自分で渡します（決定記録 #039）。
     pub fn page(&self) -> u64 {
         self.query("page")
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .unwrap_or(1)
-            .max(1)
+            .clamp(1, MAX_PAGE)
     }
 
     /// つないできた相手の IP アドレス。Laravel の `$request->ip()` に当たります。
@@ -269,10 +284,29 @@ impl Request {
     ///
     /// 同じ名前が何本も来たときは、最初の1本だけを返します。
     /// 全部を見る必要がある `Cookie` は `cookies()` を使ってください。
+    ///
+    /// `X-Forwarded-For` も何本かに分かれて届くことがあります（HAProxy の
+    /// `option forwardfor` は既定で新しいヘッダー行を足します）。1本目は相手が
+    /// 付けた値かもしれないので、**そのまま信用しないでください**。
+    /// `headers()` で全部を見て、カンマでつないだ1本として扱います。
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// 同じ名前のヘッダーを**全部**返す（届いた順）。
+    ///
+    /// RFC 9110 では、同名のヘッダーが何本か届くのは、カンマでつないだ 1 本と
+    /// 同じ意味です。`X-Forwarded-For` のように**右端から辿る**値は、1 本目だけを
+    /// 見ると相手の言い値を拾ってしまいます（HAProxy の `option forwardfor` は
+    /// 既定で新しいヘッダー行を足すので、2 本に分かれて届きます）。
+    /// `Cookie` を `cookie_pairs` が全部見るのと同じ形です。
+    pub(crate) fn header_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.headers
+            .iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 
@@ -455,15 +489,22 @@ impl Request {
 
 /// セッションに残してはいけない語。
 ///
-/// 名前を `_` `-` `.` 空白と**大文字の境目**で区切り、1語ずつ突き合わせます。
+/// 名前を `_` `-` `.` `[` `]` 空白と**大文字の境目**で区切り、1語ずつ突き合わせます。
 /// 語の**末尾の数字は落として**から突き合わせるので、一覧には数字を付けずに入れます
 /// （`password1` は `password` として当たります）。
 /// `api_key` や `private_key` は `key` の語で当たるので、一覧には1語ずつ入れます。
+///
+/// **`code` を入れています。** その引き換えに、`zip_code` や `country_code` も
+/// 覚えなくなります（検査に落ちたフォームを出し直すと、郵便番号の欄が空に戻ります）。
+/// `recovery_code` や `verification_code` のような、それ自体が合い言葉になる値を
+/// 平文でセッションのファイルに残すほうが重いので、**覚えないほうが安全な側**に
+/// 倒しました（判断 120 と同じ考え方）。
 const SENSITIVE: &[&str] = &[
     "password",
     "passwd",
     "pwd",
     "pass",
+    "passphrase",
     "secret",
     "token",
     "key",
@@ -471,12 +512,24 @@ const SENSITIVE: &[&str] = &[
     "credential",
     "credentials",
     "cvv",
+    "cvc",
+    "csc",
     "card",
     "ssn",
     "otp",
+    "totp",
     "pin",
+    "code",
+    "seed",
+    "mnemonic",
+    "recovery",
+    "backup",
+    "answer",
     "signature",
 ];
+
+/// `page()` が返すページ番号の上限。
+const MAX_PAGE: u64 = u32::MAX as u64;
 
 /// 覚えておいてはいけない入力を落とす。
 ///
@@ -516,8 +569,12 @@ pub(crate) fn is_sensitive(name: &str) -> bool {
 
 /// 名前を語に区切って1語ずつ渡す。真を返した時点で止めて真を返します。
 ///
-/// 区切りは `_` `-` `.` 空白と、**小文字から大文字へ変わる所**です
+/// 区切りは `_` `-` `.` `[` `]` 空白と、**小文字から大文字へ変わる所**です
 /// （`apiKey` は `api` と `Key`）。
+///
+/// `[` `]` を区切りにしているのは、PHP 風の配列の名前のためです。`?token[]=...` は
+/// `token[]` という 1 語になり、どの語にも当たらずに素通りしていました
+/// （アクセスログにも、検査に落ちた入力のセッションにも平文で残りました）。
 ///
 /// 大文字が続くところでは切りません。1文字ずつに切ると、`PASSWORD` や `API_KEY`
 /// のような全部大文字の名前がどの語にも当たらなくなります。
@@ -528,7 +585,7 @@ fn for_each_word(name: &str, mut found: impl FnMut(&str) -> bool) -> bool {
     let mut start = 0;
     for index in 0..bytes.len() {
         let byte = bytes[index];
-        let separator = matches!(byte, b'_' | b'-' | b'.' | b' ');
+        let separator = matches!(byte, b'_' | b'-' | b'.' | b' ' | b'[' | b']');
         let upper =
             byte.is_ascii_uppercase() && index > start && bytes[index - 1].is_ascii_lowercase();
         if !separator && !upper {
@@ -587,6 +644,15 @@ mod tests {
     }
 
     #[test]
+    fn ページ番号は上限で丸める() {
+        // `u64::MAX` をそのまま返すと `paginate` の掛け算があふれる。
+        let huge = Request::new("get", "/").with_query("page=18446744073709551615");
+        assert_eq!(huge.page(), u64::from(u32::MAX));
+        let edge = Request::new("get", "/").with_query("page=4294967295");
+        assert_eq!(edge.page(), u64::from(u32::MAX));
+    }
+
+    #[test]
     fn クエリを分解できる() {
         let req = Request::new("get", "/search").with_query("q=hello+world&page=2");
         assert_eq!(req.query("q").as_deref(), Some("hello world"));
@@ -595,8 +661,11 @@ mod tests {
     }
 
     #[test]
-    fn メソッドは大文字になる() {
-        assert_eq!(Request::new("post", "/").method(), "POST");
+    fn メソッドは受け取ったまま持つ() {
+        // HTTP のメソッドは大文字小文字を区別する。大文字にそろえていたころは
+        // `get /x` が `GET` として照合され、ハンドラまで通っていた（本来は 405）。
+        assert_eq!(Request::new("POST", "/").method(), "POST");
+        assert_eq!(Request::new("post", "/").method(), "post");
     }
 
     #[test]
@@ -807,6 +876,50 @@ mod tests {
             redact(&pairs),
             vec![("title".to_string(), "のこる".to_string())]
         );
+    }
+
+    #[test]
+    fn かっこ付きの名前も伏せる() {
+        // `?token[]=abc` は `token[]` という 1 語になり、素通りしていた。
+        for name in ["token[]", "user[password]", "data[api_key]", "otp[0]"] {
+            assert!(is_sensitive(name), "{name} は残してはいけない");
+        }
+        assert_eq!(
+            {
+                let mut out = Vec::new();
+                for_each_word("token[]", |word| {
+                    out.push(word.to_string());
+                    false
+                });
+                out
+            },
+            ["token"]
+        );
+    }
+
+    #[test]
+    fn 合い言葉になる語も伏せる() {
+        for name in [
+            "cvc",
+            "csc",
+            "passphrase",
+            "totp",
+            "seed",
+            "mnemonic",
+            "recovery_code",
+            "backup_codes",
+            "security_answer",
+            "verification_code",
+        ] {
+            assert!(is_sensitive(name), "{name} は残してはいけない");
+        }
+        // `code` を足した引き換え。郵便番号や国コードも覚えなくなる。
+        assert!(is_sensitive("zip_code"), "覚えないほうが安全な側に倒した");
+        assert!(is_sensitive("country_code"));
+        // 普通の項目はこれまでどおり残る。
+        for name in ["keyword", "shipping_address", "title", "codex", "answered"] {
+            assert!(!is_sensitive(name), "{name} は残してよい");
+        }
     }
 
     #[test]

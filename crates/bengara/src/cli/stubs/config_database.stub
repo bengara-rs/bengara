@@ -26,28 +26,42 @@ pub fn config() -> DatabaseConfig {
     let port: u16 = env("DB_PORT", 0u16);
     let username: String = env("DB_USERNAME", "");
     let password: String = env("DB_PASSWORD", "");
+    // 同時に張る接続の数の上限。どの接続にも同じ値を使います。
+    let max: u32 = env("DB_MAX_CONNECTIONS", 5u32);
+    // 接続文字列。空でなければ、host / port / username / password より優先します。
+    let url: String = env("DB_URL", "");
 
-    DatabaseConfig {
-        default: env("DB_CONNECTION", "sqlite"),
-        connections: vec![
-            // ファイルは無ければ作られます。相対パスはプロジェクト直下から見ます。
-            ConnectionConfig::sqlite("sqlite", database),
-            ConnectionConfig::mysql("mysql", db_name.clone())
-                .host(host.clone())
-                .port(port)
-                .username(username.clone())
-                .password(password.clone()),
-            // MariaDB は MySQL と同じドライバです。Laravel と同じく名前を分けておきます。
-            ConnectionConfig::mysql("mariadb", db_name.clone())
-                .host(host.clone())
-                .port(port)
-                .username(username.clone())
-                .password(password.clone()),
-            ConnectionConfig::postgres("pgsql", db_name)
-                .host(host)
-                .port(port)
-                .username(username)
-                .password(password),
-        ],
+    let default: String = env("DB_CONNECTION", "sqlite");
+    let mut connections = vec![
+        // ファイルは無ければ作られます。相対パスはプロジェクト直下から見ます。
+        ConnectionConfig::sqlite("sqlite", database).max_connections(max),
+        ConnectionConfig::mysql("mysql", db_name.clone())
+            .host(host.clone())
+            .port(port)
+            .username(username.clone())
+            .password(password.clone())
+            .max_connections(max),
+        // MariaDB は MySQL と同じドライバです。Laravel と同じく名前を分けておきます。
+        ConnectionConfig::mysql("mariadb", db_name.clone())
+            .host(host.clone())
+            .port(port)
+            .username(username.clone())
+            .password(password.clone())
+            .max_connections(max),
+        ConnectionConfig::postgres("pgsql", db_name)
+            .host(host)
+            .port(port)
+            .username(username)
+            .password(password)
+            .max_connections(max),
+    ];
+
+    // `DB_URL` は **`DB_CONNECTION` で選んだ接続だけ**に付けます。
+    // 全部に付けると、`DB::connection("mysql")` が PostgreSQL の接続文字列を
+    // 持つことになります。空のままなら何も変わりません（空の接続文字列は見ません）。
+    if let Some(selected) = connections.iter_mut().find(|c| c.name == default) {
+        selected.url = url;
     }
+
+    DatabaseConfig { default, connections }
 }

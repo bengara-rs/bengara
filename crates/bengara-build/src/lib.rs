@@ -351,16 +351,25 @@ impl Generator {
     /// ```ignore
     /// static __BENGARA_PUBLIC: &[(&str, &[u8])] = &[("robots.txt", include_bytes!("..."))];
     /// ```
-    fn public_code(&self) -> String {
+    ///
+    /// ファイル名は UTF-8 を強めていますが、**親のディレクトリ**（プロジェクトの
+    /// パスそのもの）は確かめていません。壊れた文字のまま `include_bytes!` に
+    /// 入れると「ファイルが読めない」という見当違いのエラーになるので、
+    /// ここで断ります。`OsStr` のままでは生成コードに書けないためです。
+    fn public_code(&mut self) -> String {
         let mut list = String::new();
+        let mut broken = Vec::new();
         for (key, path) in &self.public {
-            let _ = write!(
-                list,
-                "({:?}, include_bytes!({:?})),",
-                key,
-                path.to_string_lossy()
-            );
+            let Some(text) = path.to_str() else {
+                broken.push(format!(
+                    "{} を埋め込めません。プロジェクトのパスに UTF-8 で表せない文字が含まれています",
+                    path.display()
+                ));
+                continue;
+            };
+            let _ = write!(list, "({key:?}, include_bytes!({text:?})),");
         }
+        self.errors.extend(broken);
         format!(
             "#[doc(hidden)]\n\
              static __BENGARA_PUBLIC: &[(&str, &[u8])] = &[{list}];\n"
@@ -393,6 +402,34 @@ impl Generator {
         let mut table: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
 
         for entry in entries {
+            if entry.is_dir {
+                // ディレクトリ名はそのまま言語の名前です。`file_stem` で取ると
+                // `ja.old/` が `ja` になり、控えの文字が `ja` として読まれます。
+                // `resources/lang/ja/` と鍵が重なると「`ja` に鍵 `x` が2回」という、
+                // 原因の分からないエラーになっていました。
+                let Some(name) = dir_name(&entry.path) else {
+                    // 言語の名前は生成コードの文字になるので、UTF-8 でないと使えません。
+                    self.errors.push(format!(
+                        "{} の名前が UTF-8 ではありません",
+                        entry.path.display()
+                    ));
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                // `ja.old/` や `ja copy/` は控えと見て読みません。
+                if !is_source_name(name) {
+                    warn(&format!(
+                        "{} は読みません。`.` や空白が入った名前は控えのディレクトリと見なします",
+                        entry.path.display()
+                    ));
+                    continue;
+                }
+                let locale = name.to_string();
+                self.read_lang_dir(&entry.path, &locale, &mut table);
+                continue;
+            }
             let Some(stem) = file_stem(&entry.path) else {
                 // 言語の名前は生成コードの文字になるので、UTF-8 でないと使えません。
                 if is_toml(&entry.path) {
@@ -406,14 +443,20 @@ impl Generator {
             if stem.starts_with('.') {
                 continue;
             }
-            let locale = stem.to_string();
-            if entry.is_dir {
-                self.read_lang_dir(&entry.path, &locale, &mut table);
-                continue;
-            }
             if !is_toml(&entry.path) {
                 continue;
             }
+            // `ja.old.toml` や `ja copy.toml` は控えと見て読みません。
+            // ディレクトリ側（`ja.old/`）と扱いをそろえます。読んでしまうと
+            // `ja.old` という言語として表に入り、`cp` と `cp -r` で結果が変わります。
+            if !is_source_name(stem) {
+                warn(&format!(
+                    "{} は読みません。`.` や空白が入った名前は控えのファイルと見なします",
+                    entry.path.display()
+                ));
+                continue;
+            }
+            let locale = stem.to_string();
             let origin = entry.path.display().to_string();
             let pairs = self.read_toml(&entry.path);
             let into = table.entry(locale).or_default();
@@ -558,6 +601,44 @@ impl Generator {
 
         for entry in entries {
             let path = entry.path;
+
+            if entry.is_dir {
+                // ディレクトリは名前を**そのまま**使います。`file_stem` で取ると
+                // いちばん後ろの `.` から後ろが落ち、`old.bak/` が `old` になります。
+                // 控えのディレクトリが本物として取り込まれ、同じ名前のファイルが
+                // 二重に入っていました（`Api.v1/` と `Api.v2/` も両方 `api`）。
+                let Some(name) = dir_name(&path) else {
+                    // 名前が UTF-8 でないと `#[path]` に書けません。中のファイルは
+                    // 1つも取り込めないので、黙って飛ばさずに知らせます。
+                    self.errors
+                        .push(format!("{} の名前が UTF-8 ではありません", path.display()));
+                    continue;
+                };
+                if skip_dir(name) {
+                    continue;
+                }
+                // `old.bak/` や `Controllers copy/` は、`cp -r` で作った控えです。
+                // ファイルと同じように外します（`is_source_name` の説明を参照）。
+                // 取り込むと、ルートを登録するコントローラが二重に入り、
+                // 起動したとたんに「同じルートが2回」で止まっていました。
+                if !is_source_name(name) {
+                    warn(&format!(
+                        "{} は取り込みません。`.` や空白が入った名前は Rust の名前にできないので、\
+                         控えのディレクトリと見なします",
+                        path.display()
+                    ));
+                    continue;
+                }
+                let name = name.to_string();
+                let Some(module) = self.module_name(&name, &path) else {
+                    // 名前にできないディレクトリは、エラーを記録して中身を見ない。
+                    continue;
+                };
+                self.check_duplicate(&mut taken, &module, &name, dir);
+                self.emit_dir(&path, module, target, depth + 1);
+                continue;
+            }
+
             let Some(stem) = file_stem(&path) else {
                 // 名前が UTF-8 でないと `#[path]` に書けません。`collect_public` と
                 // 同じ文言で知らせます。黙って飛ばすと、置いた人には
@@ -568,20 +649,6 @@ impl Generator {
                 }
                 continue;
             };
-
-            if entry.is_dir {
-                if skip_dir(stem) {
-                    continue;
-                }
-                let stem = stem.to_string();
-                let Some(module) = self.module_name(&stem, &path) else {
-                    // 名前にできないディレクトリは、エラーを記録して中身を見ない。
-                    continue;
-                };
-                self.check_duplicate(&mut taken, &module, &stem, dir);
-                self.emit_dir(&path, module, target, depth + 1);
-                continue;
-            }
 
             if !is_rust_file(&path) {
                 continue;
@@ -604,6 +671,18 @@ impl Generator {
             // （`init` が作る `.gitignore` もこの形は拾いません）。
             // 隠しファイルは `skip_file` が先に黙って外すので、ここには来ません。
             if !is_source_name(stem) {
+                // マイグレーションだけはビルドを止めます。`2026_..._v1.2.rs` を
+                // 控えとして黙って（警告だけで）一覧から落とすと、`migrate` が
+                // その表を作らないまま成功を報告します。黙って飛ばされて困る
+                // 度合いが、ほかの置き場所とは違います。
+                if in_migrations {
+                    self.errors.push(format!(
+                        "{} の名前に `.` か空白が入っています。マイグレーションは \
+                         `日付_連番_説明.rs` の形にしてください（控えなら database/migrations/ の外へ）",
+                        path.display()
+                    ));
+                    continue;
+                }
                 warn(&format!(
                     "{} は取り込みません。`.` や空白が入った名前は Rust の名前にできないので、\
                      控えのファイルと見なします",
@@ -611,6 +690,18 @@ impl Generator {
                 ));
                 continue;
             }
+            // `#[path]` に書くので、**パス全体**が UTF-8 である必要があります。
+            // ファイル名は上で確かめましたが、親のディレクトリ（プロジェクトの
+            // パスそのもの）は確かめていません。`display()` は壊れた文字を
+            // 置き換えるので、そのまま書くと「ファイルが読めない」という
+            // 見当違いのエラーになります。
+            let Some(path_text) = path.to_str() else {
+                self.errors.push(format!(
+                    "{} を取り込めません。プロジェクトのパスに UTF-8 で表せない文字が含まれています",
+                    path.display()
+                ));
+                continue;
+            };
             let Some(module) = self.module_name(stem, &path) else {
                 continue;
             };
@@ -628,8 +719,7 @@ impl Generator {
             let _ = writeln!(self.flat, "// {}", path.display());
             let _ = writeln!(
                 self.flat,
-                "{cfg}#[path = {:?}] #[doc(hidden)] #[allow(dead_code)] pub mod {flat};",
-                path.display().to_string()
+                "{cfg}#[path = {path_text:?}] #[doc(hidden)] #[allow(dead_code)] pub mod {flat};"
             );
             let _ = writeln!(self.tree, "pub use crate::{flat} as {module};");
 
@@ -641,9 +731,13 @@ impl Generator {
                 if is_ident(stem) {
                     let _ = writeln!(self.tree, "pub use crate::{flat}::{stem};");
                 } else {
+                    // ここはビルドを止めます。`.` や空白の入った名前は控えとして
+                    // 先に外れているので、ここまで来るのは `My-Model.rs` のように
+                    // 「型を書いているつもり」の名前だけです。黙って型を公開しないと、
+                    // 使う側で「型が見つからない」という遠い場所のエラーになります。
                     self.errors.push(format!(
-                        "{} の名前は Rust の型の名前に使えません。`-` や空白を使わず、\
-                         英数字と `_` だけにしてください",
+                        "{} の名前は Rust の型の名前に使えません。\
+                         `MyModel.rs` のように、英数字と `_` だけにしてください",
                         path.display()
                     ));
                 }
@@ -657,8 +751,14 @@ impl Generator {
                         path: path.clone(),
                     });
                 } else {
-                    warn(&format!(
-                        "{} は日付で始まらないので、マイグレーションの一覧に入りません",
+                    // ここもビルドを止めます。警告だけにすると、`migrate` が
+                    // その表を作らないまま成功を報告し、あとのテストが
+                    // 「テーブルが無い」という遠い場所のエラーで落ちます。
+                    // 控えのファイル（`.` や空白入り）と同じ扱いです。
+                    self.errors.push(format!(
+                        "{} は日付で始まらないので、マイグレーションの一覧に入りません。\
+                         マイグレーションのファイル名は日付から始めてください\
+                         （例: `2026_10_05_000000_create_posts_table.rs`）",
                         path.display()
                     ));
                 }
@@ -696,6 +796,18 @@ impl Generator {
                         )),
                     }
                 }
+            }
+            // `tests/` の直下に置いた `.rs` は、cargo も**独立したテスト**として
+            // 拾います（`Cargo.toml` に `autotests = false` が無いとき）。そちらの
+            // クレートには `__bengara_hooks` も `bootstrap` も無いので、
+            // `#[bengara::test]` が展開したコードが「そんな関数は無い」で落ちます。
+            // 取り込み自体はやめません（今までどおり）。置き場所だけ案内します。
+            if target.name == "tests" && depth == 0 {
+                warn(&format!(
+                    "{} は tests/Feature/ か tests/Unit/ に置いてください。\
+                     tests/ の直下に置くと、cargo が独立したテストとしても拾います",
+                    path.display()
+                ));
             }
             // routes/console.rs があれば、定期処理の登録を呼ぶ。
             if target.name == "routes" && depth == 0 && stem == "console" {
@@ -858,9 +970,18 @@ impl Generator {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    self.errors
-                        .push(format!("{} の一覧取得に失敗しました: {e}", dir.display()));
-                    return None;
+                    // 読めた分はそのまま使います。1件で `return None` にすると
+                    // そのディレクトリの**全ファイル**が落ち、原因が1件だけだと
+                    // 分からなくなります。
+                    //
+                    // 失敗した1件の名前は OS から返りません（`read_dir` の途中の
+                    // エラーには名前が付いていません）。入っているディレクトリと
+                    // OS の理由だけを知らせます。
+                    self.errors.push(format!(
+                        "{} の中の1件を読めませんでした: {e}。読めた分だけ取り込みます",
+                        dir.display()
+                    ));
+                    continue;
                 }
             };
             // 種類は `DirEntry` から取る。あとで `is_dir()` を呼び直すと、
@@ -1053,7 +1174,10 @@ fn to_module_name(stem: &str) -> Result<String, &'static str> {
             }
             'a'..='z' | '0'..='9' | '_' => out.push(c),
             '-' | ' ' | '.' => out.push('_'),
-            _ => return Err("ファイル名に使えるのは英数字・`_`・`-` だけです"),
+            _ => {
+                return Err("名前に使えるのは英数字・`_`・`-`・`.`・空白だけです\
+                     （`-`・`.`・空白は `_` になります）");
+            }
         }
     }
     if out.starts_with(|c: char| c.is_ascii_digit()) {
@@ -1070,6 +1194,15 @@ fn to_module_name(stem: &str) -> Result<String, &'static str> {
 
 fn file_stem(path: &Path) -> Option<&str> {
     path.file_stem()?.to_str()
+}
+
+/// ディレクトリの名前。`file_stem` は使えません。
+///
+/// `file_stem` はいちばん後ろの `.` から後ろを拡張子として落とすので、
+/// `old.bak/` が `old` になります。控えのディレクトリが本物と同じ名前になり、
+/// 中のファイルが取り込まれていました。
+fn dir_name(path: &Path) -> Option<&str> {
+    path.file_name()?.to_str()
 }
 
 fn is_rust_file(path: &Path) -> bool {
@@ -1098,7 +1231,10 @@ fn skip_file(stem: &str) -> bool {
     stem.starts_with('.') || stem == "mod" || stem == "main" || stem == "lib"
 }
 
-/// 取り込まないディレクトリ。
+/// 黙って取り込まないディレクトリ。
+///
+/// 控えのディレクトリ（`old.bak/`・`Controllers copy/`）は、ここではなく
+/// `is_source_name` で外します。あちらは1行知らせるためです。
 fn skip_dir(name: &str) -> bool {
     name.starts_with('.') || name == "target"
 }
@@ -1443,6 +1579,118 @@ mod tests {
         assert!(!code.contains("Copy of User.rs"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn マイグレーションの控えはビルドを止める() {
+        // ほかの置き場所では警告だけだが、マイグレーションは黙って一覧から
+        // 落ちると `migrate` がその表を作らないまま成功を報告する。
+        let root = temp_root("migration-backup");
+        touch(&root.join("database/migrations/2026_01_01_000000_a.rs"), "");
+        touch(
+            &root.join("database/migrations/2026_01_02_000000_b.v2.rs"),
+            "",
+        );
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert_eq!(generator.errors.len(), 1, "{:?}", generator.errors);
+        assert!(generator.errors[0].contains("2026_01_02_000000_b.v2.rs"));
+        assert!(generator.errors[0].contains("マイグレーション"));
+        let code = generator.finish();
+        assert!(code.contains("compile_error!"));
+        // 本物のほうは今までどおり一覧に入る。
+        assert!(code.contains("\"2026_01_01_000000_a\""));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 日付で始まらないマイグレーションはビルドを止める() {
+        // 警告だけだったころは、`migrate` が表を作らないまま成功を報告し、
+        // あとのテストが「テーブルが無い」という遠い場所のエラーで落ちていた。
+        let root = temp_root("migration-nodate");
+        touch(&root.join("database/migrations/CreateUsersTable.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert_eq!(generator.errors.len(), 1, "{:?}", generator.errors);
+        assert!(generator.errors[0].contains("CreateUsersTable.rs"));
+        // 直し方（日付から始める例）を文面に入れる。
+        assert!(generator.errors[0].contains("2026_10_05_000000_create_posts_table.rs"));
+        assert!(generator.finish().contains("compile_error!"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 控えのディレクトリは取り込まない() {
+        // `cp -r` で作った控え。`file_stem` で名前を取っていたころは `old.bak` が
+        // `old` になり、中の控えのマイグレーションが `MIGRATIONS` に入って
+        // 実際に走っていた。`Controllers copy/` は同じルートを2回登録していた。
+        let root = temp_root("backup-dir");
+        touch(&root.join("app/Http/Controllers/HomeController.rs"), "");
+        touch(
+            &root.join("app/Http/Controllers copy/HomeController.rs"),
+            "",
+        );
+        touch(&root.join("database/migrations/2026_01_01_000000_a.rs"), "");
+        touch(
+            &root.join("database/migrations/old.bak/2025_01_01_000000_z.rs"),
+            "",
+        );
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let code = generator.finish();
+        // 本物だけを取り込む。
+        assert!(code.contains("HomeController.rs"));
+        assert!(!code.contains("Controllers copy"), "{code}");
+        assert!(!code.contains("old.bak"), "{code}");
+        // 控えのマイグレーションは一覧に入らない。
+        assert!(code.contains("\"2026_01_01_000000_a\""));
+        assert!(!code.contains("2025_01_01_000000_z"), "{code}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 控えの言語ファイルは読まない() {
+        // `cp` で作った控え。`ja.old.toml` を読むと `ja.old` という言語が増え、
+        // `ja.old/`（ディレクトリ）を外しているのと扱いが食い違っていた。
+        let root = temp_root("backup-lang");
+        touch(
+            &root.join("resources/lang/ja.toml"),
+            "[messages]\nwelcome = \"ようこそ\"\n",
+        );
+        touch(
+            &root.join("resources/lang/ja.old.toml"),
+            "[messages]\nwelcome = \"古い\"\n",
+        );
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let code = generator.finish();
+        assert!(code.contains("\"ja\""), "{code}");
+        assert!(!code.contains("ja.old"), "{code}");
+        assert!(!code.contains("古い"), "{code}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ディレクトリ名は点で切らない() {
+        // `file_stem` は `old.bak` を `old` にしてしまう。
+        assert_eq!(file_stem(Path::new("a/old.bak")), Some("old"));
+        assert_eq!(dir_name(Path::new("a/old.bak")), Some("old.bak"));
+        // 名前として使うときは `old_bak` になる（控えとして外す前の形）。
+        assert_eq!(to_module_name("old.bak").unwrap(), "old_bak");
     }
 
     #[test]

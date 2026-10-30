@@ -41,7 +41,7 @@ enum State {
     Busy,
     /// `commit` か `rollback` が済んだ。
     Finished,
-    /// 問い合わせが途中で落とされた。もう使えません。
+    /// 問い合わせが失敗したか、途中で落とされた。もう使えません。
     Poisoned,
 }
 
@@ -54,7 +54,7 @@ enum State {
 struct Borrowed<'a> {
     shared: &'a TxShared,
     raw: Option<Box<dyn RawTx>>,
-    /// 問い合わせが終わりまで進んだか。Drop のときに見ます。
+    /// 問い合わせが終わりまで進んで、しかも成功したか。Drop のときに見ます。
     done: bool,
 }
 
@@ -92,7 +92,12 @@ impl Drop for Borrowed<'_> {
                     *guard = if self.done {
                         State::Ready(raw)
                     } else {
-                        // 途中で落とされた。どこまで進んだか分からないので、もう使わない。
+                        // 失敗したか、途中で落とされた。どちらも、もう使いません。
+                        //
+                        // PostgreSQL は 1 本失敗するとトランザクションのブロックごと
+                        // aborted になり、以後のコマンドを断ります。`commit` も
+                        // エラーを返さずに巻き戻すので、ここで `Ready` に戻すと
+                        // 「`commit()` が Ok なのに何も書かれていない」になります。
                         State::Poisoned
                     };
                 }
@@ -130,8 +135,8 @@ impl TxShared {
             State::Poisoned => {
                 *guard = State::Poisoned;
                 Err(Error::msg(
-                    "問い合わせが中断されたので、このトランザクションは使えません。\
-                     中身は巻き戻されます。DB::begin() からやり直してください",
+                    "直前の問い合わせが失敗したか中断されたので、このトランザクションは\
+                     使えません。中身は巻き戻されます。DB::begin() からやり直してください",
                 ))
             }
         }
@@ -145,15 +150,15 @@ impl TxShared {
     pub(crate) async fn fetch_all(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
         let mut borrowed = self.take()?;
         let result = borrowed.raw().fetch_all(sql, bindings).await;
-        // ここまで来れば中断されていない。
-        borrowed.done = true;
+        // 中断されず、しかも成功したときだけ使い続けられる。
+        borrowed.done = result.is_ok();
         result
     }
 
     pub(crate) async fn execute(&self, sql: &str, bindings: &[Value]) -> Result<Affected> {
         let mut borrowed = self.take()?;
         let result = borrowed.raw().execute(sql, bindings).await;
-        borrowed.done = true;
+        borrowed.done = result.is_ok();
         result
     }
 }
@@ -182,13 +187,31 @@ impl Transaction {
     }
 
     /// SQL を直接投げて行を受け取る。
+    ///
+    /// 値の置き場所は `?` で書きます。PostgreSQL でも `?` のままでよく、
+    /// 投げる前に `$1` `$2` … へ振り直します（[`super::DB::select`] と同じ決まり）。
     pub async fn select(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
-        self.shared.fetch_all(sql, bindings).await
+        let sql = super::prepare_raw_sql(self.shared.driver, sql, bindings)?;
+        self.shared.fetch_all(&sql, bindings).await
     }
 
-    /// SQL を直接投げる。
+    /// SQL を直接投げる。値の置き場所の決まりは [`Transaction::select`] と同じです。
     pub async fn statement(&self, sql: &str, bindings: &[Value]) -> Result<Affected> {
-        self.shared.execute(sql, bindings).await
+        let sql = super::prepare_raw_sql(self.shared.driver, sql, bindings)?;
+        self.shared.execute(&sql, bindings).await
+    }
+
+    /// 枠組みが組み立てた SQL を、生 SQL の検査を通さずに流す（マイグレーション用）。
+    ///
+    /// `?` の数と値の数を見る検査は、**文字列の中の `?` も数えます**。
+    /// `t.string("label").default("どっち?")` のような既定値を持つ DDL が、
+    /// それだけで弾かれていました。PostgreSQL では `?` が `$1` に書き換わって
+    /// 壊れた DDL になります。
+    ///
+    /// 公開 API の [`Transaction::statement`] はそのままにしてあります。
+    /// 利用者が手で書く生 SQL には検査が要るためです。
+    pub(crate) async fn statement_raw(&self, sql: &str) -> Result<Affected> {
+        self.shared.execute(sql, &[]).await
     }
 
     /// つながっているデータベースの種類。
@@ -262,6 +285,38 @@ mod tests {
             _bindings: &'a [Value],
         ) -> DbFuture<'a, Affected> {
             Box::pin(async { Ok(Affected::default()) })
+        }
+
+        fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 問い合わせが必ず失敗する中身。
+    ///
+    /// `commit` は成功を返します。PostgreSQL の `COMMIT` と同じ形です。
+    /// 1 本失敗したブロックの `COMMIT` はエラーを返さず、黙って巻き戻します。
+    struct FailingTx;
+
+    impl RawTx for FailingTx {
+        fn fetch_all<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Vec<Row>> {
+            Box::pin(async { Err(Error::msg("UNIQUE constraint failed: users.email")) })
+        }
+
+        fn execute<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> DbFuture<'a, Affected> {
+            Box::pin(async { Err(Error::msg("UNIQUE constraint failed: users.email")) })
         }
 
         fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
@@ -429,6 +484,59 @@ mod tests {
         tx.commit().await.expect("確定できる");
         let guard = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         assert!(matches!(&*guard, State::Finished), "確定のまま残る");
+    }
+
+    #[tokio::test]
+    async fn 枠組みが組み立てた_ddl_は生_sql_の検査を通さない() {
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FakeTx))),
+        };
+        let ddl = r#"alter table "t" add column "label" varchar(255) not null default 'どっち?'"#;
+        // 利用者が書く生 SQL の口は、文字列の中の `?` も値の置き場所として数える。
+        let message = match tx.statement(ddl, &[]).await {
+            Ok(_) => panic!("検査に引っかかるはず"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("合っていません"), "{message}");
+        // 枠組みの口はそのまま流す。
+        tx.statement_raw(ddl).await.expect("流せる");
+    }
+
+    #[tokio::test]
+    async fn 失敗した問い合わせの後は使えなくなる() {
+        let shared = shared(Box::new(FailingTx));
+        let first = match shared.execute("insert into users values (1)", &[]).await {
+            Ok(_) => panic!("失敗するはず"),
+            Err(error) => error.to_string(),
+        };
+        // 失敗の元のエラーはそのまま返る。
+        assert!(first.contains("UNIQUE constraint failed"), "{first}");
+        assert!(!is_ready(&shared), "失敗の後は使える状態に戻らない");
+
+        // 以後の問い合わせは断られる。
+        let next = match shared.fetch_all("select 1", &[]).await {
+            Ok(_) => panic!("断られるはず"),
+            Err(error) => error.to_string(),
+        };
+        assert!(next.contains("使えません"), "{next}");
+    }
+
+    #[tokio::test]
+    async fn 問い合わせが失敗した後の確定はエラーになる() {
+        // PostgreSQL は 1 本失敗するとブロックごと aborted になり、`COMMIT` は
+        // エラーを返さずに巻き戻す。黙って消えないように、こちらで断る。
+        let tx = Transaction {
+            shared: Arc::new(shared(Box::new(FailingTx))),
+        };
+        assert!(
+            tx.statement("insert into users values (1)", &[])
+                .await
+                .is_err(),
+            "失敗するはず"
+        );
+        let message = tx.commit().await.expect_err("確定は断られる").to_string();
+        assert!(message.contains("使えません"), "{message}");
+        assert!(message.contains("DB::begin()"), "{message}");
     }
 
     #[test]

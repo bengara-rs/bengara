@@ -97,6 +97,37 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    // `unsafe` は再出力しません。黙って落とすと `async unsafe fn` が安全な
+    // `fn` に変わり、中の `unsafe` な呼び出しが「unsafe ブロックが要る」と
+    // 言われます。どこから来たエラーなのか分かりません。
+    if let Some(unsafety) = &input.sig.unsafety {
+        return syn::Error::new_spanned(
+            unsafety,
+            "#[bengara::test] を付けた関数に `unsafe` は書けません。\
+             関数の中で `unsafe { .. }` で囲んでください",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // `const` も再出力しません（`const` と `async` は同時に書けないので、
+    // ここに来るのは書き間違いです）。
+    if let Some(constness) = &input.sig.constness {
+        return syn::Error::new_spanned(
+            constness,
+            "#[bengara::test] を付けた関数に `const` は書けません",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // `extern "C"` などの呼び出し規約も再出力しません。
+    if let Some(abi) = &input.sig.abi {
+        return syn::Error::new_spanned(
+            abi,
+            "#[bengara::test] を付けた関数に `extern \"..\"` は書けません",
+        )
+        .to_compile_error()
+        .into();
+    }
     if let Some(where_clause) = &input.sig.generics.where_clause {
         return syn::Error::new_spanned(
             where_clause,

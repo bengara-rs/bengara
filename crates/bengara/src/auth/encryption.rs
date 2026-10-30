@@ -28,10 +28,35 @@ const NONCE_BYTES: usize = 12;
 /// セッション Cookie の署名や署名付き URL と**別の鍵**にしておきます。
 const ENCRYPTION_LABEL: &str = "bengara:encryption";
 
-/// `APP_KEY` から 32 バイトの鍵を作る。
+/// `APP_KEY` から 32 バイトの鍵を作る。**導出は 1 回だけ**です。
+///
+/// 鍵は起動後に変わらないので、呼ぶたびに HMAC を計算し直す必要はありません。
+/// 導出に失敗したとき（`APP_KEY` が無い・短い）は覚えず、次も同じエラーを返します。
+#[cfg(not(test))]
 fn cipher() -> Result<ChaCha20Poly1305> {
-    let derived = crate::config_registry::app_config().derived_key(ENCRYPTION_LABEL)?;
-    Ok(cipher_from_derived(&derived))
+    static DERIVED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    if let Some(derived) = DERIVED.get() {
+        return Ok(cipher_from_derived(derived));
+    }
+    let derived = derive_key()?;
+    let derived = DERIVED.get_or_init(|| derived);
+    Ok(cipher_from_derived(derived))
+}
+
+/// `APP_KEY` から 32 バイトの鍵を作る。**テストでは覚えません。**
+///
+/// テストの二進は 1 プロセスです。鍵を覚えてしまうと、最初に暗号化を通った
+/// テストのときの設定（まだ登録していなければ既定値）から導いた鍵が残り、
+/// あとから別の `APP_KEY` を入れた設定を登録しても効きません。
+/// テストが実行順で揺れるので、テストのときだけ毎回導出します。
+#[cfg(test)]
+fn cipher() -> Result<ChaCha20Poly1305> {
+    Ok(cipher_from_derived(&derive_key()?))
+}
+
+/// いまの設定の `APP_KEY` から、暗号化用の鍵を導く。
+fn derive_key() -> Result<Vec<u8>> {
+    crate::config_registry::app_config().derived_key(ENCRYPTION_LABEL)
 }
 
 /// 用途ごとに導出した 32 バイトの鍵から作る。

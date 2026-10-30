@@ -113,11 +113,17 @@ impl Hash {
     /// **非同期の処理の中では [`make_async`](Hash::make_async) を使ってください。**
     /// ここでは 0.2 秒ほどスレッドを塞ぎます。
     ///
-    /// 長さの上限はありません（`String` を返すので、断る手段がありません）。
-    /// ただし [`check`](Hash::check) は 1024 バイトを超える入力を断るので、
-    /// **登録のときに `max:1024` を付けて検査してください。**
-    /// 付け忘れると、その人は二度とログインできません。
-    /// 1024 バイトを超える平文を渡したときは警告をログに出します。
+    /// # 登録の検査に `max:1024` を必ず付けてください
+    ///
+    /// `make` は長さを断れません（`String` を返すので、エラーを返す手段がありません）。
+    /// 一方 [`check`](Hash::check) は **1024 バイトを超える平文を計算せずに偽とします。**
+    /// つまり **1024 バイトを超える値で作ったハッシュは、`check` が必ず偽を返します。**
+    /// その利用者は登録はできるのに、二度とログインできません。
+    ///
+    /// 付け忘れを防ぐために、パスワードを受け取る検査には**例外なく**
+    /// `max:1024` を書いてください（`"required|min:8|max:1024|confirmed"` の形）。
+    /// 上限を超える平文を渡したときは `error` でログに出しますが、
+    /// 処理は止まりません。ログを見ていなければ気付けません。
     pub fn make(password: &str) -> String {
         Self::make_with(password, iterations())
     }
@@ -127,6 +133,10 @@ impl Hash {
     /// ```ignore
     /// let password = Hash::make_async(&input).await?;
     /// ```
+    ///
+    /// **`Err` になるのは裏のスレッドが落ちたときだけです。** 長さは断りません。
+    /// [`make`](Hash::make) と同じで、**登録の検査に `max:1024` が必ず要ります。**
+    /// 超えた値で作ったハッシュは [`check`](Hash::check) が必ず偽を返します。
     pub async fn make_async(password: &str) -> Result<String> {
         let password = password.to_string();
         crate::support::blocking(move || Self::make(&password))
@@ -135,11 +145,16 @@ impl Hash {
     }
 
     /// 回数を指定して変える。
+    ///
+    /// [`make`](Hash::make) と同じで、長さは断りません。
+    /// **1024 バイトを超える値で作ったハッシュは [`check`](Hash::check) が必ず偽を返します。**
+    /// 登録の検査に `max:1024` を必ず付けてください。
     pub fn make_with(password: &str, iterations: u32) -> String {
         // 上限を超える平文は、作れても二度と照合できない（`check` が断る）。
-        // 戻り値の型を変えられないので、せめて作ったところで警告を出す。
+        // 戻り値の型を変えられないので、せめて作ったところで知らせる。
+        // 「その人は二度とログインできない」ので `warn` ではなく `error`。
         if password.len() > MAX_PASSWORD_BYTES {
-            tracing::warn!(
+            tracing::error!(
                 "パスワードが長すぎます（{} バイト、上限は {MAX_PASSWORD_BYTES} バイト）。\
                  この値は `check` が常に偽を返すので、ログインできません。\
                  登録の検査に `max:{MAX_PASSWORD_BYTES}` を足してください",

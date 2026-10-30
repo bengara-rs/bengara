@@ -86,7 +86,7 @@ where
 
 /// 鍵をファイル名に使える形にする。
 ///
-/// **小文字の**英数字と `. _ - :` だけはそのまま使います。それ以外が混じっていたら、
+/// **小文字の**英数字と `. _ -` だけはそのまま使います。それ以外が混じっていたら、
 /// 鍵全体を SHA-256 にします（日本語の鍵でも動くように）。
 ///
 /// 大文字をそのまま使わないのは、NTFS / APFS が大文字小文字を区別しないためです。
@@ -98,8 +98,14 @@ where
 /// ハッシュ側には `~` を付けます。接頭辞が無いと、64 文字の小文字 16 進は
 /// そのまま素通しするので、**別の鍵の SHA-256 を計算してその 16 進を鍵として
 /// 渡せば、狙って同じファイルを指せました**（衝突を探す必要もありません）。
-/// `~` は素通し側では `:` の置換先としてしか出ないので、`:` で始まる鍵も
-/// ハッシュ側に回して、`~` で始まる名前はハッシュだけにしています。
+///
+/// **`:` を含む鍵もハッシュ側に回します。** 以前は `:` をファイル名に使えないので
+/// `~` に置き換えていました。ところが `~` は NTFS が長い名前に付ける短い名前
+/// （`<先頭6文字>~<数字>`）の目印そのものです。実機（Windows 10 / NTFS）では
+/// 鍵 `posts.count.by.author` のファイルに短い名前 `POSTSC~1.AUT` が付き、
+/// 鍵 `postsc:1.aut`（置換後 `postsc~1.aut`）から**読み・上書き・削除**ができました。
+/// 素通し側に `~` を出さなければ、この道はふさがります
+/// （`user:1` のファイル名が読めなくなるのは、大文字と同じ引き換えです）。
 ///
 /// **末尾が `.` の鍵と装置の名前（`nul` など）もハッシュ側に回します。**
 /// Windows は末尾の `.` を黙って落とすので、`post.` と `post` が同じファイルに
@@ -109,16 +115,18 @@ where
 pub(crate) fn normalize_key(key: &str) -> String {
     let safe = !key.is_empty()
         && key.len() <= 150
-        // `:` 始まりは `~` 始まりになるので、ハッシュとぶつからないよう避ける。
-        && !key.starts_with(':')
+        // `:` を含む鍵はハッシュ側に回す。置換先の `~` が NTFS の短い名前と
+        // 区別できないため（上の説明）。
+        && !key.contains(':')
         // 末尾が `.` の名前と装置の名前を断る（`.` と `..` もここで外れる）。
+        // `~1` のような短い名前の形もここで外れる。
         && crate::storage::usable_name(key).is_ok()
         && key.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b':')
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
         });
     if safe {
-        // `:` は Windows のファイル名に使えないので、置き場所側で避ける。
-        key.replace(':', "~")
+        // 通した文字に `~` は入っていないので、そのまま使える。
+        key.to_string()
     } else {
         format!("~{}", crypto::to_hex(&crypto::sha256(key.as_bytes())))
     }
@@ -152,7 +160,9 @@ impl Cache {
 
     /// あるか。
     ///
-    /// 値そのものは返しません（置き場所が対応していれば、中身を読まずに答えます）。
+    /// 値そのものは返しません。`file` は**ファイルの中身を読みません**
+    /// （期限が入っている先頭だけを読みます）。`memory` は既定の実装のまま
+    /// メモリの値を見ますが、ディスクには触りません。
     pub async fn has(key: &str) -> Result<bool> {
         let key = normalize_key(key);
         with_store(move |store| store.has(&key)).await
@@ -220,8 +230,12 @@ impl Cache {
     }
 
     /// 数を引く。
+    ///
+    /// `by` が `i64::MIN` のときは `-by` が `i64` に収まらないので、`i64::MAX` に
+    /// 丸めます（`-by` と書くとここでパニックしていました）。
+    /// 足し算も下限で止まるので、引きすぎても `i64::MIN` より下には行きません。
     pub async fn decrement(key: &str, by: i64) -> Result<i64> {
-        Self::increment(key, -by).await
+        Self::increment(key, by.saturating_neg()).await
     }
 
     /// `serde` の型を入れる。
@@ -270,8 +284,42 @@ mod tests {
     fn 鍵はそのまま使える形に直す() {
         assert_eq!(normalize_key("posts.count"), "posts.count");
         assert_eq!(normalize_key("a_b-c.d"), "a_b-c.d");
-        // `:` はファイル名に使えないので置き換える。
-        assert_eq!(normalize_key("user:1"), "user~1");
+        // `:` はファイル名に使えないので、鍵ごとハッシュ側に回す。
+        assert_eq!(normalize_key("user:1").len(), 65);
+    }
+
+    #[test]
+    fn 素通しした鍵に短い名前の印は出ない() {
+        // `~` は NTFS が長い名前に付ける短い名前（`<先頭6文字>~<数字>`）の印。
+        // 素通し側に出すと、別の鍵が同じファイルを指せる。
+        for key in [
+            "posts.count.by.author",
+            "user:1",
+            "a:b:c",
+            "post.1",
+            "a_b-c.d",
+            "日本語の鍵",
+            "User:1",
+            ":1",
+            "~1",
+        ] {
+            let normalized = normalize_key(key);
+            let body = normalized.strip_prefix('~').unwrap_or(&normalized);
+            assert!(!body.contains('~'), "{key} -> {normalized}");
+        }
+    }
+
+    #[test]
+    fn 短い名前に化ける鍵は別の置き場所になる() {
+        // 実機（Windows 10 / NTFS）で、`posts.count.by.author` のファイルには
+        // 短い名前 `POSTSC~1.AUT` が付いた。`:` を `~` に置き換えていたころは、
+        // 鍵 `postsc:1.aut` から同じファイルを読み・上書き・削除できた。
+        let long = normalize_key("posts.count.by.author");
+        let short = normalize_key("postsc:1.aut");
+        assert_eq!(long, "posts.count.by.author", "素通しのまま");
+        assert_eq!(short.len(), 65, "ハッシュ側に回る");
+        assert!(!short.contains("postsc"), "短い名前に化けられない");
+        assert_ne!(long, short);
     }
 
     #[test]
@@ -308,10 +356,39 @@ mod tests {
         let upper = normalize_key("User:1");
         let lower = normalize_key("user:1");
         assert_eq!(upper.len(), 65, "ハッシュにする");
-        assert_eq!(lower, "user~1", "小文字はそのまま");
+        // `:` が入るので、小文字のほうもハッシュ側に回る。
+        assert_eq!(lower.len(), 65);
         assert_ne!(upper, lower);
         // 大文字小文字を無視してもぶつからない。
         assert_ne!(upper.to_ascii_lowercase(), lower.to_ascii_lowercase());
+
+        // `:` が入らない鍵で、大文字だけの違いを押さえる。
+        assert_eq!(normalize_key("user.1"), "user.1", "小文字はそのまま");
+        assert_eq!(normalize_key("User.1").len(), 65, "ハッシュにする");
+    }
+
+    #[test]
+    fn 短い名前に化ける鍵でも両方が生き残る() {
+        let dir = std::env::temp_dir().join(format!("bengara-shortname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = FileCache::new(&dir);
+
+        // 実機では `posts.count.by.author` に短い名前 `POSTSC~1.AUT` が付いた。
+        let long = normalize_key("posts.count.by.author");
+        let short = normalize_key("postsc:1.aut");
+        store.put(&long, "長い名前の値", Some(60)).unwrap();
+        store.put(&short, "別の鍵の値", Some(60)).unwrap();
+
+        // 前は短い名前ごしに同じファイルを読み・上書きしていた。
+        assert_eq!(store.get(&long).unwrap().as_deref(), Some("長い名前の値"));
+        assert_eq!(store.get(&short).unwrap().as_deref(), Some("別の鍵の値"));
+
+        // 片方を消しても、もう片方は残る。
+        store.forget(&short).unwrap();
+        assert_eq!(store.get(&long).unwrap().as_deref(), Some("長い名前の値"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -361,6 +438,16 @@ mod tests {
         ] {
             assert!(!normalize_key(key).contains('+'), "{key}");
         }
+    }
+
+    #[test]
+    fn 引く数の符号を反転してもあふれない() {
+        // `Cache::decrement` は `-by` を `increment` に渡します。
+        // `i64::MIN` のときに `-by` と書くとパニックしていました。
+        assert_eq!(i64::MIN.saturating_neg(), i64::MAX);
+        assert_eq!(5_i64.saturating_neg(), -5);
+        // 足す側も飽和するので、引きすぎても下限で止まります。
+        assert_eq!(i64::MIN.saturating_add(i64::MIN), i64::MIN);
     }
 
     #[test]

@@ -1,7 +1,6 @@
 # モデル
 
-表の行を Rust の構造体として読み書きします。
-Laravel の Eloquent に当たるものです。
+表の行を Rust の構造体として読み書きします。Laravel の Eloquent に当たるものです。
 
 ## 書く
 
@@ -31,9 +30,8 @@ pub struct Post {
 | `#[model(column = "名前")]` | フィールド | フィールド名と同じ               |
 | `#[model(skip)]`            | フィールド | 表に無い項目として扱う           |
 
-主キーを `#[model(primary)]` で指していないときは、**列名**が `id` の項目を主キーにします。
-フィールド名ではなく列名で見ます。
-そのため `#[model(column = "id")]` を付けたフィールドも主キーになります。
+主キーは `#[model(primary)]` で指します。指さないときは、**列名**が `id` の項目です
+（フィールド名ではなく列名で見ます）。
 
 フィールドに使える型は次です。どれも `Option` にできます。
 
@@ -43,26 +41,20 @@ pub struct Post {
 | 小数   | `f32` `f64`                                                           |
 | その他 | `bool` `String` `Vec<u8>`                                             |
 
-**null を許す列は `Option<...>` にしてください。** そうしないと読み出しでエラーになります。
-ふだん使うのは `i64` と `String` です。
+- **null を許す列は `Option<...>` にしてください。** そうしないと読み出しでエラーです。
+  ふだん使うのは `i64` と `String` です。
+- 幅の狭い型に収まらない値は、読み出しでエラーになります。
+- **`i64` を超える整数は `t.string(..)` の列に入れてください。** `u64` と `usize` で
+  `i64` に収まらない値は文字列として書き込むので、整数の列では桁が落ちます。
 
-表の名前を推測しないのは、英語の複数形が一定でないためです
-（`person` → `people`、`category` → `categories`）。1 行書くほうが確実です。
+列名の一覧は `Model::COLUMNS` に入ります。枠組みは読まないので、
+自分のコードで列名が欲しいときに使ってください。
 
 ### 主キーは自動採番の整数だけ
 
-**`#[derive(Model)]` は、自動採番の整数の主キー専用です。**
-`insert` のあとにデータベースが決めた番号を書き戻す作りなので、
-自分で決める主キー（文字列・UUID）は送れません。
-
-主キーに書けるのは **整数の型**だけです。
-`i8` / `i16` / `i32` / `i64` / `isize` / `u8` / `u16` / `u32` / `u64` / `usize` の 10 個です。
-それ以外の型は、分かりやすい **コンパイルエラー**になります。
-
-実際に使うのは **`i64`** です。
-
-- 行から読める整数の型も、上の 10 個と同じです。
-- 幅の狭い型に **収まらない値は読み出しでエラー**になります。
+**`#[derive(Model)]` は、自動採番の整数の主キー専用です。** 主キーに書けるのは
+整数の型（上の表の 10 個）だけで、実際に使うのは `i64` です。
+それ以外の型はコンパイルエラーになります。
 
 文字列の主キーを使いたいときは、下の「文字列の主キー」を見てください。
 
@@ -93,14 +85,13 @@ let total = Post::count().await?;             // i64
 
 let posts = Post::query()
     .where_("status", "published")
-    .where_op("views", ">", 100)
     .latest()
     .limit(10)
     .get()
     .await?;
 ```
 
-`find_or_fail` は見つからないとき `404` のエラーを返します。
+`find_or_fail` は見つからないとき 404 のエラーを返します。
 ハンドラから `?` で返すと、そのまま 404 の応答になります。
 
 ```rust
@@ -113,14 +104,15 @@ pub async fn show(req: Request) -> Result<Response> {
 
 ### 条件の書き方はクエリビルダと同じ
 
-`Post::query()` が返すのは `ModelQuery<Post>` です。
-条件の足し方は[クエリビルダ](database.md)と同じで、終端だけが型付きです。
+`Post::query()` が返す `ModelQuery<Post>` は、条件の足し方が
+[クエリビルダ](database.md)と同じです。終端だけが型付きです。
 
 | 終端                                  | 返るもの               |
 |---------------------------------------|------------------------|
 | `get()`                               | `Vec<Post>`            |
 | `first()`                             | `Option<Post>`         |
 | `first_or_fail()`                     | `Post`（無ければ 404） |
+| `find(id)`                            | `Option<Post>`         |
 | `count()`                             | `i64`                  |
 | `exists()` / `doesnt_exist()`         | `bool`                 |
 | `sum::<T>(col)` / `avg::<T>(col)`     | `Option<T>`            |
@@ -129,30 +121,15 @@ pub async fn show(req: Request) -> Result<Response> {
 | `update(&[...])` / `delete()`         | `u64`（件数）          |
 | `paginate(per_page, page)`            | `Paginator<Post>`      |
 
-モデルの型を保ったまま、次のものも使えます。
-
-`select` / `add_select` / `distinct` / `or_where_in` / `where_not_between` /
-`or_where_group` / `group_by` / `having_op` / `having_raw` / `order_by_raw` /
-`doesnt_exist` / `sum` / `avg` / `min` / `max`
-
-できないことの決まりは[クエリビルダ](database.md)と同じです。
-
-- `update` と `delete` に `join` / `limit` / `offset` / `group_by` / `having` / `distinct` を
-  付けるとエラーになります。`order_by` は黙って無視されます。
-- 列名と表名に渡せるのは英数字と `_` `.` だけです。式は書けません。
-- `sum` / `avg` / `min` / `max` は `group_by` と組み合わせられません。
-- `distinct()` を付けて `count()` / `paginate()` するときは、`select` で列を 1 つ指定します。
-- `having_op` に渡せるのは実在の列だけです。集計の結果で絞るときは `having_raw` です。
+`select` / `add_select` / `distinct` / `group_by` / `having_op` / `having_raw` /
+`order_by_raw` なども、モデルの型を保ったまま使えます。
+できないことの決まりも[クエリビルダ](database.md)と同じです
+（`update` に `limit` を付けられない、列名に式を書けない、など）。
 
 ### クエリビルダに降りる
 
-モデルの形に収まらないものが欲しいときは `query_builder()` を呼びます。
-降りるとモデルの型は外れます。
-
-| したいこと                  | 理由                                              |
-|-----------------------------|---------------------------------------------------|
-| 生の `Row` が欲しい         | `get()` が `Vec<Post>` ではなく `Vec<Row>` を返す |
-| `join` / `left_join` を使う | モデル側には置いていない                          |
+生の `Row` が欲しいときと、`join` / `left_join` を使いたいときは `query_builder()` を
+呼びます。降りるとモデルの型は外れます。
 
 ```rust
 let rows = Post::query()
@@ -167,69 +144,82 @@ let rows = Post::query()
 ## 保存する
 
 ```rust
-// 新しい行
-let mut post = Post {
-    id: 0,                       // 0 なら「まだ保存していない」
-    title: "やきそば".to_string(),
-    body: None,
-    status: "draft".to_string(),
-    views: 0,
-    created_at: String::new(),
-    updated_at: String::new(),
-};
-post.save().await?;              // insert され、post.id に ID が入る
+let mut post = Post::draft("やきそば");   // 主キーが 0 なら「まだ保存していない」
+post.save().await?;                       // insert され、post.id に ID が入る
 
-// 更新
 post.title = "焼きそば".to_string();
-post.save().await?;              // update になる
+post.save().await?;                       // update になる
 
-// 読み直す
-let fresh = post.fresh().await?; // Option<Post>
-
-// 消す
-post.delete().await?;            // 返るのは件数
+let fresh = post.fresh().await?;          // Option<Post>（読み直す）
+post.delete().await?;                     // 返るのは件数
 ```
 
-`save()` は主キーを見て `insert` と `update` を選びます。
-主キーが `0` なら新しい行です。
+`save()` は主キーを見て `insert` と `update` を選びます。主キーが `0` なら新しい行です。
+
+### 更新のときは全列を書き戻します
+
+**`save()` は、構造体が持っている値を全部書きます**（`created_at` だけは外します）。
+変えたのが 1 つの項目だけでも同じです。
+**読んでから保存するまでの間に他の人が動かした列は、巻き戻ります。**
+
+```rust
+// 駄目な書き方。題名だけ変えたいのに、読んだときの views も一緒に書き戻る。
+let mut post = Post::find_or_fail(id).await?;
+post.title = "新しい題名".to_string();
+post.save().await?;
+```
+
+変えたい列が決まっているなら、**クエリビルダの `update` を使ってください。**
+`updated_at` は入らないので、自分で入れます。
+
+```rust
+// 良い書き方。触る列は title と updated_at だけ。
+DB::table("posts")
+    .where_("id", id)
+    .update(&[("title", "新しい題名".into()), ("updated_at", now().into())])
+    .await?;
+```
+
+`increment` で増える列（閲覧数など）がある表では、必ずこの形にします。
+
+### 主キーに文字列を渡したとき
+
+パス引数やセッションの ID は文字列で届きます。`Post::find("12")`・
+`req.model::<Post>("post")`・`req.auth().user::<User>()` は、**整数に読める文字列を
+整数に直してから**主キーと比べます（PostgreSQL は `bigint = text` を断るためです）。
+
+`Model` を自分で実装して文字列の主キーを使うときは、`const INTEGER_KEY: bool = false;` を
+書いてください。`"007"` のような値が文字列のまま比べられます。
 
 ### `save()` がエラーになるとき
 
-書き込みが静かに失われないように、次の 2 つはエラーにします。
+書き込みが静かに失われないように、次の 3 つはエラーにします。
 
-| とき                                   | 返るもの | 直し方                                   |
-|----------------------------------------|----------|------------------------------------------|
-| 更新した行が **0 件**だった             | エラー   | 行が消えていないか、主キーの値を確かめる |
-| 採番された主キーを構造体に入れられない | エラー   | 主キーの型を `i64` などにする            |
+| とき                                   | 直し方                                   |
+|----------------------------------------|------------------------------------------|
+| 更新した行が **0 件**だった             | 行が消えていないか、主キーの値を確かめる |
+| 採番された主キーを構造体に入れられない | 主キーの型を `i64` などにする            |
+| 採番された値が**返らなかった**          | 主キーが自動採番の列か確かめる           |
 
-2 つ目は、主キーの型が狭くて採番された番号が入らないときに起きます
-（`u8` の主キーに `256` が返ったときなど）。
-`insert` は済んでいるので、行は 1 つ入っています。
-主キーだけが空のままなので、**そのまま `save()` を呼び直すと 2 行目が入ります。**
-エラーにして、そこで気づけるようにしてあります。
+後ろの 2 つは「行は入ったのに主キーが空のまま」です。そのまま `save()` を呼び直すと
+2 行目が入るので、そこで気づけるようにしてあります。
+自分で主キーを決める表では、値を入れてから `save()` を呼んでください。
 
-### 採番された番号はドライバで取り方が違います
-
-主キーの**列の名前**を見るのは PostgreSQL だけです。
-
-| ドライバ   | 返るもの                    |
-|------------|-----------------------------|
-| PostgreSQL | `returning 主キーの列` の値 |
-| SQLite     | 直前に入れた行の rowid      |
-| MySQL      | `auto_increment` の列の値   |
-
-`#[derive(Model)]` の主キーは自動採番の列なので、**どのドライバでも正しい値が返ります。**
-自動採番でない列を主キーにしたときだけ、SQLite と MySQL で別の値が返ります
-（[database.md](database.md) の「自動採番の番号」）。
+採番された番号の取り方はドライバで違いますが、**自動採番の列なら、どのドライバでも
+正しい値が返ります**（[database.md](database.md) の「自動採番の番号」）。
 
 ### `created_at` と `updated_at`
 
-`created_at` / `updated_at` という `String` のフィールドがあると、`save()` が入れます。
+`created_at` / `updated_at` という**列名**のフィールドがあると、`save()` が入れます。
+入れる値は `now()` が返す文字列です。`String` から `Into` で変えられる型なら動きます。
 
-| とき     | `created_at` | `updated_at` |
-|----------|--------------|--------------|
-| 新しい行 | 入る         | 入る         |
-| 更新     | そのまま     | 入る         |
+| とき     | `created_at`     | `updated_at` |
+|----------|------------------|--------------|
+| 新しい行 | 入る             | 入る         |
+| 更新     | **書き戻さない** | 入る         |
+
+更新で `created_at` を外すのは、読み直さずに作った構造体（`created_at` が空）を
+保存しても表の値を壊さないためです。変えたいときは `DB::table(..).update(..)` を使います。
 
 > **クエリビルダ（`DB::table(...)`）で直接入れたときは、時刻は入りません。**
 > `timestamps()` の列は null を許すので、そのままモデルで読むと
@@ -294,29 +284,21 @@ impl Comment {
 }
 ```
 
-読むときは `await` が付きます。**問い合わせが走る場所が目に見えます。**
+読むときは `await` が付きます。絞り込みも足せます。
 
 ```rust
 let comments = post.comments().get().await?;
 let owner = comment.post().first().await?;
-```
-
-絞り込みも足せます。
-
-```rust
 let recent = post.comments().where_op("created_at", ">", "2026-01-01").get().await?;
 ```
 
-### 触っただけでは読みません
-
-Laravel の `$post->comments` は、触った瞬間に裏で問い合わせが走ります。
-bengara ではこれをやりません。
-**N+1**（一覧を 1 回引いたあと、行ごとに追加の問い合わせが走る状態）を
-起こしにくくするためです。
+**触っただけでは読みません。** Laravel の `$post->comments` のような遅延読み込みは
+ありません。問い合わせが走るのは `await` を書いた所だけです。
 
 ### まとめて読む
 
 Laravel の `with('comments')` に当たるものは、`where_in` で引いて束ねます。
+問い合わせは記事の数に関係なく **2 回**です。
 
 ```rust
 let posts = Post::published().limit(10).get().await?;
@@ -331,36 +313,16 @@ for post in &posts {
 }
 ```
 
-問い合わせは **2 回**です。記事の数に関係なく 2 回のままです。
-
 ## ページ分け
 
 ```rust
-pub async fn index(req: Request) -> Result<Response> {
-    let page = Post::published().paginate(15, req.page()).await?;
-
-    json(&bengara::serde_json::json!({
-        "total": page.total,
-        "last_page": page.last_page(),
-        "has_more": page.has_more_pages(),
-    }))
-}
+let page = Post::published().paginate(15, req.page()).await?;
+json(&bengara::serde_json::json!({ "total": page.total, "last_page": page.last_page() }))
 ```
 
 ## トランザクションの中で使う
 
 **トランザクションの中では `_using` の付いたメソッドを使います。**
-
-```rust
-let tx = DB::begin().await?;
-
-let posts = Post::on(&tx).where_("status", "draft").get().await?;
-
-let mut post = Post::draft("やきそば");
-post.save_using(&tx).await?;
-
-tx.commit().await?;
-```
 
 | 既定の接続を使う | トランザクションの中で流す |
 |------------------|----------------------------|
@@ -369,30 +331,51 @@ tx.commit().await?;
 | `post.fresh()`   | `post.fresh_using(&tx)`    |
 | `Post::query()`  | `Post::on(&tx)`            |
 
-`save()` / `delete()` / `fresh()` は **既定の接続**を使います。
-トランザクションの中で呼ぶと、次の 2 つが起きます。
+```rust
+let tx = DB::begin().await?;
 
-- 書き込みがトランザクションの外に出ます。`rollback()` しても残ります。
-- `:memory:` のデータベースは接続が 1 本なので、空くのを待って固まります。
+let posts = Post::on(&tx).where_("status", "draft").get().await?;
+let mut post = Post::draft("やきそば");
+post.save_using(&tx).await?;
 
-`fresh_using(&tx)` は、同じトランザクションの中から読み直します。
-`save_using(&tx)` で保存した内容は、`commit()` するまで外からは見えません。
+tx.commit().await?;
+```
 
-終わった（または落ちた）トランザクションに `_using` で渡すと、エラーになります。
-詳しくは [database.md](database.md) の「使えなくなるとき」にあります。
+`save()` / `delete()` / `fresh()` は**既定の接続**を使うので、トランザクションの中で
+呼ぶと書き込みが外に出ます（`rollback()` しても残ります）。`:memory:` では接続が 1 本
+なので、空くのを待って固まります。
+
+`fresh_using(&tx)` は同じトランザクションの中から読み直します。終わった（または落ちた）
+トランザクションに `_using` で渡すとエラーです
+（[database.md](database.md) の「使えなくなるとき」）。
 
 ## 文字列の主キー
 
-`#[derive(Model)]` は **自動採番の整数**の主キー専用です。
-UUID のように自分で決める主キーのときは、次のどちらかにします。
-
-- クエリビルダ（`DB::table(...)`）で入れる。
-- `bengara::database::Model` を自分で実装する。
+`#[derive(Model)]` は**自動採番の整数**の主キー専用です。UUID のように自分で決める
+主キーのときは、クエリビルダで入れるか、`bengara::database::Model` を自分で実装します。
 
 ```rust
 DB::table("sessions")
     .insert(&[("id", key.into()), ("payload", body.into())])
     .await?;
+```
+
+## ソフトデリート
+
+`t.soft_deletes()` で `deleted_at` 列は作れます（[migrations.md](migrations.md)）。
+**ただしモデル側の仕組みはありません。** `post.delete()` は `delete from` を流し、
+`Post::all()` は消した印の付いた行も返します。絞り込みは自分で書いてください。
+
+```rust
+impl Post {
+    /// 消していないものだけ。
+    pub fn alive() -> ModelQuery<Post> {
+        Post::query().where_null("deleted_at")
+    }
+}
+
+// 消す代わりに印を付ける。
+DB::table("posts").where_("id", id).update(&[("deleted_at", now().into())]).await?;
 ```
 
 ## シーダーとファクトリ
@@ -414,11 +397,8 @@ pub async fn run() -> Result<()> {
 - ファイル名は大文字始まりです。`pub async fn run() -> Result<()>` を定義します。
 - `cargo artisan db:seed` で `DatabaseSeeder` が動きます。
   `--class=PostSeeder` で 1 本だけ指定できます。
-- ほかのシーダーを呼ぶときは、**ただの関数呼び出し**です。
-
-```rust
-crate::database::seeders::post_seeder::run().await?;
-```
+- ほかのシーダーを呼ぶときは、ただの関数呼び出しです
+  （`crate::database::seeders::post_seeder::run().await?`）。
 
 テスト用のデータを作る関数（Laravel のファクトリ）は `database/factories/` に置きます。
 **専用の仕組みはありません。** ただの関数です。
@@ -432,15 +412,13 @@ pub fn make(i: i64) -> Post {
 }
 ```
 
-```rust
-let post = crate::database::factories::post_factory::make(1);
-```
-
 ## テスト
 
 DB を使うテストの書き方は [testing.md](testing.md) にあります。
 
 ## 関連
+
+まだ無いものは [backlog.md](backlog.md) にまとめてあります。
 
 - [database.md](database.md) — 接続とクエリビルダ
 - [migrations.md](migrations.md) — 表を作る

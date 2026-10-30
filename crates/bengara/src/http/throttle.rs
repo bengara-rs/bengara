@@ -45,6 +45,12 @@ const TRUSTED_PROXIES: &str = "TRUSTED_PROXIES";
 /// （実際の上限は指定の2倍になります）。厳密に守りたいときは、
 /// 前段のプロキシか、共通の置き場所（Redis など）が要ります。
 /// いまは外部の置き場所を持っていないので、この形にしてあります。
+///
+/// **数え方は 1 つの `Mutex` で守ります。** そのため、回数の制限が掛かるルートへの
+/// リクエストは**全部がこの 1 つの錠で直列化します**（鍵が違っても同じです）。
+/// 数えるのは `HashMap` の読み書きだけなので短い時間ですが、`throttle` を
+/// 全ルートに掛けると、そこが詰まる場所になります。
+/// 鍵ごとに分ける作りには、いまはしていません。
 pub struct Throttle {
     max: u32,
     window: Duration,
@@ -336,15 +342,26 @@ fn target_of(req: &Request) -> &str {
 ///
 /// 1つも採れなければ `X-Real-IP` を見て、それも読めなければ `None`
 /// （呼ぶ側が接続元のアドレスに落とします）。
+///
+/// **同じ名前のヘッダーが何本来ても、つないだ 1 本として扱います。**
+/// 1 本目だけを見ていたころは、HAProxy の `option forwardfor`（既定で新しい
+/// ヘッダー行を足す）の下で、相手が付けた 1 本目＝言い値を鍵にしていました。
+/// 値を毎回変えるだけで、回数の制限を無制限に回せました。
 fn forwarded_ip(req: &Request, trusted: &Trusted) -> Option<IpAddr> {
     let parse = |part: &str| part.trim().parse::<IpAddr>().ok();
-    if let Some(raw) = req.header("x-forwarded-for") {
+    // 届いた順に並べる。RFC 9110 では、これがカンマでつないだ 1 本と同じ意味です。
+    let forwarded: Vec<&str> = req
+        .header_all("x-forwarded-for")
+        .flat_map(|value| value.split(','))
+        .collect();
+    if !forwarded.is_empty() {
         let found = match trusted {
             Trusted::None => None,
-            Trusted::All => raw.split(',').filter_map(parse).next(),
-            Trusted::List(_) => raw
-                .split(',')
+            Trusted::All => forwarded.iter().copied().filter_map(parse).next(),
+            Trusted::List(_) => forwarded
+                .iter()
                 .rev()
+                .copied()
                 .filter_map(parse)
                 .find(|ip| !trusted.allows(ip)),
         };
@@ -352,7 +369,23 @@ fn forwarded_ip(req: &Request, trusted: &Trusted) -> Option<IpAddr> {
             return found;
         }
     }
-    req.header("x-real-ip").and_then(parse)
+    real_ip(req)
+}
+
+/// `X-Real-IP` から採る。
+///
+/// **2 本以上届いたときは使いません。** このヘッダーは前段が「置き換える」ものです
+/// （nginx の `proxy_set_header` は、すでに来ている同名のヘッダーを消します）。
+/// 2 本あるのは前段がそろえていない証拠で、どちらが前段の値かを決める手がかりが
+/// ありません。`X-Forwarded-For` のように右端から辿ることもできないので、
+/// 言い値を拾う危険を避けて `None`（＝接続元のアドレス）に落とします。
+fn real_ip(req: &Request) -> Option<IpAddr> {
+    let mut values = req.header_all("x-real-ip");
+    let only = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    only.trim().parse::<IpAddr>().ok()
 }
 
 impl Middleware for Throttle {
@@ -557,6 +590,38 @@ mod tests {
 
         // どちらも無ければ接続元のアドレス。
         let req = from("10.0.0.1");
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("10.0.0.1|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn 転送元のヘッダーが2本に分かれても右端から採る() {
+        // HAProxy の `option forwardfor` は、既定で**新しいヘッダー行**を足す。
+        // 1 本目だけを見ていたころは、相手が付けた言い値（203.0.113.250）が鍵になり、
+        // 値を毎回変えるだけで回数の制限を無制限に回せた。
+        let trusted = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
+        let req = from("10.0.0.1").with_headers(vec![
+            ("x-forwarded-for".into(), "203.0.113.250".into()),
+            ("X-Forwarded-For".into(), "203.0.113.9, 10.0.0.1".into()),
+        ]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("203.0.113.9|/login".to_string()),
+            "つないだ 1 本として、右端から辿る"
+        );
+    }
+
+    #[test]
+    fn x_real_ipが2本来たら信用しない() {
+        // 前段が「置き換える」ヘッダーなので、2 本あるのはそろっていない証拠。
+        // どちらが前段の値かを決められないので、接続元のアドレスに落とす。
+        let trusted = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
+        let req = from("10.0.0.1").with_headers(vec![
+            ("x-real-ip".into(), "203.0.113.250".into()),
+            ("x-real-ip".into(), "203.0.113.9".into()),
+        ]);
         assert_eq!(
             key_for_with(&req, &trusted),
             Some("10.0.0.1|/login".to_string())

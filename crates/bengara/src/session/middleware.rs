@@ -1,6 +1,6 @@
 //! セッションを読み書きするミドルウェアと、CSRF の確認。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Session, SessionStore};
@@ -257,39 +257,55 @@ impl Middleware for StartSession {
             // `regenerate()` が `dirty` を立てるので、保存の判定には足しません。
             let id_changed = id_before != id_after;
             let saved = session.should_save();
-            let after = after_request(saved, loaded);
+            let mut after = after_request(saved, loaded);
 
             if after == AfterRequest::Save {
                 let data = session.snapshot_for_save();
-                if id_changed {
-                    // 古いほうは残さない。
-                    // 消せなくても応答は返す（新しいほうは正しく保存できている）。
-                    // 古い ID の Cookie はもう誰も持っていないので、致命的ではない。
-                    let store = store.clone();
-                    let old = id_before.clone();
-                    match tokio::task::spawn_blocking(move || store.destroy(&old)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            tracing::error!("作り直す前のセッションを消せませんでした: {e}")
-                        }
-                        Err(_) => tracing::error!("作り直す前のセッションの削除が中断されました"),
-                    }
-                }
-                if session.was_flushed() && data.is_empty() {
-                    // ログアウトの経路。**消せなければ 500 にする。**
-                    // 握り潰すと 200 を返しながら中身が残り、盗まれた Cookie が
-                    // 期限まで使えてしまいます。
-                    let store = store.clone();
-                    let id = id_after.clone();
-                    tokio::task::spawn_blocking(move || store.destroy(&id))
-                        .await
-                        .map_err(|_| Error::msg("セッションの削除が中断されました"))??;
+
+                // 4.0. 処理中に、この利用者のセッションが別の所から切られていないか。
+                //
+                // `logout_other_devices` / `logout_user` はファイルを消すだけです。
+                // その瞬間に処理中だったこのリクエストが保存すると、消したはずの
+                // セッションが同じ ID で復活します。置き場所が持つ「切った」印が
+                // **このセッションがログインした時刻**より新しければ、保存せずに
+                // **消す側**に倒します。比べるのはログインの時刻（ミリ秒）です。
+                // 読み込んだ時刻で比べると、切った直後に別人として同じ利用者 ID で
+                // ログインし直したセッションまで同じ秒の中で巻き込みます。
+                //
+                // **ID を作り直したかどうかは見ません。** `regenerate()` は ID だけを
+                // 変えて `AUTH_AT_KEY` を引き継ぐので、「ログインし直し」の代わりに
+                // なりません。見ないでおくと、切っている最中に `regenerate()` を
+                // 通ったリクエストが、切ったはずのセッションを新しい ID で
+                // 生き残らせます。本物のログインし直し（`Auth::login_using_id`）は
+                // `AUTH_AT_KEY` を更新するので、`at > logged_in_at` の比較が守ります。
+                let revoke_check = if loaded {
+                    session.get(crate::auth::AUTH_ID_KEY).map(|user| {
+                        // 印より前にログインしたものだけが対象。時刻が無い古い
+                        // セッションは 0 として、印があれば切る側に倒す。
+                        let logged_in_at = session
+                            .get(crate::auth::AUTH_AT_KEY)
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        (user, logged_in_at)
+                    })
                 } else {
-                    let store = store.clone();
-                    let id = id_after.clone();
-                    tokio::task::spawn_blocking(move || store.write(&id, &data))
-                        .await
-                        .map_err(|_| Error::msg("セッションの保存が中断されました"))??;
+                    None
+                };
+                let flushed = session.was_flushed() && data.is_empty();
+                // 作り直す前の ID。切られたときも、保存したときも残しません。
+                let old = id_changed.then(|| id_before.clone());
+
+                let store = store.clone();
+                let id = id_after.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    save_session(&*store, &id, &data, revoke_check, flushed, old.as_deref())
+                })
+                .await
+                .map_err(|_| Error::msg("セッションの保存が中断されました"))??;
+
+                if outcome == SaveOutcome::Revoked {
+                    tracing::info!("切られたセッションなので保存しません");
+                    after = AfterRequest::Nothing;
                 }
             }
 
@@ -325,7 +341,7 @@ impl Middleware for StartSession {
             if after != AfterRequest::Nothing {
                 let cookie = Cookie::new(&config.cookie, sign(&id_after, key))
                     .with_path(&config.path)
-                    .with_max_age(config.lifetime_secs as i64)
+                    .with_max_age(i64::try_from(config.lifetime_secs).unwrap_or(i64::MAX))
                     .with_secure(config.secure)
                     .with_http_only(true)
                     .with_same_site(config.same_site);
@@ -334,6 +350,76 @@ impl Middleware for StartSession {
             Ok(response)
         })
     }
+}
+
+/// 保存の経路で何をしたか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveOutcome {
+    /// 保存した（ログアウトの経路では消した）。
+    Done,
+    /// 処理中に切られていたので、保存せずに消した。
+    Revoked,
+}
+
+/// 「切られていないか確認 → 保存または削除」をひとまとめに行う。
+///
+/// **確認と保存を別の `spawn_blocking` に分けません。** 分けると、
+/// スレッドプールを往復するあいだに `logout_user` が走り、消したはずの
+/// セッションが復活します。1 つにまとめれば、窓は同じスレッドの中の
+/// 2 操作ぶんに縮み、往復も 1 回減ります。
+///
+/// `revoke_check` は `(利用者 ID, ログインした時刻のミリ秒)` です。
+/// 置き場所から読めていない（このリクエストで作った）セッションでは `None` にします。
+///
+/// `old` は ID を作り直したときの**作り直す前の** ID です。切られたときも
+/// 保存したときも残しません。残すと、切ったはずのセッションが古い ID で
+/// 生き残ります。「切った印」の判定にも使います（下のコメントを参照）。
+fn save_session(
+    store: &dyn SessionStore,
+    id: &str,
+    data: &BTreeMap<String, String>,
+    revoke_check: Option<(String, i64)>,
+    flushed: bool,
+    old: Option<&str>,
+) -> Result<SaveOutcome> {
+    if let Some(old) = old {
+        // 消せなくても応答は返す（新しいほうは正しく保存できている）。
+        // 古い ID の Cookie はもう誰も持っていないので、致命的ではない。
+        if let Err(e) = store.destroy(old) {
+            tracing::error!("作り直す前のセッションを消せませんでした: {e}");
+        }
+    }
+    if let Some((user, logged_in_at)) = revoke_check {
+        // 印が効いているかを、**作り直す前と後の両方の ID** で見ます。
+        //
+        // `logout_other_devices()` は「いま操作している ID」を印の除外に書きます。
+        // そのあと同じリクエストで `regenerate()` を呼ぶと、新しい ID は除外に
+        // 当たらないので印が効いてしまい、**残すはずの自分のセッションが消えます**
+        // （呼んだ本人がログアウトされる）。作り直す前の ID は除外に当たって
+        // `None` が返るので、**両方が切られているときだけ**消す形にすれば、
+        // この取り違えが起きません。
+        //
+        // 別の所からの `logout_user`（除外なし）では両方に印が効くので、
+        // 塞ぎたかった取りこぼし（処理中のリクエストが復活させる）はそのままです。
+        let revoked = |target: &str| {
+            store
+                .revoked_at(&user, target)
+                .is_some_and(|at| at > logged_in_at)
+        };
+        if revoked(id) && old.is_none_or(revoked) {
+            store.destroy(id)?;
+            return Ok(SaveOutcome::Revoked);
+        }
+    }
+    if flushed {
+        // ログアウトの経路。**消せなければ 500 にする。**
+        // 握り潰すと 200 を返しながら中身が残り、盗まれた Cookie が
+        // 期限まで使えてしまいます。
+        store.destroy(id)?;
+    } else {
+        store.write(id, data)?;
+    }
+    Ok(SaveOutcome::Done)
 }
 
 /// セッション ID ごとの錠を覚えておく地図。
@@ -359,16 +445,25 @@ struct IdLock {
 impl IdLock {
     /// その ID の錠を取る。すでに誰かが持っていれば、放されるまで待ちます。
     async fn acquire(id: &str) -> Self {
-        let lock = {
+        let lock_arc = {
             let mut map = id_locks().lock().unwrap_or_else(|e| e.into_inner());
             map.entry(id.to_string()).or_default().clone()
         };
         // 地図の錠はここで放してある。`await` を越えて持たない。
-        let guard = lock.lock_owned().await;
-        Self {
+        //
+        // **`await` より前に `IdLock` を作ります。** 地図に組を入れてから
+        // `await` すると、待っているあいだに外側の future が落とされたときに
+        // `IdLock` がまだ無く、`Drop` も走りません。組（64 文字の文字列と `Arc`）が
+        // プロセス全体の地図に残り続けます。先に作っておけば、落とされても
+        // `Drop` が片付けます。
+        let mut lock = Self {
             id: id.to_string(),
-            guard: Some(guard),
-        }
+            guard: None,
+        };
+        // `lock_owned` は `Arc` を**受け取ります**。複製を渡さないことが、
+        // `Drop` の「地図のぶんだけなら待っている人はいない」の根拠です。
+        lock.guard = Some(lock_arc.lock_owned().await);
+        lock
     }
 }
 
@@ -638,14 +733,18 @@ pub(crate) fn ensure_token(session: &Session) -> String {
 
 /// リクエストからトークンを探す。
 ///
-/// 探す順は、フォームの `_token` → `X-CSRF-TOKEN` ヘッダーです。
+/// 探す順は、`X-CSRF-TOKEN` ヘッダー → フォームの `_token` です。
+///
+/// `_token` を先に見ると、ヘッダーで送ってくる SPA の JSON 本文（最大 2 MiB）を
+/// トークンを探すためだけに毎回解析することになります。ハンドラの `req.json()` と
+/// 二重になるので、ヘッダーが無いときだけ本文を見ます。
 fn token_from_request(req: &Request) -> String {
-    if let Some(token) = req.input("_token") {
+    if let Some(token) = req.header("x-csrf-token") {
         if !token.is_empty() {
-            return token;
+            return token.to_string();
         }
     }
-    req.header("x-csrf-token").unwrap_or("").to_string()
+    req.input("_token").unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -699,6 +798,30 @@ mod tests {
         let second = ensure_token(&session);
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn トークンはヘッダーを先に見る() {
+        // ヘッダーがあれば本文は見ない（JSON を解析しない）。
+        let req = Request::new("post", "/")
+            .with_headers(vec![
+                ("x-csrf-token".into(), "from-header".into()),
+                ("content-type".into(), "application/json".into()),
+            ])
+            .with_body(b"{\"_token\":\"from-body\"}".to_vec());
+        assert_eq!(token_from_request(&req), "from-header");
+
+        // ヘッダーが無ければ本文の `_token`。
+        let req = Request::new("post", "/")
+            .with_headers(vec![(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )])
+            .with_body(b"_token=from-form".to_vec());
+        assert_eq!(token_from_request(&req), "from-form");
+
+        // どちらも無ければ空。
+        assert_eq!(token_from_request(&Request::new("post", "/")), "");
     }
 
     #[test]
@@ -932,6 +1055,157 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains_key(&id),
             "片付ける"
+        );
+    }
+
+    /// 認証 ID とログイン時刻を入れた中身を作る。
+    fn logged_in(at: i64) -> BTreeMap<String, String> {
+        let mut data = BTreeMap::new();
+        data.insert(crate::auth::AUTH_ID_KEY.to_string(), "7".to_string());
+        data.insert(crate::auth::AUTH_AT_KEY.to_string(), at.to_string());
+        data
+    }
+
+    #[test]
+    fn 切られていなければ保存する() {
+        let store = crate::session::MemoryStore::new(60);
+        let data = logged_in(1_000);
+
+        let outcome =
+            save_session(&store, "aaa", &data, Some(("7".into(), 1_000)), false, None).unwrap();
+        assert_eq!(outcome, SaveOutcome::Done);
+        assert!(store.read("aaa").unwrap().is_some());
+    }
+
+    #[test]
+    fn 切られていれば保存せずに消す() {
+        let store = crate::session::MemoryStore::new(60);
+        let data = logged_in(1_000);
+        store.write("aaa", &data).unwrap();
+        // ログインより後に切られた印。
+        store.mark_revoked("7", None);
+
+        let outcome =
+            save_session(&store, "aaa", &data, Some(("7".into(), 1_000)), false, None).unwrap();
+        assert_eq!(outcome, SaveOutcome::Revoked);
+        assert!(store.read("aaa").unwrap().is_none(), "復活させない");
+    }
+
+    #[test]
+    fn idを作り直しても切られたら生き残らない() {
+        // `regenerate()` は ID だけを変えて `AUTH_AT_KEY` を引き継ぐので、
+        // 「ID が変わった＝ログインし直し」ではない。「ID が変わったら見ない」に
+        // していたころは、切っている最中に `regenerate()` を通ったリクエストが
+        // 切ったはずのセッションを新しい ID で生き残らせた。
+        let store = crate::session::MemoryStore::new(60);
+        let data = logged_in(1_000);
+        store.write("old", &data).unwrap();
+        store.mark_revoked("7", None);
+
+        let outcome = save_session(
+            &store,
+            "new",
+            &data,
+            Some(("7".into(), 1_000)),
+            false,
+            Some("old"),
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::Revoked);
+        assert!(store.read("new").unwrap().is_none(), "新しい ID で残らない");
+        assert!(store.read("old").unwrap().is_none(), "古い ID も残らない");
+    }
+
+    #[test]
+    fn 他の端末を切った後にidを作り直しても自分は残る() {
+        // `logout_other_devices()` は「いま操作している ID」を印の除外に書く。
+        // そのあと同じリクエストで `regenerate()` を呼ぶと、新しい ID は除外に
+        // 当たらない。新しい ID だけを見ていたころは、呼んだ本人のセッションが
+        // 消えていた（＝自分がログアウトされる）。
+        let store = crate::session::MemoryStore::new(60);
+        let data = logged_in(1_000);
+        store.write("old", &data).unwrap();
+        // 除外は「作り直す前の ID」。
+        store.mark_revoked("7", Some("old"));
+
+        let outcome = save_session(
+            &store,
+            "new",
+            &data,
+            Some(("7".into(), 1_000)),
+            false,
+            Some("old"),
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::Done, "自分のセッションは残す");
+        assert!(store.read("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn 切った後にログインし直したセッションは残る() {
+        // 本物のログインし直し（`Auth::login_using_id`）は `AUTH_AT_KEY` を
+        // 更新する。印より後にログインしたものは巻き込まない。
+        let store = crate::session::MemoryStore::new(60);
+        store.mark_revoked("7", None);
+        let later = crate::support::time::now_millis() + 1_000;
+        let data = logged_in(later);
+
+        let outcome =
+            save_session(&store, "new", &data, Some(("7".into(), later)), false, None).unwrap();
+        assert_eq!(outcome, SaveOutcome::Done);
+        assert!(store.read("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn ログアウトの経路は書かずに消す() {
+        let store = crate::session::MemoryStore::new(60);
+        store.write("aaa", &logged_in(1_000)).unwrap();
+
+        let outcome = save_session(&store, "aaa", &BTreeMap::new(), None, true, None).unwrap();
+        assert_eq!(outcome, SaveOutcome::Done);
+        assert!(store.read("aaa").unwrap().is_none());
+    }
+
+    #[test]
+    fn 作り直す前のidは保存のときも消す() {
+        let store = crate::session::MemoryStore::new(60);
+        let data = logged_in(1_000);
+        store.write("old", &data).unwrap();
+
+        let outcome = save_session(&store, "new", &data, None, false, Some("old")).unwrap();
+        assert_eq!(outcome, SaveOutcome::Done);
+        assert!(store.read("new").unwrap().is_some());
+        assert!(store.read("old").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn 待っているあいだに落とされても地図に組が残らない() {
+        // 地図に組を入れてから `await` していたころは、待っているあいだに
+        // 外側の future が落とされると `IdLock` がまだ無く、`Drop` も走らない。
+        // 組（64 文字の文字列と `Arc`）がプロセス全体の地図に残り続けた。
+        let id = format!("test-{}", crypto::random_token());
+
+        let held = IdLock::acquire(&id).await;
+        let waiting = {
+            let id = id.clone();
+            tokio::spawn(async move { IdLock::acquire(&id).await })
+        };
+        // 待っている側が錠を待つところまで進める。
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "まだ待っている");
+
+        // 錠を放してから、待っている側を**動かさずに**落とす。
+        // ここに `await` が無いので、1 スレッドの runtime では進めない。
+        drop(held);
+        waiting.abort();
+        let _ = waiting.await;
+
+        assert!(
+            !id_locks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&id),
+            "落とされた側の組も片付く"
         );
     }
 

@@ -72,9 +72,10 @@ const NEEDS_LOCK: &[&str] = &[
 
 /// 中身が消えるコマンド。本番では `--force` が無いと止めます。
 ///
-/// `migrate:reset` と `migrate:refresh` も入れます。`down` を流すので、
-/// 名前に「消す」と書いていなくても中身は消えます。
+/// `migrate:rollback` と `migrate:reset` と `migrate:refresh` も入れます。
+/// `down` を流すので、名前に「消す」と書いていなくても中身は消えます。
 const DESTRUCTIVE: &[&str] = &[
+    "migrate:rollback",
     "migrate:reset",
     "migrate:refresh",
     "migrate:fresh",
@@ -322,8 +323,10 @@ mod tests {
 
     #[test]
     fn 中身が消えるコマンドは本番の保護を通る() {
-        // `migrate:reset` と `migrate:refresh` は down を流すので中身が消える。
+        // `migrate:rollback` と `migrate:reset` と `migrate:refresh` は
+        // down を流すので中身が消える。
         for command in [
+            "migrate:rollback",
             "migrate:reset",
             "migrate:refresh",
             "migrate:fresh",
@@ -332,9 +335,8 @@ mod tests {
             assert!(DESTRUCTIVE.contains(&command), "{command} が一覧に無い");
             assert!(is_command(command), "{command} が一覧に無い");
         }
-        // 足すだけのものは入れない。
+        // 足すだけのもの、読むだけのものは入れない。
         assert!(!DESTRUCTIVE.contains(&"migrate"));
-        assert!(!DESTRUCTIVE.contains(&"migrate:rollback"));
         assert!(!DESTRUCTIVE.contains(&"migrate:status"));
     }
 

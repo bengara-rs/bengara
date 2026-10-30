@@ -129,6 +129,13 @@ pub(crate) fn strip_export(line: &str) -> &str {
 ///
 /// 読めなかった行は飛ばしますが、黙って捨てずに警告を返します。起動時に1回しか
 /// 通らないので、行番号を数える費用は気にしません。
+///
+/// # `#` を含む値は必ず引用符で囲んでください
+///
+/// 引用符で囲んでいない値は、**最初の `#` より前までが値になります。**
+/// `DB_PASSWORD=p#ss` は `p` になり、警告も出ません。
+/// `#` を値に入れたいときは囲みます（`DB_PASSWORD="p#ss"`）。
+/// 囲んだ値の中の `#` は、そのまま値に残ります。
 fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
     let mut out = Vec::new();
     let mut warnings = Vec::new();

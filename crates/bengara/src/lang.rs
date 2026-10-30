@@ -20,6 +20,11 @@ static TABLE: OnceLock<LangTable> = OnceLock::new();
 
 /// 起動時に1回だけ呼ぶ。`bengara::app!()` から渡されます。
 ///
+/// **2 回目以降は何もしません。** 最初に渡された表のままです。
+/// キャッシュやメールの `install_*` と違って警告は出しません。ここは
+/// `app!()` が呼ぶだけで、利用者が差し替える入口ではないためです
+/// （`tracing::debug!` に 1 行だけ残します）。
+///
 /// **鍵は昇順（`str` の辞書順）に並んでいる前提**です（`Lang::lookup` が
 /// 二分探索します）。並べるのは `bengara-build` の役目なので、ここでは
 /// デバッグビルドのときだけ確かめます。
@@ -30,7 +35,9 @@ pub(crate) fn install(table: LangTable) {
             .all(|(_, entries)| entries.windows(2).all(|pair| pair[0].0 < pair[1].0)),
         "言語の表は鍵の昇順に並んでいる必要があります（bengara-build が並べます）"
     );
-    let _ = TABLE.set(table);
+    if TABLE.set(table).is_err() {
+        tracing::debug!("言語の表は既に決まっています。この install は効きません");
+    }
 }
 
 fn table() -> LangTable {

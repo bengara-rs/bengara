@@ -110,6 +110,32 @@ impl CargoToml {
             })
     }
 
+    /// `[[bin]]` の中に `name = "..."` の行があるか。
+    ///
+    /// `default-run` を書く前に確かめます。実在しない bin を指す `default-run` を
+    /// 書くと、`cargo build` が `default-run target ... not found` で落ちます。
+    ///
+    /// 見るのは見出しが `[[bin]]` の節だけです。`[package]` の `name` と
+    /// 取り違えないためです。空白と引用符の書き方の違いは `has_path` と同じく無視します。
+    pub(crate) fn has_bin_name(&self, name: &str) -> bool {
+        let kinds = self.classify();
+        let mut in_bin = false;
+        for (line, kind) in self.lines.iter().zip(&kinds) {
+            match kind {
+                LineKind::Header(header) => in_bin = header.as_str() == "[[bin]]",
+                LineKind::Plain
+                    if in_bin
+                        && key_of(line).is_some_and(|k| k == "name")
+                        && value_of(line).as_deref() == Some(name) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// 節の最後に行を足す。節が無ければ作る。
     pub(crate) fn add_line(&mut self, section: &str, line: &str) {
         match self.section_range(section) {
@@ -234,12 +260,26 @@ enum LineKind {
 }
 
 /// 行全体が `[...]` の形なら、その文字（行末のコメントを落としたもの）を返す。
+///
+/// かっこの内側の空白は落とします。TOML では `[ package ]` も `[package]` と
+/// 同じ節です。そのまま比べていたころは `[ package ]` を節と認識できず、
+/// `init` が `[package]` をもう 1 つ足して cargo が壊れました。
 fn header_text(line: &str) -> Option<String> {
     let trimmed = strip_comment(line).trim();
     if trimmed.len() >= 2 && trimmed.starts_with('[') && trimmed.ends_with(']') {
-        return Some(trimmed.to_string());
+        return Some(normalize_header(trimmed));
     }
     None
+}
+
+/// `[ a . b ]` → `[a.b]`、`[[ bin ]]` → `[[bin]]`。かっこの数は保ちます。
+fn normalize_header(header: &str) -> String {
+    let opens = header.bytes().take_while(|b| *b == b'[').count();
+    let closes = header.bytes().rev().take_while(|b| *b == b']').count();
+    let depth = opens.min(closes).max(1);
+    let inner = &header[depth..header.len() - depth];
+    let inner: String = inner.split_whitespace().collect();
+    format!("{}{inner}{}", "[".repeat(depth), "]".repeat(depth))
 }
 
 /// 上から1行ずつ読むときの状態。
@@ -403,6 +443,45 @@ mod tests {
     fn パッケージ名を読める() {
         let d = doc("[package]\nname = \"myapp\"\nversion = \"0.1.0\"\n");
         assert_eq!(d.package_name().as_deref(), Some("myapp"));
+    }
+
+    #[test]
+    fn 見出しの中の空白は無視する() {
+        // TOML では `[ package ]` も `[package]` と同じ節。そのまま比べていた
+        // ころは節と認識できず、`init` が `[package]` をもう 1 つ足していた。
+        let mut d = doc("[ package ]\nname = \"myapp\"\n\n[ dependencies ]\nbengara = \"0.1\"\n");
+        assert_eq!(d.package_name().as_deref(), Some("myapp"));
+        assert!(d.has_key("package", "name"));
+        assert!(d.has_key("dependencies", "bengara"));
+        d.add_line("package", "default-run = \"myapp\"");
+        assert_eq!(
+            d.lines.join("\n"),
+            "[ package ]\nname = \"myapp\"\ndefault-run = \"myapp\"\n\n[ dependencies ]\nbengara = \"0.1\""
+        );
+
+        assert_eq!(normalize_header("[ package ]"), "[package]");
+        assert_eq!(normalize_header("[[ bin ]]"), "[[bin]]");
+        assert_eq!(normalize_header("[ a . b ]"), "[a.b]");
+        assert_eq!(normalize_header("[package]"), "[package]");
+        // `[[bin]]` の繰り返しも見出しとして数える。
+        let d = doc("[[ bin ]]\npath = \"main.rs\"\n");
+        assert!(d.has_path("main.rs"));
+    }
+
+    #[test]
+    fn binの名前を調べられる() {
+        // `[package]` の name と取り違えない。`default-run` を書く前にこれで見る。
+        let d = doc(
+            "[package]\nname = \"myapp\"\n\n[[bin]]\nname = 'server'\npath = \"main.rs\"\n\n\
+             [[ bin ]]\nname=\"artisan\"\npath = \"artisan.rs\"\n",
+        );
+        assert!(d.has_bin_name("server"));
+        assert!(d.has_bin_name("artisan"));
+        // [package] の name は bin ではない。
+        assert!(!d.has_bin_name("myapp"));
+        // bin が1つも無いときは偽。
+        let d = doc("[package]\nname = \"myapp\"\n");
+        assert!(!d.has_bin_name("myapp"));
     }
 
     #[test]

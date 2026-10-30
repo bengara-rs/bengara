@@ -57,25 +57,51 @@ cargo artisan migrate --seed   # 流してからシーダーも動かす
 | `migrate:fresh`    | **表を全部消して**から流し直す                     |
 | `db:seed`          | シーダーだけ動かす                                 |
 | `db:wipe`          | 表を全部消す                                       |
+| `migrate:unlock`   | 途中で落ちて残った札（実行中の目印）を外す         |
 
 - どれにも `--database=接続の名前` を付けられます。既定は `DB_CONNECTION` です。
+- `--step=` は `migrate:rollback` だけで見ます。既定は 1 です。
+  **`--step=0` は 1 バッチ分と同じです**（0 バッチを戻す書き方はありません）。
 - 流した記録は `migrations` 表に残ります（名前とバッチ番号）。
   同じものが 2 回流れることはありません。
-- **1 本ごとにトランザクションで実行します。**
-  途中で失敗したら、その 1 本を巻き戻して止まります。
+- **1 本ごとにトランザクションで実行します。** 途中で失敗したら、その 1 本を巻き戻して
+  止まります。**MySQL は例外です。** 表を作る・変える文がトランザクションを勝手に確定
+  するので、そこまでの文は残ります。失敗した文を直して流し直してください。
+- `migrate:rollback` は、戻すバッチの全部のファイルがいまのバイナリに入っていることを
+  先に確かめます。1 本でも無ければ、**何も戻さずに**止まります。
+- 組み立てに誤りがあるマイグレーションは、**SQL を 1 本も流さずに**止まります
+  （下の「できないこと・警告が出ること」）。
+
+### 同時に流さない仕組み（札）
+
+表を変えるコマンドは、**実行の前に `migration_locks` 表に「札」を 1 枚取ります。**
+同じものが二重に走るのを防ぐためです。
+
+- 札を取るのは `migrate` / `migrate:rollback` / `migrate:reset` / `migrate:refresh` /
+  `migrate:fresh` / `db:seed` / `db:wipe` です。`migrate:status` と `migrate:unlock` は
+  取りません。
+- すでに誰かが持っていると、**何もせずにエラー**になります。
+- 札は終わったら返します。失敗したときも返します。
+
+プロセスが強制終了されると札が残ります。`cargo artisan migrate:unlock` で外します。
+持ち主（プロセス番号とホスト名）と時刻を表示するので、本当に動いていないかを
+先に確かめられます。
+
+```
+別のプロセスがマイグレーションを実行中です（myhost:1234 が 2026-10-30 10:00:00 に開始）。
+終わってからもう一度実行してください。
+途中で落ちて札が残っているときは、`migrate:unlock` で消せます。
+```
+
+`migrate:fresh` と `db:wipe` も、**`migration_locks` 表だけは消しません。**
 
 ### 本番で止まるコマンド
 
-次の 4 つは、`APP_ENV=production` のとき `--force` が無いと止まります。
+次の 5 つは、`APP_ENV=production` のとき `--force` が無いと止まります。
+`rollback` / `reset` / `refresh` は `down` が流れるので、名前に「消す」と無くても
+中身が消えます。
 
-| コマンド           | 消えるもの                             |
-|--------------------|----------------------------------------|
-| `migrate:reset`    | `down` が流れるので中身が消えます      |
-| `migrate:refresh`  | 同じく `down` が流れます               |
-| `migrate:fresh`    | 表ごと消えます                         |
-| `db:wipe`          | 表ごと消えます                         |
-
-`migrate:reset` と `migrate:refresh` は、名前に「消す」と無くても中身が消えます。
+`migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
 ### 状態を見る
 
@@ -139,7 +165,7 @@ t.uuid("key").primary();
 | `unique()`           | 重なりを禁じる                  |
 | `index()`            | 索引を付ける                    |
 | `primary()`          | 主キーにする                    |
-| `comment("説明")`    | 説明（**どのドライバでも無視します**） |
+| `comment("説明")`    | 説明（**どのドライバでも何もしません**） |
 
 **`t.id()` と `t.increments(..)` には、これらの指定が効きません。**
 自動採番の主キーは型名ひとつで全部を書くので、置く場所がありません。
@@ -177,26 +203,24 @@ schema.create("comments", |t| {
 `cascade` / `set null` / `set default` / `restrict` / `no action`
 
 大文字小文字と語の間の空白は、そろえてから見ます。
-外れた値は SQL には出ますが、**警告が出ます。** 打ち間違いに気づけるようにしてあります。
+外れた値は SQL には出ますが、打ち間違いに気づけるよう**警告が出ます。**
 
 ### 索引と外部キーの名前
 
 名前は自動で付きます。形は `{表}_{列を _ でつないだもの}_{index|unique|foreign}` です
 （`posts_status_index`・`comments_post_id_foreign` のような形）。
 
-| とき                     | 付く名前                                |
-|--------------------------|-----------------------------------------|
-| ふつう                   | 上の形のまま                            |
-| 同じ名前が 2 つできるとき | 末尾に 8 桁の 16 進を足して分けます     |
-| 63 バイトを超えるとき    | 縮めて、末尾に 8 桁の 16 進を足します   |
-
-63 バイトは PostgreSQL の名前の上限です。超えるとサーバ側で切られて、名前が重なります。
+| とき                      | 付く名前                              |
+|---------------------------|---------------------------------------|
+| ふつう                    | 上の形のまま                          |
+| 同じ名前が 2 つできるとき | 末尾に 8 桁の 16 進を足して分けます   |
+| 63 バイトを超えるとき     | 縮めて、末尾に 8 桁の 16 進を足します |
 
 外部キーに名前が付くのは、**後から足すとき**だけです（下の「表を変える」）。
 表を作るときは `create table` の中に書くので、名前はデータベースが決めます。
 
-索引は `create index ...` という別の文になります。
-MySQL で `create_if_not_exists` を使ったときだけ、表の定義の中に書きます。
+**MySQL で表を作るときだけ、索引は表の定義の中（`key` / `unique key`）に入ります。**
+ほかは `create index ...` の別の文です（`Schema::table` で変えるときは MySQL も別の文）。
 
 ## 表を変える
 
@@ -210,6 +234,7 @@ pub fn up(schema: &mut Schema) {
 }
 
 pub fn down(schema: &mut Schema) {
+    schema.drop_index("posts", &["slug"]);   // 索引 → 列の順
     schema.drop_column("posts", "slug");
 }
 ```
@@ -236,49 +261,71 @@ schema.drop("posts");
 schema.drop_if_exists("posts");
 schema.rename("posts", "articles");
 schema.drop_column("posts", "slug");
+schema.drop_index("posts", &["user_id"]);             // 列から名前を組み立てて落とす
+schema.drop_index_named("posts", "posts_email_unique"); // 名前を直に指定して落とす
 schema.raw("pragma foreign_keys = on");   // SQL をそのまま
 ```
+
+### 索引を落とす
+
+**`up` で `index()` / `unique()` を付けたら、`down` で落としてください。**
+列を落としただけでは索引が残ります。**落とす順は「索引 → 列」です**
+（SQLite は索引の付いた列を `drop_column` できません）。
+
+```rust
+pub fn down(schema: &mut Schema) {
+    schema.drop_index("posts", &["user_id"]);
+    schema.drop_column("posts", "user_id");
+}
+```
+
+`drop_index(表, &[列...])` は、`index()` と同じ規則で名前を組み立てます。
+次の 2 つは名前が合わないので、`drop_index_named(表, 名前)` を使ってください。
+
+| とき                                                         | 名前                               |
+|--------------------------------------------------------------|------------------------------------|
+| `unique()` で作った索引                                      | 末尾が `_index` ではなく `_unique` |
+| 同じ `create` の中に、同じ名前になる別の列の並びがあったとき | 末尾にハッシュが付きます           |
 
 `create_if_not_exists` は、**索引の文にも `if not exists` を付けます。**
 表だけを飛ばして索引で失敗する、ということはありません。
 
-```
-create table if not exists "users" (...)
-create index if not exists "users_name_index" on "users" ("name")
-```
-
-組み立てた SQL を確かめたいときは、`up` の中で `schema.to_sql()` を見ます。
-
-```rust
-pub fn up(schema: &mut Schema) {
-    schema.create("posts", |t| {
-        t.id();
-        t.string("title");
-    });
-    // その時点までに組み立てた SQL の一覧
-    for sql in schema.to_sql() {
-        println!("{sql}");
-    }
-}
-```
-
-`schema.driver()` でつながる先の種類も分かります。
+組み立てた SQL を確かめたいときは、`up` の中で `schema.to_sql()` を見ます
+（その時点までの SQL の一覧が返ります）。`schema.driver()` でつながる先の種類も
+分かります。
 
 ## できないこと・警告が出ること
+
+止め方は 3 つに分かれます。
+
+| 止め方       | いつ                                       |
+|--------------|--------------------------------------------|
+| コンパイルエラー | ビルドのとき                            |
+| **実行の前のエラー** | SQL を 1 本も流しません。表は変わりません |
+| 警告         | SQL はそのまま流します。失敗するかは中身次第 |
 
 | 書き方                                             | どうなるか                           | 理由                                               |
 |----------------------------------------------------|--------------------------------------|----------------------------------------------------|
 | `pub fn up` / `pub fn down` が無い                 | コンパイルエラー                     | 両方必要です                                       |
 | 列の型を変える `change()`                          | **ありません**                       | SQLite が苦手で、3 つのドライバでそろえられないためです |
+| `schema.table(..)` の中の `t.id()` / `t.increments(..)` | **実行の前にエラー**            | `alter table add column` では自動採番を足せません |
+| `t.foreign(col)` に `.on(表名)` が無い             | **実行の前にエラー**                 | 指す先の表が決まりません                           |
 | `t.id()` に `nullable()` / `default()` / `unique()`| 無視して警告                         | 型名ひとつで書くので、置く場所がありません         |
-| `schema.table(..)` の中の `t.id()` / `t.increments`| 警告が出て、**その文は実行時に失敗します** | `alter table add column` では自動採番を足せません |
-| `t.foreign(col)` に `.on(表名)` が無い             | 警告が出て、**その文は実行時に失敗します** | 指す先が決まりません                         |
 | `schema.table(..)` の中の `t.primary(&[..])`       | 警告が出て、**何も足しません**       | 後から主キーを足す書き方が、3 つのドライバでそろえられません |
 | SQLite で `schema.table(..)` の中の `t.foreign(..)`| 警告が出て、**何も足しません**       | `alter table add constraint` がありません          |
+| `schema.table(..)` で not null かつ既定値なしの列  | 警告が出て、**SQLite では必ず、PostgreSQL では行が 1 件以上あると実行のときに失敗します** | 既にある行に入れる値が決まりません |
 | `t.primary(&[..])` を 2 回呼ぶ                     | 警告。後の指定で置き換わります       | 複合主キーは 1 回で書きます                        |
 | `on_delete` / `on_update` に一覧外の値             | 警告。SQL には出ます                 | 打ち間違いに気づけるようにしてあります             |
+| `default(f64::NAN)` などの非有限の小数             | 警告が出て、**その文は実行のときに失敗します** | `NaN` / `inf` は SQL に書けません        |
+| `default(Vec<u8>)`（バイト列の既定値）             | 警告。**値は無視して `null` を書きます** | 書き方がドライバで違います（`x'..'` / `'\x..'` / `0x..`） |
+| `comment("説明")`                                  | **どのドライバでも何もしません**     | Laravel と同じ名前で書けるように置いてあるだけです |
+
+`schema.table(..)` で列を足すときは、`.nullable()` か `.default(..)` を付けてください。
+MySQL だけは型ごとの既定値で埋めて通るので、MySQL で開発していると気づけません。
 
 ## 関連
+
+まだ無いものは [backlog.md](backlog.md) にまとめてあります。
 
 - [database.md](database.md) — 接続とクエリ
 - [models.md](models.md) — 構造体として読み書きする

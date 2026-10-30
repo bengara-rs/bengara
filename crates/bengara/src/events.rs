@@ -8,13 +8,26 @@
 //! Event::dispatch("user.registered", &payload).await?;
 //! ```
 //!
-//! **起動時に登録して固定します。** 実行中に増えません。
+//! **起動時に登録します。** 実行中に増えません。
 //! 聞く側の形はジョブと同じ `async fn handle(payload: String) -> Result<()>` です。
+//!
+//! ## 組み立て直すと置き換わる
+//!
+//! 表はプロセスに 1 つです。`Application` を組み立てるたびに**丸ごと
+//! 置き換わり**、前の登録は消えます。本番では起動時に 1 回なので問題に
+//! なりませんが、テストでは効きます。`cargo test` はテストを同じプロセスの
+//! 別スレッドで並べるので、`with_events` の中身が違うアプリを 2 件の
+//! テストが組むと、後から組んだほうの表で `Event::dispatch` が動きます。
+//! 聞く側が居なくても `dispatch` は成功するので、**黙って 0 件**になり、
+//! 実行順で結果が変わります。
+//!
+//! `with_events` を既定と違う形で組み、かつ `Event::dispatch` 系を使う
+//! テストは `testing::exclusive()` の札を取ってください。
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::error::{Error, Result};
 
@@ -74,6 +87,11 @@ impl Events {
         self.listeners.get(event).map_or(0, Vec::len)
     }
 
+    /// 1 件も登録されていないか。
+    pub fn is_empty(&self) -> bool {
+        self.listeners.is_empty()
+    }
+
     fn get(&self, event: &str) -> &[Arc<dyn Listener>] {
         self.listeners.get(event).map_or(&[], Vec::as_slice)
     }
@@ -91,24 +109,55 @@ impl std::fmt::Debug for Events {
     }
 }
 
-static EVENTS: OnceLock<Events> = OnceLock::new();
+/// 登録された聞く側の表。
+///
+/// 以前は `OnceLock` でした。2 つ目以降の `Application` を黙って無視するので、
+/// テストで別の聞く側を持つアプリを組んでも効きませんでした。ルート名の表
+/// （決定記録 #136）と同じく、組み立てるたびに入れ替えられる形にします。
+///
+/// 読む側は `RwLock` の読み取り 1 回と `Arc` の複製だけです。起動後は書きません。
+/// ホットパスで錠を取るのは、ルート名の表と同じ割り切りです（決定記録 #136）。
+static EVENTS: RwLock<Option<Arc<Events>>> = RwLock::new(None);
 
-/// 起動時に1回だけ呼ぶ。2回目以降は何もしない。
+/// `Application` を組み立てるたびに呼ぶ。
+///
+/// **聞く側が 1 件でもあれば、表を丸ごと置き換えます。** 前の登録は消えます。
+/// 本番では起動時に 1 回なので問題になりませんが、テストでは同じプロセスの
+/// 別スレッドで並ぶので、後から組んだアプリの表が勝ちます。`with_events` を
+/// 既定と違う形で組み、かつ `Event::dispatch` 系を使うテストは、
+/// `testing::exclusive()` の札を取ってください。
+///
+/// **空の登録では置き換えません。** `Application::configure()` は
+/// `with_events` を書かなくても組み立てられるので、置き換えてしまうと
+/// 「イベントを使わないテスト」が「イベントを使うテスト」の表を黙って
+/// 消してしまいます（`dispatch` は聞く側 0 件でも成功するので、消えたことに
+/// 気づけません）。本番では `Application` が 1 つだけなので、残しても
+/// 結果は同じです（表が無ければ空として扱います）。
 pub(crate) fn install(events: Events) {
-    let _ = EVENTS.set(events);
+    if events.is_empty() {
+        tracing::debug!("聞く側が 1 件も無いので、いまの表はそのまま残します");
+        return;
+    }
+    *EVENTS.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(events));
 }
 
-fn events() -> &'static Events {
-    static EMPTY: OnceLock<Events> = OnceLock::new();
+/// いまの表を取る。
+///
+/// `RwLock` の読み取りと `Arc` の複製を**毎回**通ります。登録が無ければ、
+/// 共有の空の表を返します（`dispatch` は成功扱いです）。
+fn events() -> Arc<Events> {
+    static EMPTY: OnceLock<Arc<Events>> = OnceLock::new();
     EVENTS
-        .get()
-        .unwrap_or_else(|| EMPTY.get_or_init(Events::new))
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| EMPTY.get_or_init(|| Arc::new(Events::new())).clone())
 }
 
 /// 登録順に全部呼び、**1つ失敗したらそこで止める**（[`Event::dispatch_raw`] の本体）。
 ///
-/// 入れ物を引数で受け取ります。`install` は 1 回しか効かないので、
-/// `events()` 越しだとこの分岐をテストから確かめられません。
+/// 入れ物を引数で受け取ります。プロセス共通の表（`install` が入れるもの）を
+/// 通さないので、テストが並んで走っても互いの登録を踏みません。
 pub(crate) async fn dispatch_in(events: &Events, event: &str, payload: &str) -> Result<()> {
     for listener in events.get(event) {
         listener
@@ -134,6 +183,10 @@ pub struct Event;
 
 impl Event {
     /// 知らせる。登録順に全部呼び、**1つ失敗したらそこで止めます。**
+    ///
+    /// 聞く側が 1 件も無ければ、何もせず成功します。表はプロセス共通で、
+    /// 呼ぶたびに `RwLock` の読み取りと `Arc` の複製を通ります
+    /// （モジュールの説明を見てください）。
     pub async fn dispatch<T: serde::Serialize>(event: &str, payload: &T) -> Result<()> {
         let text = serde_json::to_string(payload)?;
         Self::dispatch_raw(event, &text).await
@@ -141,7 +194,7 @@ impl Event {
 
     /// 文字列をそのまま渡して知らせる。
     pub async fn dispatch_raw(event: &str, payload: &str) -> Result<()> {
-        dispatch_in(events(), event, payload).await
+        dispatch_in(&events(), event, payload).await
     }
 
     /// 知らせる。**失敗しても次を呼びます。** エラーはログに出します。
@@ -149,7 +202,7 @@ impl Event {
     /// 「ついでの処理」（通知など）で、本体を止めたくないときに使います。
     pub async fn try_dispatch<T: serde::Serialize>(event: &str, payload: &T) -> Result<()> {
         let text = serde_json::to_string(payload)?;
-        try_dispatch_in(events(), event, &text).await
+        try_dispatch_in(&events(), event, &text).await
     }
 
     /// 聞いている処理があるか。
@@ -231,7 +284,8 @@ mod tests {
 
     #[tokio::test]
     async fn 登録順に呼ばれ失敗で止まる() {
-        // `install` は1回しか効かないので、本体（`dispatch_in`）を直接叩く。
+        // プロセス共通の表を通さず、本体（`dispatch_in`）を直接叩く。
+        // `install` は表を置き換えるので、並んで走るテストと踏み合う。
         let log = Log::new();
         let events = Events::new()
             .listen("ok", log.recorder("1"))
@@ -299,6 +353,44 @@ mod tests {
 
         dispatch_in(&events, "a", "本文").await.unwrap();
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    /// `install` が表を**置き換える**ことを押さえる。
+    ///
+    /// プロセス共通の表を書くので、札（`exclusive()`）を取って直列にします。
+    /// **ほかに `install` を通るテストも札を取る必要があります。**
+    /// `Application` を組むだけで `install` が走るので、札を取らないテストと
+    /// 同時に走ると、下の `has_listeners` が実行順で変わります。
+    #[tokio::test]
+    async fn 組み立て直すと登録が置き換わる() {
+        let _lock = crate::testing::exclusive().await;
+        // ほかのテストと鍵がぶつからないよう、このテストだけの名前を使う。
+        const FIRST: &str = "events.install.first";
+        const SECOND: &str = "events.install.second";
+
+        install(Events::new().listen(FIRST, noop));
+        assert!(Event::has_listeners(FIRST));
+
+        // 以前は `OnceLock` で、2 つ目以降の `Application` を黙って無視していた。
+        install(Events::new().listen(SECOND, noop).listen(SECOND, noop));
+        assert!(!Event::has_listeners(FIRST), "前の登録は消える");
+        assert_eq!(Event::listener_count(SECOND), 2);
+        Event::dispatch_raw(SECOND, "{}").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 空の登録では置き換えない() {
+        let _lock = crate::testing::exclusive().await;
+        const KEY: &str = "events.install.keep";
+
+        install(Events::new().listen(KEY, noop));
+        assert!(Event::has_listeners(KEY));
+
+        // `with_events` を書かないアプリを組んでも、ここの登録は消えない。
+        // 消すと「イベントを使わないテスト」が「使うテスト」の表を黙って
+        // 壊します（`dispatch` は 0 件でも成功するので気づけません）。
+        install(Events::new());
+        assert!(Event::has_listeners(KEY), "空の登録では置き換えない");
     }
 
     #[tokio::test]

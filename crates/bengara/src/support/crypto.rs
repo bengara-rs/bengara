@@ -292,6 +292,14 @@ mod tests {
             )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
+        // 896 ビット（112 バイト）。2 ブロックに跨がり、詰め物が 2 ブロック目に入る長さ。
+        let long: &[u8] = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
+hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        assert_eq!(long.len(), 112);
+        assert_eq!(
+            to_hex(&sha256(long)),
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
+        );
         // 100 万文字。詰め物とブロックの繰り返しをまとめて確かめる。
         assert_eq!(
             to_hex(&sha256(&[b'a'; 1_000_000])),
@@ -325,24 +333,56 @@ mod tests {
         }
     }
 
-    /// RFC 4231 のテストケース 1・2・6。
+    /// RFC 4231 のテストケース 1・2・3・4・6・7。
     #[test]
     fn hmacが公式のテストベクタと一致する() {
+        // ケース 1。鍵 20 バイト。
         assert_eq!(
             to_hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+        // ケース 2。鍵 4 バイト（短い鍵は 0 で埋める）。
         assert_eq!(
             to_hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
-        // 鍵がブロック（64 バイト）より長い場合は、先にハッシュして縮める。
+        // ケース 3。鍵 20 バイト・本文 50 バイト（1 ブロックを超える本文）。
+        assert_eq!(
+            to_hex(&hmac_sha256(&[0xaa; 20], &[0xdd; 50])),
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
+        );
+        // ケース 4。鍵 25 バイト（0x01 から 0x19 まで）・本文 50 バイト。
+        let key: Vec<u8> = (0x01u8..=0x19).collect();
+        assert_eq!(key.len(), 25);
+        assert_eq!(
+            to_hex(&hmac_sha256(&key, &[0xcd; 50])),
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
+        );
+        // ケース 6。鍵がブロック（64 バイト）より長い場合は、先にハッシュして縮める。
         let long_key = [0xaa; 131];
         let long_msg: &[u8] = b"Test Using Larger Than Block-Size Key - Hash Key First";
         assert_eq!(
             to_hex(&hmac_sha256(&long_key, long_msg)),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
+        // ケース 7。鍵も本文もブロックより長い場合。
+        let long_data: &[u8] = b"This is a test using a larger than block-size key and a \
+larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.";
+        assert_eq!(long_data.len(), 152);
+        assert_eq!(
+            to_hex(&hmac_sha256(&long_key, long_data)),
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"
+        );
+    }
+
+    /// RFC 4231 のテストケース 5（切り詰め版）。
+    ///
+    /// RFC は先頭 128 ビットだけを載せています。`hmac_sha256` は 32 バイトを返すので、
+    /// **先頭 16 バイトだけ**を比べます。
+    #[test]
+    fn hmacの先頭16バイトが切り詰め版のテストベクタと一致する() {
+        let mac = hmac_sha256(&[0x0c; 20], b"Test With Truncation");
+        assert_eq!(to_hex(&mac[..16]), "a3b6167473100ee06e0c796c2955552b");
     }
 
     #[test]
@@ -399,6 +439,15 @@ mod tests {
         assert_eq!(
             to_hex(&pbkdf2_sha256(b"password", b"salt", 4096)),
             "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+        // 鍵も塩も長い場合。RFC 6070 の 5 番目（SHA-256 版）です。
+        // 公開されている答えは 40 バイトぶんですが、こちらは 1 ブロック（32 バイト）を
+        // 返すので、先頭 32 バイトと比べます（2 ブロック目は 1 ブロック目を変えません）。
+        let salt: &[u8] = b"saltSALTsaltSALTsaltSALTsaltSALTsalt";
+        assert_eq!(salt.len(), 36);
+        assert_eq!(
+            to_hex(&pbkdf2_sha256(b"passwordPASSWORDpassword", salt, 4096)),
+            "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1"
         );
     }
 

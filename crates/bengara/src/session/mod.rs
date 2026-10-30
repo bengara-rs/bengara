@@ -21,6 +21,7 @@ mod middleware;
 mod store;
 
 pub use middleware::{SessionConfig, StartSession, VerifyCsrfToken};
+pub(crate) use store::{rename_with_retry, MEMORY_GC_EVERY};
 pub use store::{FileStore, MemoryStore, SessionStore};
 
 use std::collections::BTreeMap;
@@ -237,7 +238,19 @@ impl Session {
     }
 
     /// 前のリクエストの入力を覚えておく（入力し直しを避けるため）。
+    ///
+    /// 合計が [`MAX_OLD_INPUT_BYTES`] を超える入力は覚えません。
+    /// 本文の上限（2 MiB）いっぱいの失敗 POST のたびに、その大きさを
+    /// セッションの置き場所に書くのを避けるためです。
     pub(crate) fn flash_input(&self, pairs: &[(String, String)]) {
+        let total: usize = pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if total > MAX_OLD_INPUT_BYTES {
+            tracing::warn!(
+                "検査に落ちた入力が {total} バイトあり、上限（{MAX_OLD_INPUT_BYTES} バイト）を\
+                 超えているので覚えません"
+            );
+            return;
+        }
         let json = serde_json::to_string(&pairs.iter().cloned().collect::<BTreeMap<_, _>>())
             .unwrap_or_else(|_| "{}".to_string());
         self.flash(OLD_INPUT_KEY, json);
@@ -342,6 +355,9 @@ const FLASH_PREFIX: &str = "__flash:";
 
 /// 前の入力を入れておく場所。
 const OLD_INPUT_KEY: &str = "__old_input";
+
+/// 検査に落ちた入力として覚える合計の上限（バイト）。
+const MAX_OLD_INPUT_BYTES: usize = 64 * 1024;
 
 /// 推測できない ID を作る。
 fn new_id() -> String {
@@ -577,5 +593,16 @@ mod tests {
         let text = format!("{s:?}");
         assert!(!text.contains("とても大事"));
         assert!(!text.contains(&s.id()));
+    }
+
+    #[test]
+    fn 大きすぎる入力は覚えない() {
+        let s = Session::empty();
+        let big = "x".repeat(MAX_OLD_INPUT_BYTES + 1);
+        s.flash_input(&[("body".to_string(), big)]);
+        assert!(s.old("body").is_none(), "上限を超える入力は覚えない");
+
+        s.flash_input(&[("title".to_string(), "小さい".to_string())]);
+        assert_eq!(s.old("title").as_deref(), Some("小さい"));
     }
 }

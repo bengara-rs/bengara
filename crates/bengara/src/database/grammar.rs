@@ -68,6 +68,46 @@ pub(crate) fn placeholder(driver: Driver, index: usize) -> String {
     }
 }
 
+/// 利用者が書いた SQL の `?` の数。
+///
+/// **文字列の中の `?` も数えます。** `?` は値の置き場所としてしか使えません。
+pub(crate) fn count_placeholders(sql: &str) -> usize {
+    sql.matches('?').count()
+}
+
+/// 利用者が書いた SQL の `?` を、ドライバの書き方に直す。
+///
+/// PostgreSQL だけ `$n` に振り直します。`already` はこの SQL より前に渡した値の数で、
+/// 番号はその次から振ります。ほかのドライバでは `?` のまま返します。
+pub(crate) fn number_placeholders(driver: Driver, sql: &str, already: usize) -> String {
+    if driver != Driver::Postgres {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut index = already;
+    for c in sql.chars() {
+        if c == '?' {
+            index += 1;
+            out.push_str(&placeholder(driver, index));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 大文字小文字と空白をそろえた演算子が `is` / `is not` か。
+///
+/// `NULL` と比べるときに `is $1` と書かないために使います
+/// （PostgreSQL は `is` の右にプレースホルダを置けません）。
+pub(crate) fn is_null_operator(operator: &str) -> Option<bool> {
+    match normalize_operator(operator).as_str() {
+        "is" => Some(false),
+        "is not" => Some(true),
+        _ => None,
+    }
+}
+
 /// 名前を引用符でくくる。`users.id` は `"users"."id"` になります。
 ///
 /// `*`、`count(*)`、`id as key` のような式はそのまま返します。
@@ -76,6 +116,14 @@ pub(crate) fn placeholder(driver: Driver, index: usize) -> String {
 /// これに頼っています。引用符を含む名前は素通しせず、`""` に逃がしてくくります。
 /// そのうえで、外から来た文字列が入りうる場所（`where_` / `order_by` / `join` の
 /// 列名など）では [`is_plain_identifier`] で先に検査します。
+///
+/// **素通しの判定は `is_expression` です。** 空白・`(`・`*` のどれかを含む名前は
+/// くくらずそのまま返します。`drop table x` のような文字列も素通しします。
+///
+/// **`schema.rs` は [`is_plain_identifier`] を1度も呼んでいません。** 表名・列名は
+/// この関数を通るだけなので、検査されません。`Schema::create` や `table(...)` に
+/// 外から来た文字列（リクエストの値、設定ファイルの値）を渡してはいけません。
+/// 移行ファイルに直接書いた名前だけを渡してください。
 pub(crate) fn quote(driver: Driver, name: &str) -> String {
     let trimmed = name.trim();
     if is_expression(trimmed) {
@@ -104,6 +152,9 @@ fn is_expression(name: &str) -> bool {
 ///
 /// `*` も式も通しません。式を書きたいときは `order_by_raw` / `having_raw` /
 /// `where_raw` を使ってください。
+///
+/// **呼ぶのはクエリビルダ（`query.rs`）だけです。** `schema.rs` は呼んでいません。
+/// 移行の表名・列名は [`quote`] を通るだけで、検査されません。
 pub(crate) fn is_plain_identifier(name: &str) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -375,6 +426,27 @@ mod tests {
         assert_eq!(no_limit(Driver::Sqlite), " limit -1");
         assert_eq!(no_limit(Driver::MySql), " limit 18446744073709551615");
         assert_eq!(no_limit(Driver::Postgres), " limit all");
+    }
+
+    #[test]
+    fn 生のsqlのプレースホルダはpostgresだけ番号に直す() {
+        assert_eq!(count_placeholders("a = ? and b in (?, ?)"), 3);
+        assert_eq!(
+            number_placeholders(Driver::Postgres, "a = ? and b in (?, ?)", 0),
+            "a = $1 and b in ($2, $3)"
+        );
+        // 前に 2 つ渡していれば 3 から振る（where_raw と having_raw を続けたとき）。
+        assert_eq!(number_placeholders(Driver::Postgres, "c > ?", 2), "c > $3");
+        // ほかのドライバは触らない。
+        assert_eq!(number_placeholders(Driver::MySql, "a = ?", 0), "a = ?");
+        assert_eq!(number_placeholders(Driver::Sqlite, "a = ?", 5), "a = ?");
+    }
+
+    #[test]
+    fn nullと比べる演算子が分かる() {
+        assert_eq!(is_null_operator("is"), Some(false));
+        assert_eq!(is_null_operator(" IS  NOT "), Some(true));
+        assert_eq!(is_null_operator("="), None);
     }
 
     #[test]

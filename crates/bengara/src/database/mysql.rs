@@ -148,20 +148,16 @@ impl RawTx for MySqlTx {
     fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
         Box::pin(async move {
             let this = *self;
-            this.tx
-                .commit()
-                .await
-                .map_err(|e| Error::msg(format!("トランザクションを確定できません: {e}")))
+            // `SqlFailure` に包む。`is_unique_violation()` が見るのは原因の連鎖だけで、
+            // `Error::msg` では種類が分からなくなるためです（遅延制約で実際に当たります）。
+            this.tx.commit().await.map_err(|e| failed("commit", e))
         })
     }
 
     fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
         Box::pin(async move {
             let this = *self;
-            this.tx
-                .rollback()
-                .await
-                .map_err(|e| Error::msg(format!("トランザクションを巻き戻せません: {e}")))
+            this.tx.rollback().await.map_err(|e| failed("rollback", e))
         })
     }
 }

@@ -19,6 +19,16 @@ pub(crate) fn now_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// いまの UNIX 時刻（ミリ秒）。
+///
+/// 「どちらが先か」を比べる印に使う。秒だと同じ秒の中の前後が分からない。
+pub(crate) fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// `YYYY-MM-DD HH:MM:SS` を UNIX 時刻（秒）に戻す。読めなければ `None`。
 ///
 /// 日付だけ（`YYYY-MM-DD`）も受け付け、00:00:00 として扱います。

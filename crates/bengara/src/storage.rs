@@ -3,7 +3,7 @@
 //! ```ignore
 //! Storage::put("notes/a.txt", "本文").await?;
 //! let body = Storage::get("notes/a.txt").await?;
-//! Storage::disk("public").put("avatars/1.png", bytes).await?;
+//! Storage::disk("public").write("avatars/1.png", bytes).await?;
 //! ```
 //!
 //! | 名前 | 実際の場所 |
@@ -194,7 +194,8 @@ impl Storage {
     /// 途中の中身を読まれたくないときは、別の名前に書いてから自分で
     /// 置き換えてください。
     pub async fn write(&self, path: &str, contents: Vec<u8>) -> Result<()> {
-        let full = self.absolute(path)?;
+        let full = self.file_path(path)?;
+        self.ensure_storage(&full)?;
         crate::support::blocking(move || {
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -202,6 +203,37 @@ impl Storage {
             std::fs::write(&full, contents).map_err(Error::Io)
         })
         .await?
+    }
+
+    /// `storage/` そのものが無ければ、作らずに知らせる（決定記録 #023）。
+    ///
+    /// `create_dir_all` は祖先をすべて作るので、置き場所が `storage/` の下に
+    /// あるときは `storage/` ごと作っていました。セッションやキャッシュは
+    /// 「無ければ作らずエラー」なのに、`Storage` だけが設定を間違えたプロセスに
+    /// 空の `storage/` を作らせていました。`storage/` の外にある置き場所
+    /// （テスト用の一時ディレクトリなど）には口を出しません。
+    fn ensure_storage(&self, full: &Path) -> Result<()> {
+        let storage = crate::paths::storage_path("");
+        if full.starts_with(&storage) && !storage.is_dir() {
+            return Err(Error::msg(format!(
+                "{} がありません。`cargo artisan storage:init` で作ってください",
+                storage.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// ファイル 1 つを指すパスにする。空と `.` は断る。
+    ///
+    /// [`absolute`](Self::absolute) は空のパスを置き場所そのものに写します
+    /// （`files("")` が一覧の起点にするため）。ファイルの読み書きに渡すと
+    /// ディレクトリを開く分かりにくいエラーになるので、ここで断ります。
+    fn file_path(&self, path: &str) -> Result<PathBuf> {
+        let full = self.absolute(path)?;
+        if full == self.root {
+            return Err(Error::msg("パスが空です。ファイルの名前を渡してください"));
+        }
+        Ok(full)
     }
 
     /// 文字列として読む。
@@ -216,7 +248,7 @@ impl Storage {
 
     /// バイト列として読む。
     pub async fn read_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        let full = self.absolute(path)?;
+        let full = self.file_path(path)?;
         crate::support::blocking(move || match std::fs::read(&full) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -230,12 +262,12 @@ impl Storage {
     /// `is_file()` 1 回だけなので、裏のスレッド（`spawn_blocking`）を経由しません。
     /// 往復のほうが調べるより高く付きます。
     pub async fn has(&self, path: &str) -> Result<bool> {
-        Ok(self.absolute(path)?.is_file())
+        Ok(self.file_path(path)?.is_file())
     }
 
     /// 消す。無くてもエラーにはしません。
     pub async fn remove(&self, path: &str) -> Result<()> {
-        let full = self.absolute(path)?;
+        let full = self.file_path(path)?;
         crate::support::blocking(move || match std::fs::remove_file(&full) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -248,7 +280,7 @@ impl Storage {
     ///
     /// `metadata()` 1 回だけなので、`has` と同じく裏のスレッドを経由しません。
     pub async fn size(&self, path: &str) -> Result<Option<u64>> {
-        let full = self.absolute(path)?;
+        let full = self.file_path(path)?;
         match std::fs::metadata(&full) {
             Ok(meta) => Ok(Some(meta.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -257,12 +289,22 @@ impl Storage {
     }
 
     /// その下にあるファイルの一覧（置き場所からの相対パス）。
+    ///
+    /// **深さは `prefix` から数えます**（`MAX_DEPTH` まで）。置き場所の
+    /// 根からではありません。
+    ///
+    /// 名前が使えない（`..` など）ときだけエラーになります。読めないものは
+    /// 飛ばして `tracing::warn!` で知らせます（決定記録 #167）。
+    ///
+    /// - `prefix` が無い・ディレクトリでない → 空の一覧
+    /// - 権限などで読めないディレクトリ → その枝だけ飛ばす
+    /// - 深さを超えた・UTF-8 でない名前 → そこだけ飛ばす
     pub async fn files(&self, prefix: &str) -> Result<Vec<String>> {
         let base = self.root.clone();
         let full = self.absolute(prefix)?;
         crate::support::blocking(move || {
             let mut out = Vec::new();
-            collect_files(&full, &base, &mut out)?;
+            collect_files(&full, &base, &mut out);
             out.sort();
             Ok(out)
         })
@@ -278,10 +320,21 @@ impl Storage {
     ///
     /// 次の 2 つを**断ります**。
     ///
-    /// - `..` と絶対パス（`:` を含むもの）。置き場所の外を触らせないため。
-    /// - 装置の名前（`nul` など）と、末尾が空白・`.` の名前。[`usable_name`] を見てください。
+    /// - `..` と絶対パス（`/` か `\` で始まるもの、`:` を含むもの）。置き場所の外を触らせないため。
+    /// - 装置の名前（`nul` など）、末尾が空白・`.` の名前、`~1` のような
+    ///   Windows の短い名前の形。[`usable_name`] を見てください。
+    ///
+    /// 先頭の `/` は以前は黙って落として置き場所の中に写していました。
+    /// 公開ドキュメントは「絶対パスはエラー」と書いていたので、書いてある
+    /// 約束のほうにそろえます。`/etc/passwd` を渡した人は、置き場所の中の
+    /// `etc/passwd` が読まれるより、断られるほうが間違いに気づけます。
     fn absolute(&self, path: &str) -> Result<PathBuf> {
-        let trimmed = path.trim_start_matches(['/', '\\']);
+        if path.starts_with(['/', '\\']) {
+            return Err(Error::msg(format!(
+                "`{path}` は置き場所の外を指しています（絶対パスは渡せません）"
+            )));
+        }
+        let trimmed = path;
         if trimmed.is_empty() {
             return Ok(self.root.clone());
         }
@@ -345,6 +398,20 @@ pub(crate) fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
     if part.chars().any(|c| c <= '\x1f') {
         return Err("制御文字が入っています");
     }
+    // `~` の直後が数字の形も断ります。NTFS は長い名前に短い名前
+    // （`<先頭6文字>~<数字>`）を自動で付けます。`storage/app/avatars/` に
+    // `alice.profile.photo.jpg` があるとき、実機（Windows 10 / NTFS）では
+    // `avatars/alicep~1.jpg` でそのファイルを読み・上書き・削除できました。
+    // 置き場所の外には出られませんが、別の名前のつもりが同じ中身を指します。
+    // バイトで見てかまいません。UTF-8 では ASCII 以外のバイトは必ず 0x80 以上で、
+    // `~` と数字に化けることがありません。
+    if part
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())
+    {
+        return Err("`~1` のような形は Windows の短い名前と区別できません");
+    }
     Ok(())
 }
 
@@ -355,8 +422,10 @@ pub(crate) fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
 const MAX_DEPTH: usize = 32;
 
 /// ディレクトリの中のファイルを集める（再帰）。
-fn collect_files(dir: &Path, base: &Path, out: &mut Vec<String>) -> Result<()> {
-    collect_files_at(dir, base, out, 0)
+///
+/// 深さは `dir`（`files` の `prefix`）を 0 として数えます。
+fn collect_files(dir: &Path, base: &Path, out: &mut Vec<String>) {
+    collect_files_at(dir, base, out, 0);
 }
 
 /// 深さを数えながら集める。
@@ -367,19 +436,29 @@ fn collect_files(dir: &Path, base: &Path, out: &mut Vec<String>) -> Result<()> {
 /// `storage:link` は作らない決まり（決定記録 #047）なので、印をたどる
 /// 前提は要りません。`entry.file_type()` は追加の問い合わせを出さない点でも
 /// `is_dir()` より軽いです。
-fn collect_files_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize) -> Result<()> {
+///
+/// **読めないものは飛ばします。エラーにしません**（決定記録 #167）。
+/// 非 UTF-8 の名前と深さ超過を飛ばすのに、`read_dir` の失敗だけ `Err` に
+/// していたころは、権限で読めないサブディレクトリ 1 つで一覧の全体が
+/// 落ちました。ファイルを `prefix` に渡しただけでもエラーでした。
+fn collect_files_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize) {
     if depth >= MAX_DEPTH {
         // 黙って打ち切ると、一覧に出ないファイルがある理由が分かりません。
         tracing::warn!(
             "{} は深さ {MAX_DEPTH} を超えたので一覧から飛ばします",
             dir.display()
         );
-        return Ok(());
+        return;
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::Io(e)),
+        // 無いものは空の一覧にします。一覧を頼むだけで作ったりはしません。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            // ディレクトリでない・権限が無い、など。その枝だけ飛ばします。
+            tracing::warn!("{} を読めないので一覧から飛ばします: {e}", dir.display());
+            return;
+        }
     };
     for entry in entries.flatten() {
         let Ok(kind) = entry.file_type() else {
@@ -390,7 +469,7 @@ fn collect_files_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize
         }
         let path = entry.path();
         if kind.is_dir() {
-            collect_files_at(&path, base, out, depth + 1)?;
+            collect_files_at(&path, base, out, depth + 1);
             continue;
         }
         if let Ok(relative) = path.strip_prefix(base) {
@@ -406,7 +485,6 @@ fn collect_files_at(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -439,9 +517,55 @@ mod tests {
             "C:/windows/system32",
             "a/..",
             "..",
+            // 絶対パス。以前は先頭の `/` を落として中に写していたが、
+            // 公開ドキュメントの「絶対パスはエラー」にそろえた。
+            "/etc/passwd",
+            "\\windows\\win.ini",
+            "/",
         ] {
             assert!(disk.absolute(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn 空のパスはファイルとして扱わない() {
+        let disk = disk("empty-path");
+        // 一覧の起点としては置き場所そのもの。
+        assert_eq!(disk.absolute("").unwrap(), disk.root);
+        assert_eq!(disk.absolute(".").unwrap(), disk.root);
+        // ファイルの読み書きに渡すと、ディレクトリを開く分かりにくいエラーに
+        // なっていた。先に断る。
+        for empty in ["", ".", "./"] {
+            let error = disk.file_path(empty).unwrap_err().to_string();
+            assert!(error.contains("パスが空です"), "{empty:?}: {error}");
+        }
+        assert!(disk.file_path("a.txt").is_ok());
+    }
+
+    #[test]
+    fn storageが無ければ作らない() {
+        // `storage/` の下を指す置き場所。テストでは `storage/` が無い。
+        let storage = crate::paths::storage_path("");
+        let disk = Storage {
+            root: crate::paths::storage_path("app"),
+        };
+        if storage.is_dir() {
+            // 手元に `storage/` がある環境では確かめようがないので飛ばす。
+            return;
+        }
+        // 以前は `create_dir_all` が `storage/` ごと作っていた（決定記録 #023 に反する）。
+        let error = disk
+            .ensure_storage(&disk.absolute("notes/a.txt").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("storage:init"), "{error}");
+        assert!(!storage.exists(), "作らない");
+
+        // `storage/` の外の置き場所には口を出さない。
+        let outside = self::disk("outside");
+        assert!(outside
+            .ensure_storage(&outside.absolute("a.txt").unwrap())
+            .is_ok());
     }
 
     #[test]
@@ -514,11 +638,37 @@ mod tests {
     }
 
     #[test]
+    fn 短い名前の形は断る() {
+        let disk = disk("shortname");
+        // NTFS は長い名前に短い名前（`<先頭6文字>~<数字>`）を自動で付ける。
+        // 実機では `avatars/alicep~1.jpg` が `alice.profile.photo.jpg` に当たり、
+        // 読み・上書き・削除ができた。
+        for bad in [
+            "avatars/alicep~1.jpg",
+            "postsc~1.aut",
+            "a~9",
+            "notes/x~12/a.txt",
+        ] {
+            let error = disk.absolute(bad).unwrap_err().to_string();
+            assert!(error.contains("使えない名前"), "{bad}: {error}");
+            assert!(error.contains("短い名前"), "{bad}: {error}");
+        }
+
+        // `~` の後ろが数字でなければ通す。短い名前は必ず `~<数字>` の形。
+        for ok in ["file~name.txt", "a~.txt", "~b", "a~", "~"] {
+            assert!(disk.absolute(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
     fn キャッシュの鍵で使う記号は断らない() {
         // `cache/mod.rs` の `normalize_key` も `usable_name` を使う。
-        // `:` を断ると、`user:1` のような鍵がハッシュ側に回ってしまう。
+        // `:` そのものは断らない（`Storage` 側は `absolute` が別に断る）。
+        // ただし `:` を含む鍵は `normalize_key` がハッシュ側に回すので、
+        // 素通しした鍵に `~` は出てこない。`~1` を断っても噛み合う。
         assert!(usable_name("user:1").is_ok());
         assert!(usable_name("a.b-c_1").is_ok());
+        assert!(usable_name("user~1").is_err());
     }
 
     #[test]
@@ -543,9 +693,9 @@ mod tests {
         assert!(full.starts_with(&disk.root));
         assert!(full.ends_with("notes/a.txt"));
 
-        // 先頭の / は落とす。
-        assert_eq!(disk.absolute("/notes/a.txt").unwrap(), full);
-        // 空のパスは置き場所そのもの。
+        // 区切りは `\` でもよい。
+        assert_eq!(disk.absolute("notes\\a.txt").unwrap(), full);
+        // 空のパスは置き場所そのもの（一覧の起点）。
         assert_eq!(disk.absolute("").unwrap(), disk.root);
     }
 
@@ -612,7 +762,7 @@ mod tests {
         }
 
         let mut out = Vec::new();
-        collect_files(&dir, &dir, &mut out).unwrap();
+        collect_files(&dir, &dir, &mut out);
         // 上限の手前までしか見ない（`d0` の 1 件目は深さ 1 で数える）。
         assert_eq!(out.len(), MAX_DEPTH - 1);
         assert!(out.iter().all(|p| p.ends_with("a.txt")));
@@ -625,5 +775,24 @@ mod tests {
         let disk = disk("empty");
         let _ = std::fs::remove_dir_all(&disk.root);
         assert!(disk.files("none").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn 無い起点とファイルの起点は空の一覧() {
+        let disk = disk("files-prefix");
+        let _ = std::fs::remove_dir_all(&disk.root);
+        std::fs::create_dir_all(&disk.root).unwrap();
+
+        // 置き場所はあるが、その下に無い起点。
+        assert!(disk.files("none/deep").await.unwrap().is_empty());
+
+        // ファイルを起点に渡しても落ちない。前は `Err` になっていた。
+        disk.write("a.txt", b"1".to_vec()).await.unwrap();
+        assert!(disk.files("a.txt").await.unwrap().is_empty());
+
+        // 名前が使えないときだけエラーにする。
+        assert!(disk.files("../secret").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&disk.root);
     }
 }

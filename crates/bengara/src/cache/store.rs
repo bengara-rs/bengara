@@ -52,7 +52,10 @@ pub trait CacheStore: Send + Sync + 'static {
     /// **期限は引き継ぎません**（期限なしで書き直します）。回数の記録に使う前提です。
     fn increment(&self, key: &str, by: i64) -> Result<i64> {
         let current = parse_number(key, self.get(key)?)?;
-        let next = current + by;
+        // あふれさせません。`current + by` はデバッグビルドでパニックし
+        // （裏のスレッドが落ちて 500 になります）、リリースでは巻き戻ります。
+        // `Entry::encode` の期限と同じく、上限・下限で止めます。
+        let next = current.saturating_add(by);
         self.put(key, &next.to_string(), None)?;
         Ok(next)
     }
@@ -138,7 +141,8 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 一時ファイルの印。**`normalize_key` が絶対に作らない形**にします。
 ///
-/// `normalize_key` が通すのは小文字英数字と `. _ - ~` だけなので、`+` は出てきません。
+/// `normalize_key` が通すのは小文字英数字と `. _ -`（とハッシュ側の先頭の `~`）
+/// だけなので、`+` は出てきません。
 /// 「後ろ2つが数字」で見分けていたときは、`report.2024.12` のような鍵の本体を
 /// 一時ファイルと取り違えていました（`cache:clear` で消えず、`cache:prune` では
 /// 期限が残っていても消えていました）。
@@ -230,7 +234,8 @@ impl CacheStore for FileCache {
         // 書いている途中の中身を読まれないよう、別の名前で書いてから置き換える。
         let temp = self.temp_path_of(key);
         std::fs::write(&temp, Entry::encode(value, seconds))?;
-        if let Err(e) = std::fs::rename(&temp, &path) {
+        // Windows では別のプロセスが開いている瞬間に失敗するので、少し待ってやり直す。
+        if let Err(e) = crate::session::rename_with_retry(&temp, &path) {
             // 置き換えに失敗したら、書きかけを残さない。
             let _ = std::fs::remove_file(&temp);
             return Err(Error::Io(e));
@@ -266,6 +271,12 @@ impl CacheStore for FileCache {
         }
     }
 
+    /// 置き場所のファイルを消す。
+    ///
+    /// **消すのはファイルだけです。** 錠のディレクトリ（`+locks/`）は
+    /// ディレクトリなので残ります。中の錠ファイルも消しません。`increment` が
+    /// 握っている最中の錠を消すと、排他が外れて数を落とします。
+    /// 錠ファイルは手放したときに消えるので、たまるのは空のディレクトリ 1 つだけです。
     fn flush(&self) -> Result<()> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -287,9 +298,21 @@ impl CacheStore for FileCache {
         Ok(())
     }
 
+    /// 期限だけを読んで答える。**値は読みません。**
+    ///
+    /// `get` を通すと、`put_json` で入れた大きな構造体まで捨てるためだけに
+    /// 読み込んでいました。期限は `期限|値` の `|` より前にしかないので、
+    /// `read_expires_at` で先頭だけ見れば足ります。
+    ///
+    /// **期限切れのファイルはその場で消しません**（`get` は消します）。
+    /// 「あるか」を聞かれただけで書き込みを起こさないほうが素直です。
+    /// 片づけは次の `get` と `cache:prune` が引き受けます。
     fn has(&self, key: &str) -> Result<bool> {
-        // 中身を読まないと期限が分からないので、`get` と同じ手順で見る。
-        Ok(self.get(key)?.is_some())
+        let Some(expires_at) = read_expires_at(&self.path_of(key)) else {
+            // 無い・読めない・壊れている。どれも「無い」とします。
+            return Ok(false);
+        };
+        Ok(expires_at == 0 || expires_at > time::now_seconds())
     }
 
     /// 錠を取ってから「読む → 足す → 書く」を行う。
@@ -308,7 +331,8 @@ impl CacheStore for FileCache {
         let _file = FileLock::acquire(&self.lock_path_of(key))?;
 
         let current = parse_number(key, self.get(key)?)?;
-        let next = current + by;
+        // あふれさせません（既定の実装と同じ理由）。
+        let next = current.saturating_add(by);
         self.put(key, &next.to_string(), None)?;
         Ok(next)
     }
@@ -332,6 +356,8 @@ impl CacheStore for FileCache {
 #[derive(Default)]
 pub struct MemoryCache {
     entries: Mutex<HashMap<String, String>>,
+    /// 書き込みの回数。期限切れをまとめて落とす間隔を決めるのに使う。
+    writes: AtomicU64,
 }
 
 impl MemoryCache {
@@ -343,12 +369,24 @@ impl MemoryCache {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// 期限切れをまとめて落とす。
+    ///
+    /// `get` は読んだ鍵しか消さないので、二度と読まれない鍵が増え続けます。
+    /// 書き込みの 100 回に 1 回ここを通します。
+    fn collect_expired(entries: &mut HashMap<String, String>) {
+        entries.retain(|_, raw| Entry::decode(raw).is_some_and(|entry| !entry.expired()));
+    }
 }
 
 impl CacheStore for MemoryCache {
     fn put(&self, key: &str, value: &str, seconds: Option<u64>) -> Result<()> {
-        self.lock()
-            .insert(key.to_string(), Entry::encode(value, seconds));
+        let mut entries = self.lock();
+        let n = self.writes.fetch_add(1, Ordering::Relaxed);
+        if n % crate::session::MEMORY_GC_EVERY == crate::session::MEMORY_GC_EVERY - 1 {
+            Self::collect_expired(&mut entries);
+        }
+        entries.insert(key.to_string(), Entry::encode(value, seconds));
         Ok(())
     }
 
@@ -392,7 +430,8 @@ impl CacheStore for MemoryCache {
                 .map_err(|_| Error::msg(format!("`{key}` の値は数ではありません")))?,
             _ => 0,
         };
-        let next = current + by;
+        // あふれさせません（`CacheStore::increment` の既定の実装と同じ理由）。
+        let next = current.saturating_add(by);
         entries.insert(key.to_string(), Entry::encode(&next.to_string(), None));
         Ok(next)
     }
@@ -420,18 +459,26 @@ fn is_temp_path(path: &Path) -> bool {
 ///
 /// 期限は `期限|値` の `|` より前にしかありません。`read_to_string` だと、
 /// `put_json` で入れた大きな構造体まで**捨てるためだけに**読み込みます。
-/// 先頭だけ読めば足ります（`i64` は最大 20 文字なので 32 バイト見れば十分）。
+///
+/// **先頭 32 バイトしか読みません。** [`Entry::encode`] は期限（`i64` なので
+/// 符号を入れて最大 20 文字）と `|` を先に書くので、`|` は 21 バイト目までに
+/// 必ず来ます。`BufReader` は通しません。既定の 8 KiB のバッファを確保して、
+/// ディスクからも最大 8 KiB 読んでいました。
 fn read_expires_at(path: &Path) -> Option<i64> {
     use std::io::Read;
 
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut file = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 32];
     let mut filled = 0;
     while filled < head.len() {
-        match reader.read(&mut head[filled..]) {
+        // `read` は頼んだより少なく返すことがあるので、`|` が出るまで繰り返す。
+        match file.read(&mut head[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(_) => return None,
+        }
+        if head[..filled].contains(&b'|') {
+            break;
         }
     }
     let head = &head[..filled];
@@ -790,6 +837,76 @@ mod tests {
     }
 
     #[test]
+    fn 数を足してもあふれない() {
+        let dir = temp_dir("incrsat");
+        let store = FileCache::new(&dir);
+
+        // `current + by` だと、デバッグビルドでは裏のスレッドが落ちて 500 に
+        // なり、リリースでは `i64::MIN` に巻き戻っていた。
+        store.put("max", &i64::MAX.to_string(), None).unwrap();
+        assert_eq!(store.increment("max", 1).unwrap(), i64::MAX);
+        assert_eq!(store.increment("max", i64::MAX).unwrap(), i64::MAX);
+
+        // 下側も止まる（`Cache::decrement` が通る道）。
+        store.put("min", &i64::MIN.to_string(), None).unwrap();
+        assert_eq!(store.increment("min", -1).unwrap(), i64::MIN);
+        assert_eq!(store.increment("min", i64::MIN).unwrap(), i64::MIN);
+
+        // メモリの置き場所も同じ。
+        let memory = MemoryCache::new();
+        memory.put("max", &i64::MAX.to_string(), None).unwrap();
+        assert_eq!(memory.increment("max", 1).unwrap(), i64::MAX);
+        memory.put("min", &i64::MIN.to_string(), None).unwrap();
+        assert_eq!(memory.increment("min", i64::MIN).unwrap(), i64::MIN);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn あるかは中身を読まない() {
+        let dir = temp_dir("hashead");
+        let store = FileCache::new(&dir);
+
+        // `put_json` で入れた大きな値でも、期限だけ見て答える。
+        let big = "あ".repeat(200_000);
+        store.put("big", &big, Some(3_600)).unwrap();
+        assert!(store.has("big").unwrap());
+
+        // 期限なしも真。無いものと壊れたものは偽。
+        store.put("forever", "1", None).unwrap();
+        assert!(store.has("forever").unwrap());
+        assert!(!store.has("none").unwrap());
+        std::fs::write(store.path_of("broken"), "ごみ").unwrap();
+        assert!(!store.has("broken").unwrap());
+
+        // 期限切れは偽。`has` は消さず、`get` が消す。
+        store.put("old", &big, Some(0)).unwrap();
+        assert!(!store.has("old").unwrap());
+        assert!(store.path_of("old").exists(), "`has` は消さない");
+        assert_eq!(store.get("old").unwrap(), None);
+        assert!(!store.path_of("old").exists(), "`get` が消す");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 期限は先頭だけ読む() {
+        let dir = temp_dir("head32");
+        let store = FileCache::new(&dir);
+
+        // `i64` は符号を入れて 20 文字まで。`|` は 21 バイト目までに必ず来る。
+        assert!(i64::MIN.to_string().len() <= 20);
+        std::fs::write(store.path_of("max"), format!("{}|値", i64::MAX)).unwrap();
+        assert_eq!(read_expires_at(&store.path_of("max")), Some(i64::MAX));
+
+        // 先頭 32 バイトに `|` が無ければ、壊れているものとして扱う。
+        std::fs::write(store.path_of("far"), format!("{}|値", "9".repeat(40))).unwrap();
+        assert_eq!(read_expires_at(&store.path_of("far")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ブロックするかを言える() {
         assert!(
             FileCache::new("どこか").blocking(),
@@ -831,5 +948,19 @@ mod tests {
             sweep_expired(Path::new("存在しないディレクトリ")).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn メモリの置き場所は期限切れをまとめて落とす() {
+        let store = MemoryCache::new();
+        let every = crate::session::MEMORY_GC_EVERY;
+        for i in 0..every {
+            // 秒 0 はその場で期限切れ。読まなければ残り続けていた。
+            store.put(&format!("k{i}"), "v", Some(0)).unwrap();
+        }
+        store.put("keep", "v", None).unwrap();
+        let len = store.lock().len();
+        assert!(len <= 2, "期限切れが残らない: {len}");
+        assert_eq!(store.get("keep").unwrap().as_deref(), Some("v"));
     }
 }

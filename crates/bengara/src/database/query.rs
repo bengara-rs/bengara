@@ -161,11 +161,12 @@ impl std::fmt::Debug for QueryBuilder {
 impl QueryBuilder {
     /// 新しく組み立てを始める。`DB::table(...)` から呼ばれます。
     pub(crate) fn new(source: Source, table: impl Into<String>) -> Self {
-        let driver = resolve_driver(&source);
+        let (driver, driver_error) = resolve_driver(&source);
         let mut query = Self {
             source,
             driver,
-            deferred_error: None,
+            // 接続名の間違いは、列名や演算子の間違いより先に知らせる。
+            deferred_error: driver_error,
             table: table.into(),
             columns: Vec::new(),
             distinct: false,
@@ -186,7 +187,11 @@ impl QueryBuilder {
     ///
     /// 組み立てのときに見つけた間違い（`deferred_error`）は残します。
     pub(crate) fn with_source(mut self, source: Source) -> Self {
-        self.driver = resolve_driver(&source);
+        let (driver, driver_error) = resolve_driver(&source);
+        self.driver = driver;
+        if let Some(message) = driver_error {
+            self.defer(message);
+        }
         self.source = source;
         self
     }
@@ -257,7 +262,8 @@ impl QueryBuilder {
 
     /// 生の SQL に書いた `?` の数と、渡した値の数が合っているか確かめる。
     fn check_raw(&mut self, place: &str, sql: &str, bindings: &[Value]) {
-        let holes = sql.matches('?').count();
+        self.check_raw_dollar(place, sql);
+        let holes = grammar::count_placeholders(sql);
         if holes != bindings.len() {
             self.defer(format!(
                 "{place} に書いた `?` の数（{holes}）と、渡した値の数（{}）が合っていません。\
@@ -265,6 +271,25 @@ impl QueryBuilder {
                 bindings.len()
             ));
         }
+    }
+
+    /// PostgreSQL で `$1` を直接書いていないか確かめる。
+    ///
+    /// ビルダーは値を積んだ順に `$1` `$2` … を振ります。利用者が `$1` と書くと、
+    /// ビルダーが振った番号と重なります。`where_("status", "published")` の次に
+    /// `where_raw("views > $1", &[])` と書くと、値は1つしか渡っていないので
+    /// `views > 'published'` を比べることになります。
+    ///
+    /// `DB::select` / `DB::statement` は値をその SQL だけに渡すので、
+    /// そちらでは `$1` の直書きを通します。
+    fn check_raw_dollar(&mut self, place: &str, sql: &str) {
+        if self.driver != Driver::Postgres || !sql.contains('$') {
+            return;
+        }
+        self.defer(format!(
+            "{place} に書いた `$` は使えません。ビルダーの `*_raw` では `?` を使ってください。\
+             `$1` は DB::select / DB::statement 専用です"
+        ));
     }
 
     /// つながる先のデータベースの種類。
@@ -518,6 +543,13 @@ impl QueryBuilder {
         not: bool,
     ) -> Self {
         self.check_column(place, column);
+        if values.len() > MAX_IN_VALUES {
+            self.defer(format!(
+                "{place} に渡した値が多すぎます（{} 件。上限は {MAX_IN_VALUES} 件）。\
+                 一覧を分割して、何回かに分けて問い合わせてください",
+                values.len()
+            ));
+        }
         self.wheres.push(Where::In {
             boolean,
             column: column.to_string(),
@@ -646,7 +678,11 @@ impl QueryBuilder {
     /// ```
     ///
     /// **外から来た文字列をそのまま渡さないでください。** 引用も検査もしません。
+    ///
+    /// PostgreSQL で `$1` と書いたときだけ、終端メソッドでエラーになります。
+    /// ビルダーが振る番号と重なるためです。
     pub fn order_by_raw(mut self, sql: &str) -> Self {
+        self.check_raw_dollar("order_by_raw", sql);
         self.orders.push(Order::Raw(sql.to_string()));
         self
     }
@@ -694,10 +730,13 @@ impl QueryBuilder {
     }
 
     /// ページ番号から `limit` と `offset` を決める。ページは1から数えます。
+    ///
+    /// 掛け算はあふれさせません。`?page=18446744073709551615` のような値が
+    /// `req.page()` からそのまま届くので、飽和させて上限に張り付かせます
+    /// （デバッグビルドでパニックし、リリースでは別のページが返っていました）。
     pub fn for_page(self, page: u64, per_page: u64) -> Self {
-        let page = page.max(1);
         let per_page = per_page.max(1);
-        self.limit(per_page).offset((page - 1) * per_page)
+        self.limit(per_page).offset(page_offset(page, per_page))
     }
 
     // ---- SQL の組み立て ----
@@ -822,8 +861,10 @@ impl QueryBuilder {
 
     fn compile_limit(&self, c: &mut Compiler, limit: Option<u64>, offset: Option<u64>) {
         // 件数は数値なので、そのまま置いても安全。
+        // SQLite と PostgreSQL は符号付き 64 ビットまでしか受け付けないので、
+        // それより大きい値は上限に丸める（`u64::MAX` は "datatype mismatch" になる）。
         if let Some(limit) = limit {
-            c.sql.push_str(&format!(" limit {limit}"));
+            c.sql.push_str(&format!(" limit {}", clamp_count(limit)));
         }
         if let Some(offset) = offset {
             if limit.is_none() {
@@ -831,7 +872,7 @@ impl QueryBuilder {
                 // 「上限なし」の書き方は方言で違うので grammar に集めてある。
                 c.sql.push_str(grammar::no_limit(self.driver));
             }
-            c.sql.push_str(&format!(" offset {offset}"));
+            c.sql.push_str(&format!(" offset {}", clamp_count(offset)));
         }
     }
 
@@ -854,6 +895,13 @@ impl QueryBuilder {
                 ..
             } => {
                 c.sql.push_str(&grammar::quote(driver, column));
+                // `is` / `is not` に NULL を渡したときは、プレースホルダを置かずに
+                // `is null` と書く。PostgreSQL は `"c" is $1` を受け付けない。
+                if let (Some(not), Value::Null) = (grammar::is_null_operator(operator), value) {
+                    c.sql
+                        .push_str(if not { " is not null" } else { " is null" });
+                    return;
+                }
                 c.sql.push(' ');
                 c.sql.push_str(operator);
                 c.sql.push(' ');
@@ -1005,12 +1053,22 @@ impl QueryBuilder {
         Ok(rows.into_iter().next())
     }
 
-    /// 主キー（`id`）で1行取る。
+    /// **`id` という名前の列**で1行取る。
+    ///
+    /// 主キーの名前が `id` でない表には使えません。その表では
+    /// `where_(列, 値)` に `first()` を続けてください。モデルなら
+    /// `Model::find` / `ModelQuery::find` が主キーの名前を知っています。
+    ///
+    /// 整数に読める文字列は整数として渡します。PostgreSQL は `bigint = text`
+    /// を断るためです。
     ///
     /// 条件を1つ足すので、ここだけはビルダーを複製します。
     /// 以前は `first()` も複製していたので、2回複製していました。
     pub async fn find(&self, id: impl IntoValue) -> Result<Option<Row>> {
-        self.clone().where_("id", id.into_value()).first().await
+        self.clone()
+            .where_("id", super::normalize_key(id.into_value()))
+            .first()
+            .await
     }
 
     /// 最初の行の、ある列の値を取る。
@@ -1305,6 +1363,13 @@ impl QueryBuilder {
     /// その場合、SQLite と MySQL は指定とは別の値（rowid や 0）を返します。
     /// 名前だけでは見分けられないので（`id` 以外でも普通に正しい）、
     /// 警告は出しません。毎回の `insert` で鳴って雑音になるためです。
+    ///
+    /// **採番されない列を主キーに指定すると、MySQL では `0` が返ります。**
+    /// `last_insert_id()` は、その接続で `auto_increment` が働いていないときに
+    /// `0` を返すためです。`auto_increment` を持たない表（主キーが文字列の表や、
+    /// 値を自分で入れる表）がこれに当たります。
+    /// エラーにはならないので、返った `0` を主キーとして使わないでください。
+    /// SQLite では rowid が返るので、`0` ではなく別の値になります。
     pub async fn insert_get_id_as(
         &self,
         values: &[(&str, Value)],
@@ -1322,10 +1387,12 @@ impl QueryBuilder {
 
         if self.driver == Driver::Postgres {
             let rows = self.source.fetch_all(&sql, &bindings).await?;
-            return rows
-                .first()
-                .ok_or_else(|| Error::msg("insert が ID を返しませんでした"))?
-                .get::<i64>(primary_key);
+            // 1列だけ返るので位置で読む。`t.id` のように表名を付けて渡されると、
+            // 返る列名は `id` になって名前では引けない。
+            return match rows.first().and_then(|row| row.at(0)) {
+                Some(value) => i64::from_value(value),
+                None => Err(Error::msg("insert が ID を返しませんでした")),
+            };
         }
 
         let affected = self.source.execute(&sql, &bindings).await?;
@@ -1533,7 +1600,7 @@ impl QueryBuilder {
         // `count()` が `check()` を通している。ここでは組み立てるだけ。
         let (sql, bindings) = self.select_sql(&Shape {
             limit: Some(per_page),
-            offset: Some((page - 1) * per_page),
+            offset: Some(page_offset(page, per_page)),
             ..self.shape()
         });
         let data = self.source.fetch_all(&sql, &bindings).await?;
@@ -1546,12 +1613,38 @@ impl QueryBuilder {
     }
 }
 
+/// ページ番号から読み飛ばす件数を決める。あふれたら上限に張り付く。
+fn page_offset(page: u64, per_page: u64) -> u64 {
+    page.max(1)
+        .saturating_sub(1)
+        .saturating_mul(per_page.max(1))
+}
+
+/// `limit` / `offset` に書く数を、データベースが受け付ける範囲（符号付き 64 ビット）に丸める。
+fn clamp_count(count: u64) -> u64 {
+    count.min(i64::MAX as u64)
+}
+
+/// `where_in` に一度に渡せる値の数の上限。
+///
+/// 下回りの上限は SQLite が 32,766、PostgreSQL が 65,535 です。超えると
+/// ドライバの分かりにくいエラーになるので、手前で分割を案内します。
+const MAX_IN_VALUES: usize = 30_000;
+
 /// 投げ先から、SQL の組み立てに使うドライバを決める。
 ///
-/// 設定が読めないときは SQLite を仮に使います。本当のエラーは終端メソッド
-/// （`check`）で返します。
-fn resolve_driver(source: &Source) -> Driver {
-    source.driver().unwrap_or(Driver::Sqlite)
+/// 設定が読めないときは SQLite を仮に使い、**理由を一緒に返します。**
+/// 組み立ては `Result` を返せないので、受け取った側が `deferred_error` に積みます。
+///
+/// 終端メソッドの `check` も `source.driver()` を見るので、エラーになること自体は
+/// 理由を捨てても変わりません。積むのは `to_sql()` と `Debug` のためです。
+/// 設定に無い接続名（`DB::connection("typo")`）を渡したとき、理由を捨てていると
+/// `Debug` に SQLite の SQL だけが出て、何が悪いのか分かりませんでした。
+fn resolve_driver(source: &Source) -> (Driver, Option<String>) {
+    match source.driver() {
+        Ok(driver) => (driver, None),
+        Err(e) => (Driver::Sqlite, Some(e.to_string())),
+    }
 }
 
 /// 列の名前として受け付けるか確かめる。その場でエラーを返せる所で使います。
@@ -1601,40 +1694,31 @@ impl Compiler {
     }
 
     /// 値を1つ足して、置き場所を SQL に書く。
+    ///
+    /// 書く文字は `grammar::placeholder` と同じです。SQLite と MySQL は `?` の
+    /// 1文字なので、`String` を作らずその場で足します。`where_in` に3万件渡すと
+    /// 3万回の確保になっていました。
     fn push_value(&mut self, value: Value) {
         self.bindings.push(value);
-        let placeholder = grammar::placeholder(self.driver, self.bindings.len());
-        self.sql.push_str(&placeholder);
+        match self.driver {
+            Driver::Postgres => {
+                use std::fmt::Write;
+                // `String` への書き込みは失敗しないので、結果は見ない。
+                let _ = write!(self.sql, "${}", self.bindings.len());
+            }
+            _ => self.sql.push('?'),
+        }
     }
 
-    /// 利用者が書いた SQL を足す。`?` を使っている場合は番号を振り直す。
+    /// 利用者が書いた SQL を足す。PostgreSQL では `?` を `$n` に振り直す。
     ///
     /// `?` の数と値の数が合っているかは、組み立てのとき
-    /// （`QueryBuilder::check_raw`）に確かめます。
+    /// （`QueryBuilder::check_raw`）に確かめます。振り直しは
+    /// `DB::select` などの生の SQL と同じ関数（`grammar::number_placeholders`）です。
     fn push_raw(&mut self, sql: &str, bindings: &[Value]) {
-        if self.driver != Driver::Postgres {
-            self.sql.push_str(sql);
-            self.bindings.extend_from_slice(bindings);
-            return;
-        }
-        // PostgreSQL は番号付きなので、`?` を順に差し替える。
-        let mut out = String::with_capacity(sql.len());
-        let mut values = bindings.iter();
-        for c in sql.chars() {
-            if c == '?' {
-                if let Some(value) = values.next() {
-                    self.bindings.push(value.clone());
-                    out.push_str(&grammar::placeholder(self.driver, self.bindings.len()));
-                    continue;
-                }
-            }
-            out.push(c);
-        }
-        // 余った値はそのまま後ろに付ける（番号だけ消費される）。
-        for value in values {
-            self.bindings.push(value.clone());
-        }
-        self.sql.push_str(&out);
+        let numbered = grammar::number_placeholders(self.driver, sql, self.bindings.len());
+        self.bindings.extend_from_slice(bindings);
+        self.sql.push_str(&numbered);
     }
 }
 
@@ -1671,13 +1755,14 @@ impl<T> Paginator<T> {
         if self.data.is_empty() {
             return None;
         }
-        Some((self.current_page - 1) * self.per_page + 1)
+        Some(page_offset(self.current_page, self.per_page).saturating_add(1))
     }
 
     /// このページの最後の件が、全体で何件目か。0 件なら `None`。
     pub fn to(&self) -> Option<u64> {
         let from = self.from()?;
-        Some(from + self.data.len() as u64 - 1)
+        // `from()` が `Some` なら 1 件以上あるので、`len - 1` は 0 以上。
+        Some(from.saturating_add(self.data.len() as u64 - 1))
     }
 
     /// このページが空か。
@@ -1805,6 +1890,99 @@ mod tests {
         assert_eq!(sql, "select * from \"posts\" limit 15 offset 30");
         let (sql, _) = builder().offset(5).to_sql();
         assert_eq!(sql, "select * from \"posts\" limit -1 offset 5");
+    }
+
+    #[test]
+    fn 大きなページ番号でもあふれない() {
+        // `req.page()` の値がそのまま届く。以前はデバッグでパニック、リリースで回り込んでいた。
+        let (sql, _) = builder().for_page(u64::MAX, 15).to_sql();
+        assert_eq!(
+            sql,
+            format!("select * from \"posts\" limit 15 offset {}", i64::MAX)
+        );
+        assert_eq!(page_offset(0, 10), 0);
+        assert_eq!(page_offset(1, 10), 0);
+        assert_eq!(page_offset(3, 10), 20);
+        assert_eq!(page_offset(u64::MAX, u64::MAX), u64::MAX);
+
+        // limit / offset に直接渡した値も、データベースが受ける範囲に丸める。
+        let (sql, _) = builder().limit(u64::MAX).offset(u64::MAX).to_sql();
+        assert_eq!(
+            sql,
+            format!(
+                "select * from \"posts\" limit {} offset {}",
+                i64::MAX,
+                i64::MAX
+            )
+        );
+
+        // ページ分けの計算も同じ。
+        let page: Paginator<i32> = Paginator {
+            data: vec![1],
+            total: 1,
+            per_page: u64::MAX,
+            current_page: u64::MAX,
+        };
+        assert_eq!(page.from(), Some(u64::MAX));
+        assert_eq!(page.to(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn nullと_is_で比べるときはプレースホルダを置かない() {
+        // PostgreSQL は `"c" is $1` を受け付けない。
+        let (sql, bindings) = builder()
+            .where_op("deleted_at", "is", Value::Null)
+            .or_where_op("body", "IS NOT", Value::Null)
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"deleted_at\" is null or \"body\" is not null"
+        );
+        assert!(bindings.is_empty());
+
+        // NULL 以外の値はこれまでどおり値を渡す。
+        let (sql, bindings) = builder().where_op("flag", "is", true).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"flag\" is ?");
+        assert_eq!(bindings, vec![Value::Bool(true)]);
+    }
+
+    #[test]
+    fn 多すぎるwhere_inは分割を案内する() {
+        let many: Vec<i64> = (0..=MAX_IN_VALUES as i64).collect();
+        let message = builder()
+            .where_in("id", &many)
+            .check()
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("分割"), "{message}");
+        let fits: Vec<i64> = (0..MAX_IN_VALUES as i64).collect();
+        builder()
+            .where_in("id", &fits)
+            .check()
+            .expect("上限ちょうどは通る");
+    }
+
+    #[test]
+    fn postgresの生のsqlは番号を続きから振る() {
+        let query = QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder()
+        };
+        let (sql, bindings) = query
+            .where_("status", "published")
+            .where_raw("length(title) > ?", &[Value::Int(3)])
+            .group_by(&["author_id"])
+            .having_raw(
+                "count(*) > ? and sum(views) > ?",
+                &[Value::Int(1), Value::Int(2)],
+            )
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"status\" = $1 and length(title) > $2 \
+             group by \"author_id\" having count(*) > $3 and sum(views) > $4"
+        );
+        assert_eq!(bindings.len(), 4);
     }
 
     #[test]
@@ -2016,6 +2194,70 @@ mod tests {
             .where_raw("length(title) > ?", &[Value::Int(3)])
             .check()
             .expect("数が合えば通る");
+    }
+
+    #[test]
+    fn postgresのビルダーでドル記号の直書きは断る() {
+        // `$1` を直接書くと、ビルダーが振る番号と重なって別の値を見にいく。
+        let postgres = || QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder()
+        };
+        for query in [
+            postgres().where_raw("x > $1", &[]),
+            postgres().or_where_raw("x > $1", &[]),
+            postgres().having_raw("count(*) > $1", &[]),
+            postgres().order_by_raw("$1"),
+        ] {
+            let message = query.check().expect_err("断られる").to_string();
+            assert!(message.contains("`?` を使ってください"), "{message}");
+            assert!(message.contains("DB::select"), "{message}");
+        }
+
+        // ほかのドライバは `$` を特別扱いしない。
+        for driver in [Driver::Sqlite, Driver::MySql] {
+            let query = QueryBuilder {
+                driver,
+                ..builder()
+            };
+            query
+                .where_raw("x > $1", &[])
+                .check()
+                .expect("postgres 以外は通る");
+        }
+
+        // `?` で渡す形はこれまでどおり通る。
+        postgres()
+            .where_raw("x > ?", &[Value::Int(1)])
+            .check()
+            .expect("`?` なら通る");
+    }
+
+    #[test]
+    fn 値の置き場所はドライバごとに変わる() {
+        // `push_value` を `?` の直書きに変えても、出る SQL は同じこと。
+        for (driver, expected) in [
+            (
+                Driver::Sqlite,
+                "select * from \"posts\" where \"id\" in (?, ?, ?)",
+            ),
+            (
+                Driver::MySql,
+                "select * from `posts` where `id` in (?, ?, ?)",
+            ),
+            (
+                Driver::Postgres,
+                "select * from \"posts\" where \"id\" in ($1, $2, $3)",
+            ),
+        ] {
+            let query = QueryBuilder {
+                driver,
+                ..builder()
+            };
+            let (sql, bindings) = query.where_in("id", &[1i64, 2, 3]).to_sql();
+            assert_eq!(sql, expected, "{driver}");
+            assert_eq!(bindings.len(), 3, "{driver}");
+        }
     }
 
     #[test]

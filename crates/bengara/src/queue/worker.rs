@@ -52,8 +52,12 @@ pub(crate) const DEFAULT_RETRY_AFTER: i64 = 90;
 ///
 /// 1 回目 10 秒、2 回目 20 秒、3 回目 40 秒…と伸ばします。
 /// すぐ試し直すと、同じ理由で失敗し続けて DB を叩くだけになるためです。
-pub(crate) fn backoff_secs(attempts: u32) -> i64 {
-    let shift = attempts.min(6);
+///
+/// `attempts` は `jobs.attempts` の実値なので、負の値も来ます
+/// （アプリが `DB::table("jobs").update(..)` で書けます）。`clamp` で
+/// 0〜6 に収め、ずらし幅が負になることを防ぎます。
+pub(crate) fn backoff_secs(attempts: i64) -> i64 {
+    let shift = attempts.clamp(0, 6);
     10 * (1_i64 << shift) / 2
 }
 
@@ -68,9 +72,12 @@ pub(crate) fn reclaim_cutoff(now: i64, retry_after: i64) -> String {
 ///
 /// 目印が残っていた（`reserved_at` がある）ときだけ +1 します。同じジョブを
 /// 永久に回し続けず、`tries` に達したら諦められるようにするためです。
-pub(crate) fn next_attempts(reserved_at: Option<&str>, attempts: u32) -> u32 {
+///
+/// 値は `jobs.attempts` の実値（`i64`）です。丸めないので負の値も来ます。
+/// あふれないよう飽和加算にします。
+pub(crate) fn next_attempts(reserved_at: Option<&str>, attempts: i64) -> i64 {
     if reserved_at.is_some() {
-        attempts + 1
+        attempts.saturating_add(1)
     } else {
         attempts
     }
@@ -125,7 +132,8 @@ struct Reserved {
     id: i64,
     job: String,
     payload: String,
-    attempts: u32,
+    /// 予約のときに書いた `attempts`。列の実値なので負の値も来ます。
+    attempts: i64,
     queue: String,
     /// 予約したときに書いた `reserved_at`。
     ///
@@ -151,8 +159,8 @@ enum Reservation {
 /// **トランザクションを使いません。2 文の比較交換（compare-and-set）です。**
 ///
 /// 1. `select` で候補を 1 件取る。
-/// 2. `update ... where id = ? and (reserved_at is null or reserved_at <= cutoff)`
-///    を投げ、0 件なら負けたと見なす（[`Reservation::Lost`]）。
+/// 2. `update ... where id = ? and <1 文目と同じ条件> and attempts = <1 文目で見た値>`
+///    を投げ、0 件なら負けたと見なす（[`Reservation::Lost`]、[`claim_row`]）。
 ///
 /// 2 つのワーカーが同じ行を見ても、更新が通るのは 1 つだけです。
 ///
@@ -190,24 +198,26 @@ async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservatio
     let id: i64 = row.get("id")?;
     let reserved_at: Option<String> = row.get("reserved_at")?;
     let was_stale = reserved_at.is_some();
-    let done = row.get::<i64>("attempts")?.max(0) as u32;
+    // **丸めません。** 2 文目は列の実値と突き合わせるので、`max(0)` で丸めると
+    // 負の `attempts` が入った行で `where attempts = ?` が永久に 0 件になり、
+    // `Reservation::Lost` を待たずに繰り返して全力ループになりました。
+    let done = row.get::<i64>("attempts")?;
     let attempts = next_attempts(reserved_at.as_deref(), done);
 
     // 回収しようとした行が、もう `tries` ぶん試されていたら諦める。
     // ここで止めないと、ワーカーごと落とすジョブが永久に回り続けます。
     // `Options.tries == 0` は `commands.rs` が弾くので、無制限はありません。
-    if let (true, Some(reserved_at)) = (done >= tries, reserved_at.as_deref()) {
-        give_up_stale(&row, id, reserved_at, done).await?;
+    //
+    // 見るのは**数え直した `attempts`** です。列から読んだ `done` で見ていた
+    // ころは、落ちた進行中の 1 回が数えられないまま 1 回ぶん多く動きました
+    //（`--tries 3` で 4 回走り、`failed_jobs` の文面だけ「3 回」と出る）。
+    if let (true, Some(reserved_at)) = (attempts >= i64::from(tries), reserved_at.as_deref()) {
+        give_up_stale(&row, id, reserved_at, attempts).await?;
         // 自分は予約していないので、待たずに次の 1 件を見る。
         return Ok(Reservation::Lost);
     }
 
-    let affected = reclaimable(DB::table(TABLE).where_("id", id), &cutoff)
-        .update(&[
-            ("reserved_at", Value::Text(now.clone())),
-            ("attempts", Value::Int(attempts as i64)),
-        ])
-        .await?;
+    let affected = claim_row(queue, id, done, &now, &cutoff, attempts).await?;
 
     if affected == 0 {
         // ほかのワーカーが先に取った。待たずに取り直す。
@@ -230,6 +240,37 @@ async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservatio
     }))
 }
 
+/// `reserve` の 2 文目。**1 文目で見たとおりの行だけ**を予約する。
+///
+/// `id` と取り直しの条件（[`reclaimable`]）だけで絞っていたころは、
+/// 1 文目と 2 文目の間に別のワーカーが同じ行を取って**速く失敗**すると、
+/// こちらの更新が通ってしまいました。[`fail`] は `reserved_at` を外して
+/// `attempts` を増やし、`available_at` を先へ送ります。それを知らないまま
+/// 上書きするので、(a) 待ち時間を無視して即再実行し、(b) `attempts` を
+/// 1 文目で見た古い値に巻き戻して `--tries` より多く試していました。
+///
+/// 1 文目と同じ条件（[`reservable`]）に `attempts` の一致を足し、本当の
+/// 比較交換にします。どれか 1 つでも変わっていれば 0 件になり、負けた側は
+/// 待たずに取り直します。
+/// `seen_attempts` は**列から読んだ値そのまま**です。丸めた値を渡すと、
+/// 条件と実値がずれて永久に 0 件になります。
+async fn claim_row(
+    queue: &str,
+    id: i64,
+    seen_attempts: i64,
+    now: &str,
+    cutoff: &str,
+    attempts: i64,
+) -> Result<u64> {
+    reservable(DB::table(TABLE).where_("id", id), queue, now, cutoff)
+        .where_("attempts", seen_attempts)
+        .update(&[
+            ("reserved_at", Value::Text(now.to_string())),
+            ("attempts", Value::Int(attempts)),
+        ])
+        .await
+}
+
 /// 回収しようとした行を、予約せずに `failed_jobs` へ移す。
 ///
 /// ワーカープロセスごと落とすジョブ（OOM kill・SIGKILL・`panic = "abort"`）は
@@ -239,7 +280,7 @@ async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservatio
 ///
 /// `fail` と同じ「**先に消して、1 件だった側だけ入れる**」形です。0 件なら
 /// 別のワーカーが先に動かしたので、`failed_jobs` にも入れません。
-async fn give_up_stale(row: &Row, id: i64, reserved_at: &str, attempts: u32) -> Result<()> {
+async fn give_up_stale(row: &Row, id: i64, reserved_at: &str, attempts: i64) -> Result<()> {
     let error = format!(
         "{attempts} 回試しましたが、ワーカーが応答しなくなったため諦めました\
          （処理の途中でワーカープロセスが落ちています）"
@@ -292,36 +333,16 @@ async fn finish(reserved: &Reserved) -> Result<()> {
 /// 戻すだけだと、まだ動いている別のワーカーがいるのに 3 つ目のワーカーが
 /// 同じジョブを取れてしまいます。
 async fn fail(reserved: &Reserved, tries: u32, error: &str) -> Result<bool> {
-    let attempts = reserved.attempts + 1;
-    if attempts >= tries {
-        // 入れるのと消すのを 1 つのトランザクションにする。
-        // 分けると、間でプロセスが死んだときに両方の表に残って再実行されます。
-        let tx = DB::begin().await?;
-        // **先に消します。** 0 件なら自分の予約ではないので、
-        // `failed_jobs` にも入れません（別のワーカーの結果を踏まない）。
-        let affected = mine(tx.table(TABLE), reserved).delete().await?;
-        if affected == 0 {
-            tx.commit().await?;
-            warn_not_mine(reserved.id);
-            return Ok(true);
-        }
-        tx.table(FAILED_TABLE)
-            .insert(&[
-                ("queue", Value::Text(reserved.queue.clone())),
-                ("job", Value::Text(reserved.job.clone())),
-                ("payload", Value::Text(reserved.payload.clone())),
-                ("error", Value::Text(error.to_string())),
-                ("failed_at", Value::Text(crate::database::now())),
-            ])
-            .await?;
-        tx.commit().await?;
+    let attempts = reserved.attempts.saturating_add(1);
+    if attempts >= i64::from(tries) {
+        give_up(reserved, error).await?;
         return Ok(true);
     }
 
     let next = time::format_timestamp(time::now_seconds() + backoff_secs(attempts));
     let affected = mine(DB::table(TABLE), reserved)
         .update(&[
-            ("attempts", Value::Int(attempts as i64)),
+            ("attempts", Value::Int(attempts)),
             ("available_at", Value::Text(next)),
             ("reserved_at", Value::Null),
         ])
@@ -332,13 +353,42 @@ async fn fail(reserved: &Reserved, tries: u32, error: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// 諦めて `failed_jobs` へ移す（[`fail`] の上限到達と、名前の無いジョブで使う）。
+///
+/// 入れるのと消すのを 1 つのトランザクションにします。
+/// 分けると、間でプロセスが死んだときに両方の表に残って再実行されます。
+///
+/// **先に消します。** 0 件なら自分の予約ではないので、
+/// `failed_jobs` にも入れません（別のワーカーの結果を踏まない）。
+async fn give_up(reserved: &Reserved, error: &str) -> Result<()> {
+    let tx = DB::begin().await?;
+    let affected = mine(tx.table(TABLE), reserved).delete().await?;
+    if affected == 0 {
+        tx.commit().await?;
+        warn_not_mine(reserved.id);
+        return Ok(());
+    }
+    tx.table(FAILED_TABLE)
+        .insert(&[
+            ("queue", Value::Text(reserved.queue.clone())),
+            ("job", Value::Text(reserved.job.clone())),
+            ("payload", Value::Text(reserved.payload.clone())),
+            ("error", Value::Text(error.to_string())),
+            ("failed_at", Value::Text(crate::database::now())),
+        ])
+        .await?;
+    tx.commit().await
+}
+
+/// 名前の無いジョブの説明文。
+fn unknown_job_message(name: &str) -> String {
+    format!("`{name}` というジョブはありません（app/Jobs/ を確かめてください）")
+}
+
 /// ジョブを 1 件動かす。パニックも失敗として扱います。
 async fn run_one(jobs: &[Job], reserved: &Reserved) -> std::result::Result<(), String> {
     let Some(job) = jobs.iter().find(|j| j.name == reserved.job) else {
-        return Err(format!(
-            "`{}` というジョブはありません（app/Jobs/ を確かめてください）",
-            reserved.job
-        ));
+        return Err(unknown_job_message(&reserved.job));
     };
 
     let handle = job.handle;
@@ -353,6 +403,37 @@ async fn run_one(jobs: &[Job], reserved: &Reserved) -> std::result::Result<(), S
     }
 }
 
+/// 続けて競り合いに負けてよい回数。
+///
+/// [`Reservation::Lost`] は普通ならすぐ解消するので待ちません。ですが
+/// 2 文目の条件が**永久に合わない**行が先頭にあると、同じ行を選び直して
+/// 全力で回り続けます（CPU を使い切り、キューは 1 件も進みません）。
+/// 続けてこの回数負けたら `--sleep` の待ちに落として歯止めにします。
+const MAX_CONSECUTIVE_LOST: u32 = 10;
+
+/// 続けて負けた回数を数え、待ちに落ちるべきかを返す。
+///
+/// 落ちると決めたら数えた回数を 0 に戻します。待った後は、また
+/// [`MAX_CONSECUTIVE_LOST`] 回まで待たずに取り直せます。
+fn back_off_after_losses(lost: &mut u32) -> bool {
+    *lost += 1;
+    if *lost >= MAX_CONSECUTIVE_LOST {
+        *lost = 0;
+        return true;
+    }
+    false
+}
+
+/// `--sleep` 秒待つ。ここで止まらないよう、細かく区切って合図を見る。
+async fn idle_sleep(sleep: u64, stop: &AtomicBool) {
+    for _ in 0..sleep.max(1) * 10 {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// `queue:work` の本体。止まるまでジョブを処理し続けます。
 pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) -> Result<()> {
     println!(
@@ -361,6 +442,8 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
     );
 
     let mut processed = 0u64;
+    // 続けて競り合いに負けた回数。取れたら 0 に戻します。
+    let mut lost = 0u32;
     loop {
         if stop.load(Ordering::Relaxed) {
             println!("\n停止の合図を受けました。{processed} 件処理しました。");
@@ -368,24 +451,44 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
         }
 
         let reserved = match reserve(&options.queue, options.retry_after, options.tries).await? {
-            Reservation::Taken(reserved) => reserved,
-            // 競り合いに負けただけなので待たない。
-            Reservation::Lost => continue,
+            Reservation::Taken(reserved) => {
+                lost = 0;
+                reserved
+            }
+            // 競り合いに負けただけなので待たない。ただし負け続けるときは、
+            // 条件が永久に合わない行で全力ループになるので待ちに落ちる。
+            Reservation::Lost => {
+                if back_off_after_losses(&mut lost) {
+                    idle_sleep(options.sleep, &stop).await;
+                }
+                continue;
+            }
             Reservation::Empty => {
+                lost = 0;
                 if options.once {
                     println!("待っているジョブはありません。");
                     return Ok(());
                 }
-                // 空なら少し待つ。ここで止まらないよう、細かく区切って合図を見る。
-                for _ in 0..options.sleep.max(1) * 10 {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+                idle_sleep(options.sleep, &stop).await;
                 continue;
             }
         };
+
+        // 名前の無いジョブは、待っても動くようにならない。再挑戦の待ち時間
+        //（10 秒・20 秒…）を 3 回ぶん積むだけなので、すぐ `failed_jobs` へ移す。
+        // ファイルを置き忘れたまま `queue:retry` で戻せるよう、記録は残す。
+        if !jobs.iter().any(|j| j.name == reserved.job) {
+            let message = unknown_job_message(&reserved.job);
+            give_up(&reserved, &message).await?;
+            eprintln!(
+                "  {} #{} 失敗（諦めました）: {message}",
+                reserved.job, reserved.id
+            );
+            if options.once {
+                return Ok(());
+            }
+            continue;
+        }
 
         let started = std::time::Instant::now();
         match run_one(jobs, &reserved).await {
@@ -406,15 +509,15 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
                         "  {} #{} 失敗（{} 回目で諦めました）: {message}",
                         reserved.job,
                         reserved.id,
-                        reserved.attempts + 1
+                        reserved.attempts.saturating_add(1)
                     );
                 } else {
                     eprintln!(
                         "  {} #{} 失敗（{} 回目、{} 秒後に再挑戦）: {message}",
                         reserved.job,
                         reserved.id,
-                        reserved.attempts + 1,
-                        backoff_secs(reserved.attempts + 1)
+                        reserved.attempts.saturating_add(1),
+                        backoff_secs(reserved.attempts.saturating_add(1))
                     );
                 }
             }
@@ -558,14 +661,120 @@ mod tests {
 
     #[test]
     fn 更新も同じ条件で絞る() {
-        // 2 文目（update）の `where` は 1 文目と同じものを使う。
+        // 2 文目（update）の `where` は 1 文目と同じ条件に、見た `attempts` を足す。
+        let now = time::format_timestamp(1_700_000_000);
         let cutoff = reclaim_cutoff(1_700_000_000, 90);
-        let (sql, bindings) = reclaimable(DB::table(TABLE).where_("id", 7), &cutoff).to_sql();
+        let (sql, bindings) =
+            reservable(DB::table(TABLE).where_("id", 7), "default", &now, &cutoff)
+                .where_("attempts", 2_i64)
+                .to_sql();
 
         assert!(sql.contains("\"id\" = ?"), "{sql}");
+        assert!(sql.contains("\"queue\" = ?"), "{sql}");
+        assert!(sql.contains("\"available_at\" <= ?"), "{sql}");
         assert!(sql.contains("and (\"reserved_at\" is null"), "{sql}");
         assert!(sql.contains("or \"reserved_at\" <= ?"), "{sql}");
-        assert_eq!(bindings, vec![Value::Int(7), Value::Text(cutoff)]);
+        assert!(sql.contains("and \"attempts\" = ?"), "{sql}");
+        assert_eq!(
+            bindings,
+            vec![
+                Value::Int(7),
+                Value::Text("default".to_string()),
+                Value::Text(now),
+                Value::Text(cutoff),
+                Value::Int(2),
+            ]
+        );
+    }
+
+    /// すぐ取れるジョブを 1 本入れて、その id を返す。
+    #[cfg(feature = "sqlite")]
+    async fn 待っているジョブを入れる(job: &str) -> i64 {
+        let now = crate::database::now();
+        DB::table(TABLE)
+            .insert_get_id(&[
+                ("queue", Value::Text(DEFAULT_QUEUE.to_string())),
+                ("job", Value::Text(job.to_string())),
+                ("payload", Value::Text("{}".to_string())),
+                ("attempts", Value::Int(0)),
+                ("available_at", Value::Text(now.clone())),
+                ("created_at", Value::Text(now)),
+            ])
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 間に別のワーカーが失敗させた行は取らない() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        let id = 待っているジョブを入れる("SendWelcome").await;
+
+        // 1 文目で見た状態（attempts = 0、available_at = 今）。
+        let now_secs = time::now_seconds();
+        let now = time::format_timestamp(now_secs);
+        let cutoff = reclaim_cutoff(now_secs, DEFAULT_RETRY_AFTER);
+
+        // 2 文目を投げる前に、別のワーカーが同じ行を取って速く失敗した形。
+        // `fail` と同じく、予約を外して回数を増やし、次の時刻を先へ送る。
+        let later = time::format_timestamp(now_secs + 60);
+        DB::table(TABLE)
+            .where_("id", id)
+            .update(&[
+                ("attempts", Value::Int(1)),
+                ("available_at", Value::Text(later.clone())),
+                ("reserved_at", Value::Null),
+            ])
+            .await
+            .unwrap();
+
+        // 以前は `id` と取り直しの条件だけで更新が通り、待ち時間を無視して
+        // 即再実行し、`attempts` を 0 に巻き戻していた。
+        let affected = claim_row(DEFAULT_QUEUE, id, 0, &now, &cutoff, 0)
+            .await
+            .unwrap();
+        assert_eq!(affected, 0, "負けたと見なす");
+
+        let row = DB::table(TABLE).find(id).await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>("attempts").unwrap(), 1, "回数を巻き戻さない");
+        assert_eq!(
+            row.get::<String>("available_at").unwrap(),
+            later,
+            "待ち時間を保つ"
+        );
+        assert!(row.value("reserved_at").unwrap().is_null(), "予約しない");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 名前の無いジョブは待たずに諦める() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        待っているジョブを入れる("NoSuchJob").await;
+
+        // 登録されているジョブが 1 つも無い状態で 1 本だけ処理する。
+        let stop = Arc::new(AtomicBool::new(false));
+        let options = Options {
+            once: true,
+            ..Options::default()
+        };
+        run(&[], &options, stop).await.unwrap();
+
+        // 以前は 10 秒・20 秒と待って 3 回回してから諦めていた。
+        assert_eq!(
+            DB::table(TABLE).count().await.unwrap(),
+            0,
+            "キューから消える"
+        );
+        let failed = failed_list().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].1, "NoSuchJob");
+        assert!(
+            failed[0].3.contains("というジョブはありません"),
+            "{}",
+            failed[0].3
+        );
     }
 
     #[test]
@@ -695,7 +904,7 @@ mod tests {
     async fn ワーカーごと落ちたジョブは諦める() {
         let _db = crate::testing::refresh_database().await;
         表を作る().await;
-        // 3 回ぶん試したあと、ワーカーごと落ちて目印が残ったままの行。
+        // `tries` を超えて試したあと、ワーカーごと落ちて目印が残ったままの行。
         放置されたジョブを入れる(3).await;
 
         // 以前はここで予約し直し、`attempts` が `tries` を超えても回収され
@@ -728,6 +937,78 @@ mod tests {
                 .unwrap(),
             Reservation::Empty
         ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 落ちた1回も数えて諦める() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        // 2 回ぶん記録されたあと、3 回目の途中でワーカーごと落ちた行。
+        // 落ちた 1 回はまだ `attempts` に数えられていない。
+        放置されたジョブを入れる(2).await;
+
+        // 列の値（2）で見ていたころは `2 >= 3` が偽で予約し直し、
+        // `--tries 3` でも 4 回走っていた。数え直した値（3）で諦める。
+        let taken = reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
+            .await
+            .unwrap();
+        assert!(matches!(taken, Reservation::Lost), "予約しない");
+        assert_eq!(
+            DB::table(TABLE).count().await.unwrap(),
+            0,
+            "キューから消える"
+        );
+
+        // 文面の回数も、実際に動いた回数とそろう。
+        let failed = failed_list().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].3.starts_with("3 回試しました"), "{}", failed[0].3);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 回数が負の行でも予約できる() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        let id = 待っているジョブを入れる("SendWelcome").await;
+        // アプリが `DB::table("jobs").update(..)` で負の値を入れた形。
+        DB::table(TABLE)
+            .where_("id", id)
+            .update(&[("attempts", Value::Int(-1))])
+            .await
+            .unwrap();
+
+        // 読んだ値を `max(0)` で丸めていたころは、2 文目の
+        // `where attempts = 0` が永久に 0 件になり、`Lost` を待たずに
+        // 繰り返して全力ループになった（キューは 1 件も進まない）。
+        match reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
+            .await
+            .unwrap()
+        {
+            Reservation::Taken(reserved) => {
+                assert_eq!(reserved.id, id);
+                assert_eq!(reserved.attempts, -1, "読んだ値をそのまま持つ");
+            }
+            _ => panic!("予約できるはずです"),
+        }
+        // 回数は `attempts + 1` で進むので、いずれ `tries` に達する。
+        assert_eq!(next_attempts(Some("2024-01-01 00:00:00"), -1), 0);
+        // ずらし幅が負にならない。
+        assert_eq!(backoff_secs(-1), 5);
+    }
+
+    #[test]
+    fn 負けが続いたら待ちに落ちる() {
+        // 2 文目の条件が永久に合わない行があると、`Lost` の繰り返しで
+        // 全力ループになる。ある回数で `--sleep` の待ちに落として歯止めにする。
+        let mut lost = 0;
+        for _ in 1..MAX_CONSECUTIVE_LOST {
+            assert!(!back_off_after_losses(&mut lost), "数回なら待たない");
+        }
+        assert!(back_off_after_losses(&mut lost), "続けて負けたら待つ");
+        // 数え直すので、次はまた待たずに取り直せる。
+        assert!(!back_off_after_losses(&mut lost));
     }
 
     #[cfg(feature = "sqlite")]

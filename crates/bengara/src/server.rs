@@ -15,6 +15,14 @@ use crate::http::{Request, Response};
 /// 受け取る本文の上限（2 MiB）。超えると 413 を返します。
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// 本文を読み終えるまでに掛けてよい時間。過ぎると 408 を返します。
+///
+/// 2 MiB をこの時間で送れない相手は、回線が細いのではなく、わざと遅く送って
+/// 接続を握り続けている可能性のほうが高いです。
+/// 接続そのものの待ち時間（ヘッダーが来るまで・idle）と同時接続数の上限は
+/// 持ちません。前段のプロキシで掛けてください（`docs/deployment.md`）。
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// サーバーを起動して、止まるまで待つ。
 pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -130,13 +138,26 @@ async fn dispatch(
         return early_error(Error::http(413, "本文が大きすぎます"), wants_json);
     }
 
-    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
-        Ok(bytes) => bytes.to_vec(),
-        Err(_) => {
+    // 本文を読むのに掛けてよい時間に上限を置く。送りを遅らせるだけで接続とタスクを
+    // 握り続けられないようにするため。間に合わなければ 408 で切る。
+    let read = tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        axum::body::to_bytes(body, MAX_BODY_BYTES),
+    )
+    .await;
+    let bytes = match read {
+        Ok(Ok(bytes)) => bytes.to_vec(),
+        Ok(Err(_)) => {
             // ここに来るのは、途中で接続が切れた・chunked が壊れていた・
             // 長さの申告が無いまま上限を超えた、のどれかです。
             // 「大きすぎる」と分かっているのは申告を見た上の分岐だけなので、ここは 400。
             return early_error(Error::http(400, "本文を読み取れませんでした"), wants_json);
+        }
+        Err(_elapsed) => {
+            return early_error(
+                Error::http(408, "本文の受け取りに時間がかかりすぎました"),
+                wants_json,
+            );
         }
     };
 
@@ -160,15 +181,19 @@ async fn dispatch(
         .with_body(bytes)
         .with_remote_addr(peer);
 
+    // アクセスログに出す文字列は、ログが有効なときだけ作る。
+    // `RUST_LOG=warn` で動かしているときに、リクエストごとの確保を 2 本減らせます。
+    let logging = tracing::enabled!(tracing::Level::INFO);
     let started = std::time::Instant::now();
-    let method = req.method().to_string();
-    let target = log_target(&req);
+    let line = logging.then(|| (req.method().to_string(), log_target(&req)));
     let response = app.handle(req).await;
-    tracing::info!(
-        "{method} {target} -> {} ({} ms)",
-        response.status(),
-        started.elapsed().as_millis()
-    );
+    if let Some((method, target)) = line {
+        tracing::info!(
+            "{method} {target} -> {} ({} ms)",
+            response.status(),
+            started.elapsed().as_millis()
+        );
+    }
 
     into_axum(response)
 }
@@ -506,6 +531,17 @@ mod tests {
             log_target(&req),
             "/reset?%74oken=***&%73ignature=***&page=2",
             "名前は生のまま出し、値だけ伏せる"
+        );
+    }
+
+    #[test]
+    fn ログはかっこ付きの名前と合い言葉も伏せる() {
+        // `token[]` は 1 語として扱われ、以前は値がそのままログに残っていた。
+        let req = Request::new("GET", "/pay")
+            .with_query("token[]=abc&cvc=123&recovery_code=xyz&keyword=rust");
+        assert_eq!(
+            log_target(&req),
+            "/pay?token[]=***&cvc=***&recovery_code=***&keyword=rust"
         );
     }
 

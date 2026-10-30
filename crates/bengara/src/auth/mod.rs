@@ -36,6 +36,12 @@ use crate::support::blocking;
 /// （`destroy_for_user`）。
 pub(crate) const AUTH_ID_KEY: &str = "bengara_auth_id";
 
+/// ログインした時刻（UNIX ミリ秒）を入れる鍵の名前。
+///
+/// `logout_user` などで「切った」印より前にログインしたセッションだけを
+/// 捨てるために使います（`StartSession` が保存の直前に見ます）。
+pub(crate) const AUTH_AT_KEY: &str = "bengara_auth_at";
+
 /// 表と結びついた「ログインできる人」。
 ///
 /// `Model` を継承しているので、主キーと表の名前は `#[derive(Model)]` から取れます。
@@ -103,6 +109,7 @@ impl<'a> Auth<'a> {
         // 他人のセッション ID を押し付ける攻撃（セッション固定化）を防ぐ。
         session.regenerate();
         session.put(AUTH_ID_KEY, id.to_string());
+        session.put(AUTH_AT_KEY, crate::support::time::now_millis().to_string());
         Ok(())
     }
 
@@ -246,7 +253,12 @@ impl<'a> Auth<'a> {
         let Some(id) = self.id() else {
             return Ok(None);
         };
-        U::query().where_(U::PRIMARY_KEY, id).first().await
+        // セッションには文字列で入っている。整数の主キーなら整数に直して束縛する
+        // （PostgreSQL は `bigint = text` を断る）。
+        U::query()
+            .where_(U::PRIMARY_KEY, U::key_value(id))
+            .first()
+            .await
     }
 
     /// ログイン中の利用者を読む。いなければ 401 のエラー。

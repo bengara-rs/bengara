@@ -44,22 +44,15 @@ pub async fn handle(args: &[String]) -> Result<()> {
 **ファイル名は大文字で始めてください。** 小文字始まりのファイルはコマンドの一覧に
 入りません。黙って無視せず、ビルドのときに警告を出します。
 
-**使える文字は英数字と `_` `-` だけです。**
+**使える文字は英数字と `_` `-` だけです。** `My Report.rs` や `Send.Report.rs` は
+控えのファイルと見なして取り込みません（警告が出ます。
+[directory-structure.md](directory-structure.md)）。
 
-| ファイル名       | どうなるか                                           |
-|------------------|------------------------------------------------------|
-| `My Report.rs`   | **取り込みません。** 警告が出ます（控えと見なします） |
-| `Send.Report.rs` | 同じ                                                 |
-
-`.` や空白が入った名前は、`User.old.rs` のような控えのファイルであることが多いので、
-取り込まずに警告だけ出します（[directory-structure.md](directory-structure.md)）。
-コマンドにしたいなら、名前を英数字と `_` `-` だけにしてください。
+**名前に `:` は使えません。** `-` で区切ってください。
+Laravel の `make:command` が作る `app:send-report` に近い形です（頭の `app:` は付けません）。
 
 **名前がぶつかったらビルドが止まります。** ディレクトリを分けても同じです。
-`SendReport.rs` と `Sub/Send_Report.rs` はどちらも `send-report` になるので、
-片方が呼べなくなります。黙って先に並んだほうを使う、ということはしません。
-
-Laravel の `make:command` が作る `app:send-report` に近い形です（頭の `app:` は付けません）。
+`SendReport.rs` と `Sub/Send_Report.rs` はどちらも `send-report` になります。
 
 **フレームワークのコマンドが先です。** `migrate` や `queue:work` と同じ名前を付けると、
 自分のほうは呼ばれません。`list` で確かめてください。
@@ -107,9 +100,8 @@ pub async fn handle(args: &[String]) -> Result<()> {
 
 **解析はしません。** Laravel の `$signature` に当たるものは無いので、
 必要な形で自分で読んでください。
-
-フレームワークのコマンドは旗をコマンドごとに照合します（[artisan.md](artisan.md)）。
-自作コマンドにはその仕組みが掛かりません。 **知らない旗は自分で断ってください。**
+**知らない旗も自分で断ってください。** フレームワークのコマンドがする旗の照合
+（[artisan.md](artisan.md)）は、自作コマンドには掛かりません。
 
 ## 中で何をするか
 
@@ -126,20 +118,16 @@ pub const DESCRIPTION: &str = "記事とコメントの数を出す";
 pub async fn handle(_args: &[String]) -> Result<()> {
     println!("記事:     {}", Post::count().await?);
     println!("コメント: {}", Comment::count().await?);
+    println!("利用者:   {}", DB::table("users").count().await?);
     println!("待ちジョブ: {}", Queue::size().await?);
     Ok(())
 }
 ```
 
-## 無いもの
+## まだ無いもの
 
-| 項目                      | 代わりにすること           |
-|---------------------------|----------------------------|
-| `$signature` の文法       | `&[String]` を自分で読む   |
-| 対話（`ask` / `confirm`） | ありません                 |
-| 進捗バー                  | `println!` で出す          |
-| `make:command`            | ファイルを手で作る         |
-| 名前の中の `:`            | 使えません（`-` で区切る） |
+まだ無いものは [backlog.md](backlog.md) にまとめてあります。
+**ファイルは手で作ります**（`make:command` はありません）。
 
 ## 関連
 

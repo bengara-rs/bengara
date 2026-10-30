@@ -37,7 +37,21 @@ const WATCH_DIRS: &[&str] = &[
 ];
 
 /// 見張るファイル。
-const WATCH_FILES: &[&str] = &[".env", "Cargo.toml", "build.rs", "main.rs", "artisan.rs"];
+///
+/// ビルドの入り口になるものを入れます。`Cargo.lock` は依存の版（`Cargo.toml` を
+/// 直さずに `cargo update` で動く）、`.cargo/config.toml` は rustflags と別名、
+/// `rust-toolchain.toml` は使うコンパイラそのものを決めます。どれも書き換えると
+/// できあがる実行ファイルが変わるので、見張らないと古い版が動き続けます。
+const WATCH_FILES: &[&str] = &[
+    ".env",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/config.toml",
+    "rust-toolchain.toml",
+    "build.rs",
+    "main.rs",
+    "artisan.rs",
+];
 
 /// 掘らないディレクトリの名前。重いものと、ビルドに関係ないもの。
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "storage"];
@@ -311,6 +325,12 @@ fn stop(child: &mut Option<Running>) {
 /// |--------------|-------------------------------|------------------------|
 /// | 起動時に1回  | `startup_prefix`（pid 抜き）  | 前回の分も含めて全部   |
 /// | ビルドのたび | `copy_prefix`（自分の pid）   | 自分が作った分だけ     |
+///
+/// **残っている細い窓**: `serve` を2つ同時に動かすと、起動時の片付け
+/// （pid 抜きの `startup_prefix`）が、もう一方の `serve` が `fs::copy` した直後・
+/// `spawn` する前のコピーを消すことがあります。消されたほうの起動はそこで
+/// 失敗します。起動のたびに1回しか起きず、`serve` をもう一度動かせば直るので、
+/// 鍵をかけてまでは守っていません。
 fn clean_old_copies(run_dir: &Path, prefix: &str) {
     let Ok(entries) = std::fs::read_dir(run_dir) else {
         return;

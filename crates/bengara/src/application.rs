@@ -39,6 +39,11 @@ struct Inner {
     storage_public_canonical: Option<Arc<Path>>,
     debug: bool,
     exceptions: Option<Arc<Exceptions>>,
+    /// ルートに当たらなかったときの最内側（静的ファイル → 404）。
+    ///
+    /// 起動時に 1 つ作って使い回します。以前は 404 のたびに `Arc` を作っていました。
+    /// `Inner` を強く持つと自分を指す輪になって解放されないので、`Weak` で持ちます。
+    not_found: Arc<dyn ErasedHandler>,
 }
 
 /// エラーからレスポンスを作る関数。
@@ -104,8 +109,7 @@ impl Application {
     /// 1本のリクエストを処理する。ソケットを使わないので、テストからも呼べます。
     pub(crate) async fn handle(&self, mut req: Request) -> Response {
         let is_head = req.method() == "HEAD";
-        let options = RenderOptions::new(self.inner.debug, wants_json(&req))
-            .with_exceptions(self.inner.exceptions.clone());
+        let options = self.render_options(&req);
 
         // 共通ミドルウェアは、ルートに当たらなかったときも通します（Laravel と同じ）。
         // そのため、ここでは並びを1本だけ回し、分岐は最内側のハンドラに寄せます。
@@ -221,23 +225,18 @@ impl Application {
                     }
                 }))
             }
-            Matched::NotFound => {
-                let app = self.clone();
-                let options = options.clone();
-                Arc::new(Erased::new(move |req: Request| {
-                    let app = app.clone();
-                    let options = options.clone();
-                    async move { Ok(app.serve_static_or_404(&req, options).await) }
-                }))
-            }
+            // 起動時に作ったものをそのまま返す。描画の指定はリクエストから作り直せる。
+            Matched::NotFound => self.inner.not_found.clone(),
         }
     }
 
-    async fn serve_static_or_404(
-        &self,
-        req: &Request,
-        options: crate::http::response::RenderOptions,
-    ) -> Response {
+    /// 描画の指定（`APP_DEBUG` と、JSON で返すか）をリクエストから作る。
+    fn render_options(&self, req: &Request) -> RenderOptions {
+        RenderOptions::new(self.inner.debug, wants_json(req))
+            .with_exceptions(self.inner.exceptions.clone())
+    }
+
+    async fn serve_static_or_404(&self, req: &Request) -> Response {
         if let Some(response) = self.serve_static(req).await {
             return response;
         }
@@ -246,7 +245,7 @@ impl Application {
                 status: 404,
                 message: String::new(),
             },
-            options,
+            self.render_options(req),
         )
     }
 
@@ -394,10 +393,15 @@ pub struct ApplicationBuilder {
 }
 
 impl ApplicationBuilder {
-    /// ミドルウェアを登録する。
+    /// エラーの見せ方を差し替える。
+    ///
+    /// 登録した関数を上から順に試し、最初に応答を返したものを使います。
+    /// どれも返さなければ bengara の既定の形になります。
     ///
     /// ```ignore
-    /// .with_middleware(|m| m.append(AddPoweredBy::handle).alias("admin", EnsureAdmin::handle))
+    /// .with_exceptions(|e| e.render(|error| {
+    ///     (error.status() == 404).then(|| Response::text("ありません").with_status(404))
+    /// }))
     /// ```
     pub fn with_exceptions(mut self, configure: impl FnOnce(Exceptions) -> Exceptions) -> Self {
         self.exceptions = configure(std::mem::take(&mut self.exceptions));
@@ -446,6 +450,8 @@ impl ApplicationBuilder {
     pub fn create(self) -> Application {
         let mut defs = self.routing.defs;
         if let Some(path) = self.routing.health {
+            // `path` は `Routing::health` が登録と同じ形にそろえてある（`register_path`）。
+            // そろえずに比べると重なりに気づけず、`Routes::build` でパニックしていた。
             let already = defs.iter().any(|d| d.path == path && d.method == "GET");
             if already {
                 tracing::warn!("{path} は routes/*.rs にもあるため、health の登録を飛ばします");
@@ -483,28 +489,48 @@ impl ApplicationBuilder {
         let storage_public_dir: Arc<Path> = Arc::from(crate::storage::Storage::public_root());
         let storage_public_canonical = storage_public_dir.canonicalize().ok().map(Arc::from);
 
+        let exceptions = (!self.exceptions.is_empty()).then(|| Arc::new(self.exceptions));
         Application {
-            inner: Arc::new(Inner {
-                routes: Routes::build(defs),
-                global,
-                public_dir,
-                public_canonical,
-                storage_public_dir,
-                storage_public_canonical,
-                debug: app_config().debug,
-                exceptions: (!self.exceptions.is_empty()).then(|| Arc::new(self.exceptions)),
+            inner: Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
+                let weak = weak.clone();
+                let not_found: Arc<dyn ErasedHandler> =
+                    Arc::new(Erased::new(move |req: Request| {
+                        let weak = weak.clone();
+                        async move {
+                            match weak.upgrade() {
+                                Some(inner) => {
+                                    Ok(Application { inner }.serve_static_or_404(&req).await)
+                                }
+                                // アプリが先に落ちたあとに届いた分。実際には起きない。
+                                None => Ok(Response::new(404)),
+                            }
+                        }
+                    }));
+                Inner {
+                    routes: Routes::build(defs),
+                    global,
+                    public_dir,
+                    public_canonical,
+                    storage_public_dir,
+                    storage_public_canonical,
+                    debug: app_config().debug,
+                    exceptions,
+                    not_found,
+                }
             }),
         }
     }
 }
 
 /// `health("/up")` が返す内容。
+///
+/// 出すのは `status` と `name` だけです。`env`（`production` など）は外から
+/// 誰でも見られる場所に出す理由が無いので入れません。
 async fn health() -> crate::error::Result<Response> {
     let config = app_config();
     Response::json(&serde_json::json!({
         "status": "ok",
         "name": config.name,
-        "env": config.env,
     }))
 }
 
@@ -527,8 +553,13 @@ impl Routing {
     }
 
     /// 生存確認用のルートを足す（Laravel の `/up` に当たります）。
+    ///
+    /// ここで**登録と同じ形**にそろえて持ちます（`register_path`）。`create()` は
+    /// この値を `routes/*.rs` のパスと突き合わせて、重なっていれば飛ばします。
+    /// 以前は渡された生の文字列のまま持っていたので、`.health("up")` と
+    /// `Route::get("/up", ..)` が重なっていることに気づけず、起動時にパニックしました。
     pub fn health(mut self, path: &str) -> Self {
-        self.health = Some(crate::http::routing::normalize(path));
+        self.health = Some(crate::http::routing::register_path(path));
         self
     }
 }
@@ -620,6 +651,37 @@ mod tests {
         let response = app.handle(Request::new("DELETE", "/report")).await;
         assert_eq!(response.status(), 405);
         assert_eq!(response.header("allow"), Some("POST"));
+    }
+
+    #[tokio::test]
+    async fn healthが重なっていても起動できる() {
+        // `.health("up")` と `Route::get("/up", ..)` の両方があるとき、以前は
+        // 生の文字列と登録後のパスを比べていたので重なりに気づけず、
+        // `Routes::build` が「同じパスが2回」で**起動時にパニック**していた。
+        for given in ["up", "/up", "/up/"] {
+            let app = Application::configure()
+                .with_routing(|r| {
+                    r.web(|| {
+                        Route::get("/up", ok);
+                    })
+                    .health(given)
+                })
+                .create();
+            // 飛ばした結果、`routes/web.rs` のほうが残る。
+            assert_eq!(app.routes().len(), 1, "{given}");
+            let response = app.handle(Request::new("GET", "/up")).await;
+            assert_eq!(response.status(), 200, "{given}");
+            assert_eq!(response.body(), b"ok", "{given}");
+        }
+    }
+
+    #[tokio::test]
+    async fn 小文字のメソッドは405になる() {
+        // HTTP のメソッドは大文字小文字を区別する。以前は大文字にそろえていたので、
+        // `get /` がハンドラまで通っていた。
+        let response = app().handle(Request::new("get", "/")).await;
+        assert_eq!(response.status(), 405);
+        assert_eq!(response.header("allow"), Some("GET, HEAD"));
     }
 
     #[test]

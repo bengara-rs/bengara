@@ -88,7 +88,7 @@ macro_rules! route_method {
             let group = folded();
             push(RouteDef {
                 method: $method,
-                path: normalize(&format!("{}{}", group.prefix, normalize(path))),
+                path: register_path(&format!("{}{}", group.prefix, normalize(path))),
                 name: None,
                 middleware: group.middleware,
                 handler: Arc::new(Erased::new(handler)),
@@ -279,6 +279,71 @@ pub(crate) fn normalize(path: &str) -> String {
     out
 }
 
+/// パスの固定の部分を、ブラウザが送る形（`%xx`）にそろえる。
+///
+/// 照合は**符号化されたままのパス**で行います。`Route::get("/こんにちは", ..)` を
+/// そのまま登録すると、ブラウザは `/%E3%81%93...` を送ってくるので永久に当たりません。
+/// 登録のときに固定の部分だけ符号化しておけば、書いたとおりに当たります。
+/// パス引数（`{post}` / `{*path}`）はそのまま残します。`%` は残すので、
+/// 符号化済みのパスを渡しても二重にはなりません。
+///
+/// 区間を残すかどうかは「`{` を**含むか**」で見ます。頭が `{` かどうかで見ていたころは、
+/// `/file-{name}` のようにパス引数の前に固定文字がある区間が丸ごと符号化され、
+/// `/file-%7Bname%7D` として登録されていました。警告もエラーも出ず、必ず 404 でした。
+/// `{id}.json` のように後ろに固定文字がある形も、同じ規則でそのまま残ります。
+fn encode_static_segments(path: &str) -> String {
+    // `{` と `}` は `path_literal` に入っていないので、ここで早抜けの対象に足します。
+    // 足さないと、パス引数つきのパスが必ず下の組み立てを通ります。
+    if path
+        .bytes()
+        .all(|byte| super::percent::path_literal(byte) || matches!(byte, b'{' | b'}'))
+    {
+        return path.to_string();
+    }
+    path.split('/')
+        .map(|segment| {
+            // パス引数を含む区間は丸ごと素通し。符号化すると照合できなくなります。
+            if segment.contains('{') {
+                segment.to_string()
+            } else {
+                super::percent::encode(segment, super::percent::path_literal)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// 登録するパスの形にそろえる（`normalize` ＋ 固定の部分の符号化）。
+///
+/// ルートの登録（`Route::get` など）と、`health()` の重なりの判定が**同じ関数**を
+/// 通るようにするための入口です。片方だけ素のパスで比べると、`.health("up")` と
+/// `Route::get("/up", ..)` が重なっていることに気づけず、`Routes::build` が
+/// 起動時にパニックしていました。
+pub(crate) fn register_path(path: &str) -> String {
+    encode_static_segments(&normalize(path))
+}
+
+/// 照合に使うパス。登録側（`normalize`）と同じ規則で、末尾の `/` を落とします。
+///
+/// `/` 単独は落としません（それ自体がルートです）。
+///
+/// `Routes::find` と、署名付き URL の検証（`http/url.rs`）の**両方**から呼びます。
+/// 規則を2か所に書いていたころは、`/unsubscribe/` がルートには当たるのに
+/// 署名の対象だけ1文字違いになり、必ず 403 になっていました。
+pub(crate) fn match_path(path: &str) -> &str {
+    if path.len() > 1 && path.ends_with('/') {
+        let trimmed = path.trim_end_matches('/');
+        // 全部 `/` だったときは `/` として扱う。
+        if trimmed.is_empty() {
+            "/"
+        } else {
+            trimmed
+        }
+    } else {
+        path
+    }
+}
+
 /// 照合に使う、固定されたルートの一覧。
 pub(crate) struct Routes {
     by_method: HashMap<&'static str, matchit::Router<usize>>,
@@ -334,17 +399,18 @@ impl Routes {
     }
 
     /// メソッドとパスからルートを探す。
+    ///
+    /// 引く前にパスを2つそろえます。
+    ///
+    /// | やること | なぜ |
+    /// |---|---|
+    /// | 末尾の `/` を落とす（`match_path`） | 登録側も落とすので、`GET /posts/` が 404 にならない |
+    /// | `%xx` の16進を大文字にする | 登録側は常に大文字で符号化する。`/%e3%81%82` も当てる |
+    ///
+    /// リダイレクトはしません。
     pub(crate) fn find(&self, method: &str, path: &str) -> Matched<'_> {
-        // 登録側は末尾の `/` を落とす（`normalize`）ので、照合側でも落としてから引く。
-        // そうしないと `GET /posts/` が 404 になります。リダイレクトはしません。
-        // `/` 単独は落とさない（それ自体がルート）。
-        if path.len() > 1 && path.ends_with('/') {
-            let trimmed = path.trim_end_matches('/');
-            // 全部 `/` だったときは `/` として引く。
-            let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
-            return self.find_slashless(method, trimmed);
-        }
-        self.find_slashless(method, path)
+        let path = super::percent::upcase_hex(match_path(path));
+        self.find_slashless(method, &path)
     }
 
     /// 末尾の `/` を落としたパスで探す。
@@ -542,6 +608,107 @@ mod tests {
         assert_eq!(normalize("posts"), "/posts");
         assert_eq!(normalize("/posts/"), "/posts");
         assert_eq!(normalize("  /posts  "), "/posts");
+    }
+
+    #[test]
+    fn 日本語のパスは符号化して登録する() {
+        // 照合は符号化されたままのパスで行うので、そのまま登録すると永久に 404 だった。
+        assert_eq!(
+            encode_static_segments("/こんにちは"),
+            "/%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF"
+        );
+        // パス引数は触らない。固定の部分だけ符号化する。
+        assert_eq!(
+            encode_static_segments("/記事/{post}/a b/{*rest}"),
+            "/%E8%A8%98%E4%BA%8B/{post}/a%20b/{*rest}"
+        );
+        // 符号化済みと ASCII だけのパスはそのまま。
+        assert_eq!(
+            encode_static_segments("/posts/%E3%81%82"),
+            "/posts/%E3%81%82"
+        );
+        assert_eq!(encode_static_segments("/posts/{post}"), "/posts/{post}");
+
+        let defs = collect(|| {
+            Route::get("/こんにちは", || async { Ok(Response::text("hi")) });
+        });
+        let routes = Routes::build(defs);
+        assert!(matches!(
+            routes.find("GET", "/%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF"),
+            Matched::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn パス引数の前後に固定文字があっても符号化しない() {
+        // 区間の頭が `{` かどうかで見ていたころは、丸ごと `%7B...%7D` になり、
+        // 警告もエラーも出ないまま必ず 404 だった。
+        assert_eq!(encode_static_segments("/file-{name}"), "/file-{name}");
+        assert_eq!(encode_static_segments("/v{n}/x"), "/v{n}/x");
+        // 後ろに固定文字がある形も、今までどおりそのまま。
+        assert_eq!(
+            encode_static_segments("/posts/{id}.json"),
+            "/posts/{id}.json"
+        );
+
+        let defs = collect(|| {
+            Route::get("/file-{name}", ok);
+        });
+        let routes = Routes::build(defs);
+        match routes.find("GET", "/file-abc") {
+            Matched::Found { params, .. } => {
+                assert_eq!(params, vec![("name".to_string(), "abc".to_string())]);
+            }
+            _ => panic!("当たらなかった"),
+        }
+        // URL を引く側も素のパスのまま。
+        assert_eq!(
+            fill("/file-{name}", &[("name", "abc")]).unwrap(),
+            "/file-abc"
+        );
+    }
+
+    #[test]
+    fn 十六進が小文字でもルートに当たる() {
+        // 登録は常に大文字の16進。同じ URL なのに大文字小文字で 404 になっていた。
+        let defs = collect(|| {
+            Route::get("/あ", ok);
+        });
+        let routes = Routes::build(defs);
+        assert_eq!(defs_path(&routes), "/%E3%81%82");
+        assert!(matches!(
+            routes.find("GET", "/%e3%81%82"),
+            Matched::Found { .. }
+        ));
+        assert!(matches!(
+            routes.find("GET", "/%E3%81%82"),
+            Matched::Found { .. }
+        ));
+    }
+
+    /// 1本だけ登録したルートのパス。
+    fn defs_path(routes: &Routes) -> &str {
+        &routes.all()[0].path
+    }
+
+    #[test]
+    fn 末尾のスラッシュを落とす規則は1か所() {
+        // 署名付き URL の検証（`http/url.rs`）も同じ関数を通します。
+        assert_eq!(match_path("/unsubscribe/"), "/unsubscribe");
+        assert_eq!(match_path("/unsubscribe"), "/unsubscribe");
+        assert_eq!(match_path("/"), "/");
+        assert_eq!(match_path("///"), "/");
+        assert_eq!(match_path(""), "");
+    }
+
+    #[test]
+    fn 登録するパスの形は1か所でそろえる() {
+        // `health()` の重なりの判定もこの関数を通します。
+        assert_eq!(register_path("up"), "/up");
+        assert_eq!(register_path("/up/"), "/up");
+        assert_eq!(register_path("/あ"), "/%E3%81%82");
+        // 何回通しても形が変わらない（`%` は残すので二重にならない）。
+        assert_eq!(register_path(&register_path("/あ")), "/%E3%81%82");
     }
 
     #[test]

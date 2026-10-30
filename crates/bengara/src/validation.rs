@@ -44,7 +44,10 @@ pub struct Validated {
 impl Validated {
     /// 値を取り出す。無ければ空文字。
     ///
-    /// `nullable` を付けた項目は、送られてこなければ空文字になります。
+    /// `nullable` を付けた項目は、送られてこなかったときと、空だったときに
+    /// 空文字になります。**空白だけの値も空文字です。** そうしないと
+    /// `nullable|min:8` を飛ばした項目で、規則が 1 つも当たっていない値が
+    /// 「入力があった」ように見えてしまいます。
     pub fn get(&self, field: &str) -> &str {
         self.values.get(field).map(String::as_str).unwrap_or("")
     }
@@ -262,12 +265,23 @@ impl Rule {
                 }
                 Rule::Between(lo, hi)
             }
-            "in" => Rule::In(
-                text("in")?
+            // 許可値から**空の要素を落とします**。`in:admin,user,` と書くと、
+            // 末尾のカンマが空文字を許可値にして `role=`（空）が通ってしまいます。
+            // 1 つも残らなければ規則の書き間違いなので、`min` の引数忘れと同じ 500。
+            "in" => {
+                let allowed: Vec<String> = arg
+                    .unwrap_or("")
                     .split(',')
                     .map(|s| s.trim().to_string())
-                    .collect(),
-            ),
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if allowed.is_empty() {
+                    return Err(Error::msg(
+                        "規則 `in` には 1 つ以上の値が要ります（例: in:admin,user）",
+                    ));
+                }
+                Rule::In(allowed)
+            }
             "confirmed" => Rule::Confirmed,
             "same" => Rule::Same(text("same")?),
             "different" => Rule::Different(text("different")?),
@@ -350,7 +364,9 @@ pub(crate) fn validate(input: &Input, rules: &[(&str, &str)]) -> Result<Validate
         // 値は `Input::new` で前後の空白を落としてある。
         // 以前はここだけ `trim()` していたので、`age=" 5 "` が `integer` で落ちた。
         let value = raw.unwrap_or("");
-        let is_blank = value.is_empty();
+        // 「空」の判定だけは空白を落として見る。`password` の類いは値の空白を落とさないが、
+        // 空白だけのパスワードを `required` が通してしまうのは違う（Laravel も落とす）。
+        let is_blank = value.trim().is_empty();
         let nullable = parsed.contains(&Rule::Nullable);
         let required = parsed.contains(&Rule::Required);
 
@@ -361,7 +377,11 @@ pub(crate) fn validate(input: &Input, rules: &[(&str, &str)]) -> Result<Validate
         // 検査を飛ばすのは、**送られてこなかった**ときと `nullable` が付いているときだけ。
         // 空文字は飛ばしません（Laravel と同じ）。飛ばすと `in` や `email` が素通りします。
         if is_blank && (raw.is_none() || nullable) {
-            // 送られてきた項目と `nullable` の項目だけ、空文字として入れておく。
+            // 空として飛ばした項目には**空文字**を入れる。来た値をそのまま入れては
+            // いけない。`password` の類いは空白を落とさないので、`nullable|min:8|confirmed`
+            // に `"   "` を送ると、規則が 1 つも当たらないまま
+            // `get("password")` が空でない値を返す。アプリが「入力があった」と見なして、
+            // 長さも確認欄の一致も通さずに保存してしまう。
             if raw.is_some() || nullable {
                 out.insert(field.to_string(), String::new());
             }
@@ -440,13 +460,15 @@ fn check(
                 );
             }
         }
+        // `alpha` の 3 つは、空の列に `all` が `true` を返すので空文字を明示的に弾きます。
+        // ここまで来た空文字は「送られてきた空」です。`in` や `email` と同じく落とします。
         Rule::Alpha => {
-            if !value.chars().all(char::is_alphabetic) {
+            if value.is_empty() || !value.chars().all(char::is_alphabetic) {
                 errors.add(field, format!("{field} は文字だけで入力してください。"));
             }
         }
         Rule::AlphaNum => {
-            if !value.chars().all(char::is_alphanumeric) {
+            if value.is_empty() || !value.chars().all(char::is_alphanumeric) {
                 errors.add(
                     field,
                     format!("{field} は文字と数字だけで入力してください。"),
@@ -454,9 +476,10 @@ fn check(
             }
         }
         Rule::AlphaDash => {
-            if !value
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            if value.is_empty()
+                || !value
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
             {
                 errors.add(
                     field,
@@ -691,10 +714,84 @@ mod tests {
     }
 
     #[test]
+    fn 空白だけのパスワードもrequiredで落ちる() {
+        // `password` は空白を落とさない項目だが、「空か」の判定は空白を除いて見る。
+        // 以前は `"   "` が `required` を通り、`min:8` にも当たらない長さなら素通りだった。
+        for value in ["   ", "\t"] {
+            let e = errors_of(&input(&[("password", value)]), &[("password", "required")]);
+            assert!(e.has("password"), "`{value:?}` は空として扱う");
+        }
+        // 空白を含む本物のパスワードは、空白も含めてそのまま通る。
+        let ok = validate(
+            &input(&[("password", " pass word ")]),
+            &[("password", "required|min:8")],
+        )
+        .unwrap();
+        assert_eq!(ok.get("password"), " pass word ");
+    }
+
+    #[test]
     fn nullableなら空でも通り他の規則は当たらない() {
         let ok = validate(&input(&[("age", "")]), &[("age", "nullable|integer")]).unwrap();
         assert_eq!(ok.get("age"), "");
         assert!(ok.has("age"));
+    }
+
+    #[test]
+    fn 空として飛ばした項目は空文字で返る() {
+        // `nullable` で飛ばした項目に来た値を入れると、規則が 1 つも当たらないまま
+        // `get` が空でない値を返す。アプリが「入力があった」と見なして、
+        // `min:8` も `confirmed` も通さずに保存してしまう。
+        let ok = validate(
+            &input(&[("password", "   ")]),
+            &[("password", "nullable|min:8")],
+        )
+        .unwrap();
+        assert_eq!(ok.get("password"), "", "空白だけなら空文字で返す");
+        assert!(ok.has("password"));
+
+        // 確認欄が無くても同じ。飛ばした項目は空文字。
+        let ok = validate(
+            &input(&[("password", "\t")]),
+            &[("password", "nullable|min:8|confirmed")],
+        )
+        .unwrap();
+        assert_eq!(ok.get("password"), "");
+
+        // 空白を落とす項目も空文字（従来どおり）。
+        let ok = validate(&input(&[("age", " ")]), &[("age", "nullable|integer")]).unwrap();
+        assert_eq!(ok.get("age"), "");
+    }
+
+    #[test]
+    fn alphaの3つは空文字を通さない() {
+        // `all` は空の列に `true` を返す。空文字は飛ばされないので、ここで弾く。
+        for rule in ["alpha", "alpha_num", "alpha_dash"] {
+            let e = errors_of(&input(&[("s", "")]), &[("s", rule)]);
+            assert!(e.has("s"), "`{rule}` は空文字を弾くはず");
+        }
+        // `nullable` が付いていれば今までどおり飛ばす。
+        assert!(errors_of(&input(&[("s", "")]), &[("s", "nullable|alpha")]).is_empty());
+        // 送られてこなければ飛ばす。
+        assert!(errors_of(&input(&[]), &[("s", "alpha")]).is_empty());
+    }
+
+    #[test]
+    fn inの許可値から空を落とす() {
+        // 末尾のカンマで空文字が許可値になると、`role=` が通ってしまう。
+        assert!(!errors_of(&input(&[("role", "")]), &[("role", "in:admin,user,")]).is_empty());
+        // 値そのものは今までどおり通る。
+        assert!(errors_of(&input(&[("role", "user")]), &[("role", "in:admin,user,")]).is_empty());
+
+        // 許可値が 1 つも残らないのは規則の書き間違い。422 ではなく 500。
+        let i = input(&[("role", "")]);
+        for bad in ["in", "in:", "in:,,", "in: , "] {
+            let error = validate(&i, &[("role", bad)]).unwrap_err();
+            assert!(
+                !matches!(error, Error::Validation(_)),
+                "`{bad}` は 422 にせず 500 にする: {error}"
+            );
+        }
     }
 
     #[test]

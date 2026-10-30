@@ -114,13 +114,28 @@ impl Schedule {
     /// 処理を足す。
     ///
     /// 名前は**前回いつ動いたか**を覚える鍵になります。重ならない名前にしてください。
+    ///
+    /// # パニック
+    ///
+    /// 同じ名前を 2 回登録するとパニックします。名前は前回の時刻と錠の鍵なので、
+    /// 2 件目は 1 件目が書いた時刻を見て、`Every::Minute` 以外は**二度と動きません。**
+    /// 起動時に止めるのは、未登録のミドルウェア名と同じ考え方です（決定記録 #087）。
     pub fn job<F, Fut>(&mut self, name: impl Into<String>, every: Every, run: F) -> &mut Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
+        let name = name.into();
+        if let Some(existing) = self.tasks.iter().find(|t| t.name == name) {
+            panic!(
+                "定期処理 `{name}` は既に登録されています（{}）。\
+                 名前は前回の時刻を覚える鍵なので、重ねると 2 件目が動きません。\
+                 routes/console.rs で別の名前にしてください",
+                existing.every.label()
+            );
+        }
         self.tasks.push(Task {
-            name: name.into(),
+            name,
             every,
             run: Box::new(move || Box::pin(run())),
         });
@@ -211,8 +226,12 @@ pub(crate) fn state_dir() -> PathBuf {
 /// 置き場所を用意する。
 ///
 /// `storage/` そのものが無いなら、作らずに知らせます（決定記録 #023）。
+/// 作るときは `storage:init` と同じく所有者だけに絞ります（Unix で 0700）。
+/// 錠の置き場所（`+locks/`）もここで作って同じ権限にします。
+/// `FileLock` に任せると、`create_dir_all` の既定の権限（umask まかせ）になります。
 fn ensure_state_dir(dir: &Path) -> Result<()> {
-    if dir.is_dir() {
+    let locks = dir.join(LOCK_DIR);
+    if dir.is_dir() && locks.is_dir() {
         return Ok(());
     }
     let storage = crate::paths::storage_path("");
@@ -222,13 +241,23 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
             storage.display()
         )));
     }
-    std::fs::create_dir_all(dir)?;
+    for path in [dir, locks.as_path()] {
+        if !path.is_dir() {
+            std::fs::create_dir_all(path)?;
+            crate::ops::restrict(path)?;
+        }
+    }
     Ok(())
 }
 
 /// 前回動いた時刻（UNIX 秒）を読む。無い・壊れていれば `None`。
 fn read_last_run(dir: &Path, task: &Task) -> Option<i64> {
-    let raw = std::fs::read_to_string(dir.join(task.state_file())).ok()?;
+    read_last_run_file(&dir.join(task.state_file()))
+}
+
+/// 覚えるファイルを直接指定して読む（錠の中から使います）。
+fn read_last_run_file(path: &Path) -> Option<i64> {
+    let raw = std::fs::read_to_string(path).ok()?;
     // 1行目は名前（人が見るため）、2行目が時刻。
     raw.lines().nth(1)?.trim().parse().ok()
 }
@@ -245,17 +274,19 @@ fn read_last_run(dir: &Path, task: &Task) -> Option<i64> {
 /// ファイルが残り、`read_last_run` が `None` を返して毎分走り出しました。
 /// 改行を潰して直した形が、書き込みの非原子性で開き直っていました。
 /// 作りは `cache/store.rs` の `FileCache::put` にそろえます。
+#[cfg(test)]
 fn write_last_run(dir: &Path, task: &Task, now: i64) -> Result<()> {
-    let path = dir.join(task.state_file());
-    let name = task.name.replace(['\n', '\r'], " ");
+    write_last_run_file(dir, &task.state_file(), &task.name, now)
+}
+
+/// 覚えるファイルの名前を直接指定して書く（錠の中から使います）。
+fn write_last_run_file(dir: &Path, state_file: &str, task_name: &str, now: i64) -> Result<()> {
+    let path = dir.join(state_file);
+    let name = task_name.replace(['\n', '\r'], " ");
     let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 一時ファイルの名前は、覚えるファイル（SHA-256 の16進）とぶつからない
     // ように印を入れる。プロセス番号と連番で、同時に走っても重ならない。
-    let temp = dir.join(format!(
-        "{}+tmp.{}.{seq}",
-        task.state_file(),
-        std::process::id()
-    ));
+    let temp = dir.join(format!("{state_file}+tmp.{}.{seq}", std::process::id()));
     std::fs::write(&temp, format!("{name}\n{now}\n"))?;
     if let Err(e) = std::fs::rename(&temp, &path) {
         // 置き換えに失敗したら、書きかけを残さない。
@@ -281,10 +312,37 @@ const LOCK_DIR: &str = "+locks";
 /// （落ちたプロセスの錠も、そのときには古い錠として外れます）。
 const CLAIM_LOCK_TRIES: u32 = 100;
 
-/// そのタスクを守る錠ファイルの場所。
+/// そのタスクを守る錠ファイルの場所（テストから使います）。
+#[cfg(test)]
 fn lock_path(dir: &Path, task: &Task) -> PathBuf {
-    dir.join(LOCK_DIR)
-        .join(format!("{}.lock", task.state_file()))
+    lock_path_for(dir, &task.state_file())
+}
+
+/// 覚えるファイルの名前から錠ファイルの場所を決める。
+fn lock_path_for(dir: &Path, state_file: &str) -> PathBuf {
+    dir.join(LOCK_DIR).join(format!("{state_file}.lock"))
+}
+
+/// 前回時刻として**覚える**値。判定に使う `now` とは分けます。
+///
+/// 間隔が 1 分以上のタスクは、**分の頭に丸めて**覚えます。判定の時刻を
+/// そのまま覚えると、先行タスクにかかった時間が記録に積まれます。
+/// 10:00:00 に始まった `schedule:run` の 3 本目が 10:00:40 に `claim` すると
+/// 10:00:40 が残り、`Every::Minutes(5)` の次は 10:05:10 以降（許容は
+/// [`DUE_SLACK_SECS`] の 30 秒）＝ cron が呼ぶ 10:06:00 まで待って
+/// **6 分ごと**になります。丸めればずれが積まないので、30 秒の幅が効き
+/// 続けます（決定記録 #121 が直した現象です）。
+///
+/// 判定のほうは取りたての `now` のままにします。先頭で 1 回だけ取った時刻で
+/// 判定すると、後ろのタスクが「前回が未来」と誤検知して二重に動きました。
+///
+/// `Every::Seconds(_)` と間隔 60 秒未満のタスクは丸めません。秒を指定した
+/// 意図を崩さないためです（[`is_due`] の `exact` と同じ考え方）。
+fn remembered_at(every: Every, now: i64) -> i64 {
+    if matches!(every, Every::Seconds(_)) || every.seconds() < 60 {
+        return now;
+    }
+    now - now.rem_euclid(60)
 }
 
 /// 錠を取って「読む → 判定 → 書く」を行う。動かすべきなら真を返す。
@@ -292,20 +350,46 @@ fn lock_path(dir: &Path, task: &Task) -> PathBuf {
 /// 錠が守るのは**前回時刻の読み書きだけ**です。2 台が同じ `storage/` を
 /// 共有していても、読んだ直後に別の側が書く、という食い違いは起きません。
 ///
+/// **いまの時刻はこの中で取ります。** `schedule:run` の先頭で 1 回だけ取って
+/// いたころは、前のタスクが長引くと後ろのタスクの判定が古い時刻で行われました。
+/// 10:00 に始まった A の 1 本目が 90 秒かかる間に、10:01 の B が 2 本目を動かして
+/// 10:01 を書きます。A が 2 本目に来ると「前回（10:01）がいま（10:00）より後」と
+/// 見て、時計ずれの扱いで**もう一度動かしていました。** `Every::Hour` が 30 秒内に
+/// 2 回走る形です。
+///
+/// **書く時刻は丸めます。** 判定の時刻をそのまま覚えると、先行タスクに
+/// かかった時間が記録に積まれ、`Every::Minutes(5)` の次回が 6 分後に
+/// なりました（決定記録 #121）。判定は取りたての `now`、書くのは
+/// [`remembered_at`] が丸めた値、と分けます。
+///
 /// **間隔より長くかかる処理の重なりは防ぎません。** 処理そのものは錠を
 /// 手放してから動かします（長い処理の間ずっと握ると、古い錠と見なされて
 /// 外されてしまうため）。`Every::Minute` は `seconds()` が 0 で `is_due` が
 /// 常に真なので、2 つの `schedule:run` が同時に走れば毎回両方が動きます。
 /// 重なりの防止は未実装で、時間での錠の自動解除は却下済みです（決定記録 #076）。
-fn claim(dir: &Path, task: &Task, now: i64) -> Result<bool> {
-    let _lock =
-        crate::support::lock::FileLock::acquire_tries(&lock_path(dir, task), CLAIM_LOCK_TRIES)?;
-    if !is_due(read_last_run(dir, task), task.every, now) {
-        return Ok(false);
-    }
-    // 先に時刻を書く。処理が失敗しても、次の1分でまた走らないようにするため。
-    write_last_run(dir, task, now)?;
-    Ok(true)
+///
+/// 錠の取得は待ち（`sleep`）を含むので、`spawn_blocking` の中で行います。
+/// 非同期の土台で待つと、同じスレッドのほかの処理を止めます。
+async fn claim(dir: &Path, task: &Task) -> Result<bool> {
+    let dir = dir.to_path_buf();
+    let state_file = task.state_file();
+    let name = task.name.clone();
+    let every = task.every;
+    crate::support::blocking(move || {
+        let _lock = crate::support::lock::FileLock::acquire_tries(
+            &lock_path_for(&dir, &state_file),
+            CLAIM_LOCK_TRIES,
+        )?;
+        let now = crate::support::time::now_seconds();
+        if !is_due(read_last_run_file(&dir.join(&state_file)), every, now) {
+            return Ok(false);
+        }
+        // 先に時刻を書く。処理が失敗しても、次の1分でまた走らないようにするため。
+        // 書く値は分の頭に丸める（ずれを積まないため。[`remembered_at`]）。
+        write_last_run_file(&dir, &state_file, &name, remembered_at(every, now))?;
+        Ok(true)
+    })
+    .await?
 }
 
 /// 動かすべきものを動かす。返るのは動かした名前です。
@@ -317,11 +401,10 @@ pub(crate) async fn run_due(schedule: &Schedule) -> Result<Vec<String>> {
 
 /// 置き場所を指定して動かす（テストから使います）。
 async fn run_due_in(dir: &Path, schedule: &Schedule) -> Result<Vec<String>> {
-    let now = crate::support::time::now_seconds();
     let mut done = Vec::new();
 
     for task in &schedule.tasks {
-        match claim(dir, task, now) {
+        match claim(dir, task).await {
             Ok(true) => {}
             // まだ動かすときではない。
             Ok(false) => continue,
@@ -334,7 +417,7 @@ async fn run_due_in(dir: &Path, schedule: &Schedule) -> Result<Vec<String>> {
         }
 
         let started = std::time::Instant::now();
-        match (task.run)().await {
+        match run_task(task).await {
             Ok(()) => {
                 println!(
                     "  {} 成功（{} ms）",
@@ -348,6 +431,22 @@ async fn run_due_in(dir: &Path, schedule: &Schedule) -> Result<Vec<String>> {
         }
     }
     Ok(done)
+}
+
+/// タスクを 1 つ動かす。パニックも失敗として扱います。
+///
+/// `tokio::spawn` で包むのは、キューの `run_one` と同じ考え方です。
+/// 包まないと 1 件のパニックで `schedule:run` 全体が落ち、残りのタスクが
+/// 動かないまま終了コードも異常になります。時刻は先に書いてあるので、
+/// 次の 1 分でも再試行されず、**黙って 1 回ぶん飛んでいました。**
+async fn run_task(task: &Task) -> std::result::Result<(), String> {
+    let future = (task.run)();
+    match tokio::spawn(future).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) if e.is_panic() => Err("処理がパニックしました".to_string()),
+        Err(e) => Err(format!("処理を動かせませんでした: {e}")),
+    }
 }
 
 /// 登録されている処理を表で出す（`schedule:list`）。
@@ -496,6 +595,104 @@ mod tests {
         assert_eq!(schedule.tasks()[0].name(), "a");
         assert_eq!(schedule.tasks()[1].every(), Every::Hour);
         assert!(format!("{schedule:?}").contains("a(毎分)"));
+    }
+
+    #[test]
+    #[should_panic(expected = "既に登録されています")]
+    fn 同じ名前は登録できない() {
+        // 名前は前回の時刻と錠の鍵。重ねると 2 件目が 1 件目の時刻を見て、
+        // `Every::Minute` 以外は二度と動かなかった。
+        let mut schedule = Schedule::new();
+        schedule
+            .job("掃除", Every::Hour, || async { Ok(()) })
+            .job("掃除", Every::Day, || async { Ok(()) });
+    }
+
+    #[tokio::test]
+    async fn パニックしても残りのタスクは動く() {
+        let dir = temp_dir("panic");
+        let mut schedule = Schedule::new();
+        schedule
+            .job("落ちる処理", Every::Hour, || async {
+                panic!("わざと落ちる")
+            })
+            .job("次の処理", Every::Hour, || async { Ok(()) });
+
+        // 以前は 1 件目のパニックで `schedule:run` 全体が落ち、2 件目は
+        // 動かないまま時刻だけが残っていた（次の 1 分でも再試行されない）。
+        let done = run_due_in(&dir, &schedule).await.unwrap();
+        assert_eq!(done, vec!["次の処理".to_string()]);
+        // 落ちたほうも時刻は残る（次の 1 分で繰り返し落ちないため）。
+        assert!(read_last_run(&dir, &schedule.tasks()[0]).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 判定の時刻は処理の直前に取る() {
+        let dir = temp_dir("fresh-now");
+        let mut schedule = Schedule::new();
+        schedule.job("1時間ごと", Every::Hour, || async { Ok(()) });
+        let task = &schedule.tasks()[0];
+
+        // 別の `schedule:run` が「いま」より後の時刻を書いた形（前の実行が
+        // 長引いて、判定の時刻が古くなっていた）。先頭で 1 回だけ取った時刻で
+        // 判定していたころは「前回が未来」と見て、警告つきで二重に動かした。
+        let later = crate::support::time::now_seconds() + 5;
+        write_last_run(&dir, task, later).unwrap();
+
+        // 時刻を取り直すので、5 秒後の前回は「まだ早い」ではなく未来と見る。
+        // ここで確かめたいのは、動かさないこと**ではなく**、前回の時刻が
+        // 判定の瞬間の `now` と比べられること。
+        assert!(
+            claim(&dir, task).await.unwrap(),
+            "未来の前回は動かす（時計ずれの扱い）"
+        );
+        // 書くのは判定の瞬間の時刻を分の頭に丸めた値。未来の時刻は残らない。
+        let written = read_last_run(&dir, task).unwrap();
+        let now = crate::support::time::now_seconds();
+        assert!(written <= now, "未来の時刻は残らない: {written}");
+        assert!(written > now - 120, "判定の瞬間の時刻: {written}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 覚える時刻は分の頭に丸める() {
+        // 1_700_000_000 は秒が 20（分の頭 + 20 秒）。
+        let now: i64 = 1_700_000_000;
+        assert_eq!(now.rem_euclid(60), 20);
+
+        // 間隔が 1 分以上のものは丸める。先行タスクにかかった時間を記録に
+        // 積まないため（決定記録 #121）。
+        assert_eq!(remembered_at(Every::Minutes(5), now), now - 20);
+        assert_eq!(remembered_at(Every::Hour, now), now - 20);
+        assert_eq!(remembered_at(Every::Day, now), now - 20);
+
+        // 秒を指定したものと 1 分未満は丸めない（秒の意図を崩さない）。
+        assert_eq!(remembered_at(Every::Seconds(30), now), now);
+        assert_eq!(remembered_at(Every::Seconds(300), now), now);
+        assert_eq!(remembered_at(Every::Minute, now), now);
+    }
+
+    #[test]
+    fn 丸めればずれが積まない() {
+        // cron は 10:00:00・10:05:00… に呼ぶ。先行タスクで 40 秒食われて
+        // `claim` が 10:00:40 になった形。
+        let late: i64 = 1_700_000_020;
+        assert_eq!(late.rem_euclid(60), 40);
+        let remembered = remembered_at(Every::Minutes(5), late);
+        assert_eq!(remembered.rem_euclid(60), 0, "分の頭");
+
+        // 丸めた値を覚えれば、5 分後の呼び出しでちょうど動く。
+        assert!(is_due(
+            Some(remembered),
+            Every::Minutes(5),
+            remembered + 300
+        ));
+        // そのままの秒を覚えると、経つのは 260 秒で許容（30 秒）を超え、
+        // 1 回ぶん飛んで 6 分ごとになっていた。
+        assert!(!is_due(Some(late), Every::Minutes(5), remembered + 300));
     }
 
     #[test]

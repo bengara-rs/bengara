@@ -37,6 +37,14 @@ use crate::http::Response;
 /// `/storage/...` で配信する頭のパス。
 pub(crate) const STORAGE_PREFIX: &str = "/storage/";
 
+/// `/storage/...` の応答に付ける `Content-Security-Policy`。
+///
+/// `sandbox` は、その文書をスクリプト実行もフォーム送信もできない別オリジンとして扱わせます。
+/// `storage/app/public/` は利用者が上げたファイルの置き場所なので、`.svg` や `.html` を
+/// 直接開かれても自分のオリジンでスクリプトが動かないようにします。
+/// `public/` と埋め込みは自分で置いたファイルなので付けません。
+pub(crate) const STORAGE_CSP: &str = "sandbox";
+
 /// 振り分けの前に、リクエストのパスを1回だけ正規化する。
 ///
 /// やることは2つです。
@@ -190,7 +198,13 @@ pub(crate) fn serve_storage(
     if rest.trim_start_matches('/').is_empty() {
         return None;
     }
-    serve(public_disk, canonical_root, rest, if_none_match, want_body)
+    let response = serve(public_disk, canonical_root, rest, if_none_match, want_body)?;
+    // 利用者が置いたファイルを配る入口なので、`.svg` や `.html` を直接開いても
+    // 同じオリジンのスクリプトとして動かないようにする。304 には本文が無いので付けない。
+    if response.status() == 304 {
+        return Some(response);
+    }
+    Some(response.with_header("content-security-policy", STORAGE_CSP))
 }
 
 /// 配信するときの鍵（`/` 区切り）に直す。
@@ -231,15 +245,9 @@ pub(crate) fn serve(
     if path.is_dir() {
         path.push("index.html");
     }
-    // ファイルは**1回だけ開く**。情報も中身も同じハンドルから採ります。
-    // 以前は metadata → canonicalize → read と開き直していたので、その間に
-    // 書き換わると古い ETag や、本文と合わない Content-Length を返しました。
-    let mut file = std::fs::File::open(&path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    // シンボリックリンクなどで置き場所の外に出ていないか確かめる。
+    // 1. 先に**実体**を求める。シンボリックリンクなどで置き場所の外に出ていないかを、
+    //    開く前に確かめるためです。無いファイルはここで失敗するので 404 になります
+    //    （以前の `File::open` が失敗していたのと同じ順です）。
     let canonical = path.canonicalize().ok()?;
     let inside = match canonical_root {
         Some(root) => canonical.starts_with(root),
@@ -249,6 +257,18 @@ pub(crate) fn serve(
             .unwrap_or(false),
     };
     if !inside {
+        return None;
+    }
+    // 2. 確かめた**その実体**を開く。canonical なパスにはシンボリックリンクが無いので、
+    //    開く直前に差し替えられても、置き場所の中のファイルにしかなりません。
+    //    以前は「開く → canonicalize → 判定」の順だったので、その間に同じパスが
+    //    差し替わると、外のファイルの中身を内側と判定して返せました。
+    //
+    //    ファイルを開くのは**1回だけ**。情報も中身も同じハンドルから採ります
+    //    （開き直すと、古い ETag や本文と合わない Content-Length を返します。判断 #140）。
+    let mut file = std::fs::File::open(&canonical).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
         return None;
     }
 
@@ -549,6 +569,23 @@ mod tests {
     }
 
     #[test]
+    fn storageの配信にはcspが付く() {
+        let dir = temp_dir("storage-csp");
+        std::fs::write(dir.join("a.svg"), "<svg/>").unwrap();
+        let res = serve_storage(&dir, None, "/storage/a.svg", None, true).expect("あるはず");
+        assert_eq!(res.header("content-security-policy"), Some(STORAGE_CSP));
+        // 304 には付けない（本文が無い）。
+        let etag = res.header("etag").unwrap().to_string();
+        let res = serve_storage(&dir, None, "/storage/a.svg", Some(&etag), true).unwrap();
+        assert_eq!(res.status(), 304);
+        assert_eq!(res.header("content-security-policy"), None);
+        // public/ 側には付けない。
+        std::fs::write(dir.join("b.svg"), "<svg/>").unwrap();
+        let res = serve(&dir, None, "/b.svg", None, true).expect("あるはず");
+        assert_eq!(res.header("content-security-policy"), None);
+    }
+
+    #[test]
     fn 静的ファイルにはnosniffが付く() {
         // 埋め込みから。
         let res = serve_embedded(files(), "/css/app.css", None).expect("あるはず");
@@ -708,6 +745,25 @@ mod tests {
         assert!(serve(&dir, None, "/../a.txt", None, true).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 置き場所の外を指すリンクは404() {
+        // 判定は**実体**で行い、その実体を開きます。開いてから判定する順だと、
+        // その間に同じパスが差し替わったときに、外のファイルの中身を内側と
+        // 判定して返せました。
+        let dir = temp_dir("symlink");
+        let outside = temp_dir("symlink-outside");
+        std::fs::write(outside.join("secret.txt"), "ひみつ").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("link.txt")).unwrap();
+        let root = dir.canonicalize().unwrap();
+
+        assert!(serve(&dir, Some(&root), "/link.txt", None, true).is_none());
+        assert!(serve(&dir, None, "/link.txt", None, true).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

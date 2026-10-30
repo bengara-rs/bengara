@@ -306,12 +306,60 @@ impl Blueprint {
         }
     }
 
-    /// 組み立てた SQL を取り出す。
-    fn build(self) -> Vec<String> {
-        match self.mode {
+    /// 組み立てた SQL と、直さないと必ず壊れる間違いを取り出す。
+    ///
+    /// 間違いに当たったものは、先に組み立てから外します。SQL に出しません。
+    fn build(mut self) -> (Vec<String>, Vec<String>) {
+        let errors = self.collect_errors();
+        let statements = match self.mode {
             Mode::Create { if_not_exists } => self.build_create(if_not_exists),
             Mode::Alter => self.build_alter(),
+        };
+        (statements, errors)
+    }
+
+    /// 直さないと必ず壊れる間違いを集めて、組み立てから外す。
+    ///
+    /// 組み立ては同期なので `Result` を返せません。ほかの矛盾は
+    /// `tracing::warn!` で知らせて SQL はそのまま出し、実行のときに失敗させています。
+    /// ここに入れるのは、**その安全網が効かないもの**だけです。
+    ///
+    /// - `.on(表名)` の無い外部キー。SQLite は親表が無くても外部キーを張れるので、
+    ///   `create table` が成功して、名前が空の親を指す表が残ります。
+    /// - `Schema::table`（alter）の中の `id()`。`add column` に自動採番の主キーは
+    ///   書けないので、どのドライバでも必ず失敗します。
+    fn collect_errors(&mut self) -> Vec<String> {
+        let table = self.table.clone();
+        let alter = self.mode == Mode::Alter;
+        let mut errors = Vec::new();
+
+        self.foreigns.retain(|foreign| {
+            if !foreign.on.is_empty() {
+                return true;
+            }
+            errors.push(format!(
+                "{table}.{} の foreign() に .on(表名) がありません。\
+                 指す先の表が決まりません",
+                foreign.column
+            ));
+            false
+        });
+
+        if alter {
+            self.columns.retain(|column| {
+                if column.kind != ColumnType::Id {
+                    return true;
+                }
+                errors.push(format!(
+                    "{table}.{} に id() を使っています。alter table add column では\
+                     自動採番の主キーを足せません。表を作り直してください",
+                    column.name
+                ));
+                false
+            });
         }
+
+        errors
     }
 
     fn build_create(self, if_not_exists: bool) -> Vec<String> {
@@ -357,6 +405,25 @@ impl Blueprint {
 
     fn build_alter(self) -> Vec<String> {
         let driver = self.driver;
+        if driver == Driver::Sqlite || driver == Driver::Postgres {
+            // SQLite は、既定値の無い not null の列を後から足せない
+            // （"Cannot add a NOT NULL column with default value NULL"）。
+            // PostgreSQL は、表が空のときだけ足せる。行があると
+            // `column "x" of relation "y" contains null values` で落ちる。
+            // MySQL は型ごとの既定値で埋めて通る。
+            // 組み立てからは外さず、先に知らせる。
+            for column in &self.columns {
+                if column.kind != ColumnType::Id && !column.nullable && column.default.is_none() {
+                    tracing::warn!(
+                        "{}.{} は not null で既定値がありません。SQLite では必ず、\
+                         PostgreSQL では行が 1 件以上あると、この文は実行のときに失敗します。\
+                         .nullable() か .default(..) を付けてください",
+                        self.table,
+                        column.name
+                    );
+                }
+            }
+        }
         let mut statements: Vec<String> = self
             .columns
             .iter()
@@ -471,11 +538,9 @@ impl Blueprint {
     ///
     /// どちらかに当たるときは、列の並びから作ったハッシュを後ろに付けます。
     fn constraint_name(&self, columns: &[String], suffix: &str) -> String {
-        let base = base_constraint_name(&self.table, columns, suffix);
-        if base.len() <= MAX_NAME_LEN && !self.name_is_ambiguous(&base, columns) {
-            return base;
-        }
-        hashed_constraint_name(&base, columns)
+        constraint_name_for(&self.table, columns, suffix, |base| {
+            self.name_is_ambiguous(base, columns)
+        })
     }
 
     /// 同じ名前になる別の列の並びが、この表の組み立ての中にあるか。
@@ -540,16 +605,8 @@ impl Blueprint {
                         column.name
                     );
                 }
-                if self.mode == Mode::Alter {
-                    // 組み立てからは外しません。外すと列だけが黙って消えた表ができます。
-                    // そのまま流して、実行のときに失敗させます。
-                    tracing::warn!(
-                        "{}.{} に id() を使っています。alter table add column では \
-                         自動採番の主キーを足せないので、この文は実行のときに失敗します",
-                        self.table,
-                        column.name
-                    );
-                }
+                // alter の中の `id()` は、ここへ来る前に
+                // collect_errors() が外しています。
                 sql.push_str(auto_increment_sql(driver));
                 return sql;
             }
@@ -567,7 +624,7 @@ impl Blueprint {
         }
         if let Some(default) = &column.default {
             sql.push_str(" default ");
-            sql.push_str(&default_sql(driver, default));
+            sql.push_str(&default_sql(driver, &column.name, default));
         }
         // 作るときの unique は、列の指定として書く。
         if column.unique && self.mode != Mode::Alter {
@@ -578,20 +635,8 @@ impl Blueprint {
 
     fn foreign_sql(&self, foreign: &ForeignKey) -> String {
         let driver = self.driver;
-        if foreign.on.is_empty() {
-            // 指す先の表が決まっていないので、流せない SQL になる。
-            // ここは同期の組み立てで `Result` を返せないため、警告にしてあります
-            // （`column_sql` が id() の矛盾を知らせるのと同じ方針）。
-            //
-            // 組み立てからは外しません。外すと、外部キーだけが黙って消えた表ができます。
-            // `references "" (...)` のまま流して、実行のときに失敗させます。
-            tracing::warn!(
-                "{}.{} の foreign() に .on(表名) がありません。\
-                 指す先が決まらないので、この文は実行のときに失敗します",
-                self.table,
-                foreign.column
-            );
-        }
+        // `.on(表名)` の無い外部キーは、ここへ来る前に
+        // collect_errors() が外しています。
         let mut sql = format!(
             "foreign key ({}) references {} ({})",
             grammar::quote(driver, &foreign.column),
@@ -679,7 +724,10 @@ impl ColumnDefinition<'_> {
         self
     }
 
-    /// 説明を付ける。SQLite では無視されます。
+    /// 説明を付ける。**いまはどのドライバでも何もしません。**
+    ///
+    /// Laravel の `comment()` と同じ名前で書けるように置いてあります。
+    /// SQL には出ないので、説明はマイグレーションのコメントとして残ります。
     pub fn comment(self, _text: &str) -> Self {
         self
     }
@@ -730,6 +778,10 @@ impl ForeignKeyDefinition<'_> {
 pub struct Schema {
     driver: Driver,
     statements: Vec<String>,
+    /// 組み立てで見つけた、直さないと必ず壊れる間違い。
+    ///
+    /// ランナーが [`Schema::take_errors`] で見て、SQL を流す前に落とします。
+    errors: Vec<String>,
 }
 
 impl Schema {
@@ -738,6 +790,7 @@ impl Schema {
         Self {
             driver,
             statements: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -772,6 +825,9 @@ impl Schema {
     ///
     /// 外部キーは SQLite では足せません（`alter table` に `add constraint` がない）。
     /// 主キーはどのデータベースでも足せません。どちらも組み立てのときに警告を出します。
+    ///
+    /// `id()` はここでは使えません。どのデータベースでも必ず失敗するので、
+    /// 警告ではなく**実行の前のエラー**にします。
     pub fn table(&mut self, table: &str, build: impl FnOnce(&mut Blueprint)) {
         self.run(table, Mode::Alter, build);
     }
@@ -779,7 +835,9 @@ impl Schema {
     fn run(&mut self, table: &str, mode: Mode, build: impl FnOnce(&mut Blueprint)) {
         let mut blueprint = Blueprint::new(self.driver, table, mode);
         build(&mut blueprint);
-        self.statements.extend(blueprint.build());
+        let (statements, errors) = blueprint.build();
+        self.statements.extend(statements);
+        self.errors.extend(errors);
     }
 
     /// 表を消す。
@@ -814,6 +872,51 @@ impl Schema {
         ));
     }
 
+    /// 索引を落とす（Laravel の `dropIndex`）。
+    ///
+    /// 名前は列の並びから組み立てます。`index()` と同じ規則なので、
+    /// `t.index(&["user_id"])` で作った索引は `drop_index("posts", &["user_id"])`
+    /// で落とせます。`up` で索引を付けたら、`down` でこれを呼んでください。
+    /// **SQLite は索引の付いた列を `drop_column` できません。** 落とす順は
+    /// 「索引 → 列」です。
+    ///
+    /// 出す SQL はドライバで変わります。MySQL に `drop index if exists` が
+    /// 無いためです。
+    ///
+    /// | ドライバ   | SQL                                              |
+    /// |------------|--------------------------------------------------|
+    /// | SQLite     | `drop index if exists "名前"`                     |
+    /// | PostgreSQL | `drop index if exists "名前"`                     |
+    /// | MySQL      | ``alter table `表` drop index `名前` ``          |
+    ///
+    /// 次の 2 つのときは名前が合いません。[`Schema::drop_index_named`] を使ってください。
+    ///
+    /// - `unique()` で作った索引。名前の末尾が `_index` ではなく `_unique` になります。
+    /// - 同じ `create` の中に、同じ名前になる別の列の並びがあったとき
+    ///   （`index(&["b_c"])` と `index(&["b", "c"])` など）。名前の後ろにハッシュが
+    ///   付くので、落とすときだけでは同じ名前を作れません。
+    pub fn drop_index(&mut self, table: &str, columns: &[&str]) {
+        let columns: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
+        let name = constraint_name_for(table, &columns, index_suffix(false), |_| false);
+        self.drop_index_named(table, &name);
+    }
+
+    /// 名前を直に指定して索引を落とす。
+    ///
+    /// 出す SQL は [`Schema::drop_index`] と同じです。
+    pub fn drop_index_named(&mut self, table: &str, name: &str) {
+        let driver = self.driver;
+        self.statements.push(match driver {
+            // MySQL に `drop index if exists` はありません。
+            Driver::MySql => format!(
+                "alter table {} drop index {}",
+                grammar::quote(driver, table),
+                grammar::quote(driver, name)
+            ),
+            _ => format!("drop index if exists {}", grammar::quote(driver, name)),
+        });
+    }
+
     /// SQL をそのまま足す。
     pub fn raw(&mut self, sql: impl Into<String>) {
         self.statements.push(sql.into());
@@ -827,6 +930,14 @@ impl Schema {
     /// 組み立てた SQL の一覧を取り出す。ランナーが呼びます。
     pub(crate) fn into_statements(self) -> Vec<String> {
         self.statements
+    }
+
+    /// 組み立てで見つけた、直さないと必ず壊れる間違いを取り出す。
+    ///
+    /// ランナーが SQL を流す**前**に呼びます。空でなければ 1 本も流しません。
+    /// 2 回目は空になります。
+    pub(crate) fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.errors)
     }
 }
 
@@ -862,6 +973,26 @@ fn index_suffix(unique: bool) -> &'static str {
     } else {
         "index"
     }
+}
+
+/// 索引や外部キーに付ける名前を作る。
+///
+/// 表の組み立てからも（[`Blueprint::constraint_name`]）、索引を落とすときからも
+/// （[`Schema::drop_index`]）呼びます。名前の作り方を 2 か所に書かないためです。
+///
+/// `is_ambiguous` は「同じ名前になる別の列の並びが、同じ組み立ての中にあるか」です。
+/// 索引を落とすだけのときは、比べる相手が無いので常に偽になります。
+fn constraint_name_for(
+    table: &str,
+    columns: &[String],
+    suffix: &str,
+    is_ambiguous: impl FnOnce(&str) -> bool,
+) -> String {
+    let base = base_constraint_name(table, columns, suffix);
+    if base.len() <= MAX_NAME_LEN && !is_ambiguous(&base) {
+        return base;
+    }
+    hashed_constraint_name(&base, columns)
 }
 
 /// これまでと同じ作り方の名前。
@@ -965,12 +1096,21 @@ fn type_sql(driver: Driver, kind: &PlainType) -> String {
 }
 
 /// 既定値の書き方。値は SQL に直接書くので、文字列は引用符を重ねて逃がす。
-fn default_sql(driver: Driver, default: &DefaultValue) -> String {
+fn default_sql(driver: Driver, name: &str, default: &DefaultValue) -> String {
     match default {
         DefaultValue::Raw(sql) => sql.clone(),
         DefaultValue::Value(Value::Null) => "null".into(),
         DefaultValue::Value(Value::Int(v)) => v.to_string(),
-        DefaultValue::Value(Value::Float(v)) => v.to_string(),
+        DefaultValue::Value(Value::Float(v)) => {
+            if !v.is_finite() {
+                // `NaN` / `inf` と書いた SQL は流せない。組み立ては `Result` を
+                // 返せないので、警告を出してそのまま流し、実行のときに失敗させる。
+                tracing::warn!(
+                    "既定値 {v} は SQL に書けません。この文は実行のときに失敗します（列: {name}）"
+                );
+            }
+            v.to_string()
+        }
         DefaultValue::Value(Value::Bool(v)) => match driver {
             Driver::Postgres => v.to_string(),
             _ => i32::from(*v).to_string(),
@@ -984,7 +1124,12 @@ fn default_sql(driver: Driver, default: &DefaultValue) -> String {
             };
             format!("'{escaped}'")
         }
-        DefaultValue::Value(Value::Bytes(_)) => "null".into(),
+        DefaultValue::Value(Value::Bytes(_)) => {
+            // ドライバごとに書き方が違う（`x'..'` / `'\x..'` / `0x..`）ので、
+            // バイト列の既定値は書きません。黙って消えないように知らせます。
+            tracing::warn!("バイト列の既定値は SQL に書けません。値は無視します（列: {name}）");
+            "null".into()
+        }
     }
 }
 
@@ -1059,16 +1204,102 @@ mod tests {
     }
 
     #[test]
-    fn on_を書き忘れた外部キーは指す先が空になる() {
-        // 流せない SQL になるので、組み立てのときに警告を出している。
-        // 警告そのものは tracing に出るので、ここでは形だけを確かめる。
+    fn on_を書き忘れた外部キーは実行の前のエラーになる() {
+        // 以前は `references "" ("id")` のまま SQL に出していた。
+        // SQLite は親表が無くても外部キーを張れるので、create table が成功して
+        // 名前が空の親を指す表が残っていた。
         let mut schema = sqlite();
         schema.create("comments", |t| {
             t.id();
             t.foreign_id("post_id");
             t.foreign("post_id");
         });
-        assert!(schema.to_sql()[0].contains("references \"\" (\"id\")"));
+        // SQL には出さない。
+        let sql = schema.to_sql();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(!sql[0].contains("foreign key"), "{sql:?}");
+        let errors = schema.take_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("comments.post_id"), "{}", errors[0]);
+        assert!(errors[0].contains(".on(表名)"), "{}", errors[0]);
+        // 取り出したら空になる。
+        assert!(schema.take_errors().is_empty());
+    }
+
+    #[test]
+    fn 表を変えるときの_id_は実行の前のエラーになる() {
+        // `alter table add column` に自動採番の主キーは書けない。
+        // どのドライバでも必ず失敗するので、警告ではなくエラーにする。
+        let mut schema = sqlite();
+        schema.table("posts", |t| {
+            t.id();
+            t.string("slug").nullable();
+        });
+        let sql = schema.to_sql();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(sql[0].contains("\"slug\""), "{sql:?}");
+        assert!(!sql[0].contains("autoincrement"), "{sql:?}");
+        let errors = schema.take_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("posts.id"), "{}", errors[0]);
+
+        // 表を作るときの `id()` は今までどおり。
+        let mut schema = sqlite();
+        schema.create("posts", |t| {
+            t.id();
+        });
+        assert!(schema.take_errors().is_empty());
+    }
+
+    #[test]
+    fn 索引を落とす文はドライバで変わる() {
+        let expected = [
+            (
+                Driver::Sqlite,
+                r#"drop index if exists "posts_user_id_index""#,
+            ),
+            (
+                Driver::MySql,
+                "alter table `posts` drop index `posts_user_id_index`",
+            ),
+            (
+                Driver::Postgres,
+                r#"drop index if exists "posts_user_id_index""#,
+            ),
+        ];
+        for (driver, want) in expected {
+            let mut schema = Schema::new(driver);
+            schema.drop_index("posts", &["user_id"]);
+            assert_eq!(schema.to_sql(), [want.to_string()], "{driver}");
+            assert!(schema.take_errors().is_empty(), "{driver}");
+        }
+
+        // 名前を直に指定する口も同じ形。
+        let mut schema = sqlite();
+        schema.drop_index_named("posts", "posts_user_id_unique");
+        assert_eq!(
+            schema.to_sql(),
+            [r#"drop index if exists "posts_user_id_unique""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn 落とす索引の名前は_index_で作る名前と同じ() {
+        // `up` で付けた索引を `down` で落とせないと、SQLite では
+        // 索引の付いた列を drop_column できずに rollback が必ず失敗する。
+        for columns in [vec!["user_id"], vec!["status", "user_id"]] {
+            let mut created = sqlite();
+            created.create("posts", |t| {
+                t.index(&columns);
+            });
+            // `create index "名前" on ...` の名前を取り出す。
+            let made = created.to_sql()[1].split('"').nth(1).unwrap().to_string();
+
+            let mut dropped = sqlite();
+            dropped.drop_index("posts", &columns);
+            let gone = dropped.to_sql()[0].split('"').nth(1).unwrap().to_string();
+            assert_eq!(made, gone, "{columns:?}");
+        }
     }
 
     #[test]

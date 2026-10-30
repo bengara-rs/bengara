@@ -50,18 +50,15 @@ MAIL_FROM_NAME=myapp
 | `starttls`        | 587          | 平文でつないで `STARTTLS` で切り替える |
 | `none`（`null` と `false` も） | 25 | 暗号化しない                     |
 
-`ssl` と `smtps` は `tls` と同じ、`false` は `none` と同じ扱いです。
-
 **書かなければ `starttls`。`MAIL_ENCRYPTION=` と空にすると暗号化なしになります。**
 行を書かないのと値を空にするのは**別の意味**です。空にすると、利用者名とパスワードが
 平文で流れます。
 
-知らない語を書いたときは、警告をログに出して既定に倒します。
-`MAIL_DRIVER` は `log` に、`MAIL_ENCRYPTION` は `starttls` になります
-（暗号化する側に倒します）。
+知らない語を書いたときは、警告をログに出して既定に倒します
+（`MAIL_DRIVER` は `log`、`MAIL_ENCRYPTION` は `starttls`）。
 
-**`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名にしたいときは、上の例のように
-`.env` へ書いてください。
+**`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名にしたいときは、上の例の
+ように `.env` へ書いてください。
 
 `config/mail.rs` を置くと `.env` より優先します。無くても動きます。
 
@@ -109,24 +106,21 @@ Mail::to("alice@example.com")
 | `send()`                 | 送る                       |
 
 `text` と `html` の両方を書いても構いません。`log` はどちらも書き出します。
-
-送る前に中身を見られます。
-
-```rust
-let mail = Mail::to("alice@example.com").subject("ようこそ").text("本文");
-let message: &Message = mail.message();
-assert_eq!(message.to, ["alice@example.com"]);
-mail.send().await?;
-```
+送る前の中身は `mail.message()` で見られます（返るのは `&Message`）。
 
 ## 断るもの
 
-`send()` は、送る前に 2 つだけ確かめます。
+`send()` は、送る前に 3 つだけ確かめます。
 
-| 断るもの                   | メッセージ                 |
-|----------------------------|----------------------------|
-| 宛先が空（空白だけも同じ） | `メールの宛先がありません` |
-| `text` も `html` も無い    | `メールの本文がありません` |
+| 断るもの                   | メッセージ                                   |
+|----------------------------|----------------------------------------------|
+| 宛先が空（空白だけも同じ） | `メールの宛先がありません`                   |
+| `text` も `html` も無い    | `メールの本文がありません`                   |
+| 宛先・差出人・件名に改行   | `メールの宛先・差出人・件名に改行は入れられません` |
+
+改行を断るのは、**ヘッダーに偽の行を混ぜられないようにするため**です。
+検査するのは `to` / `also_to` / `cc` / `bcc` / `from` / `reply_to` / `subject` です。
+本文（`text` / `html`）の改行は、そのまま通ります。
 
 **アドレスの形は確かめません。** 入力から受け取るなら `email` の検査規則を通してください
 （[validation.md](validation.md)）。
@@ -147,23 +141,13 @@ Subject: ようこそ
 ## キューから送る
 
 **メールはキューから送るのがよいです。** 送信は待ち時間が長いので、
-画面の中で待つと応答が遅くなります。
+画面の中で待つと応答が遅くなります。画面の中では積むだけにします。
 
 ```rust
-// 画面の中
 Queue::push("SendWelcome", &Payload { user_id: user.id }).await?;
 ```
 
-```rust
-// app/Jobs/SendWelcome.rs
-pub async fn handle(payload: String) -> Result<()> {
-    let payload: Payload = bengara::serde_json::from_str(&payload)?;
-    let Some(user) = User::find(payload.user_id).await? else {
-        return Ok(());
-    };
-    Mail::to(&user.email).subject("ようこそ").text("...").send().await
-}
-```
+送るのは `app/Jobs/SendWelcome.rs` の中です（[queue.md](queue.md)）。
 
 ## テスト
 
@@ -178,29 +162,20 @@ async fn お知らせを送る() {
         .await
         .unwrap();
 
-    let sent = Mail::sent();
+    let sent = Mail::sent();            // Vec<Message>
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].to, ["alice@example.com"]);
     assert_eq!(sent[0].subject, "ようこそ");
 }
 ```
 
-| メソッド             | 返るもの       |
-|----------------------|----------------|
-| `Mail::sent()`       | `Vec<Message>` |
-| `Mail::clear_sent()` | –              |
-
 気をつけることが 3 つあります。
 
-- 溜まったメールは **テストの間ずっと残ります。** 数を確かめる前に `clear_sent()` を呼んでください。
-- 溜まる場所はプロセス共通です。テストは並んで走るので、 **`Mail::sent()` で数を確かめるテストは
-  `bengara::testing::exclusive()` で札を取ってください**（[testing.md](testing.md)）。
-- `MAIL_DRIVER` を **本物の環境変数**で渡したときは、そちらを使います
-  （`.env` の値はテストに効きません）。
-
-```sh
-MAIL_DRIVER=log cargo test
-```
+- 溜まったメールは**テストの間ずっと残ります。** 数を確かめる前に `clear_sent()` を
+  呼んでください。
+- 溜まる場所はプロセス共通です。テストは並んで走るので、**`Mail::sent()` で数を確かめる
+  テストは `bengara::testing::exclusive()` で札を取ってください**（[testing.md](testing.md)）。
+- `MAIL_DRIVER` を**本物の環境変数**で渡したときは、そちらを使います
+  （`MAIL_DRIVER=log cargo test` のとき。`.env` の値はテストに効きません）。
 
 ## SMTP で送る
 
@@ -223,44 +198,35 @@ MAIL_FROM=noreply@example.com
 MAIL_FROM_NAME=myapp
 ```
 
-送り方は `log` と同じです。書き換えるのは `.env` だけです。
-
-```rust
-Mail::to("alice@example.com")
-    .subject("ようこそ")
-    .text("登録ありがとうございます。")
-    .send()
-    .await?;
-```
+**送り方は `log` と同じです。** 書き換えるのは `.env` だけです。
 
 ### 知っておくこと
 
-- **つなぐのは1通目を送るときです。** 起動時にはつなぎません。接続は溜めておくので、
-  2通目から暗号化の握り直しが起きません。
+- **つなぐのは 1 通目を送るときです。** 接続は溜めておくので、2 通目から暗号化の
+  握り直しが起きません。
 - **TLS は rustls を使います。** OS の証明書置き場は見ません。自分で建てた
   証明書（自己署名）のサーバにはつながりません。
-- `text` と `html` の両方を書くと `multipart/alternative` になります。読む側が選びます。
-- 差出人と宛先は `alice@example.com` と `アリス <alice@example.com>` の両方の形を
+- `text` と `html` の両方を書くと `multipart/alternative` になります。
+- 宛先と差出人は `alice@example.com` と `アリス <alice@example.com>` の両方の形を
   受け付けます。読めないときは、どの欄のどの文字列かを添えて断ります。
 - **フラグを付けずに `MAIL_DRIVER=smtp` にすると、送るときにエラーになります。**
-  黙って `log` には落ちません。送れたつもりになるのを防ぐためです。
+  黙って `log` には落ちません。
 
   ```
   SMTP で送るには Cargo.toml を `bengara = { version = "0.1", features = ["mail"] }` にしてください
   ```
 
 - `MAIL_ENCRYPTION=none` のまま `MAIL_USERNAME` を使うと、警告をログに出します。
-  利用者名とパスワードが暗号化されずに流れるためです。
 
 ### ビルドに要るもの
 
-`mail` を付けると、暗号化のために C コンパイラが要ります（rustls が使う `ring`）。
+`mail` を付けると、暗号化のために C コンパイラが要ります。
 
-| OS      | 用意するもの                                    |
-|---------|-------------------------------------------------|
-| Linux   | `cc`（`build-essential` など）                  |
-| macOS   | Xcode Command Line Tools                        |
-| Windows | Visual Studio の C++ ビルドツール               |
+| OS      | 用意するもの                      |
+|---------|-----------------------------------|
+| Linux   | `cc`（`build-essential` など）    |
+| macOS   | Xcode Command Line Tools          |
+| Windows | Visual Studio の C++ ビルドツール |
 
 ## 送り先を自分で作る
 
@@ -275,14 +241,11 @@ bengara::mail::install_mailer(Box::new(MyMailer));
 
 ## 無いもの
 
-| 項目                  | 代わりにすること       |
-|-----------------------|------------------------|
-| 添付ファイル          | ありません             |
-| 自己署名の証明書      | ありません（rustls が断ります） |
-| 送れなかったときの再送 | キューの再試行に任せる（[queue.md](queue.md)） |
-| Markdown の文面       | `html` に自分で入れる  |
-| テンプレート（Blade） | `format!` で組み立てる |
-| 通知（Notification）  | `Mail` を直接使う      |
+テンプレート（Blade）と Markdown の文面はありません。文面は `format!` で組み立てて
+`text` か `html` に入れます。通知（Notification）はないので `Mail` を直接使います。
+添付ファイルと自己署名の証明書はありません。送れなかったときの再送は、キューの
+再試行に任せます（[queue.md](queue.md)）。
+ほかにまだ無いものは [backlog.md](backlog.md) にまとめてあります。
 
 ## 関連
 

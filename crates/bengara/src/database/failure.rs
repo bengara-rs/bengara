@@ -43,6 +43,11 @@ impl std::error::Error for SqlFailure {
 /// SQL の失敗を、どの文で起きたか分かる形にする。
 ///
 /// **渡した値は出しません。** 個人情報が混じることがあるためです。
+///
+/// `commit` / `rollback` の失敗も、`sql` に `"commit"` / `"rollback"` を入れて
+/// ここを通します。どちらも SQL の文なので、出る文はそのまま読めます。
+/// 包まずに `Error::msg` にすると、`is_unique_violation()` が見る原因の連鎖が
+/// 切れてしまいます（遅延制約は確定のときに当たります）。
 pub(crate) fn failed(sql: &str, error: sqlx::Error) -> Error {
     Error::other(SqlFailure {
         sql: sql.to_string(),
@@ -83,6 +88,22 @@ mod tests {
     fn 包んでいないエラーは一意制約違反ではない() {
         assert!(!is_unique_violation(&Error::msg("ただのメッセージ")));
         assert!(!is_unique_violation(&Error::http(409, "Conflict")));
+    }
+
+    #[test]
+    fn 包んだ失敗は原因を残し文も読める() {
+        // `commit` / `rollback` も同じ包み方にします。`Error::msg` だと
+        // 原因の連鎖が切れて、`is_unique_violation()` が必ず `false` になります。
+        let error = failed("commit", sqlx::Error::RowNotFound);
+        assert!(
+            matches!(&error, Error::Other(_)),
+            "原因を残す腕に入っていること"
+        );
+        let message = error.to_string();
+        assert!(message.contains("SQL の実行に失敗しました"), "{message}");
+        assert!(message.contains("commit"), "{message}");
+        // 原因の連鎖から `SqlFailure` が見つかること（この原因は一意制約違反ではない）。
+        assert!(!is_unique_violation(&error));
     }
 
     #[test]

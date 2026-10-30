@@ -1,25 +1,9 @@
 # 導入手順
 
 空のプロジェクトから、ブラウザで画面が出るところまでの手順です。
-つまずきやすい点は、その手順の中に書いてあります。
+つまずいたときは、最後の「つまずいたとき」を見てください。
 
-## 先に知っておくこと
-
-必要なものは Rust 1.85 以上です（edition 2021）。
-
-bengara 自身のコードは edition 2021 で書いています。
-ただし依存クレートの hyper-util が edition 2024 を要求します。
-そのため Rust 1.82 では依存の解決に失敗し、実際の下限は 1.85 になります。
-
-> **Rust 1.85 でデータベース（`sqlite` / `mysql` / `postgres`）を使うとき**は、
-> 依存を 1 つ古い版に固定してください。
-> sqlx がたどる `icu_*` が、新しい版では Rust 1.88 以上を要求します。
->
-> ```sh
-> cargo update idna_adapter --precise 1.2.0
-> ```
->
-> 1.88 以上の Rust を使うなら、何もしなくて構いません。
+必要なものは Rust 1.85 以上です。
 
 ## 1. プロジェクトを作る
 
@@ -28,17 +12,16 @@ cargo new myapp && cd myapp
 cargo add bengara --features sqlite
 ```
 
-**データベースを使うなら機能フラグを忘れないでください。** SQLite なら `sqlite`、
+データベースを使うなら機能フラグを付けます。SQLite なら `sqlite`、
 MySQL / MariaDB なら `mysql`、PostgreSQL なら `postgres` です。
+使わないなら `cargo add bengara` だけで構いません。
+SMTP でメールを送るなら `mail` も足します（[mail.md](mail.md)）。
+
 後から足すときは `Cargo.toml` を次の形にします。
 
 ```toml
 bengara = { version = "0.1", features = ["sqlite"] }
 ```
-
-使わないなら `cargo add bengara` だけで構いません。依存が 74 個少なくなります。
-
-SMTP でメールを送るなら `mail` も足します（[mail.md](mail.md)）。
 
 ## 2. main.rs を仮の形にする
 
@@ -48,11 +31,8 @@ SMTP でメールを送るなら `mail` も足します（[mail.md](mail.md)）�
 fn main() { bengara::run() }
 ```
 
-**これを先にやってください。** この状態では `init` と `--version` だけが使えます。
+この状態では `init` と `--version` だけが使えます。
 ほかのコマンドを叩くと「先に init を実行してください」と案内が出ます。
-
-`cargo new` が作ったままの `println!` だけの `main` でも `init` は動きます。
-ただし `bengara::run()` にしておくと案内が読めるので確実です。
 
 ## 3. init を実行する
 
@@ -60,16 +40,24 @@ fn main() { bengara::run() }
 cargo run -- init
 ```
 
-`init` がすることは 3 つです。
+| すること                                | 中身                                                        |
+|-----------------------------------------|-------------------------------------------------------------|
+| ディレクトリとファイルを作る            | 入口の `main.rs` は `bengara::app!();` の 1 行              |
+| `Cargo.toml` に項目を足す               | 下の表                                                      |
+| `src/main.rs` を消す                    | `src/` が空になれば `src/` も消す                           |
 
-- 足りないディレクトリとファイルを作る（既にあるファイルには触りません）
-- `Cargo.toml` に `[[bin]]`、`default-run`、`autobins = false`、`[build-dependencies]`、`[profile.release]` を足す
-  （`bengara` の依存がまだ無ければ、`features = ["sqlite"]` 付きで書き足します）
-- `src/main.rs` を消し、`src/` が空になれば `src/` も消す
+| 足す項目            | 何のため                                                     |
+|---------------------|--------------------------------------------------------------|
+| `rust-version`      | bengara が動く Rust の下限（1.85）                           |
+| `autobins = false`  | 入口は直下の `main.rs` と `artisan.rs`。`src/` は使いません  |
+| `autotests = false` | `tests/` 直下の `.rs` を別のテストとして拾わせない（[testing.md](testing.md)） |
+| `default-run`       | `cargo run` で動かす bin。該当する `[[bin]]` があるときだけ   |
+| `[build-dependencies]` / `[profile.release]` | ビルドの設定                         |
 
 何度実行しても壊れません。足りないものだけを作り足します。
+`bengara` の依存がまだ無ければ、`features = ["sqlite"]` 付きで書き足します。
 
-### 既にあるファイルへの例外は 3 つ
+既にあるファイルは次のように扱います。
 
 | ファイル             | すること                       |
 |----------------------|--------------------------------|
@@ -77,22 +65,8 @@ cargo run -- init
 | `.cargo/config.toml` | `artisan` の別名が無ければ足す |
 | `build.rs`           | **書き換えません**（案内だけ） |
 
-- `.gitignore`: `cargo new` は `/target` の 1 行だけの `.gitignore` を必ず作ります。
-  そのまま残すと `/.env` が入らず、`APP_KEY` 入りの `.env` が git に入ってしまいます。
-- `.cargo/config.toml`: リンカの指定などで自前のものを持っている人は多いです。
-  そのまま残すと `cargo artisan` が「そんなサブコマンドは無い」で終わります。
-- `build.rs`: 自前の `build.rs` を壊さないよう、書き換えません。
-  `bengara_build::discover()` の呼び出しが無いときだけ、足す 1 行を案内します。
-  **無いままだと `bengara::app!()` が自動検出の結果を読めません。**
-
-### src/main.rs が消えないとき
-
-`init` が `src/main.rs` を消すのは、中身が次のどちらかのときです。
-
-- `cargo new` の雛形のまま
-- `fn main() { bengara::run() }` だけ
-
-自分で書いたコードが入っていると消さず、案内だけを出します。その場合は手で移してください。
+**`build.rs` に `bengara_build::discover()` が無いと、`bengara::app!()` が
+自動検出の結果を読めません。** 無いときは足す 1 行を案内します。
 
 ## 4. APP_KEY を作る
 
@@ -100,11 +74,9 @@ cargo run -- init
 cargo artisan key:generate
 ```
 
-`init` が作る `.env` の `APP_KEY` は**空**です。これを埋めるのが `key:generate` です。
-
-**`APP_KEY` は 64 文字以上が必須です。** 空のままだと、セッション・署名付き URL・暗号化を使う
-最初のリクエストでエラーになります。ここで作っておくのが確実です。
-くわしくは [configuration.md](configuration.md) の APP_KEY にあります。
+`init` が作る `.env` の `APP_KEY` は空です。これを埋めます。
+**64 文字以上が必須です。** 空のままだと、セッション・署名付き URL・暗号化を使う
+最初のリクエストでエラーになります（[configuration.md](configuration.md)）。
 
 ## 5. 起動する
 
@@ -114,9 +86,7 @@ cargo artisan serve
 
 → http://127.0.0.1:8000
 
-### ポートが使われているとき
-
-既定は `.env` の `APP_PORT`（既定 8000）です。変えるには次のどちらかを使います。
+ポートを変えるには、次のどちらかを使います。
 
 ```sh
 cargo artisan serve --port 8124
@@ -126,32 +96,6 @@ cargo artisan serve --port 8124
 # .env
 APP_PORT=8124
 ```
-
-`serve` 中に本体が自分で終了した場合（ポートが使用中など）は、その旨が表示されます。
-次にファイルを変更したときに起動し直します。
-
-### cargo artisan が「そんなコマンドはない」と言われるとき
-
-`cargo artisan` は Cargo のエイリアスです。`init` が次のファイルを作ります。
-
-```toml
-# .cargo/config.toml
-[alias]
-artisan = ["run", "-q", "--bin", "artisan", "--"]
-```
-
-**このファイルを `.gitignore` に入れないでください。** 消えると使えなくなります。
-その場合は `cargo run --bin artisan -- serve` で代用できます。
-
-### プロジェクトのルートで実行する
-
-| 動かし方                       | どこで実行するか                                             |
-|--------------------------------|--------------------------------------------------------------|
-| `cargo artisan` / `cargo run`  | プロジェクトの中ならどこでも。ルートは `CARGO_MANIFEST_DIR` から決まります |
-| `./target/debug/myapp`         | **プロジェクトのルート**で実行してください                   |
-
-ルートの決め方（4 か所を順に見ます）と、決まらないときの動きは
-[deployment.md](deployment.md) にあります。**決まらなければ起動しません。**
 
 ## 6. データベースを用意する
 
@@ -199,8 +143,8 @@ async fn 記事が作れる() {
 cargo build --release
 ```
 
-実行ファイルが 2 つできます（本体と `artisan`）。本番に置くのは本体だけで足ります。
-`public/` と設定はバイナリに入ります。本体の大きさは**約 6.0 MB**（`sqlite` 機能つき）です。
+実行ファイルが 2 つできます（本体と `artisan`）。本番に置くのは本体だけです。
+`public/` と設定はバイナリに入ります。本体の大きさは約 6.0 MB（`sqlite` 機能つき）です。
 
 本番に置くものは 3 つです（[deployment.md](deployment.md)）。
 
@@ -210,18 +154,55 @@ cargo build --release
 | `.env`                | 環境ごとの値               |
 | 書き込める `storage/` | 実行時の書き込み先         |
 
-`storage/` の下は `./myapp storage:init` が作ります。作るのは 8 つです。
+`storage/` の下は `./myapp storage:init` が作ります。
 
-```
-storage/app  storage/app/public  storage/framework
-storage/framework/cache  storage/framework/schedule  storage/framework/serve
-storage/framework/sessions  storage/logs
+## つまずいたとき
+
+### Rust 1.85 でデータベースを使うと依存が解決できない
+
+依存を 1 つ古い版に固定してください。1.88 以上の Rust なら何もしなくて構いません。
+
+```sh
+cargo update idna_adapter --precise 1.2.0
 ```
 
-## src/ を作り直さない
+### `cargo artisan` が「そんなコマンドはない」と言われる
+
+`cargo artisan` は Cargo のエイリアスです。`init` が次のファイルを作ります。
+**`.gitignore` に入れないでください。** 消えると使えなくなります。
+その場合は `cargo run --bin artisan -- serve` で代用できます。
+
+```toml
+# .cargo/config.toml
+[alias]
+artisan = ["run", "-q", "--bin", "artisan", "--"]
+```
+
+### `src/main.rs` が消えない
+
+`init` が消すのは、中身が `cargo new` の雛形のままか、
+`fn main() { bengara::run() }` だけのときです。
+自分で書いたコードが入っていると、案内だけを出します。手で移してください。
+
+### ポートが使われている
+
+`serve` 中に本体が自分で終了した場合は、その旨が表示されます。
+次にファイルを変更したときに起動し直します。
+
+### どこで実行するか
+
+| 動かし方                      | どこで実行するか                             |
+|-------------------------------|----------------------------------------------|
+| `cargo artisan` / `cargo run` | プロジェクトの中ならどこでも                 |
+| `./target/debug/myapp`        | **プロジェクトのルート**                     |
+
+基準ディレクトリの決め方は [deployment.md](deployment.md) にあります。
+**決まらなければ起動しません。**
+
+### `src/` に置いたファイルが見つからない
 
 bengara のプロジェクトに `src/` はありません。入口は直下の `main.rs` と `artisan.rs` です。
-**`src/` にファイルを置いても自動検出の対象になりません。**
+**`src/` は自動検出の対象になりません**（[directory-structure.md](directory-structure.md)）。
 
 ## 次に読むもの
 
@@ -229,4 +210,4 @@ bengara のプロジェクトに `src/` はありません。入口は直下の 
 - [routing.md](routing.md) — ルートを足す
 - [artisan.md](artisan.md) — `serve` の動き
 - [testing.md](testing.md) — テストを書く
-- [deployment.md](deployment.md) — 本番に置く（**実行ファイル・`.env`・書き込める `storage/`**）
+- [deployment.md](deployment.md) — 本番に置く

@@ -57,12 +57,9 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `URL::signedRoute(...)`                             | `signed_url("/unsubscribe", &[("user", "12")])?` — **ルート名ではなくパス**を渡します |
 | `$request->hasValidSignature()`                     | `has_valid_signature(&req)?`                                                          |
 | ミドルウェア `signed` が自動で止める                | **止まりません。** 自分で確かめて返し方を決めます                                     |
-
-`signed_url()` は **URL にそのまま書けない文字**を含むパスを断ります（空白・`?`・`#`・
-`<`・`>`・`\`・非 ASCII など）。符号化済みのパスを渡してください。
-
-**末尾の `/` は無視します。** `/posts` と `/posts/` は同じルートに当たります。
-Laravel は 301 で寄せますが、bengara は転送せずそのまま処理します。
+| メソッドは大文字にそろえてから照合する              | **大文字小文字を区別します。** `get /x` は 405（`allow: GET, HEAD`）。`req.method()` も届いたままを返します |
+| 末尾の `/` は 301 で寄せる                          | **無視します。** `/posts` と `/posts/` は同じルートに当たります（署名付き URL も同じ規則） |
+| （Laravel には無い）                                | `signed_url()` は、URL にそのまま書けない文字（空白・`?`・`#`・`<`・`>`・`\`・非 ASCII など）を含むパスを断ります |
 
 ## コントローラとレスポンス
 
@@ -87,22 +84,20 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `$request->input('title')`               | `req.input("title")` — `Option<String>`                   |
 | `$request->validate([...])`              | `req.validate(&[("title", "required\|max:255")])?`        |
 | 規則は配列でも文字列でも書ける           | **文字列だけ**です                                        |
-| `TrimStrings` が値の前後の空白を落とす   | 同じ。除くのも同じ 3 つ（下の節）                         |
+| `TrimStrings` が値の前後の空白を落とす   | 同じ。落とさないのも同じ 3 つ（`current_password` / `password` / `password_confirmation`） |
 | 空白を落とすのは全部の入力               | **検査する値だけ**です。`req.input()` は落としません      |
 | `min` / `max` / `between` の決め方       | 同じ。`numeric` か `integer` が付いた項目だけ値で比べます |
 | 空文字の扱い                             | 同じ。飛ばすのは未送信のときと `nullable` のときだけです  |
+| `nullable` で飛ばした値はそのまま残る    | **空文字が入ります。** 来た値は残しません                 |
+| `alpha` 系は空文字を通す                 | **落とします**（`alpha` / `alpha_num` / `alpha_dash`）    |
+| `in:admin,user,` の末尾のカンマ          | 空の許可値は落とします。1 つも残らなければ **500**        |
 | 落ちると例外 → リダイレクトか JSON       | 落ちると `Error::Validation` → 422。`Accept` で分かれます |
 | `old('title')`                           | `req.session().old("title")`                              |
 | `regex:` / `unique:` / `exists:`         | ありません。`exists()` をクエリで書きます                 |
 | 重なりは `unique:` で止める              | 表の `unique` が砦です。`is_unique_violation` で見分けます |
 | フォームリクエスト（`StorePostRequest`） | ありません                                                |
 
-検査に渡る値は、前後の空白を落とします（Laravel の `TrimStrings` と同じ）。
-`age=" 5 "` は `5` として検査し、通った値も `5` で返ります。
-
-**落とさない項目は 3 つです。** `current_password`・`password`・`password_confirmation`
-です。Laravel の `$except` と同じ 3 つなので、`password` の `min:8` は前後の空白も
-数えた長さで測ります。
+くわしくは [validation.md](validation.md) にあります。
 
 ## セッションと CSRF
 
@@ -120,10 +115,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | 失敗すると 419                            | 同じ                                                       |
 | `VerifyCsrfToken::$except`                | `VerifyCsrfToken::new().except("/api/posts")`              |
 | （Laravel には無い）                      | `except_route("api.*")` でルート名で外せます。**勧める形** |
-
-**`except` に `/api/*` のようなまとめ書きをしないでください。**
-セッションは全ルートに掛かるので、`/api/*` も Cookie で認証されます。
-外していいのは Cookie を使わない API だけです。
+| `except` にまとめ書きする                 | **しないでください。** 外していいのは Cookie を使わない API だけです |
 
 ## ミドルウェア・エラー・回数の制限
 
@@ -158,13 +150,13 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | MySQL / PostgreSQL / SQLite / SQL Server           | **SQL Server 以外**（機能フラグ `sqlite` / `mysql` / `postgres`） |
 | `$table->timestamp('at')` が PostgreSQL で `timestamp`  | PostgreSQL では **`text` 列**になります（日時は文字列のため）  |
 | `decimal` の値が文字列で返る                       | MySQL / PostgreSQL では `Value::Text`。末尾の 0 は落ちます    |
+| `decimal` に文字列を渡して書ける                   | **読みと書きが非対称です。** 書くときは数（`Value::Float` / `Int`）を渡します。PostgreSQL は文字列を受け取りません。桁を落とさず書くなら `DB::statement` で `$1::numeric`（ビルダーの `*_raw` は PostgreSQL で `$` を断ります） |
 | MySQL の `$table->float()` は 4 バイト             | **どのドライバでも 8 バイト**です（MySQL は `float(53)`）     |
 | `charset` / `collation` の指定                      | **ありません。** サーバの既定に従います                       |
 | 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作ります |
 
-`update` / `delete` / `truncate` に `join` / `limit` / `offset` / `group_by` / `having` /
-`distinct` を付けるとエラーです。`order_by` だけは黙って無視します。
-`truncate` に条件（`where_`）を付けるのもエラーです（絞って消すなら `delete()`）。
+`update` / `delete` / `truncate` に付けられない指定の一覧は、
+[database.md](database.md) の「できないこと・エラーになること」にあります。
 
 ## モデルとマイグレーション
 
@@ -177,6 +169,8 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `with('comments')` でまとめ読み            | `where_in` で 2 回に分けます                                      |
 | `Post::create([...])`                      | 構造体を作って `post.save().await?`                               |
 | `save()` が 0 件の更新でも成功を返す       | **`Err` になります。** 書き込みが静かに消えないようにしています    |
+| `save()` は変わった属性だけを書く          | **更新のときは `created_at` 以外の全列を書き戻します**（下の節）   |
+| `$table->dropIndex(['user_id'])`           | `Schema::drop_index("posts", &["user_id"])`。名前で消すなら `Schema::drop_index_named(表, 名前)` |
 | `DB::transaction` の中で `$model->save()`  | `post.save_using(&tx).await?` を使います                          |
 | `$casts` で型を変える                      | 構造体の宣言がそのまま型です                                      |
 | `Post::factory()->count(3)->create()`      | `database/factories/` のただの関数                                |
@@ -184,7 +178,10 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `$table->string('title')->change()`        | **ありません**（SQLite が苦手なため）                             |
 | `php artisan migrate`                      | `cargo artisan migrate`（本番は `./myapp migrate`）               |
 
-`#[derive(Model)]` が扱えるのは **自動採番の整数の主キー**だけです。
+**`save()` の書き戻しは Laravel と大きく違います。** Laravel は変わった属性だけを
+書きますが、bengara は **`created_at` 以外の全列**を書き戻すので、読んでから別の場所で
+増えた列（`views` など）は古い値に巻き戻ります。変える列だけを書きたいときは
+クエリビルダを使ってください（[models.md](models.md)）。
 
 ## 認証と認可
 
@@ -215,6 +212,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | Laravel                         | bengara                                                              |
 |---------------------------------|----------------------------------------------------------------------|
 | `php artisan test` / PHPUnit    | `cargo test`                                                         |
+| `phpunit.xml` がテストの場所を決める | `Cargo.toml` に `autotests = false`（`init` が書きます）。置き場所は `tests/Feature/` と `tests/Unit/` |
 | `$this->get('/')->assertOk()`   | `get("/").await.assert_ok()`                                         |
 | トレイトを使う宣言が必要        | `#[bengara::test]` が道具を注入します。`use` は不要です              |
 | `RefreshDatabase` トレイト      | `let db = refresh_database().await;`                                 |
@@ -228,6 +226,7 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 | `Cache::remember('k', 60, fn() => ...)`   | `Cache::remember("k", 60, \|\| async { ... }).await?`                    |
 | `Cache::increment` が期限を引き継ぐ       | **引き継ぎません。** 期限なしで書き直します                              |
 | `Cache::tags([...])`                      | ありません。鍵に頭を付けます                                             |
+| 鍵が `user:1` のようにコロンを含む        | 動きますが、**ファイル名はハッシュ**になります（`:` を含む鍵、大文字を含む鍵が対象） |
 | （期限切れの掃除コマンドは無い）          | `Cache::prune()` と `cargo artisan cache:prune`                          |
 | `Storage::disk('s3')`                     | `storage/` の下だけです。S3 はありません                                 |
 | `Storage::url($path)` / `storage:link`    | ありません。`/storage/` ＋ パスを組み立てます                            |
@@ -279,7 +278,6 @@ Laravel は 301 で寄せますが、bengara は転送せずそのまま処理�
 ## PHP 固有の機能は作らない
 
 PHP の言語や実行の形に強く結びついた機能は作りません。
-Rust では原理的に作れないものがあるためです。
 
 | PHP 固有のもの                                     | bengara                                       |
 |----------------------------------------------------|-----------------------------------------------|
@@ -298,9 +296,8 @@ Rust では原理的に作れないものがあるためです。
 | 連想配列を前提にした API（`config(...)`） | 型をキーにする `config::<AppConfig>()`          |
 | グローバル名前空間のヘルパ関数            | `use bengara::prelude::*;` の自由関数           |
 
-「作らない」と決める前に、名前と考え方だけ借りられないか、
-Rust では別の形のほうが自然でないかを毎回検討しています。
 借りられるものは **Laravel と同じ名前のまま中身を Rust の形で作ります。**
+「作らない」と決めた理由は [decisions.md](decisions.md) にあります。
 
 ## その他
 

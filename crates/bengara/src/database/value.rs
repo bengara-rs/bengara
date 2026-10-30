@@ -106,11 +106,25 @@ macro_rules! from_int {
         })*
     };
 }
-from_int!(i8, i16, i32, i64, u8, u16, u32, isize, usize);
+// `isize` は `i64` と同じ幅・同じ符号なので、そのまま `as i64` で入れられます。
+// 符号なしで同じ幅の `u64` と `usize` だけは、下の `try_from` の形にします。
+from_int!(i8, i16, i32, i64, u8, u16, u32, isize);
 
 impl From<u64> for Value {
     fn from(v: u64) -> Self {
         // i64 に収まらない値は、桁を落とさないように文字列にする。
+        match i64::try_from(v) {
+            Ok(v) => Value::Int(v),
+            Err(_) => Value::Text(v.to_string()),
+        }
+    }
+}
+
+impl From<usize> for Value {
+    fn from(v: usize) -> Self {
+        // 64 ビット環境では `u64` と同じ幅なので、同じ扱いにする。
+        // `as i64` だと `usize::MAX` が黙って `-1` になり、入れた値が読めなくなる。
+        // 32 ビット環境では必ず収まるので、下の分岐は通らないだけ。
         match i64::try_from(v) {
             Ok(v) => Value::Int(v),
             Err(_) => Value::Text(v.to_string()),
@@ -215,6 +229,13 @@ fn float_to_i64(v: f64) -> Result<i64> {
     if v < i64::MIN as f64 || v >= i64::MAX as f64 {
         return Err(Error::msg(format!("{v} は i64 に収まりません")));
     }
+    // 小数部を黙って捨てない。`2.9` を `2` で返すと、読んだ値が別の値になる。
+    // SQLite の `decimal` の列は `Float` で返るので、ここを通ることがある。
+    if v.fract() != 0.0 {
+        return Err(Error::msg(format!(
+            "{v} には小数部があるので整数として読めません。f64 で読んでください"
+        )));
+    }
     Ok(v as i64)
 }
 
@@ -236,7 +257,9 @@ macro_rules! from_value_int {
 
 // `#[derive(Model)]` が主キーに許す整数は、ここに実装があるものと同じにそろえます。
 // そろっていないと、主キーの型を変えたときに読みにくいエラーが出ます。
-from_value_int!(i8, i16, i32, isize, u8, u16, u32, usize);
+// `u64` と `usize` は下に手で書きます。`Value::Text` で入った大きな値を
+// 読み戻す経路が要るためです。
+from_value_int!(i8, i16, i32, isize, u8, u16, u32);
 
 /// `FromValue` を実装している整数の型の名前。
 ///
@@ -258,6 +281,20 @@ impl FromValue for u64 {
         }
         let v = i64::from_value(value)?;
         u64::try_from(v).map_err(|_| Error::msg(format!("{v} は u64 に収まりません")))
+    }
+}
+
+impl FromValue for usize {
+    fn from_value(value: &Value) -> Result<Self> {
+        // `i64` に収まらない値は `Value::Text` で入る（`From<usize> for Value`）。
+        // 往復できるように、文字列のときは先に usize として読む。
+        if let Value::Text(v) = value {
+            if let Ok(parsed) = v.trim().parse::<usize>() {
+                return Ok(parsed);
+            }
+        }
+        let v = i64::from_value(value)?;
+        usize::try_from(v).map_err(|_| Error::msg(format!("{v} は usize に収まりません")))
     }
 }
 
@@ -564,6 +601,24 @@ mod tests {
     }
 
     #[test]
+    fn 大きなusizeは往復できる() {
+        // 64 ビット環境では `u64` と同じ幅。`as i64` だと `-1` になっていた。
+        let stored = Value::from(usize::MAX);
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(stored, Value::Text(usize::MAX.to_string()));
+        }
+        assert_eq!(usize::from_value(&stored).unwrap(), usize::MAX);
+
+        // 収まる値はこれまでどおり Int のまま。
+        assert_eq!(Value::from(7usize), Value::Int(7));
+        assert_eq!(usize::from_value(&Value::Int(7)).unwrap(), 7usize);
+
+        // 負の数は usize として読めない。
+        assert!(usize::from_value(&Value::Int(-1)).is_err());
+        assert!(usize::from_value(&Value::Text("やきそば".into())).is_err());
+    }
+
+    #[test]
     fn option_は_null_になる() {
         let none: Option<&str> = None;
         assert_eq!(Value::from(none), Value::Null);
@@ -658,9 +713,15 @@ mod tests {
         // 幅の狭い整数も、同じエラーが通って出る。
         assert!(i32::from_value(&Value::Float(f64::NAN)).is_err());
 
-        // 普通の小数はこれまでどおり読める。
-        assert_eq!(i64::from_value(&Value::Float(2.9)).unwrap(), 2);
-        assert_eq!(i64::from_value(&Value::Float(-2.9)).unwrap(), -2);
+        // 小数部があるものも断る。以前は 2.9 が黙って 2 になっていた。
+        let error = i64::from_value(&Value::Float(2.9)).unwrap_err().to_string();
+        assert!(error.contains("小数部"), "{error}");
+        assert!(i64::from_value(&Value::Float(-2.9)).is_err());
+
+        // 小数部が無ければ読める。
+        assert_eq!(i64::from_value(&Value::Float(2.0)).unwrap(), 2);
+        assert_eq!(i64::from_value(&Value::Float(-3.0)).unwrap(), -3);
+        assert_eq!(i32::from_value(&Value::Float(7.0)).unwrap(), 7);
     }
 
     #[cfg(feature = "database")]

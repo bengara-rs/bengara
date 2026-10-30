@@ -137,6 +137,14 @@ impl AppConfig {
         self.env == "local"
     }
 
+    /// テストの最中か。
+    ///
+    /// `#[bengara::test]` は、`APP_ENV` が本物の環境変数にも `.env` にも無いとき
+    /// `testing` を入れます（Laravel の `phpunit.xml` と同じ既定）。
+    pub fn is_testing(&self) -> bool {
+        self.env == "testing"
+    }
+
     /// 署名に使う鍵を取り出す。設定されていなければ、直し方を書いたエラーを返す。
     ///
     /// 長さも確かめます。短い鍵でも HMAC は計算できてしまうので、

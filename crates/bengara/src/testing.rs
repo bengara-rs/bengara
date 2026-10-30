@@ -137,9 +137,23 @@ impl TestClient {
     }
 
     /// トークンを返すルートを叩いて、`token` の値を取り出す。
+    ///
+    /// # パニック
+    ///
+    /// 応答が JSON の `token`（文字列）を持たないときはパニックします。
+    /// 以前は空文字を返していたので、トークンの口が 500 を返しても黙って
+    /// `""` を送り、テストの失敗は「419」や「500」として遠い場所に出ていました。
     pub async fn csrf_token(&self, token_uri: &str) -> String {
         let res = self.get(token_uri).await;
-        res.json()["token"].as_str().unwrap_or_default().to_string()
+        match res.json()["token"].as_str() {
+            Some(token) if !token.is_empty() => token.to_string(),
+            _ => panic!(
+                "GET {token_uri} が CSRF トークンを返しませんでした（{} / 本文: {}）。\
+                 `{{\"token\": req.csrf_token()}}` を返すルートを指定してください",
+                res.status(),
+                res.body_preview()
+            ),
+        }
     }
 
     /// メソッド・ヘッダーまで自分で決めて送る。

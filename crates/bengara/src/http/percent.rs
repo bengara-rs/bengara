@@ -4,6 +4,8 @@
 //! 署名の組み立て（`url.rs`）・ルートの組み立て（`routing.rs`）・Cookie（`cookie.rs`）が
 //! 食い違わないようにしてあります。片方だけ直すと署名が合わなくなるためです。
 
+use std::borrow::Cow;
+
 /// 16進の大文字。`%XX` の形で書きます。
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -116,6 +118,15 @@ pub(crate) fn decode_strict(input: &str) -> String {
 
 fn decode_with(input: &str, plus_is_space: bool) -> String {
     let bytes = input.as_bytes();
+    // 戻すものが無ければ、そのまま複製して返す。
+    // 静的ファイルのパスやクエリの大半は `%` も `+` も含まないので、
+    // バイト列の組み立てと UTF-8 の検査を丸ごと飛ばせます。
+    let needs_work = bytes
+        .iter()
+        .any(|&b| b == b'%' || (plus_is_space && b == b'+'));
+    if !needs_work {
+        return input.to_string();
+    }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -141,6 +152,45 @@ fn decode_with(input: &str, plus_is_space: bool) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `%xx` の**16進2文字だけ**を大文字にそろえる。復号はしません。
+///
+/// 符号化するときは常に大文字の16進です（`HEX`）。照合は符号化されたままの
+/// 文字列で行うので、そろえないと `GET /%e3%81%82` が `/%E3%81%82` で登録された
+/// ルートに当たらず、同じ URL なのに大文字小文字で 404 になります。
+///
+/// `%` が無ければ借りたまま返すので、確保は増えません
+/// （静的ファイルへのリクエストは、ほとんどがこの道です）。
+/// 16進として読めない並び（`%zz` や末尾の `%4`）はそのまま残します。
+pub(crate) fn upcase_hex(path: &str) -> Cow<'_, str> {
+    let bytes = path.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Cow::Borrowed(path);
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && hex(bytes[i + 1]).is_some()
+            && hex(bytes[i + 2]).is_some()
+        {
+            out.push(b'%');
+            out.push(bytes[i + 1].to_ascii_uppercase());
+            out.push(bytes[i + 2].to_ascii_uppercase());
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // 変えたのは ASCII の16進2文字だけなので、UTF-8 として正しいままです。
+    match String::from_utf8(out) {
+        Ok(text) => Cow::Owned(text),
+        // 起きません。起きたときは元のパスのまま照合に進みます。
+        Err(_) => Cow::Borrowed(path),
+    }
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -204,6 +254,21 @@ mod tests {
     fn プラスの扱いが2通りある() {
         assert_eq!(decode("a+b"), "a b");
         assert_eq!(decode_strict("a+b"), "a+b");
+    }
+
+    #[test]
+    fn 十六進の小文字を大文字にそろえる() {
+        // 符号化は常に大文字なので、照合の前にそろえないと 404 になる。
+        assert_eq!(upcase_hex("/%e3%81%82"), "/%E3%81%82");
+        assert_eq!(upcase_hex("/%E3%81%82"), "/%E3%81%82");
+        assert_eq!(upcase_hex("/Abc%2fd"), "/Abc%2Fd", "16進以外は触らない");
+        // 16進として読めない並びはそのまま。
+        assert_eq!(upcase_hex("/%zz"), "/%zz");
+        assert_eq!(upcase_hex("/%4"), "/%4");
+        // 多バイト文字をそのまま通す。
+        assert_eq!(upcase_hex("/あ%2f"), "/あ%2F");
+        // `%` が無ければ確保しない。
+        assert!(matches!(upcase_hex("/posts"), Cow::Borrowed(_)));
     }
 
     #[test]

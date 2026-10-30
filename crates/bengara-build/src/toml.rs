@@ -13,7 +13,8 @@
 //! - 節（`[messages]`）の中の `key = "値"` を `messages.welcome` という鍵にします。
 //! - 節の外に書いた `key = "値"` は、そのままの鍵になります。
 //! - 値は**必ず引用符でくくってください**。数や真偽をそのまま書くとエラーにします。
-//!   `"` の中では `\n` `\t` `\r` `\\` `\"` が使えます。
+//!   `"` の中では `\n` `\t` `\r` `\\` `\"` が使えます。これ以外の `\` の使い方は
+//!   エラーにします（黙って2文字として残すと、書いた人に何も伝わらないためです）。
 //! - 入れ子の節（`[a.b]`）は、そのまま `a.b.key` になります。
 //!
 //! 依存クレートを増やさないために自前で書いています。
@@ -76,12 +77,22 @@ pub(crate) fn parse(text: &str) -> Result<Vec<(String, String)>, String> {
                  英数字・`_`・`-`・`.` だけにしてください（引用符でくくる書き方は読みません）"
             ));
         }
-        let value = unquote(value.trim()).ok_or_else(|| {
-            format!(
-                "{line_number} 行目: 値は `\"値\"` の形にしてください。\
-                 引用符でくくり、中の `\"` は `\\\"` にします"
-            )
-        })?;
+        let value = match unquote(value.trim()) {
+            Ok(value) => value,
+            Err(Unquote::Escape(c)) => {
+                return Err(format!(
+                    "{line_number} 行目: `\\{c}` は読めない逃げ方です。\
+                     使えるのは `\\n` `\\t` `\\r` `\\\\` `\\\"` だけです\
+                     （`\\` をそのまま出したいときは `\\\\` と書きます）"
+                ));
+            }
+            Err(Unquote::Shape) => {
+                return Err(format!(
+                    "{line_number} 行目: 値は `\"値\"` の形にしてください。\
+                     引用符でくくり、中の `\"` は `\\\"` にします"
+                ));
+            }
+        };
 
         let full = if section.is_empty() {
             key.to_string()
@@ -130,27 +141,38 @@ fn is_key(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
+/// `unquote` が断る理由。
+enum Unquote {
+    /// 引用符でくくっていない、または途中で閉じている。
+    Shape,
+    /// 知らない逃げ方（`\q` など）。中の1文字を添えます。
+    Escape(char),
+}
+
 /// 引用符を外す。`"..."` は `\n` などを解釈し、`'...'` はそのままです。
 ///
 /// 閉じの引用符は**行の終わり**になければなりません。途中で閉じていると、
 /// `a = "x""y"` のような行が `x""y` という値になって通ってしまいます。
-fn unquote(value: &str) -> Option<String> {
+fn unquote(value: &str) -> Result<String, Unquote> {
     if let Some(rest) = value.strip_prefix('\'') {
-        let inner = rest.strip_suffix('\'')?;
+        let inner = rest.strip_suffix('\'').ok_or(Unquote::Shape)?;
         // 単引用符の中では `\` も文字なので、`'` が出たらそこで値が終わっています。
         if inner.contains('\'') {
-            return None;
+            return Err(Unquote::Shape);
         }
-        return Some(inner.to_string());
+        return Ok(inner.to_string());
     }
-    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .ok_or(Unquote::Shape)?;
 
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         // 逃がしていない `"`。ここで値が終わっていて、後ろに余りがあります。
         if c == '"' {
-            return None;
+            return Err(Unquote::Shape);
         }
         if c != '\\' {
             out.push(c);
@@ -162,15 +184,15 @@ fn unquote(value: &str) -> Option<String> {
             Some('r') => out.push('\r'),
             Some('\\') => out.push('\\'),
             Some('"') => out.push('"'),
-            // 知らない逃げ方は、そのまま2文字として残す。
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
+            // 知らない逃げ方は断ります。そのまま2文字として残すと、
+            // `"あ\qい"` が画面に `あ\qい` と出るだけで、書いた人には
+            // 何も伝わりません（読めない形は通さない、という決まりです）。
+            Some(other) => return Err(Unquote::Escape(other)),
+            // 値の終わりにある `\`。逃がす相手がいないので、そのまま1文字にします。
             None => out.push('\\'),
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -227,6 +249,17 @@ mod tests {
     fn 二重引用符は逃げ方を解釈する() {
         let pairs = parse("[m]\na = \"1行目\\n2行目\\t終わり\"\n").unwrap();
         assert_eq!(pairs[0].1, "1行目\n2行目\t終わり");
+    }
+
+    #[test]
+    fn 知らない逃げ方はエラーにする() {
+        // 以前は `\q` がそのまま2文字として残り、画面に `あ\qい` と出ていた。
+        let error = parse("[m]\na = \"あ\\qい\"\n").unwrap_err();
+        assert!(error.contains("2 行目"), "{error}");
+        assert!(error.contains("\\q"), "{error}");
+        // 知っている5つは今までどおり通る。
+        let pairs = parse("a = \"\\n\\t\\r\\\\\\\"\"\n").unwrap();
+        assert_eq!(pairs[0].1, "\n\t\r\\\"");
     }
 
     #[test]

@@ -208,6 +208,10 @@ pub mod prelude {
         Registered, Request, Response, Result, Route, RouteGroup, Routing, SameSite, Throttle,
     };
 
+    // JSON を組み立てるマクロ。`bengara::serde_json::json!` と書く手間を省きます。
+    // 関数の `json()` とは名前の種類が違うので、両方を同時に使えます。
+    pub use serde_json::json;
+
     // セッションまわりは `session::` のまま使うと長いので、よく使う型だけ入れておきます。
     pub use crate::session::{Session, SessionConfig, StartSession, VerifyCsrfToken};
     pub use crate::validation::{Validated, ValidationErrors};

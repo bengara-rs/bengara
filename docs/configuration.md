@@ -1,7 +1,9 @@
 # 設定
 
+設定ファイルの書き方と、`.env` に書ける項目の一覧です。
+
 設定は Rust のコードです。`config/` 直下にファイルを置くと、起動時に自動で登録されます。
-設定がバイナリに入るので、本番に設定ファイルを置く必要はありません。
+設定はバイナリに入るので、本番に設定ファイルを置く必要はありません。
 
 ## 設定ファイルを書く
 
@@ -21,8 +23,12 @@ pub fn config() -> AppConfig {
 }
 ```
 
-**`config/` 直下のファイルには `pub fn config() -> 何らかの型` を必ず定義します。**
-無いとビルドが通りません。
+**設定として登録されるのは、`config/` 直下の小文字で始まるファイルだけです。**
+そのファイルには `pub fn config() -> 何らかの型` を必ず定義します。無いとビルドが通りません。
+
+`config/Mail.rs` のように大文字で始めると、設定には登録されません
+（[directory-structure.md](directory-structure.md)）。
+`config/mail.rs` のように小文字で始めてください。
 
 ### 読み出す
 
@@ -65,7 +71,7 @@ let mail = config::<crate::config::mail::MailConfig>();
 
 ### 今の環境を調べる
 
-`AppConfig` には、`env` を見るだけの短い関数が 2 つあります。
+`AppConfig` には、`env` を見るだけの短い関数が 3 つあります。
 
 ```rust
 if config::<AppConfig>().is_local() {
@@ -77,8 +83,9 @@ if config::<AppConfig>().is_local() {
 |-------------------|----------------------------------|
 | `is_production()` | `APP_ENV` が `production` のとき |
 | `is_local()`      | `APP_ENV` が `local` のとき      |
+| `is_testing()`    | `APP_ENV` が `testing` のとき（`#[bengara::test]` が無ければ入れる値） |
 
-比較するのは **この 2 つの文字列だけ**です。`staging` のような他の値を使うときは、
+比較するのは **この 3 つの文字列だけ**です。`staging` のような他の値を使うときは、
 `config::<AppConfig>().env` を自分で比べてください。
 
 ## env() の型
@@ -111,9 +118,8 @@ let dir: std::path::PathBuf = env("CACHE_DIR", "storage/cache");
 | 空白だけ（`A="   "`）         | 既定値              |
 | 前後に空白がある（`A=" x "`） | `x`（空白は落ちる） |
 
-**値の前後の空白は残りません。** 引用符で囲んでも落とします。`A="  padded  "` と
-書いても、受け取るのは `padded` です。空白そのものを値にしたいときは、設定を読む側で
-既定値を空白にしてください（`env("A", " ")`）。
+**値の前後の空白は残りません。** 引用符で囲んでも落とします。
+空白そのものを値にしたいときは、読む側の既定値を空白にしてください（`env("A", " ")`）。
 
 同じ理由で、 **`.env` の書き方では値を空にできません。** 空にしたいときは
 `env("MAIL_FROM_NAME", "")` のように、既定値そのものを空にしてください。
@@ -146,7 +152,9 @@ APP_PORT=8000
   `APP_PORT=8000#dev` の値は `8000` です。
 - **引用符で囲まない値は、最初の `#` で切れます。**
   `NAME=Bob's App # コメント` の値は `Bob's App` です。
-- 引用符で**囲んだ**値の中の `#` は値の一部です（`A="a#b"` の値は `a#b`）。
+- **`#` を含む値は必ず引用符で囲んでください。** 引用符で囲んだ値の中の `#` は
+  値の一部になります（`A="a#b"` の値は `a#b`）。囲まないと `#` より前までが値です
+  （`DB_PASSWORD=p#ss` の値は `p`。正しくは `DB_PASSWORD="p#ss"`）。
 - 行頭の `export` は無視します。区切りは空白でもタブでもかまいません。
 - `"..."` の中で解釈するのは `\n` `\r` `\t` `\\` `\"` `\'` の 6 つだけです。
   **それ以外は `\` ごとそのまま残ります。** Windows のパスをそのまま書けます
@@ -180,9 +188,13 @@ APP_PORT=8000
 |-------------|-------------------------|--------------------------------------------|---------------|
 | `APP_NAME`  | `init` 時のパッケージ名 | アプリ名。`AppConfig.name`                 | `config/*.rs` |
 | `APP_ENV`   | `production`            | 環境名。`AppConfig.env`                    | `config/*.rs` |
-| `APP_DEBUG` | `false`                 | エラーページの詳細表示、ログの既定の細かさ | `config/*.rs` |
+| `APP_DEBUG` | `false`                 | エラーページの詳細表示、ログの既定の細かさ | 本体と `config/*.rs`（下の注） |
 | `APP_URL`   | `http://localhost:8000` | `AppConfig.url` と `url()` の土台          | `config/*.rs` |
 | `RUST_LOG`  | （なし）                | ログの細かさ。無ければ `APP_DEBUG` で決まる | 本体          |
+
+`APP_DEBUG` は 2 か所で読みます。エラーページの詳細表示は `config/app.rs` の `debug` を見ますが、
+ログの既定の細かさは起動の最初に本体が環境変数を直接読んで決めます。
+`config/app.rs` で `debug` を別の値にしても、ログの細かさは変わりません。
 
 ### HTTP とプロセス
 
@@ -225,16 +237,25 @@ APP_PORT=8000
 |--------------------|----------------------------|---------------------------------------------------|---------------|
 | `DB_CONNECTION`    | `sqlite`                   | 既定で使う接続の名前                              | `config/*.rs` |
 | `DB_DATABASE`      | SQLite は `database/database.sqlite`、ほかは `bengara` | SQLite はファイル、ほかはデータベース名 | `config/*.rs` |
-| `DB_URL`           | 空                         | 接続文字列。**他の値より優先します**              | `config/*.rs` |
+| `DB_URL`           | 空                         | 接続文字列。**`DB_CONNECTION` で選んだ接続にだけ**効きます（下の注） | `config/*.rs` |
 | `DB_HOST`          | `127.0.0.1`                | つなぎ先（MySQL / PostgreSQL）                    | `config/*.rs` |
-| `DB_PORT`          | 3306 / 5432                | ポート（MySQL / PostgreSQL）                      | `config/*.rs` |
-| `DB_USERNAME`      | `root` / `postgres`        | 利用者名（MySQL / PostgreSQL）                    | `config/*.rs` |
+| `DB_PORT`          | 空（ドライバの既定）       | ポート。空なら 3306（MySQL）/ 5432（PostgreSQL） | `config/*.rs` |
+| `DB_USERNAME`      | 空                         | 利用者名（MySQL / PostgreSQL）                    | `config/*.rs` |
 | `DB_PASSWORD`      | 空                         | パスワード（MySQL / PostgreSQL）                  | `config/*.rs` |
-| `DB_MAX_CONNECTIONS` | 5                        | 同時に張る接続の数の上限                          | `config/*.rs` |
+| `DB_MAX_CONNECTIONS` | 5                        | 同時に張る接続の数の上限。**全部の接続に同じ値が入ります** | `config/*.rs` |
 | `DB_TEST_DATABASE` | SQLite は `:memory:`       | テストで使うデータベース。**MySQL / PostgreSQL では必須** | 本体 |
 
 `DB_` で始まるものは `config/database.rs` が読みます（[database.md](database.md)）。
 `config/database.rs` を書き換えれば、別の名前の環境変数にもできます。
+
+`DB_URL` と `DB_MAX_CONNECTIONS` は効く範囲が違います。
+
+| 名前                 | 効く範囲                                                                 |
+|----------------------|--------------------------------------------------------------------------|
+| `DB_URL`             | `DB_CONNECTION` で選んだ接続だけ。`DB_HOST` / `DB_PORT` / `DB_USERNAME` / `DB_PASSWORD` より優先 |
+| `DB_MAX_CONNECTIONS` | 4 つの接続（`sqlite` / `mysql` / `mariadb` / `pgsql`）すべて              |
+
+`#` を含む接続文字列は引用符で囲んでください（`DB_URL="postgres://u:p#ss@host/db"`）。
 
 ### キャッシュとメールと言語
 
@@ -251,8 +272,8 @@ APP_PORT=8000
 | `MAIL_PASSWORD`       | 空                    | SMTP のパスワード                         | 本体か config/ |
 | `MAIL_EHLO_NAME`      | 空（`localhost`）     | `EHLO` で名乗る名前                       | 本体か config/ |
 | `MAIL_TIMEOUT`        | 10                    | 返事を待つ上限の秒数                      | 本体か config/ |
-| `APP_LOCALE`          | `ja`                  | 画面の言語                                | 本体か config/ |
-| `APP_FALLBACK_LOCALE` | `ja`                  | 鍵が無いときに見る言語                    | 本体か config/ |
+| `APP_LOCALE`          | `ja`                  | 画面の言語                                | 本体           |
+| `APP_FALLBACK_LOCALE` | `ja`                  | 鍵が無いときに見る言語                    | 本体           |
 
 くわしくは [cache.md](cache.md) / [mail.md](mail.md) / [localization.md](localization.md) にあります。
 `config/cache.rs`・`config/filesystems.rs`・`config/mail.rs` を置くと、そちらが優先します。
@@ -265,9 +286,9 @@ APP_PORT=8000
 cargo artisan key:generate
 ```
 
-- **64 文字以上が必須です。** 短いと、セッション・署名付き URL・暗号化を使う
-  **最初のリクエストでエラーになります**。
-- 空のままでも同じです。これらを使うリクエストが失敗します。
+- **64 文字以上が必須です。** 短いときと空のときは、セッション・署名付き URL・
+  暗号化を使う**最初のリクエストでエラーになります**。
+- `key:generate` は 32 バイトを 16 進にした 64 文字を作ります。
 - 鍵は用途ごとに作り分けます。`APP_KEY` をそのまま使いません。
 
 | 用途         | 作り分けの名前       |
@@ -304,18 +325,17 @@ TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 ### どのアドレスを採るか
 
 `X-Forwarded-For` は `送ってきた人, プロキシ1, プロキシ2` のように**左から右へ**積まれます。
-左端はクライアントが好きに書ける値です（nginx の `$proxy_add_x_forwarded_for` は、
-受け取った値に**追記**します）。そのため左端を信じてはいけません。
+**左端はクライアントが好きに書ける値です。**
 
-| `TRUSTED_PROXIES` | 採るアドレス                                           |
-|-------------------|--------------------------------------------------------|
-| アドレスの列      | **右端から見て、一覧に無い最初のアドレス**             |
-| `*`               | 左端（ほかに手がかりがないため）                       |
+| `TRUSTED_PROXIES` | 採るアドレス                               |
+|-------------------|--------------------------------------------|
+| アドレスの列      | **右端から見て、一覧に無い最初のアドレス** |
+| `*`               | 左端                                       |
 
-**アドレスとして読めない値は捨てます。** 1 つも読めなければ、つないできた相手に落とします。
-
-`*` は「前段がヘッダーを必ず上書きする」構成でだけ使ってください。
-追記する構成で `*` にすると、左端を書き換えるだけで回数の制限を回せます。
+- **アドレスとして読めない値は捨てます。** 1 つも読めなければ、
+  つないできた相手に落とします。
+- **`*` は「前段がヘッダーを必ず上書きする」構成でだけ使ってください。**
+  追記する構成で `*` にすると、左端を書き換えるだけで回数の制限を回せます。
 
 ## 機能フラグ
 
@@ -336,8 +356,7 @@ bengara は使わない機能をバイナリに入れないようにしていま
 キャッシュ・ファイル・多言語・イベント・定期処理も、フラグなしで使えます。
 メールは `log` と `array` だけフラグなしで使えます。
 
-`Cargo.toml` には `database` と `tls` というフラグも入っていますが、
-**これは内側の土台で、利用者が書くものではありません。**
+`Cargo.toml` の `database` と `tls` は内側の土台で、**利用者が書くものではありません。**
 上の表のフラグを指定すると、必要なぶんが自動で入ります。
 
 ### データベース（sqlite / mysql / mariadb / postgres）

@@ -293,11 +293,7 @@ impl Mail {
         Builder {
             message: Message {
                 to: vec![address.into()],
-                from: if config.from_name.is_empty() {
-                    config.from.clone()
-                } else {
-                    format!("{} <{}>", config.from_name, config.from)
-                },
+                from: from_header(&config.from_name, &config.from),
                 ..Message::default()
             },
         }
@@ -379,16 +375,53 @@ impl Builder {
     }
 }
 
+/// 差出人の欄（`"名前" <アドレス>`）を組み立てる。
+///
+/// 名前は**引用符で囲みます。** 囲まずに `名前 <アドレス>` と書いていたころは、
+/// `MAIL_FROM_NAME`（既定はアプリ名）に `,` や `"` が入ると SMTP 側の読み取りが
+/// 「From のアドレスが読めません」で落ち、1 通も送れませんでした。
+/// 引用符の中では `\` と `"` を `\` で逃がします（RFC 5322 の quoted-string）。
+fn from_header(name: &str, address: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return address.to_string();
+    }
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\" <{address}>")
+}
+
 /// 送れる形になっているか。
 ///
-/// 宛先が無いメールと本文が無いメールは、送り先に渡す前に断ります。
-/// 送り先によっては黙って捨てられ、送れたつもりになるためです。
+/// 確かめるのは次の**3 つ**です。
+///
+/// | 断るもの | 理由 |
+/// |---|---|
+/// | 宛先が空 | 送り先によっては黙って捨てられ、送れたつもりになる |
+/// | 本文が空 | 同じ |
+/// | 宛先・差出人・件名に改行 | `log` の送り先はヘッダーを 1 行ずつ書くので、偽のヘッダー行を作れた |
+///
+/// 改行の検査は `to` / `cc` / `bcc` / `from` / `reply_to` / `subject` に掛けます。
 fn check(message: &Message) -> Result<()> {
     if message.to.iter().all(|a| a.trim().is_empty()) {
         return Err(Error::msg("メールの宛先がありません"));
     }
     if message.text.is_none() && message.html.is_none() {
         return Err(Error::msg("メールの本文がありません"));
+    }
+    let header_fields = message
+        .to
+        .iter()
+        .chain(&message.cc)
+        .chain(&message.bcc)
+        .chain(std::iter::once(&message.from))
+        .chain(message.reply_to.iter())
+        .chain(std::iter::once(&message.subject));
+    for field in header_fields {
+        if field.contains(['\r', '\n']) {
+            return Err(Error::msg(
+                "メールの宛先・差出人・件名に改行は入れられません",
+            ));
+        }
     }
     Ok(())
 }
@@ -497,6 +530,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("本文がありません"));
+    }
+
+    #[test]
+    fn 差出人の名前は引用符で囲む() {
+        assert_eq!(from_header("", "a@example.com"), "a@example.com");
+        assert_eq!(from_header("  ", "a@example.com"), "a@example.com");
+        assert_eq!(
+            from_header("bengara", "a@example.com"),
+            "\"bengara\" <a@example.com>"
+        );
+        // `,` や `"` が入っても壊れない（囲まないと SMTP 側で読めなかった）。
+        assert_eq!(
+            from_header("Shop, Inc. \"本店\"", "a@example.com"),
+            "\"Shop, Inc. \\\"本店\\\"\" <a@example.com>"
+        );
+        assert_eq!(
+            from_header("a\\b", "a@example.com"),
+            "\"a\\\\b\" <a@example.com>"
+        );
+    }
+
+    #[test]
+    fn 改行の入ったヘッダーは断る() {
+        let base = Message {
+            to: vec!["a@example.com".to_string()],
+            from: "b@example.com".to_string(),
+            subject: "件名".to_string(),
+            text: Some("本文".into()),
+            ..Message::default()
+        };
+        assert!(check(&base).is_ok());
+
+        // `log` の送り先はヘッダーをそのまま 1 行ずつ書くので、
+        // 改行で偽の行を作れた。
+        for broken in [
+            Message {
+                subject: "件名\nBcc: x@example.com".to_string(),
+                ..base.clone()
+            },
+            Message {
+                to: vec!["a@example.com\r\nCc: x@example.com".to_string()],
+                ..base.clone()
+            },
+            Message {
+                cc: vec!["c@example.com\n".to_string()],
+                ..base.clone()
+            },
+            Message {
+                reply_to: Some("r@example.com\r".to_string()),
+                ..base.clone()
+            },
+            Message {
+                from: "\"x\ny\" <b@example.com>".to_string(),
+                ..base.clone()
+            },
+        ] {
+            let error = check(&broken).unwrap_err().to_string();
+            assert!(error.contains("改行は入れられません"), "{error}");
+        }
     }
 
     #[test]

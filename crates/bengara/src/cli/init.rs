@@ -61,7 +61,9 @@ const KEEP: &[&str] = &[
     "database/factories",
     "database/migrations",
     "resources/views",
-    "storage/logs", // storage/ の中は storage_directories() が作る
+    // `storage/` の下は入れない。`storage/.gitignore` が `*` で全部無視するので、
+    // `.gitkeep` を置いても git には入らない（作る意味が無い）。
+    // 中のディレクトリは `storage:init` が作る。
     "tests/Unit",
 ];
 
@@ -539,12 +541,19 @@ fn update_manifest(manifest: &mut CargoToml, name: &str) {
             &format!("rust-version = \"{}\"", env!("CARGO_PKG_RUST_VERSION")),
         );
     }
-    if !manifest.has_key("package", "default-run") {
-        manifest.add_line("package", &format!("default-run = \"{name}\""));
-    }
     // 入口はプロジェクト直下の main.rs と artisan.rs。src/ は使わない。
     if !manifest.has_key("package", "autobins") {
         manifest.add_line("package", "autobins = false");
+    }
+    // `tests/` の直下に置いた `.rs` を、cargo が**独立したテスト**として登録しない
+    // ようにする。登録されると、そのクレートには `__bengara_hooks` も `bootstrap` も
+    // 無いので、`#[bengara::test]` が展開したコードが「そんな関数は無い」で落ちる。
+    // テストは bengara-build が本体の中に取り込むので、cargo 側の自動検出は要らない。
+    //
+    // `autoexamples` と `autobenches` は足さない。`examples/` と `benches/` は
+    // bengara が走査しない場所なので二重にならず、cargo の自動検出がそのまま役に立つ。
+    if !manifest.has_key("package", "autotests") {
+        manifest.add_line("package", "autotests = false");
     }
     // データベースは機能フラグで出し入れする。Laravel と同じく SQLite から始める。
     if !manifest.has_key("dependencies", "bengara") {
@@ -576,6 +585,28 @@ fn update_manifest(manifest: &mut CargoToml, name: &str) {
     }
     if !manifest.has_path("artisan.rs") {
         manifest.append_block(&["[[bin]]", "name = \"artisan\"", "path = \"artisan.rs\""]);
+    }
+
+    // `default-run` は、その名前の bin が本当にあるときだけ書く。だから
+    // `[[bin]]` を足したあとに見る。
+    //
+    // すでに `[[bin]] name = "server" path = "main.rs"` を持つプロジェクトでは、
+    // `main.rs` の bin が「すでにある」ので上では足されない。それでも
+    // `default-run = "myapp"` を書くと、`cargo build` が
+    // `default-run target 'myapp' not found` で落ちていた。
+    //
+    // 無いときは書かない（勝手に2つめの bin を足さない）。bin が2つあって
+    // `default-run` が無いと `cargo run` が「どれを動かすか決められない」と
+    // 言うだけで、こちらは直し方が分かるエラーになる。
+    if !manifest.has_key("package", "default-run") {
+        if manifest.has_bin_name(name) {
+            manifest.add_line("package", &format!("default-run = \"{name}\""));
+        } else {
+            println!(
+                "[[bin]] に name = \"{name}\" が無いので、default-run は書きませんでした。\n\
+                 `cargo run` で動かす bin を [package] default-run に書いてください。\n"
+            );
+        }
     }
 }
 
@@ -661,6 +692,25 @@ mod tests {
         );
         update_manifest(&mut manifest, "myapp");
         assert_eq!(manifest.count_lines("[[bin]]"), 2);
+    }
+
+    #[test]
+    fn 実在しないbinはdefault_runに書かない() {
+        // すでに `[[bin]] name = "server" path = "main.rs"` を持つプロジェクト。
+        // `main.rs` の bin は足されないので、`default-run = "myapp"` を書くと
+        // `cargo build` が `default-run target 'myapp' not found` で落ちていた。
+        let mut manifest = CargoToml::load_for_test(
+            "[package]\nname = \"myapp\"\n\n[[bin]]\nname = \"server\"\npath = \"main.rs\"\n",
+        );
+        update_manifest(&mut manifest, "myapp");
+        assert!(!manifest.contains("default-run"));
+
+        // 素のプロジェクトでは、足した `[[bin]]` に合わせて書く。
+        let mut manifest = CargoToml::load_for_test("[package]\nname = \"myapp\"\n");
+        update_manifest(&mut manifest, "myapp");
+        assert!(manifest.contains("default-run = \"myapp\""));
+        // `tests/` の直下の `.rs` を cargo が独立したテストにしないようにする。
+        assert!(manifest.contains("autotests = false"));
     }
 
     #[test]

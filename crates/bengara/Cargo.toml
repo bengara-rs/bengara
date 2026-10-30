@@ -49,7 +49,7 @@ tls = ["sqlx/tls-rustls-ring-webpki"]
 
 # 暗号化（encrypt / decrypt）。既定では入りません。
 # 署名（SHA-256 / HMAC）は自前なのでフラグは要りませんが、
-# 暗号は実績のあるクレートに任せます（決定記録 #050）。
+# 暗号は実績のあるクレートに任せます（判断 30）。
 encryption = ["chacha20poly1305"]
 
 # SMTP でメールを送る。既定では入りません。

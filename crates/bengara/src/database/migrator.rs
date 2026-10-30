@@ -107,6 +107,21 @@ fn lock_error(held: Option<(String, String)>, detail: &str) -> Error {
     }
 }
 
+/// 組み立ての誤りを見てから SQL を取り出す。誤りがあれば 1 本も流しません。
+///
+/// `up` / `down` は同期なので `Result` を返せません。実行すれば必ず壊れるものは
+/// `Schema` に溜まるので、流す**前**にここで落とします。
+fn take_statements(name: &str, mut schema: Schema) -> Result<Vec<String>> {
+    let errors = schema.take_errors();
+    if !errors.is_empty() {
+        return Err(Error::msg(format!(
+            "マイグレーション `{name}` の組み立てに誤りがあります:\n  - {}",
+            errors.join("\n  - ")
+        )));
+    }
+    Ok(schema.into_statements())
+}
+
 /// マイグレーションを実行する側。
 pub(crate) struct Migrator {
     backend: Arc<dyn Backend>,
@@ -278,11 +293,11 @@ impl Migrator {
     async fn apply(&self, migration: &Migration, batch: i64) -> Result<()> {
         let mut schema = Schema::new(self.driver());
         (migration.up)(&mut schema);
-        let statements = schema.into_statements();
+        let statements = take_statements(migration.name, schema)?;
 
         let tx = self.begin().await?;
         for sql in &statements {
-            tx.statement(sql, &[]).await?;
+            tx.statement_raw(sql).await?;
         }
         tx.table(TABLE)
             .insert(&[
@@ -313,17 +328,30 @@ impl Migrator {
             .take(steps.max(1) as usize)
             .collect();
 
-        let mut done = Vec::new();
+        // 戻すものを先に全部そろえる。途中でファイルの無いものに当たって止まると、
+        // バッチの半分だけ戻した状態が残る。
+        let mut planned: Vec<(&String, &Migration)> = Vec::new();
+        let mut missing: Vec<&str> = Vec::new();
         // 新しく入れたものから戻す。
         for (name, batch) in ran.iter().rev() {
             if !targets.contains(batch) {
                 continue;
             }
-            let Some(migration) = migrations.iter().find(|m| m.name == name) else {
-                return Err(Error::msg(format!(
-                    "`{name}` のファイルがいまのバイナリに入っていないので戻せません"
-                )));
-            };
+            match migrations.iter().find(|m| m.name == name) {
+                Some(migration) => planned.push((name, migration)),
+                None => missing.push(name),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Error::msg(format!(
+                "次のファイルがいまのバイナリに入っていないので、このバッチは戻せません: {}\n\
+                 何も戻していません。",
+                missing.join(", ")
+            )));
+        }
+
+        let mut done = Vec::new();
+        for (name, migration) in planned {
             self.revert(migration)
                 .await
                 .map_err(|e| Error::msg(format!("{name} の巻き戻しに失敗しました: {e}")))?;
@@ -340,11 +368,11 @@ impl Migrator {
     async fn revert(&self, migration: &Migration) -> Result<()> {
         let mut schema = Schema::new(self.driver());
         (migration.down)(&mut schema);
-        let statements = schema.into_statements();
+        let statements = take_statements(migration.name, schema)?;
 
         let tx = self.begin().await?;
         for sql in &statements {
-            tx.statement(sql, &[]).await?;
+            tx.statement_raw(sql).await?;
         }
         tx.table(TABLE)
             .where_("migration", migration.name)
@@ -405,18 +433,18 @@ impl Migrator {
         // トランザクションを使うのは、接続を1本に固定するためです。
         let tx = self.begin().await?;
         if let Some(sql) = before {
-            tx.statement(sql, &[]).await?;
+            tx.statement_raw(sql).await?;
         }
         let mut result = Ok(());
         for sql in &statements {
-            if let Err(error) = tx.statement(sql, &[]).await {
+            if let Err(error) = tx.statement_raw(sql).await {
                 result = Err(error);
                 break;
             }
         }
         // 失敗しても確かめを戻す。止めたままの接続をプールに返さないため。
         if let Some(sql) = after {
-            let restored = tx.statement(sql, &[]).await;
+            let restored = tx.statement_raw(sql).await;
             if result.is_ok() {
                 result = restored.map(|_| ());
             }
@@ -553,6 +581,31 @@ mod tests {
                 "drop table if exists \"comments\"".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn 組み立てに誤りがあると実行の前に落ちる() {
+        // `.on(表名)` の無い外部キー。SQL を 1 本も流さずに落とす。
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.create("comments", |t| {
+            t.foreign_id("post_id");
+            t.foreign("post_id");
+        });
+        let message = take_statements("2026_10_05_000000_create_comments_table", schema)
+            .expect_err("落ちる")
+            .to_string();
+        assert!(message.contains("組み立てに誤りがあります"), "{message}");
+        assert!(
+            message.contains("2026_10_05_000000_create_comments_table"),
+            "{message}"
+        );
+        assert!(message.contains("comments.post_id"), "{message}");
+
+        // 誤りが無ければそのまま取り出せる。
+        let mut schema = Schema::new(Driver::Sqlite);
+        (LIST[0].up)(&mut schema);
+        let statements = take_statements(LIST[0].name, schema).expect("取り出せる");
+        assert_eq!(statements.len(), 1);
     }
 
     #[test]

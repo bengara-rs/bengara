@@ -590,6 +590,9 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
         for warning in warnings {
             tracing::warn!("{warning}");
         }
+        // 設定を登録する**前**に入れる。`AppConfig` は登録のときに `APP_KEY` を読むため。
+        install_test_app_key();
+        install_test_env();
         if !config_registry::installed() {
             let mut registry = Registry::new();
             (hooks.configs)(&mut registry);
@@ -604,6 +607,50 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
     });
 }
 
+/// テストで `APP_KEY` が無いときに使う鍵。64 文字（`MIN_KEY_CHARS`）です。
+///
+/// 秘密ではありません。テストはソケットを開かず、Cookie も外に出ないので、
+/// 固定の値で足ります。本物の環境変数や `.env` に値があればそちらを使います。
+const TEST_APP_KEY: &str = "bengara-test-key-0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// `.env` を読んだあとも `APP_KEY` が空なら、テスト用の鍵を入れる。
+///
+/// 取得したばかりのリポジトリには `.env` が無い。そのままだとセッションと署名付き URL を
+/// 使う全テストが「`APP_KEY` が設定されていません」の 500 で落ちる。
+/// メールの溜め込みやハッシュの回数と同じく、テストが自分で動ける状態にしておく。
+///
+/// `boot_for_tests` の `Once` の中（ほかのスレッドが環境変数を読む前）からだけ呼ぶ。
+fn install_test_app_key() {
+    let present = std::env::var("APP_KEY")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if present {
+        return;
+    }
+    // edition 2021 では set_var は安全な関数（`load_dotenv` と同じ理由）。
+    std::env::set_var("APP_KEY", TEST_APP_KEY);
+    tracing::debug!("APP_KEY が無いので、テスト用の固定の鍵を使います");
+}
+
+/// `.env` を読んだあとも `APP_ENV` が空なら、`testing` を入れる。
+///
+/// 本体の既定は `production`（安全側）。そのままテストが走ると、本番だけの
+/// 振る舞い（Cookie の `Secure` 強制、開発用の確認情報を出さない）が効いて、
+/// `.env` の有無でテストの結果が変わる。Laravel の `phpunit.xml` が
+/// `APP_ENV=testing` を入れるのと同じ既定を持たせる。
+///
+/// `boot_for_tests` の `Once` の中からだけ呼ぶ。
+fn install_test_env() {
+    let present = std::env::var("APP_ENV")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if present {
+        return;
+    }
+    std::env::set_var("APP_ENV", "testing");
+    tracing::debug!("APP_ENV が無いので、testing として動かします");
+}
+
 static TEST_HOOKS: std::sync::OnceLock<Hooks> = std::sync::OnceLock::new();
 
 /// テストのときに覚えておいた `Hooks`。
@@ -614,6 +661,12 @@ pub(crate) fn test_hooks() -> Hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn テスト用の鍵は必要な長さを満たす() {
+        // 1 文字でも短いと、セッションを使う全テストが 500 で落ちる。
+        assert!(TEST_APP_KEY.chars().count() >= config_registry::MIN_KEY_CHARS);
+    }
 
     #[test]
     fn イベントの聞く側が要るコマンドは組み立てる() {

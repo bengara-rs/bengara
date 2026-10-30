@@ -40,7 +40,11 @@ pub fn url(path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") {
         return path.to_string();
     }
-    let path = path.trim_start_matches('/');
+    // 先頭の `/` は**1本だけ**落とす。何本でも落としていたころは、`//x` が `/x` と
+    // 同じ文字列になり、`/x` 用の署名で `//x` も通っていました（署名の対象は
+    // `url(path)` の文字列です）。照合する側（`routing::match_path`）も続いた `/` を
+    // まとめないので、こちらも畳まない形にそろえます。
+    let path = path.strip_prefix('/').unwrap_or(path);
     format!("{base}/{path}")
 }
 
@@ -72,7 +76,9 @@ pub fn temporary_signed_url(
     params: &[(&str, &str)],
     valid_for_secs: u64,
 ) -> Result<String> {
-    let expires = now() + valid_for_secs;
+    // 足し算はあふれない形にする。`u64::MAX` 秒を渡されても、デバッグでパニックせず、
+    // リリースで巻き戻って「作った瞬間に期限切れ」の URL にもならない。
+    let expires = now().saturating_add(valid_for_secs);
     build_signed(path, params, Some(expires))
 }
 
@@ -91,6 +97,8 @@ fn build_signed_with(
     // 空の path はルートとして扱う。ブラウザが開くと `req.path()` は `/` になるので、
     // ここで `/` にそろえないと末尾の 1 文字差で必ず署名が合わなくなる。
     let path = if path.is_empty() { "/" } else { path };
+    // 末尾の `/` は、照合する側（`verify_signature`）と同じ規則で落とす。
+    let path = super::routing::match_path(path);
     check_signable_path(path)?;
 
     let mut pairs: Vec<(String, String)> = params
@@ -155,6 +163,13 @@ pub fn has_valid_signature(req: &super::Request) -> Result<bool> {
 ///
 /// `given` は、クエリに入っていた `signature` の値を**全部**並べたものです。
 fn verify_signature(key: &[u8], path: &str, pairs: &[(String, String)], given: &[String]) -> bool {
+    // 届いたパスは、ルートの照合（`routing::find`）と**同じ関数**で末尾の `/` を落とす。
+    // 落とさないと、`/unsubscribe/` はルートに当たるのに署名の対象だけ 1 文字違いになり、
+    // 必ず 403 になります。メールや転載でリンクの末尾に `/` が付くのはよくあります。
+    //
+    // `%xx` の16進の大文字化（`percent::upcase_hex`）は**通しません**。署名は
+    // 符号化された文字列そのものに対して作るので、形を変えると必ず合わなくなります。
+    let path = super::routing::match_path(path);
     // `signature` は 1 つだけ。2 つ以上を後ろ勝ちにすると、前の値を無視したまま
     // 通ってしまう（`?signature=ごみ&signature=本物` が通る）。
     let [given] = given else {
@@ -319,6 +334,43 @@ mod tests {
         assert!(roundtrip(""), "空のパスで必ず 403 になってはいけない");
         assert!(roundtrip("/"));
         assert!(roundtrip("/unsubscribe"));
+    }
+
+    /// `sign_path` で作ったリンクを、`request_path` で届いたものとして照合する。
+    fn verify_as(sign_path: &str, request_path: &str) -> bool {
+        let link = build_signed_with(KEY, sign_path, &[("user", "12")], None).unwrap();
+        let (_, query) = link.split_once('?').unwrap();
+        let mut pairs = Vec::new();
+        let mut given = Vec::new();
+        for pair in query.split('&') {
+            let (k, v) = pair.split_once('=').unwrap();
+            if k == SIGNATURE {
+                given.push(v.to_string());
+            } else {
+                pairs.push((k.to_string(), v.to_string()));
+            }
+        }
+        verify_signature(KEY, request_path, &pairs, &given)
+    }
+
+    #[test]
+    fn 末尾のスラッシュが付いても署名が通る() {
+        // ルートの照合は末尾の `/` を落とすので、署名だけ 1 文字違いで 403 に
+        // なってはいけない（メールや転載で `/` が付くのはよくある）。
+        assert!(verify_as("/unsubscribe", "/unsubscribe/"));
+        assert!(verify_as("/unsubscribe/", "/unsubscribe"));
+        assert!(verify_as("/unsubscribe/", "/unsubscribe/"));
+        // `/` 単独は落とさない。
+        assert!(verify_as("/", "/"));
+    }
+
+    #[test]
+    fn 先頭のスラッシュを増やすと通らない() {
+        // `url()` が先頭の `/` を何本でも畳んでいたころは、`/x` 用の署名で
+        // `//x` も通っていた。
+        assert!(verify_as("/x", "/x"));
+        assert!(!verify_as("/x", "//x"));
+        assert!(!verify_as("/x", "///x"));
     }
 
     #[test]

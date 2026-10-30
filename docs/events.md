@@ -58,7 +58,23 @@ pub fn app() -> Application {
 })
 ```
 
-**登録は起動時の 1 回だけです。** 走っている途中では増やせません。
+**走っている途中では増やせません。** 登録は `Application` を組み立てるときに決まります。
+
+### 組み立て直すと置き換わる
+
+登録の表はプロセスに 1 つです。**`Application` を組み立てるたびに丸ごと置き換わります**
+（聞く側が 1 件も無い登録では置き換えません）。
+
+本番では起動時に 1 回なので気にしなくて構いません。**効くのはテストです。**
+テストは同じプロセスの別スレッドで並ぶので、`with_events` の中身が違うアプリを 2 件の
+テストが組むと、後から組んだほうの表で `Event::dispatch` が動きます。
+聞く側が居なくても `dispatch` は成功するので、**黙って 0 件**になります。
+
+**`with_events` を既定と違う形で組み、かつ `Event::dispatch` 系を使うテストは、
+`bengara::testing::exclusive()` の札を取ってください**（[testing.md](testing.md)）。
+
+`with_events` のクロージャが受け取る `Events` には、中身を見るメソッド
+（`is_empty()` / `count(名前)` / `names()`）があります。
 
 ## 知らせる
 
@@ -83,8 +99,8 @@ Event::try_dispatch("user.registered", &payload).await?;
 誰も聞いていないときは何も起きません。エラーにもなりません。
 
 **どこから呼んでも届きます。** コントローラ・ジョブ・自作コマンド・定期処理のどれでも
-同じです。`bootstrap/app.rs` は、置き場所が要らないコマンド（`init` / `--version` /
-`--help` など）以外のすべてで読まれます。
+同じです。ただし呼ぶたびに登録の表を読むので、**1 リクエストで何千回も呼ぶ作りには
+向きません。**
 
 ```rust
 if Event::has_listeners("user.registered") { /* ... */ }
@@ -138,13 +154,10 @@ let payload: Payload = bengara::serde_json::from_str(&payload)?;
 
 ## 無いもの
 
-| 項目                                | 代わりにすること               |
-|-------------------------------------|--------------------------------|
-| イベントのクラス                    | 名前は文字列。中身は構造体     |
-| 自動登録（`app/Listeners/` を見る） | `bootstrap/app.rs` に書く      |
-| モデルのイベント（`created` など）  | `Event::dispatch` を自分で呼ぶ |
-| 購読者（`EventSubscriber`）         | `listen` を並べる              |
-| 放送（Broadcasting / WebSocket）    | ありません                     |
+イベントのクラスはありません。名前は文字列、中身は構造体です。
+`app/Listeners/` の自動登録もないので、`bootstrap/app.rs` に書きます。
+モデルのイベント（`created` など）は `Event::dispatch` を自分で呼んでください。
+ほかにまだ無いものは [backlog.md](backlog.md) にまとめてあります。
 
 ## 関連
 

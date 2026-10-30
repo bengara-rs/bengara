@@ -125,7 +125,7 @@ impl Backend for SqliteBackend {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| failed(sql, e))?;
-            Ok(affected(&result))
+            Ok(affected(sql, &result))
         })
     }
 
@@ -178,27 +178,23 @@ impl RawTx for SqliteTx {
                 .execute(&mut *self.tx)
                 .await
                 .map_err(|e| failed(sql, e))?;
-            Ok(affected(&result))
+            Ok(affected(sql, &result))
         })
     }
 
     fn commit(self: Box<Self>) -> DbFuture<'static, ()> {
         Box::pin(async move {
             let this = *self;
-            this.tx
-                .commit()
-                .await
-                .map_err(|e| Error::msg(format!("トランザクションを確定できません: {e}")))
+            // `SqlFailure` に包む。`is_unique_violation()` が見るのは原因の連鎖だけで、
+            // `Error::msg` では種類が分からなくなるためです（遅延制約で実際に当たります）。
+            this.tx.commit().await.map_err(|e| failed("commit", e))
         })
     }
 
     fn rollback(self: Box<Self>) -> DbFuture<'static, ()> {
         Box::pin(async move {
             let this = *self;
-            this.tx
-                .rollback()
-                .await
-                .map_err(|e| Error::msg(format!("トランザクションを巻き戻せません: {e}")))
+            this.tx.rollback().await.map_err(|e| failed("rollback", e))
         })
     }
 }
@@ -206,15 +202,31 @@ impl RawTx for SqliteTx {
 /// 更新系の結果を `Affected` に直す。
 ///
 /// `last_insert_rowid()` は接続ごとに「最後に入れた行」を覚えています。
-/// update / delete / DDL では意味が無く、行が入らなかったときは
-/// **同じ接続で前に入れた古い番号**が返ります。
-/// そのまま渡すと取り違えるので、1行も変わらなかったときは入れません。
-fn affected(result: &SqliteQueryResult) -> Affected {
+/// update / delete / DDL では意味が無く、**同じ接続で前に入れた古い番号**が返ります。
+/// 取り違えないよう、番号を入れるのは次の両方が成り立つときだけです。
+///
+/// - 行を入れる文（`insert` / `replace`）である
+/// - 1行以上が変わった（`insert ... select` で0件のときを外す）
+///
+/// MySQL と PostgreSQL も、update / delete では `None` になります。
+fn affected(sql: &str, result: &SqliteQueryResult) -> Affected {
     let rows = result.rows_affected();
     Affected {
         rows,
-        last_insert_id: (rows > 0).then(|| result.last_insert_rowid()),
+        last_insert_id: (rows > 0 && inserts(sql)).then(|| result.last_insert_rowid()),
     }
+}
+
+/// 行を入れる文か。先頭の語を、大文字小文字の違いを無視して見ます。
+///
+/// 枠組みはコメント付きの SQL を組み立てないので、`/* ... */ insert ...` の形は
+/// 考えません。
+fn inserts(sql: &str) -> bool {
+    let head = sql.trim_start();
+    ["insert", "replace"].iter().any(|word| {
+        head.get(..word.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(word))
+    })
 }
 
 /// 値をプレースホルダへ渡す。
@@ -397,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 行が変わらないときは採番の番号を返さない() {
+    async fn 採番の番号を返すのは行を入れた文だけ() {
         let db = memory().await;
         db.execute("create table t (a integer)", &[]).await.unwrap();
 
@@ -406,8 +418,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inserted.last_insert_id, Some(1), "insert では番号が返る");
+        // 前後の空白と大文字小文字は見ない。
+        let inserted = db
+            .execute("  INSERT INTO t (a) VALUES (2)", &[])
+            .await
+            .unwrap();
+        assert_eq!(inserted.last_insert_id, Some(2));
+        // `replace` も行を入れる文。
+        let replaced = db
+            .execute("replace into t (rowid, a) values (1, 3)", &[])
+            .await
+            .unwrap();
+        assert_eq!(replaced.last_insert_id, Some(1));
 
-        // 当てはまる行が無い update。古い rowid を返してはいけない。
+        // 行が変わった update。**古い rowid を返してはいけない。**
+        // MySQL と PostgreSQL はここで `None` になる。
+        let updated = db.execute("update t set a = 9", &[]).await.unwrap();
+        assert_eq!(updated.rows, 2);
+        assert_eq!(updated.last_insert_id, None, "update では番号を返さない");
+
+        // 当てはまる行が無い update。
         let updated = db
             .execute("update t set a = 2 where a = 99", &[])
             .await
@@ -415,9 +445,35 @@ mod tests {
         assert_eq!(updated.rows, 0);
         assert_eq!(updated.last_insert_id, None);
 
+        // delete も同じ。
+        let deleted = db.execute("delete from t where a = 9", &[]).await.unwrap();
+        assert_eq!(deleted.rows, 2);
+        assert_eq!(deleted.last_insert_id, None, "delete では番号を返さない");
+
         // DDL も同じ。
         let created = db.execute("create table u (a integer)", &[]).await.unwrap();
         assert_eq!(created.last_insert_id, None);
+
+        // 1件も入らない insert では、古い番号を返さない。
+        let nothing = db
+            .execute("insert into t (a) select a from t", &[])
+            .await
+            .unwrap();
+        assert_eq!(nothing.rows, 0);
+        assert_eq!(nothing.last_insert_id, None);
+    }
+
+    #[test]
+    fn 行を入れる文かは先頭の語で見る() {
+        assert!(inserts("insert into t values (1)"));
+        assert!(inserts("  \n\tINSERT INTO t VALUES (1)"));
+        assert!(inserts("Replace Into t values (1)"));
+        assert!(!inserts("update t set a = 1"));
+        assert!(!inserts("delete from t"));
+        assert!(!inserts("create table t (a integer)"));
+        assert!(!inserts(""));
+        // 先頭が多バイト文字でも落ちない。
+        assert!(!inserts("やきそば"));
     }
 
     #[tokio::test]
