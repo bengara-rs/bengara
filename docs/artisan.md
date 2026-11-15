@@ -1,196 +1,238 @@
 # artisan
 
-`cargo artisan` は開発用コマンドの入口です。グローバルなインストールは要りません。
-本番では実行ファイルを直接叩きます（`./myapp migrate` など）。
+コマンドの一覧と、コマンドごとに付けられる指定の説明です。
+開発用の `serve`（変更を見張って作り直す）の動きもここにあります。
+
+| 場面 | 打ち方                                  |
+|------|-----------------------------------------|
+| 開発 | `cargo artisan migrate`                 |
+| 本番 | `./myapp migrate`（実行ファイルを直接） |
+
+グローバルなインストールは要りません。
 
 ## コマンドの一覧
 
-`cargo artisan list` で、下の表と同じものが 1 画面に出ます。
+`cargo artisan list` で、同じ一覧が画面に出ます。引数なしの `cargo artisan` も同じです。
 
-| コマンド           | 動き                                           | 条件・詳しくは                     |
-|--------------------|------------------------------------------------|------------------------------------|
-| `serve`            | 起動して、変更を見張って作り直す               | [serve の動き](#serve-の動き)      |
-| `init`             | Laravel と同じ構成のファイルを作る             |                                    |
-| `list`             | 全部のコマンドの一覧                           | `help` / `--help` / `-h` も同じ    |
-| `--version`        | bengara の版                                   |                                    |
-| `route:list`       | ルートの表（METHOD / URI / NAME / MIDDLEWARE） | [routing.md](routing.md)           |
-| `key:generate`     | `APP_KEY` を作って `.env` に書く               | `--force` で上書き                 |
-| `session:gc`       | 期限切れのセッションのファイルを消す           | [session.md](session.md)           |
-| `storage:init`     | `storage/` の下の書き込み先を作る              | [deployment.md](deployment.md)     |
-| `about`            | いまの設定と置き場所を出す                     | `APP_KEY` の値は出しません         |
-| `migrate`          | まだ流していないマイグレーションを流す         | `--seed` でシーダーも              |
-| `migrate:status`   | 流したかどうかを一覧にする                     | 読むだけ。いつでも流せます         |
-| `migrate:rollback` | 最後のバッチを巻き戻す                         | **本番は `--force`**、`--step=2` で 2 バッチ分 |
-| `migrate:reset`    | 全部巻き戻す                                   | **本番は `--force`**               |
-| `migrate:refresh`  | 全部巻き戻してから流し直す                     | **本番は `--force`**、`--seed` 可  |
-| `migrate:fresh`    | 表を全部消してから流し直す                     | **本番は `--force`**、`--seed` 可  |
-| `migrate:unlock`   | 途中で落ちて残った実行中の札を外す             | [deployment.md](deployment.md)     |
-| `db:seed`          | シーダーを流す                                 | `--class=DatabaseSeeder` で 1 本   |
-| `db:wipe`          | 表を全部消す                                   | **本番は `--force`**               |
-| `cache:clear`      | キャッシュを全部消す                           | [cache.md](cache.md)               |
-| `cache:prune`      | 期限切れのキャッシュだけ消す                   | [cache.md](cache.md)               |
-| `queue:work`       | ジョブを処理する                               | [queue.md](queue.md)               |
-| `queue:failed`     | 諦めたジョブの一覧                             | [queue.md](queue.md)               |
-| `queue:retry`      | 諦めたジョブをキューへ戻す                     | [queue.md](queue.md)               |
-| `queue:flush`      | 諦めたジョブの記録を捨てる                     | [queue.md](queue.md)               |
-| `schedule:run`     | いま動かすべき定期処理を動かす                 | [scheduling.md](scheduling.md)     |
-| `schedule:list`    | 定期処理の一覧                                 | [scheduling.md](scheduling.md)     |
-| `lang:list`        | 読み込まれている言語の一覧                     | [localization.md](localization.md) |
+### 開発用（`cargo artisan` だけ）
 
-- `migrate*` / `db:*` / `queue:*` はデータベースの機能フラグ（`sqlite` / `mysql` /
-  `mariadb` / `postgres` のどれか）が要ります（[configuration.md](configuration.md)）。
-- 引数なしの `cargo artisan` は `list` と同じです。引数なしで本体を動かすと `serve` になります。
-- `make:*` コマンドはありません。意図的な判断です（[decisions.md](decisions.md)）。
-- `app/Console/Commands/*.rs` に置いた自作コマンドも、同じ一覧に並びます。
+| コマンド | 動き                                   | 詳しくは                               |
+|----------|----------------------------------------|----------------------------------------|
+| `serve`  | 起動して、変更があれば作り直す         | [serve の動き](#serve-の動き)          |
+| `init`   | Laravel と同じ構成のファイルを作る     | [getting-started.md](getting-started.md) |
+| `list`   | コマンドの一覧（`help` `--help` `-h` も同じ） |                                 |
+| `--version` | bengara の版（`-V` `version` も同じ） |                                      |
 
-## 仕組み
+### 本体
 
-`cargo artisan` は 3 段になっています。
+| コマンド       | 動き                                           | 詳しくは                           |
+|----------------|------------------------------------------------|------------------------------------|
+| `serve`        | HTTP サーバーを起動する（見張りはしません）    | [deployment.md](deployment.md)     |
+| `route:list`   | ルートの表（METHOD / URI / NAME / MIDDLEWARE） | [routing.md](routing.md)           |
+| `key:generate` | `APP_KEY` を作って `.env` に書く               | [configuration.md](configuration.md) |
+| `about`        | いまの設定と置き場所を出す                     | [deployment.md](deployment.md)     |
+| `storage:init` | `storage/` の下の書き込み先を作る              | [deployment.md](deployment.md)     |
+| `session:gc`   | 期限切れのセッションのファイルを消す           | [session.md](session.md)           |
 
-| 段                    | 何か                                                                        |
-|-----------------------|-----------------------------------------------------------------------------|
-| 1. Cargo のエイリアス | `.cargo/config.toml` の `artisan = ["run", "-q", "--bin", "artisan", "--"]` |
-| 2. `artisan` バイナリ | `artisan.rs`。`serve` `init` `list` `--version` を自分で処理する             |
-| 3. 本体への委譲       | 知らないコマンドは本体を呼び直して実行する                                  |
+本体を引数なしで動かすと `serve` になります（`./myapp`）。
 
-- `cargo artisan --version` は受け付けます（`-V` も同じ）。`list` には載せていません。
-- `list` は開発用のコマンドを出したあと、本体を呼び直して残りを続けて出します。
-  **アプリがビルドできないときは、開発用のコマンドだけを出して終わります。**
-- `init` 前の `main.rs`（`fn main() { bengara::run() }`）は `init` と `--version`
-  だけを受け付けます。それ以外は「先に init を実行してください」と案内します。
+### データベース
 
-## 本番で `--force` が要るコマンド
+| コマンド           | 動き                                     |
+|--------------------|------------------------------------------|
+| `migrate`          | まだ流していないマイグレーションを流す   |
+| `migrate:status`   | 流したかどうかを一覧にする（読むだけ）   |
+| `migrate:rollback` | 最後のバッチを巻き戻す                   |
+| `migrate:reset`    | 全部巻き戻す                             |
+| `migrate:refresh`  | 全部巻き戻してから流し直す               |
+| `migrate:fresh`    | 表を全部消してから流し直す               |
+| `migrate:unlock`   | 途中で落ちて残った「実行中」の札を外す   |
+| `db:seed`          | シーダー（初期データ）を流す             |
+| `db:wipe`          | 表を全部消す                             |
 
-`APP_ENV=production` のとき、 **中身が消える次の 5 つ**は `--force` を付けないと止まります。
+くわしくは [migrations.md](migrations.md) にあります。
 
-| コマンド           | 中身が消える理由                      |
-|--------------------|---------------------------------------|
-| `migrate:rollback` | `down` を流すので、巻き戻した分の中身が消える |
-| `migrate:reset`    | `down` を流すので、表ごと中身が消える |
-| `migrate:refresh`  | 流し直す前に `down` を流す            |
-| `migrate:fresh`    | 表を全部消す                          |
-| `db:wipe`          | 表を全部消す                          |
+### 周辺機能
 
-**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります
-（[deployment.md](deployment.md)）。
+| コマンド        | 動き                             | 詳しくは                           |
+|-----------------|----------------------------------|------------------------------------|
+| `cache:clear`   | キャッシュを全部消す             | [cache.md](cache.md)               |
+| `cache:prune`   | 期限切れのキャッシュだけ消す     | [cache.md](cache.md)               |
+| `queue:work`    | ジョブを処理する                 | [queue.md](queue.md)               |
+| `queue:failed`  | 諦めたジョブの一覧               | [queue.md](queue.md)               |
+| `queue:retry`   | 諦めたジョブをキューへ戻す       | [queue.md](queue.md)               |
+| `queue:flush`   | 諦めたジョブの記録を捨てる       | [queue.md](queue.md)               |
+| `schedule:run`  | いま動かすべき定期処理を動かす   | [scheduling.md](scheduling.md)     |
+| `schedule:list` | 定期処理の一覧                   | [scheduling.md](scheduling.md)     |
+| `lang:list`     | 読み込まれている言語の一覧       | [localization.md](localization.md) |
 
-## コマンドの旗
+### 決まりごと
 
-**旗はコマンドごとに分かれています。** 受け付けない旗を書くと、その場でエラーになります。
+- データベースとキューのコマンドには、データベースの機能フラグが要ります
+  （[configuration.md](configuration.md)）。
+- `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます
+  （[console-commands.md](console-commands.md)）。
+- 無い名前を打つと、エラーと一覧を出して終了コード 1 で終わります。
+- コードを生成する `make:*` コマンドはありません。ファイルは手で作ります。
 
-| コマンド       | 使える旗                                                                   |
-|----------------|----------------------------------------------------------------------------|
-| `serve`        | `--host H` / `--port P`（`--port=8080` の形も可）。下の注                  |
-| `key:generate` | `--force`                                                                  |
-| `queue:work`   | `--queue=名前` / `--tries=3` / `--sleep=1` / `--retry-after=90` / `--once` |
-| `queue:retry`  | `--id=1`                                                                   |
-| `migrate` 系   | `--database=` / `--class=` / `--step=` / `--seed` / `--force`              |
-| 上記以外       | **旗を受け付けません**                                                     |
+## コマンドに付けられる指定
 
-旗を受け付けないのは `cache:clear` / `cache:prune` / `queue:failed` / `queue:flush` /
-`schedule:run` / `schedule:list` / `lang:list` です。
+**指定（`--force` のような旗）はコマンドごとに決まっています。**
+受け付けない指定を書くと、何も実行せずにエラーで終わります。
 
 ```
 $ cargo artisan cache:clear --tries=9
 エラー: `cache:clear` は `--tries=9` を受け付けません（このコマンドは旗を取りません）
 ```
 
-**`key:generate` も同じです。** `--forse` のような打ち間違いはエラーになります。
+### 本体と周辺機能
 
-**`cargo artisan serve` は旗を確かめません。** 書いた旗はそのまま本体に渡します。
-本体が受け付けない旗だと本体がその場で終わり、`serve` の画面に
-「本体が異常終了しました（終了コード 1）」と出ます。
-`serve` は止まらず、次の変更でもう一度起動します。
+| コマンド       | 使える指定                                      |
+|----------------|-------------------------------------------------|
+| `serve`        | `--host <ホスト>` / `--port <ポート>`（`--port=8080` の形も可） |
+| `key:generate` | `--force`（すでにある鍵を作り直す）             |
+| `queue:work`   | 下の表                                          |
+| `queue:retry`  | `--id=1`（1 件だけ戻す）                        |
+| 上記以外       | **指定を受け付けません。** 余分な引数も断ります |
 
-- `migrate` 系の `--database=接続の名前` はどのコマンドにも付けられます。
-- `queue:work` の `--retry-after=` は、予約されたまま残ったジョブを取り直すまでの
-  秒数です（既定 90 秒、[queue.md](queue.md)）。
-- `cache:prune` は、置き場所に掃除の仕組みが無いとき（`CACHE_DRIVER=memory`）に、
-  そう分かる文を出して終わります。消した数は出ません。
+`init` / `list` / `--version` だけは、余分な引数を無視します。
+
+| `queue:work` の指定 | 既定      | 意味                                                |
+|---------------------|-----------|-----------------------------------------------------|
+| `--queue=名前`      | `default` | 処理するキュー                                      |
+| `--tries=3`         | 3         | 諦めるまでに試す回数（1 以上）                      |
+| `--sleep=1`         | 1         | ジョブが無いときに待つ秒数                          |
+| `--timeout=60`      | 60        | 1 件のジョブを待つ上限の秒数。`0` は無制限          |
+| `--retry-after=90`  | 90        | 処理中のまま残ったジョブを取り直すまでの秒数（1 以上） |
+| `--once`            | —         | 1 件だけ処理して終わる                              |
+
+**`--timeout` は `--retry-after` より短くしてください。** 同じか長いと、同じジョブが
+二重に動くことがあります（起動時に警告が出ます）。くわしくは [queue.md](queue.md) にあります。
+
+### データベース
+
+| コマンド           | `--database=` | `--seed` | `--class=` | `--step=` | `--force` |
+|--------------------|---------------|----------|------------|-----------|-----------|
+| `migrate`          | ○             | ○        | ○          | ×         | ○         |
+| `migrate:status`   | ○             | ×        | ×          | ×         | ×         |
+| `migrate:rollback` | ○             | ×        | ×          | ○         | ○         |
+| `migrate:reset`    | ○             | ×        | ×          | ×         | ○         |
+| `migrate:refresh`  | ○             | ○        | ○          | ×         | ○         |
+| `migrate:fresh`    | ○             | ○        | ○          | ×         | ○         |
+| `migrate:unlock`   | ○             | ×        | ×          | ×         | ×         |
+| `db:seed`          | ○             | ×        | ○          | ×         | ○         |
+| `db:wipe`          | ○             | ×        | ×          | ×         | ○         |
+
+| 指定                    | 意味                                                    |
+|-------------------------|---------------------------------------------------------|
+| `--database=接続の名前` | 既定ではない接続に流す                                  |
+| `--seed`                | 流した後にシーダーも流す                                |
+| `--class=シーダーの名前` | そのシーダーだけ流す（`--class=DatabaseSeeder`）       |
+| `--step=2`              | 巻き戻すバッチの数（既定 1）                            |
+| `--force`               | 本番で、中身が消えるコマンドを通す                      |
+
+- `--class=` は、`db:seed` 以外では `--seed` と一緒に使います。
+- **シーダーは既定の接続にだけ流せます。** `db:seed` と `--seed` に、既定と違う
+  `--database=` を付けるとエラーになります。
+- `migrate` と `db:seed` の `--force` は、付けても付けなくても同じ動きです。
+- `migrate:status` と `migrate:unlock` は、記録の表や札の表が無くても**作りません。**
+
+## 本番で `--force` が要るコマンド
+
+`APP_ENV=production` のとき、**中身が消える次の 5 つ**は `--force` を付けないと止まります。
+
+| コマンド           | 中身が消える理由                         |
+|--------------------|------------------------------------------|
+| `migrate:rollback` | 巻き戻した分の表と中身が消える           |
+| `migrate:reset`    | 全部を巻き戻す                           |
+| `migrate:refresh`  | 流し直す前に全部を巻き戻す               |
+| `migrate:fresh`    | 表を全部消す                             |
+| `db:wipe`          | 表を全部消す                             |
+
+**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります
+（[deployment.md](deployment.md)）。
 
 ## serve の動き
 
-ホストとポートの既定は `.env` の `APP_HOST`（既定 `127.0.0.1`）と `APP_PORT`（既定 `8000`）です。
+```sh
+cargo artisan serve
+cargo artisan serve --host 0.0.0.0 --port 8124
+```
+
+ホストとポートの既定は、`.env` の `APP_HOST`（`127.0.0.1`）と `APP_PORT`（`8000`）です。
 
 1. アプリをビルドする。
-2. `storage/framework/serve/` に実行ファイルをコピーしてから起動する。
-   同じプロジェクトで `serve` を 2 つ動かしても衝突しません。
-   **起動のときに、前回までの控えもまとめて片付けます。**
-3. 変更を見張る。
-4. 変更があれば再ビルドして再起動する。
+2. できた実行ファイルを `storage/framework/serve/` に写して起動する。
+3. ファイルの変更を見張る。
+4. 変更があれば、ビルドし直して起動し直す。
 
-### 見張る対象
+同じプロジェクトで `serve` を 2 つ動かしても、写した実行ファイルはぶつかりません。
+前回までの写しは、起動のときに片付けます。
 
-**見張るのはビルドに影響するファイルだけです。**
+### 見張るもの
 
-| 種類           | 対象                                                       |
-|----------------|------------------------------------------------------------|
-| ファイルの種類 | `.rs` と、`resources/lang/` の `.toml`                     |
-| ディレクトリ   | `app` `bootstrap` `config` `database` `resources` `routes` |
-| ファイル       | `.env` `Cargo.toml` `Cargo.lock` `.cargo/config.toml` `rust-toolchain.toml` `build.rs` `main.rs` `artisan.rs` |
+**見張るのは、ビルドに影響するファイルだけです。**
 
-言語ファイルは **2 つの置き方のどちらも見張ります。**
+| 見張る                                                             | 条件                         |
+|--------------------------------------------------------------------|------------------------------|
+| `app/` `bootstrap/` `config/` `database/` `routes/` `resources/` の `.rs` | 下のディレクトリも含む |
+| `resources/lang/<言語>.toml` と `resources/lang/<言語>/*.toml`     | それより下は見ません         |
+| `.env` `Cargo.toml` `Cargo.lock` `build.rs` `main.rs` `artisan.rs` |                              |
+| `.cargo/config.toml` `rust-toolchain.toml`                         |                              |
 
-| 見張る                            | 見張らない                              |
-|-----------------------------------|-----------------------------------------|
-| `resources/lang/ja.toml`          | `resources/lang/ja/admin/messages.toml` |
-| `resources/lang/ja/messages.toml` | （`<言語>/` より下のディレクトリ）      |
+| 見張らない                                  | 直したときにすること                 |
+|---------------------------------------------|--------------------------------------|
+| `public/`                                   | 何も要りません。すぐ反映されます     |
+| `tests/`                                    | `cargo test` を実行する              |
+| `storage/` `target/` `node_modules/` `.git/` | —                                   |
+| 隠しファイルと隠しディレクトリ              | —                                    |
+| データベースのファイル                      | —                                    |
 
-次のものは **見張りません。**
-
-| 見張らないもの                                   | 直したときにすること              |
-|--------------------------------------------------|-----------------------------------|
-| `public/`                                        | 何も要りません（すぐ反映されます） |
-| データベースのファイル（`-wal` / `-shm` を含む） | —                                 |
-| `storage/` `target` `node_modules` `.git`        | —                                 |
-| 隠しファイル                                     | —                                 |
-
-### 見張り方
-
-更新時刻を 0.4 秒ごとに確認し、変更が続いている間は 0.25 秒待って、
-まとめて 1 回ビルドします。
-
-比べるのは **ファイルの数と、更新時刻のいちばん新しいもの**の 2 つだけです。
-**数も最大の更新時刻も同じまま中身だけ入れ替わった場合は、取りこぼします。**
-そのときはファイルを 1 つ触るか、`serve` を入れ直してください。
+- 0.4 秒ごとに確かめます。保存が続いている間は待って、1 回のビルドにまとめます。
+- 比べるのは**ファイルの数**と**いちばん新しい更新時刻**です。どちらも変わらない
+  書き換えは見落とします。そのときはファイルを 1 つ保存し直してください。
+- ビルドが自分で書き換えた `Cargo.lock` では、作り直しません。
+  ビルドの最中に `cargo update` をしたときは、ファイルを 1 つ保存し直してください。
 
 ### 失敗したとき
 
-- ビルドに失敗したら、直前に動いていた版をそのまま動かし続け、エラーを表示します。
-- 本体が自分で終了した場合（ポートが使用中など）はその旨を表示し、次の変更で起動し直します。
-- **初回のビルドや起動が失敗しても、`serve` は止まりません。** エラーを出してから
-  見張りを続けます。ファイルを直せば、もう一度ビルドして起動します。
+| 起きたこと                       | 動き                                             |
+|----------------------------------|--------------------------------------------------|
+| ビルドに失敗した                 | エラーを出し、**前の版をそのまま動かし続けます** |
+| 本体が自分で終わった             | その旨を出し、次の変更でもう一度起動します       |
+| 初回のビルドや起動に失敗した     | `serve` は止まりません。直せばもう一度試します   |
 
-## 終了のしかた
+本体が自分で終わるのは、ポートが使われているときや、`serve` に知らない指定を
+付けたときです。画面に「本体が異常終了しました（終了コード 1）」と出ます。
 
-本体は Ctrl+C と（Unix では）SIGTERM を受けたら、処理中のリクエストを終えてから止まります。
-`queue:work` も同じで、 **いま動かしている 1 件を終わらせてから**止まります。
+### 止め方
 
-`serve` から動かした本体だけは別です。
+Ctrl+C で止めます。
 
-- **`serve` は本体を即座に止めます。** 処理中のリクエストは待ちません。
-- `APP_SHUTDOWN_TIMEOUT` の猶予は `serve` では通りません。
-  停止の猶予を確かめたいときは、本体を直接動かしてください（`cargo run -- serve`）。
-- **`artisan` が落ちたときも本体を止めます。** パニックやエラーで終わっても、
-  本体がポートを握ったままにはなりません。次の `serve` が「address in use」で
-  失敗することはありません。
-- 例外は `artisan` を強制終了したときです（`kill -9`、タスクマネージャからの終了）。
-  片付けの処理ごと消えるので、本体が残ります。残ったら手で止めてください。
+- **`serve` は本体をすぐに止めます。** 処理中のリクエストは待ちません。
+- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめたいときは、見張りなしで
+  動かしてください（`cargo run -- serve`）。動きは [deployment.md](deployment.md) にあります。
+- `serve` がエラーで終わったときも、本体は一緒に止まります。
+- `serve` を強制終了したとき（`kill -9`、タスクマネージャ）だけは、本体が残ります。
+  残ったら手で止めてください。
 
-止め方のくわしい話は [deployment.md](deployment.md) にあります。
+## 仕組み
 
-## 自分のコマンド
+`cargo artisan` は 3 段で動きます。
 
-`app/Console/Commands/*.rs` に置いたものが、同じ一覧に並びます。
+| 段                    | 何か                                                                        |
+|-----------------------|-----------------------------------------------------------------------------|
+| 1. Cargo の別名       | `.cargo/config.toml` の `artisan = ["run", "-q", "--bin", "artisan", "--"]` |
+| 2. `artisan` の実行ファイル | `artisan.rs`。開発用のコマンドを自分で処理する                        |
+| 3. 本体へ渡す         | それ以外のコマンドは、本体を動かして任せる                                  |
 
-```sh
-cargo artisan greet アリス
-```
-
-書き方は [console-commands.md](console-commands.md) にあります。
+- `artisan` はアプリのコードを取り込みません。**アプリがビルドできないときも動きます。**
+- そのとき `cargo artisan list` は、開発用のコマンドだけを出します。
+- 本体の実行ファイル名がパッケージ名と違っていても動きます
+  （`[[bin]] name = "server" path = "main.rs"`）。
 
 ## 関連
 
-- [getting-started.md](getting-started.md)
-- [routing.md](routing.md)
+- [getting-started.md](getting-started.md) — 最初の手順
 - [console-commands.md](console-commands.md) — 自分のコマンドを足す
+- [deployment.md](deployment.md) — 本番での動かし方と止め方

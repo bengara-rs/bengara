@@ -19,7 +19,9 @@ use crate::error::{Error, Result};
 /// 既定の置き場所の名前。
 const DEFAULT_DISK: &str = "local";
 
-/// 置き場所の設定。`config/storage.rs` が返します。
+/// 置き場所の設定。`config/filesystems.rs` が返します。
+///
+/// ファイル名は自由です。見分けるのは名前ではなく、`config()` が返す型です。
 ///
 /// ```ignore
 /// pub fn config() -> StorageConfig {
@@ -215,10 +217,7 @@ impl Storage {
     fn ensure_storage(&self, full: &Path) -> Result<()> {
         let storage = crate::paths::storage_path("");
         if full.starts_with(&storage) && !storage.is_dir() {
-            return Err(Error::msg(format!(
-                "{} がありません。`cargo artisan storage:init` で作ってください",
-                storage.display()
-            )));
+            return Err(Error::msg(crate::paths::missing_storage_message(&storage)));
         }
         Ok(())
     }
@@ -560,8 +559,22 @@ mod tests {
             .to_string();
         assert!(error.contains("storage:init"), "{error}");
         assert!(!storage.exists(), "作らない");
+    }
 
-        // `storage/` の外の置き場所には口を出さない。
+    #[test]
+    fn storageが無いときの案内はコマンドの呼び方を言う() {
+        // キャッシュ（`cache/store.rs`）と同じ文。本番には cargo が無いので、
+        // 実行ファイルでの呼び方も言う。
+        let text = crate::paths::missing_storage_message(Path::new("/srv/app/storage"));
+        assert!(text.contains("がありません"), "{text}");
+        assert!(text.contains("cargo artisan storage:init"), "{text}");
+        assert!(text.contains("./<実行ファイル> storage:init"), "{text}");
+        assert!(text.ends_with("を実行してください"), "{text}");
+    }
+
+    #[test]
+    fn storageの外の置き場所には口を出さない() {
+        // テスト用の一時ディレクトリは `storage/` の外。`storage/` の有無を見ない。
         let outside = self::disk("outside");
         assert!(outside
             .ensure_storage(&outside.absolute("a.txt").unwrap())

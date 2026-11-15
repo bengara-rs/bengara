@@ -138,12 +138,20 @@ impl Cookie {
 
 /// `Path` / `Domain` から、ヘッダーを壊す文字を落とす。
 ///
-/// 落とすのは制御文字（`\r` `\n` `\0`）と、属性の区切りの `;` です。名前と値は
-/// `%xx` に逃がしますが、この2つは逃がすと意味が変わるので落とします。
-/// 残すと `Set-Cookie` ヘッダーが作れず、**そのリクエストが 500 になります**。
+/// 落とすのは**制御文字の全部**（`char::is_control`。水平タブも含みます）と、
+/// 属性の区切りの `;` です。名前と値は `%xx` に逃がしますが、この2つは逃がすと
+/// 意味が変わるので落とします。
+///
+/// 制御文字が残ると、応答を組み立てるところ（`response::header_value_ok`）が
+/// **その `Set-Cookie` を 1 本まるごと落とします**（ほかのヘッダーと応答は残ります）。
+/// 以前ここで落としていたのは `\r` `\n` `\0` だけだったので、`\x01` や `\x7f` が
+/// 1 文字入るだけで、文字ではなく Cookie そのものが消えていました。
+/// 落とす範囲を向こうの検査より広くそろえてあるので、属性が原因で Cookie が
+/// 消えることはありません。
+///
 /// 黙って落とすので、落としたときだけ1行だけ残します。
 fn sanitize_attribute<'a>(attribute: &str, value: &'a str) -> Cow<'a, str> {
-    let bad = |c: char| matches!(c, '\r' | '\n' | '\0' | ';');
+    let bad = |c: char| c.is_control() || c == ';';
     if !value.contains(bad) {
         return Cow::Borrowed(value);
     }
@@ -234,8 +242,27 @@ mod tests {
     }
 
     #[test]
+    fn pathとdomainの制御文字は全部落とす() {
+        // 以前落としていたのは `\r` `\n` `\0` だけ。ほかの制御文字が残ると、
+        // 応答を組み立てるところが `Set-Cookie` を 1 本まるごと落としていた。
+        let header = Cookie::new("a", "b")
+            .with_path("/x\u{1}y\u{7f}z\tw\u{1b}\u{85}")
+            .with_domain("exa\u{8}mple.com\u{0}")
+            .to_header_value();
+        assert!(header.contains("; Path=/xyzw;"), "{header:?}");
+        assert!(header.contains("; Domain=example.com;"), "{header:?}");
+        // 残った値に制御文字が 1 つも無い（＝ヘッダーとして組み立てられる）。
+        assert!(!header.chars().any(char::is_control), "{header:?}");
+        // 普通の値は借りたまま返す（確保しない）。
+        assert!(matches!(
+            sanitize_attribute("Path", "/admin"),
+            Cow::Borrowed("/admin")
+        ));
+    }
+
+    #[test]
     fn pathとdomainの危ない文字は落とす() {
-        // 改行や `;` が残ると `Set-Cookie` ヘッダーを作れず、応答全体が 500 になる。
+        // 改行や `;` が残ると、属性を足されたり `Set-Cookie` が落ちたりする。
         let header = Cookie::new("a", "b")
             .with_path("/x\r\nSet-Cookie: evil=1")
             .with_domain("example.com\n; Secure")

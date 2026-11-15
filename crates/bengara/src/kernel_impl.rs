@@ -5,6 +5,7 @@
 
 use crate::application::Application;
 use crate::config_registry::{self, Registry};
+use crate::console::Command;
 use crate::env_vars::{self, env};
 use crate::error::Result;
 use crate::{paths, server, Hooks};
@@ -12,17 +13,190 @@ use crate::{paths, server, Hooks};
 /// 置き場所が無くても使えるコマンド。
 ///
 /// `init` はこれから置き場所を作るところなので、`--version` と `--help` は
-/// どこで実行しても答えられるべきなので、基準ディレクトリの確認を飛ばします。
-const WITHOUT_BASE: &[&str] = &[
-    "init",
-    "--version",
-    "-V",
-    "version",
-    "--help",
-    "-h",
-    "help",
-    "list",
+/// どこで実行しても答えられるべきなので、基準ディレクトリの確認も、
+/// アプリの組み立て（`bootstrap/app.rs`）も飛ばします。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standalone {
+    Init,
+    Version,
+    Help,
+}
+
+/// アプリを組み立ててから動かすコマンド。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppCommand {
+    Serve,
+    RouteList,
+    KeyGenerate,
+    SessionGc,
+    StorageInit,
+    About,
+    /// DB のコマンド（`database/commands.rs` の一覧）。
+    Database,
+    /// 周辺のコマンド（`commands.rs` の一覧）。
+    Extra,
+    /// アプリが `app/Console/Commands/` に置いた自作コマンド。
+    Custom,
+}
+
+/// 打たれた名前が指すもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Standalone(Standalone),
+    App(AppCommand),
+    /// どれでもない。
+    Unknown,
+}
+
+/// このファイルが受け持つコマンド 1 つ。
+struct Builtin {
+    /// 受け付ける名前（別名を含む）。
+    names: &'static [&'static str],
+    target: Target,
+    /// ヘルプの名前の欄に出す文字。
+    label: &'static str,
+    /// ヘルプに出す説明。
+    description: &'static str,
+    /// 説明の下に並べる旗（旗、説明）。
+    flags: &'static [(&'static str, &'static str)],
+}
+
+/// このファイルが受け持つコマンドの表。**名前はここにだけ書きます。**
+///
+/// 置き場所が要るか（[`needs_base`]）・振り分け（[`resolve`]）・ヘルプ
+/// （[`kernel_help`]）・同名の自作コマンドの検査（[`shadowed`]）は、全部
+/// この表から決めます。以前は名前が別々の場所に散っていて、`list` `help`
+/// `init` `version` だけが自作コマンドより**後ろ**で照合されていました。
+/// `app/Console/Commands/List.rs` を置くと `cargo artisan list` が自作の
+/// ほうを実行していました。
+///
+/// DB のコマンドと周辺のコマンドの名前は、それぞれのファイルの `COMMANDS` に
+/// あります（[`builtin`] がまとめて見ます）。並びはヘルプに出す順です。
+const BUILTINS: &[Builtin] = &[
+    Builtin {
+        names: &["serve"],
+        target: Target::App(AppCommand::Serve),
+        label: "(引数なし) / serve",
+        description: "HTTP サーバーを起動する",
+        flags: &[
+            (
+                "--host <ホスト>",
+                "待ち受けるホスト（既定: APP_HOST か 127.0.0.1）",
+            ),
+            (
+                "--port <ポート>",
+                "待ち受けるポート（既定: APP_PORT か 8000）",
+            ),
+        ],
+    },
+    Builtin {
+        names: &["route:list"],
+        target: Target::App(AppCommand::RouteList),
+        label: "route:list",
+        description: "登録されているルートを一覧にする",
+        flags: &[],
+    },
+    Builtin {
+        names: &["key:generate"],
+        target: Target::App(AppCommand::KeyGenerate),
+        label: "key:generate",
+        description: "APP_KEY を作って .env に書き込む（--force で上書き）",
+        flags: &[],
+    },
+    Builtin {
+        names: &["session:gc"],
+        target: Target::App(AppCommand::SessionGc),
+        label: "session:gc",
+        description: "期限切れのセッションを消す",
+        flags: &[],
+    },
+    Builtin {
+        names: &["storage:init"],
+        target: Target::App(AppCommand::StorageInit),
+        label: "storage:init",
+        description: "storage/ の下の書き込み先を作る（デプロイ時に1回）",
+        flags: &[],
+    },
+    Builtin {
+        names: &["about"],
+        target: Target::App(AppCommand::About),
+        label: "about",
+        description: "いまの設定と置き場所を出す",
+        flags: &[],
+    },
+    Builtin {
+        names: &["init"],
+        target: Target::Standalone(Standalone::Init),
+        label: "init",
+        description: "Laravel と同じ構成のファイルを作る（最初の1回だけ）",
+        flags: &[],
+    },
+    Builtin {
+        names: &["--version", "-V", "version"],
+        target: Target::Standalone(Standalone::Version),
+        label: "--version",
+        description: "版番号を出す",
+        flags: &[],
+    },
+    Builtin {
+        names: &["--help", "-h", "help", "list"],
+        target: Target::Standalone(Standalone::Help),
+        label: "--help",
+        description: "このヘルプを出す",
+        flags: &[],
+    },
 ];
+
+/// フレームワークのコマンドなら、指すものを返す。
+///
+/// このファイルの表・DB のコマンド・周辺のコマンドの 3 つをまとめて見ます。
+/// **フレームワークのコマンドかどうかは、ここだけで決めます。**
+fn builtin(name: &str) -> Option<Target> {
+    if let Some(found) = BUILTINS.iter().find(|b| b.names.contains(&name)) {
+        return Some(found.target);
+    }
+    if crate::database::commands::is_command(name) {
+        return Some(Target::App(AppCommand::Database));
+    }
+    if crate::commands::is_command(name) {
+        return Some(Target::App(AppCommand::Extra));
+    }
+    None
+}
+
+/// 打たれた名前から、動かすものを決める。
+///
+/// **フレームワークのコマンドが必ず先です**（`docs/console-commands.md`）。
+/// 自作コマンドを見るのは、フレームワークのどのコマンドでもなかったときだけです。
+fn resolve(name: &str, custom: &[Command]) -> Target {
+    if let Some(target) = builtin(name) {
+        return target;
+    }
+    if crate::console::find(custom, name).is_some() {
+        return Target::App(AppCommand::Custom);
+    }
+    Target::Unknown
+}
+
+/// フレームワークのコマンドと同じ名前の自作コマンド。**これらは呼ばれません。**
+///
+/// 黙って無視すると、`app/Console/Commands/List.rs` を書いた人が「動かない」
+/// 理由を探すことになるので、起動のときに知らせます。
+fn shadowed(custom: &[Command]) -> Vec<&'static str> {
+    custom
+        .iter()
+        .map(|command| command.name)
+        .filter(|name| builtin(name).is_some())
+        .collect()
+}
+
+/// 基準ディレクトリが要るコマンドか。
+///
+/// 要らないのは [`Standalone`] だけです。知らない名前と自作コマンドは「要る」に
+/// 倒します（置き場所が決まらないまま動き出さないため）。
+fn needs_base(command: &str) -> bool {
+    !matches!(builtin(command), Some(Target::Standalone(_)))
+}
 
 /// 本体の入口。`bengara::app!()` から呼ばれます。
 pub fn main(hooks: Hooks, factory: fn() -> Application) {
@@ -32,7 +206,7 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     // 置き場所が決まらないまま動き出さない（決定記録 #064）。
     // **`.env` を読む前**に確かめる。読む場所そのものが決まっていないため。
     // つまり `APP_BASE_PATH` は `.env` に書いても効きません。
-    let needs_base = !WITHOUT_BASE.contains(&command);
+    let needs_base = needs_base(command);
     if needs_base {
         if let Err(error) = paths::guard() {
             eprintln!("エラー: {error}");
@@ -51,6 +225,11 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     }
     for warning in warnings {
         tracing::warn!("{warning}");
+    }
+    // フレームワークのコマンドと同じ名前の自作コマンドは呼ばれない。
+    // 黙って無視せず、どのコマンドを動かしたときも知らせる。
+    for name in shadowed((hooks.commands)()) {
+        tracing::warn!("{}", shadowed_message(name));
     }
 
     // `APP_STORAGE_PATH` は `.env` に書いても効くので、読み込んだ**後**に確かめる。
@@ -82,62 +261,82 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
         None => ("serve", &[] as &[String]),
     };
 
+    // 振り分けは [`resolve`] に任せる。フレームワークのコマンドが必ず先。
+    let kind = match resolve(command, (hooks.commands)()) {
+        Target::Standalone(standalone) => return run_standalone(standalone, hooks),
+        Target::Unknown => {
+            eprintln!("`{command}` というコマンドはありません。");
+            print_help(hooks);
+            std::process::exit(1);
+        }
+        Target::App(kind) => kind,
+    };
+
     // アプリの組み立て（`bootstrap/app.rs`）は、ここで**1回だけ**行う。
     //
     // 組み立てのときにイベントの聞く側（`Event::listen`）が固定されるので、
     // 飛ばすと `queue:work` や自作コマンドの中の `Event::dispatch` が
     // 何も呼ばずに終わります（決定記録）。`serve` と `route:list` のほかにも
-    // 要るので、`needs_application` で広く真にしてあります。
-    let app = if needs_application(command) {
-        Some(build(factory))
-    } else {
-        None
-    };
+    // 要るので、[`AppCommand`] の全部で組み立てます。
+    let app = build(factory);
 
-    match command {
-        "serve" => {
+    match kind {
+        AppCommand::Serve => {
             let options = ServeOptions::parse(rest)?;
-            let app = app.unwrap_or_else(|| build(factory));
             // 使う絶対パスを出す。設定の間違いはここを見れば分かる。
             crate::ops::log_paths();
             server::serve(app, &options.host, options.port)
         }
-        "route:list" => {
-            print_routes(&app.unwrap_or_else(|| build(factory)));
+        AppCommand::RouteList => {
+            crate::commands::no_flags(command, rest)?;
+            print_routes(&app);
             Ok(())
         }
-        "key:generate" => generate_key(rest),
-        "session:gc" => sweep_sessions(),
-        "storage:init" => crate::ops::storage_init(),
-        "about" => {
+        AppCommand::KeyGenerate => generate_key(rest),
+        AppCommand::SessionGc => {
+            crate::commands::no_flags(command, rest)?;
+            sweep_sessions()
+        }
+        AppCommand::StorageInit => {
+            crate::commands::no_flags(command, rest)?;
+            crate::ops::storage_init()
+        }
+        AppCommand::About => {
+            crate::commands::no_flags(command, rest)?;
             print_about(&hooks);
             Ok(())
         }
         // DB のコマンド（migrate / db:seed など）。
-        name if crate::database::commands::is_command(name) => {
-            crate::database::commands::run(name, rest, (hooks.migrations)(), (hooks.seeders)())
+        AppCommand::Database => {
+            crate::database::commands::run(command, rest, (hooks.migrations)(), (hooks.seeders)())
         }
         // 周辺のコマンド（cache:clear / queue:work / schedule:run など）。
-        name if crate::commands::is_command(name) => crate::commands::run(name, rest, hooks),
-        // アプリが `app/Console/Commands/` に置いた自作コマンド。
-        name if crate::console::find((hooks.commands)(), name).is_some() => {
-            crate::commands::run_custom(name, rest, hooks)
-        }
-        "init" => crate::cli::init_here(),
-        "--version" | "-V" | "version" => {
+        AppCommand::Extra => crate::commands::run(command, rest, hooks),
+        AppCommand::Custom => crate::commands::run_custom(command, rest, hooks),
+    }
+}
+
+/// 置き場所もアプリの組み立ても要らないコマンドを動かす。
+fn run_standalone(command: Standalone, hooks: Hooks) -> Result<()> {
+    match command {
+        Standalone::Init => crate::cli::init_here(),
+        Standalone::Version => {
             println!("bengara {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        "--help" | "-h" | "help" | "list" => {
+        Standalone::Help => {
             print_help(hooks);
             Ok(())
         }
-        other => {
-            eprintln!("`{other}` というコマンドはありません。");
-            print_help(hooks);
-            std::process::exit(1);
-        }
     }
+}
+
+/// 同じ名前の自作コマンドがあるときの警告。
+fn shadowed_message(name: &str) -> String {
+    format!(
+        "自作コマンド `{name}` は呼ばれません。フレームワークに同じ名前のコマンドがあります\
+         （app/Console/Commands/ のファイル名を変えてください）"
+    )
 }
 
 /// そのコマンドでアプリを組み立てるか。
@@ -145,10 +344,14 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
 /// 組み立てると、ルート・ミドルウェア・**イベントの聞く側**が固定されます。
 /// `Event::dispatch` はどのコマンドからでも呼べることになっているので、
 /// 置き場所が要らないコマンド（`init` / `--version` / `--help` など）を除いて
-/// すべて真にします。`WITHOUT_BASE` と同じ並びを使うのは、置き場所が無ければ
-/// `bootstrap/app.rs` も読めないためです。
+/// すべて真にします。置き場所の要否（[`needs_base`]）と同じにするのは、
+/// 置き場所が無ければ `bootstrap/app.rs` も読めないためです。
+///
+/// 振り分けそのものは型（[`Standalone`] と [`AppCommand`]）で分かれています。
+/// この関数は、その対応をテストで名前から確かめるためのものです。
+#[cfg(test)]
 fn needs_application(command: &str) -> bool {
-    !WITHOUT_BASE.contains(&command)
+    !matches!(resolve(command, &[]), Target::Standalone(_))
 }
 
 /// `bootstrap/app.rs` を呼んでアプリを固定する。
@@ -223,11 +426,8 @@ fn generate_key(rest: &[String]) -> Result<()> {
     }
 
     let body = std::fs::read_to_string(&path)?;
-    let already_set = body
-        .lines()
-        .any(|line| app_key_value(line).is_some_and(|value| !value.trim().is_empty()));
 
-    if already_set && !force {
+    if app_key_is_set(&body) && !force {
         println!(
             "APP_KEY はすでに設定されています。作り直すと、いまのセッションと\n\
              署名付き URL がすべて無効になります。それでもよければ --force を付けてください。"
@@ -236,8 +436,61 @@ fn generate_key(rest: &[String]) -> Result<()> {
     }
 
     let key = crate::support::crypto::random_token();
-    std::fs::write(&path, write_app_key(&body, &key))?;
+    replace_file(&path, &write_app_key(&body, &key))?;
     println!("APP_KEY を {} に書き込みました。", path.display());
+    Ok(())
+}
+
+/// `.env` の中身で、`APP_KEY` がすでに設定されているか。
+///
+/// **`.env` の読み込みと同じ規則で値を読みます**（`env_vars::dotenv_value`）。
+/// `=` の右側をそのまま見ていたころは、`APP_KEY=""` や `APP_KEY= # 後で` を
+/// 「設定済み」と見て書き込みませんでした。読み込みではどちらも空なので、
+/// 「設定されています」と言われたのに起動すると「設定されていません」になります。
+///
+/// 見るのは**最初の `APP_KEY` の行**です。読み込みは先に出てきた行を採るためです。
+fn app_key_is_set(body: &str) -> bool {
+    body.lines()
+        .find_map(app_key_value)
+        .is_some_and(|raw| !env_vars::dotenv_value(raw).trim().is_empty())
+}
+
+/// ファイルの中身を、一時ファイルに書いてから置き換える。
+///
+/// `std::fs::write` は切り詰めてから書くので、途中で落ちると `.env` が空か
+/// 途中までになります。`.env` が壊れると、次の起動で設定が全部既定値に戻ります。
+/// 同じディレクトリに書いてから `rename` で置き換えます
+/// （`support::fs::write_atomic`。`schedule.rs` の前回時刻と同じ作りです）。
+///
+/// - **リンクなら、指している先を置き換えます。** リンクそのものを置き換えると、
+///   共有の `.env` へのリンクが普通のファイルに変わってしまいます。
+/// - **権限は元のファイルから引き継ぎます。** 一時ファイルは、中身を書く前に
+///   所有者だけに絞ります（鍵が入るため）。
+/// - 読み取り専用のファイルは、これまでどおり書き込まずにエラーにします。
+fn replace_file(path: &std::path::Path, body: &str) -> Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let permissions = std::fs::metadata(&target)?.permissions();
+    if permissions.readonly() {
+        return Err(crate::Error::msg(format!(
+            "{} は読み取り専用なので書き込めません",
+            path.display()
+        )));
+    }
+
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".env".to_string());
+    let temp = target.with_file_name(format!("{name}.tmp.{}", std::process::id()));
+
+    // 所有者だけに絞って書き、元の権限を付け直してから置き換える。
+    // 失敗したときの書きかけは `write_atomic` が消します。
+    crate::support::fs::write_atomic(
+        &temp,
+        &target,
+        body.as_bytes(),
+        crate::support::fs::Access::Keep(permissions),
+    )?;
     Ok(())
 }
 
@@ -299,8 +552,11 @@ fn newline_of(body: &str) -> &'static str {
 /// `.env` の読み込みと**同じ前処理**をします（前後の空白と先頭の `export` を外す）。
 /// そろえないと `export APP_KEY=…` を見落とし、末尾に 2 行目を足してしまいます。
 /// 読み込みは先に出てくる値を採るので、鍵は変わらないのに「書き込みました」と出ます。
+///
+/// 先頭の BOM も外します（読み込みが外すため。Windows のメモ帳が付けます）。
+/// 残すと 1 行目の `APP_KEY=` を見落とし、同じく末尾に 2 行目を足します。
 fn app_key_value(line: &str) -> Option<&str> {
-    env_vars::strip_export(line.trim()).strip_prefix("APP_KEY=")
+    env_vars::strip_export(line.trim_start_matches('\u{feff}').trim()).strip_prefix("APP_KEY=")
 }
 
 /// `APP_KEY` の行なら値を差し替える。そうでなければそのまま返す。
@@ -472,24 +728,14 @@ fn print_help(hooks: Hooks) {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let kernel = kernel_help();
     let database = describe(crate::database::commands::COMMANDS);
     let extras = describe(crate::commands::COMMANDS);
     println!(
         "\
 本体のコマンド
 
-  (引数なし) / serve   HTTP サーバーを起動する
-      --host <ホスト>  待ち受けるホスト（既定: APP_HOST か 127.0.0.1）
-      --port <ポート>  待ち受けるポート（既定: APP_PORT か 8000）
-  route:list           登録されているルートを一覧にする
-  key:generate         APP_KEY を作って .env に書き込む（--force で上書き）
-  session:gc           期限切れのセッションを消す
-  storage:init         storage/ の下の書き込み先を作る（デプロイ時に1回）
-  about                いまの設定と置き場所を出す
-  init                 Laravel と同じ構成のファイルを作る（最初の1回だけ）
-  --version            版番号を出す
-  --help               このヘルプを出す
-
+{kernel}
 データベースのコマンド
 {database}
   どれにも --database=<接続の名前> を付けられます。
@@ -504,14 +750,35 @@ fn print_help(hooks: Hooks) {
     crate::console::print_list((hooks.commands)());
 }
 
+/// このファイルが受け持つコマンドの説明（ヘルプの最初のかたまり）。
+///
+/// [`BUILTINS`] から作ります。名前を表とヘルプの 2 か所に書かないためです。
+/// 桁は端末での幅でそろえます（名前の欄に日本語が入るため）。
+fn kernel_help() -> String {
+    use crate::support::text;
+
+    let mut out = String::new();
+    for builtin in BUILTINS {
+        out.push_str(&format!(
+            "  {} {}\n",
+            text::pad(builtin.label, 20),
+            builtin.description
+        ));
+        for (flag, description) in builtin.flags {
+            out.push_str(&format!("      {} {description}\n", text::pad(flag, 16)));
+        }
+    }
+    out
+}
+
 /// ログの出力を用意する。
 ///
 /// 出力の細かさは `RUST_LOG` で決めます。設定がなければ、`APP_DEBUG` が真なら
 /// `debug`、そうでなければ `info` にします。
 ///
 /// 機能フラグ `log-filter`（既定で入っています）があると、`RUST_LOG=myapp=debug` のような
-/// 細かい絞り込みが使えます。外した場合は `trace` / `debug` / `info` / `warn` / `error` の
-/// 1語だけを見ます。
+/// 細かい絞り込みが使えます。外した場合は `trace` / `debug` / `info` / `warn` / `error` /
+/// `off` の1語だけを見ます。
 fn init_tracing() {
     let default = if env("APP_DEBUG", false) {
         "debug"
@@ -532,11 +799,7 @@ fn init_tracing() {
 
     #[cfg(not(feature = "log-filter"))]
     let builder = {
-        let level = std::env::var("RUST_LOG")
-            .ok()
-            .and_then(|raw| parse_level(&raw))
-            .or_else(|| parse_level(default))
-            .unwrap_or(tracing::Level::INFO);
+        let level = max_level(std::env::var("RUST_LOG").ok().as_deref(), default);
         tracing_subscriber::fmt().with_max_level(level)
     };
 
@@ -544,16 +807,36 @@ fn init_tracing() {
     let _ = builder.with_target(false).try_init();
 }
 
-/// `info` などの1語をログの細かさに変える。
-#[cfg(not(feature = "log-filter"))]
-fn parse_level(raw: &str) -> Option<tracing::Level> {
+/// `RUST_LOG` の値と既定から、ログの細かさを決める（`log-filter` を外したとき用）。
+///
+/// 読めない値と空は既定に落とします。`off` は「読めない」ではなく、
+/// **何も出さない**という指定として扱います。
+///
+/// テストでも使うので、`log-filter` が入っているときもテストにだけ残します
+/// （既定のビルドでは `log-filter` が入るので、外した側の枝は普段コンパイルされません）。
+#[cfg(any(test, not(feature = "log-filter")))]
+fn max_level(raw: Option<&str>, default: &str) -> tracing::level_filters::LevelFilter {
+    raw.and_then(parse_level)
+        .or_else(|| parse_level(default))
+        .unwrap_or(tracing::level_filters::LevelFilter::INFO)
+}
+
+/// `info` などの1語をログの細かさに変える。読めなければ `None`。
+///
+/// 返すのは `Level` ではなく `LevelFilter` です。`Level` には「何も出さない」が
+/// 無いので、以前は `off` を `None`（読めない）にするしかなく、既定の細かさに
+/// 戻っていました。`RUST_LOG=off` と書いたのに `info` で出続ける形です。
+#[cfg(any(test, not(feature = "log-filter")))]
+fn parse_level(raw: &str) -> Option<tracing::level_filters::LevelFilter> {
+    use tracing::level_filters::LevelFilter;
+
     match raw.trim().to_ascii_lowercase().as_str() {
-        "trace" => Some(tracing::Level::TRACE),
-        "debug" => Some(tracing::Level::DEBUG),
-        "info" => Some(tracing::Level::INFO),
-        "warn" | "warning" => Some(tracing::Level::WARN),
-        "error" => Some(tracing::Level::ERROR),
-        "off" | "none" => None,
+        "trace" => Some(LevelFilter::TRACE),
+        "debug" => Some(LevelFilter::DEBUG),
+        "info" => Some(LevelFilter::INFO),
+        "warn" | "warning" => Some(LevelFilter::WARN),
+        "error" => Some(LevelFilter::ERROR),
+        "off" | "none" => Some(LevelFilter::OFF),
         _ => None,
     }
 }
@@ -701,9 +984,273 @@ mod tests {
 
     #[test]
     fn 置き場所の要否と組み立ての要否はそろえる() {
-        for command in WITHOUT_BASE {
-            assert!(!needs_application(command), "{command}");
+        // 表にある名前の全部で、2 つの要否が一致する。
+        for builtin in BUILTINS {
+            for command in builtin.names {
+                assert_eq!(needs_base(command), needs_application(command), "{command}");
+            }
         }
+        // 置き場所が要らないのは、この 8 つだけ。
+        let without_base: Vec<&str> = BUILTINS
+            .iter()
+            .flat_map(|builtin| builtin.names.iter().copied())
+            .filter(|command| !needs_base(command))
+            .collect();
+        assert_eq!(
+            without_base,
+            [
+                "init",
+                "--version",
+                "-V",
+                "version",
+                "--help",
+                "-h",
+                "help",
+                "list"
+            ]
+        );
+        // 知らない名前と自作コマンドは「要る」に倒す。
+        assert!(needs_base("greet"));
+        assert!(needs_base("migrate"));
+        assert!(needs_base("queue:work"));
+    }
+
+    /// テスト用の自作コマンド。
+    fn custom(name: &'static str) -> Command {
+        Command {
+            name,
+            description: "",
+            handle: |_| Box::pin(async { Ok(()) }),
+        }
+    }
+
+    #[test]
+    fn 同じ名前の自作コマンドよりフレームワークが先() {
+        // `app/Console/Commands/List.rs` などを置いた形。以前は `list` `help`
+        // `init` `version` だけ自作コマンドの後ろで照合していて、自作のほうが動いた。
+        let commands = [
+            custom("list"),
+            custom("help"),
+            custom("init"),
+            custom("version"),
+            custom("serve"),
+            custom("about"),
+            custom("migrate"),
+            custom("queue:work"),
+            custom("greet"),
+        ];
+        assert_eq!(
+            resolve("list", &commands),
+            Target::Standalone(Standalone::Help)
+        );
+        assert_eq!(
+            resolve("help", &commands),
+            Target::Standalone(Standalone::Help)
+        );
+        assert_eq!(
+            resolve("init", &commands),
+            Target::Standalone(Standalone::Init)
+        );
+        assert_eq!(
+            resolve("version", &commands),
+            Target::Standalone(Standalone::Version)
+        );
+        assert_eq!(resolve("serve", &commands), Target::App(AppCommand::Serve));
+        assert_eq!(resolve("about", &commands), Target::App(AppCommand::About));
+        assert_eq!(
+            resolve("migrate", &commands),
+            Target::App(AppCommand::Database)
+        );
+        assert_eq!(
+            resolve("queue:work", &commands),
+            Target::App(AppCommand::Extra)
+        );
+        // ぶつからない名前は自作コマンドに届く。
+        assert_eq!(resolve("greet", &commands), Target::App(AppCommand::Custom));
+        assert_eq!(resolve("nope", &commands), Target::Unknown);
+        assert_eq!(resolve("greet", &[]), Target::Unknown);
+
+        // 同名の自作コマンドがあっても、置き場所の要否は変わらない
+        // （以前は `list` が置き場所の確認を飛ばしたまま自作コマンドを動かした）。
+        assert!(!needs_base("list"));
+    }
+
+    #[test]
+    fn 呼ばれない自作コマンドを見つける() {
+        let commands = [
+            custom("greet"),
+            custom("list"),
+            custom("cache:clear"),
+            custom("db:seed"),
+            custom("send-report"),
+        ];
+        assert_eq!(shadowed(&commands), ["list", "cache:clear", "db:seed"]);
+        assert!(shadowed(&[custom("greet")]).is_empty());
+        assert!(shadowed(&[]).is_empty());
+
+        let text = shadowed_message("list");
+        assert!(text.contains("`list`"), "{text}");
+        assert!(text.contains("呼ばれません"), "{text}");
+        assert!(text.contains("app/Console/Commands/"), "{text}");
+    }
+
+    #[test]
+    fn コマンドの名前は表の中で重ならない() {
+        // 重なると、後ろのほうは決して選ばれない。
+        let mut names: Vec<&str> = BUILTINS
+            .iter()
+            .flat_map(|builtin| builtin.names.iter().copied())
+            .chain(crate::database::commands::COMMANDS.iter().map(|(n, _)| *n))
+            .chain(crate::commands::COMMANDS.iter().map(|(n, _)| *n))
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "同じ名前が 2 回出ている");
+        // どの名前も、フレームワークのコマンドとして見つかる。
+        for name in names {
+            assert!(builtin(name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn ヘルプは表から作る() {
+        let help = kernel_help();
+        // 表にあるものは、全部ヘルプに出る。
+        for builtin in BUILTINS {
+            assert!(help.contains(builtin.label), "{}", builtin.label);
+            assert!(help.contains(builtin.description), "{}", builtin.label);
+        }
+        // 桁は端末での幅でそろえる（名前の欄に日本語が入る）。
+        assert!(
+            help.contains("  (引数なし) / serve   HTTP サーバーを起動する\n"),
+            "{help}"
+        );
+        assert!(
+            help.contains("      --host <ホスト>  待ち受けるホスト"),
+            "{help}"
+        );
+        assert!(
+            help.contains("  route:list           登録されているルートを一覧にする\n"),
+            "{help}"
+        );
+        assert!(
+            help.contains("  --help               このヘルプを出す\n"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn 空の値やコメントだけの鍵は未設定と見る() {
+        // `.env` の読み込みでは、どれも空になる。以前は「設定済み」と見て書き込まなかった。
+        assert!(!app_key_is_set("APP_KEY=\n"));
+        assert!(!app_key_is_set("APP_KEY=\"\"\n"));
+        assert!(!app_key_is_set("APP_KEY=''\n"));
+        assert!(!app_key_is_set("APP_KEY= # 後で\n"));
+        assert!(!app_key_is_set("APP_KEY=#後で\n"));
+        assert!(!app_key_is_set("APP_KEY=\"   \"\n"));
+        assert!(!app_key_is_set("APP_NAME=myapp\n"), "行が無い");
+        assert!(!app_key_is_set(""));
+
+        assert!(app_key_is_set("APP_KEY=abc\n"));
+        assert!(app_key_is_set("APP_KEY=\"abc\"\n"));
+        assert!(app_key_is_set("export APP_KEY=abc # 本番用\n"));
+        assert!(app_key_is_set("APP_NAME=myapp\r\nAPP_KEY=abc\r\n"));
+
+        // 読み込みは先に出てきた行を採る。判定も同じ行を見る。
+        assert!(!app_key_is_set("APP_KEY=\nAPP_KEY=abc\n"));
+        assert!(app_key_is_set("APP_KEY=abc\nAPP_KEY=\n"));
+    }
+
+    #[test]
+    fn bomつきの1行目の鍵も見つける() {
+        // メモ帳が付ける BOM。見落とすと末尾に 2 行目を足し、空の 1 行目が勝つ。
+        let body = "\u{feff}APP_KEY=\nAPP_NAME=myapp\n";
+        assert_eq!(app_key_value("\u{feff}APP_KEY=abc"), Some("abc"));
+        let updated = write_app_key(body, "new");
+        assert_eq!(updated, "\u{feff}APP_KEY=new\nAPP_NAME=myapp\n");
+        assert_eq!(updated.matches("APP_KEY=").count(), 1);
+    }
+
+    /// テスト用の空ディレクトリ。
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bengara-kernel-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn envは一時ファイル経由で置き換える() {
+        let dir = temp_dir("replace");
+        let path = dir.join(".env");
+        std::fs::write(&path, "APP_NAME=myapp\nAPP_KEY=old\n").unwrap();
+
+        replace_file(&path, "APP_NAME=myapp\nAPP_KEY=new\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "APP_NAME=myapp\nAPP_KEY=new\n"
+        );
+
+        // 書きかけ（`.env.tmp.*`）が残らない。
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, [".env"], "残っている: {left:?}");
+
+        // 無いファイルは作らない（`key:generate` は先に `.env` の有無を確かめる）。
+        assert!(replace_file(&dir.join("無い"), "x").is_err());
+        assert!(!dir.join("無い").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 読み取り専用のenvには書かない() {
+        let dir = temp_dir("readonly");
+        let path = dir.join(".env");
+        std::fs::write(&path, "APP_KEY=old\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        // 置き換え（rename）は、読み取り専用でも通ってしまう OS がある。
+        // 直接書いていたころと同じく、書かずにエラーにする。
+        let error = replace_file(&path, "APP_KEY=new\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("読み取り専用"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "APP_KEY=old\n");
+
+        // 後片付けのために書ける状態へ戻す。
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&path, permissions);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offはログを止める指定として読む() {
+        use tracing::level_filters::LevelFilter;
+
+        // 以前は `off` が「読めない値」と同じ扱いで、既定の細かさに戻っていた。
+        assert_eq!(parse_level("off"), Some(LevelFilter::OFF));
+        assert_eq!(parse_level(" OFF "), Some(LevelFilter::OFF));
+        assert_eq!(parse_level("none"), Some(LevelFilter::OFF));
+        assert_eq!(max_level(Some("off"), "info"), LevelFilter::OFF);
+        assert_eq!(max_level(Some("off"), "debug"), LevelFilter::OFF);
+
+        // ほかの語はこれまでどおり。
+        assert_eq!(max_level(Some("warn"), "info"), LevelFilter::WARN);
+        assert_eq!(max_level(Some("TRACE"), "info"), LevelFilter::TRACE);
+        // 読めない値・空・指定なしは既定に落ちる。
+        assert_eq!(max_level(Some("myapp=debug"), "debug"), LevelFilter::DEBUG);
+        assert_eq!(max_level(Some(""), "info"), LevelFilter::INFO);
+        assert_eq!(max_level(None, "debug"), LevelFilter::DEBUG);
     }
 
     #[test]

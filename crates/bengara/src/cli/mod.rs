@@ -7,9 +7,11 @@ mod cargo_toml;
 mod init;
 mod serve;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
+use self::cargo_toml::CargoToml;
 use crate::error::{Error, Result};
 
 /// `init` の前の入口（`fn main() { bengara::run() }`）の中身。
@@ -18,8 +20,8 @@ pub(crate) fn run_before_init() {
     let command = args.first().map(String::as_str).unwrap_or("");
     let result = match command {
         "init" => init::run(&project_root()),
-        "--version" | "-V" | "version" => {
-            println!("bengara {}", env!("CARGO_PKG_VERSION"));
+        name if is_version(name) => {
+            print_version();
             Ok(())
         }
         _ => {
@@ -43,15 +45,17 @@ pub(crate) fn artisan() {
     };
 
     let result = match command {
-        "list" | "help" | "--help" | "-h" => {
+        name if is_help(name) => {
             print_artisan_help();
             // 実行時のコマンドは本体しか知らない（自作コマンドを含む）。
             // Laravel の `artisan list` と同じく、全部を1画面で出す。
             delegate_list(&root);
             Ok(())
         }
-        "--version" | "-V" => {
-            println!("bengara {}", env!("CARGO_PKG_VERSION"));
+        // `version` も本体へ渡さずにここで答える。渡すと本体のビルドが要り、
+        // アプリが壊れているときに版も出せない。`init` の前の入口とも同じ扱いになる。
+        name if is_version(name) => {
+            print_version();
             Ok(())
         }
         "init" => init::run(&root),
@@ -105,23 +109,67 @@ fn delegate_list(root: &Path) {
 fn spawn_app(root: &Path, args: &[String], quiet: bool) -> Result<ExitStatus> {
     let cargo = cargo_command();
     let manifest = root.join("Cargo.toml");
+    // 読めないときは `--bin` を付けずに進む。cargo が同じファイルを読んで理由を出す。
+    let bin = CargoToml::load(&manifest).ok().and_then(|m| main_bin(&m));
     std::process::Command::new(&cargo)
         // `serve` と同じく、プロジェクトのルートで動かす。`--manifest-path` だけだと
         // 呼び出し元のカレントディレクトリが本体に渡ってしまう。
         .current_dir(root)
-        .arg("run")
-        .arg("-q")
-        .arg("--manifest-path")
-        .arg(&manifest)
+        .args(run_arguments(&manifest, bin.as_deref(), args))
         .stderr(if quiet {
             Stdio::null()
         } else {
             Stdio::inherit()
         })
-        .arg("--")
-        .args(args)
         .status()
         .map_err(|e| Error::msg(format!("{} を実行できません: {e}", cargo.display())))
+}
+
+/// 本体（`main.rs`）の bin の名前。`Cargo.toml` の `[[bin]]` から読みます。
+///
+/// `serve` のビルドと、本体への受け渡しの両方で使います。bin の名前は
+/// パッケージ名と同じとは限りません（`[[bin]] name = "server" path = "main.rs"`）。
+pub(crate) fn main_bin(manifest: &CargoToml) -> Option<String> {
+    manifest.bin_name_for_path("main.rs")
+}
+
+/// 本体を動かす `cargo run` の引数。
+///
+/// bin の名前が分かっているときは `--bin` で名指しします。`default-run` に頼ると、
+/// それを書いていないプロジェクト（`init` は bin の名前がパッケージ名と違うとき
+/// 書きません）で、cargo が「どの bin か決められない」と言って止まります。
+/// bin は `artisan` と本体の2つが必ずあるためです。
+///
+/// 分からないとき（`main.rs` の `[[bin]]` が無い）は付けません。今までどおり
+/// cargo の決め方に任せます。
+fn run_arguments(manifest: &Path, bin: Option<&str>, args: &[String]) -> Vec<OsString> {
+    let mut out: Vec<OsString> = vec!["run".into(), "-q".into()];
+    out.push("--manifest-path".into());
+    out.push(manifest.into());
+    if let Some(bin) = bin {
+        out.push("--bin".into());
+        out.push(bin.into());
+    }
+    out.push("--".into());
+    out.extend(args.iter().map(OsString::from));
+    out
+}
+
+/// 版を聞く言葉か。2つの入口（`init` の前と `artisan`）で同じ一覧を使います。
+fn is_version(command: &str) -> bool {
+    matches!(command, "--version" | "-V" | "version")
+}
+
+/// 一覧（ヘルプ）を聞く言葉か。2つの入口で同じ一覧を使います。
+///
+/// 以前は入口ごとに別々に書いていたので、`init` の前の入口だけ `-h` と `list` を
+/// 知らず、「`-h` はまだ使えません」と答えていました。
+fn is_help(command: &str) -> bool {
+    matches!(command, "list" | "help" | "--help" | "-h")
+}
+
+fn print_version() {
+    println!("bengara {}", env!("CARGO_PKG_VERSION"));
 }
 
 /// 実行中の cargo のパス。同じツールチェーンを使うためです。
@@ -143,7 +191,8 @@ pub(crate) fn version_requirement() -> String {
 }
 
 fn print_before_init_help(command: &str) {
-    if !command.is_empty() && command != "help" && command != "--help" {
+    // 一覧を聞いただけのとき（`-h` や `list`）は、叱らずに案内だけ出す。
+    if !command.is_empty() && !is_help(command) {
         eprintln!("`{command}` はまだ使えません。先に init を実行してください。\n");
     }
     println!(
@@ -180,4 +229,78 @@ bengara {version} — cargo artisan
 ",
         version = env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn 本体への受け渡しはbinを名指しする() {
+        // `default-run` が無くても動くように、`--bin` を付ける。
+        let args = run_arguments(
+            Path::new("Cargo.toml"),
+            Some("server"),
+            &["migrate".to_string(), "--force".to_string()],
+        );
+        assert_eq!(
+            strings(&args),
+            [
+                "run",
+                "-q",
+                "--manifest-path",
+                "Cargo.toml",
+                "--bin",
+                "server",
+                "--",
+                "migrate",
+                "--force"
+            ]
+        );
+    }
+
+    #[test]
+    fn binが分からないときは名指ししない() {
+        // 今までどおり cargo の決め方（`default-run`）に任せる。
+        let args = run_arguments(Path::new("Cargo.toml"), None, &["list".to_string()]);
+        assert_eq!(
+            strings(&args),
+            ["run", "-q", "--manifest-path", "Cargo.toml", "--", "list"]
+        );
+    }
+
+    #[test]
+    fn 本体のbinの名前はmain_rsのbinから読む() {
+        let manifest = CargoToml::load_for_test(
+            "[package]\nname = \"myapp\"\n\n[[bin]]\nname = \"server\"\npath = \"main.rs\"\n\n\
+             [[bin]]\nname = \"artisan\"\npath = \"artisan.rs\"\n",
+        );
+        assert_eq!(main_bin(&manifest).as_deref(), Some("server"));
+        // `init` の前（`[[bin]]` が無い）は分からない。
+        let manifest = CargoToml::load_for_test("[package]\nname = \"myapp\"\n");
+        assert_eq!(main_bin(&manifest), None);
+    }
+
+    #[test]
+    fn 版と一覧の言葉は2つの入口で同じ() {
+        for word in ["--version", "-V", "version"] {
+            assert!(is_version(word), "{word}");
+            assert!(!is_help(word), "{word}");
+        }
+        // `-h` と `list` も一覧として扱う。以前は `init` の前の入口が
+        // 「`-h` はまだ使えません」と答えていた。
+        for word in ["list", "help", "--help", "-h"] {
+            assert!(is_help(word), "{word}");
+            assert!(!is_version(word), "{word}");
+        }
+        for word in ["", "serve", "init", "migrate", "-v"] {
+            assert!(!is_help(word) && !is_version(word), "{word}");
+        }
+    }
 }

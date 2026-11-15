@@ -111,10 +111,7 @@ pub(crate) fn log_paths() {
     let storage = crate::paths::storage_root();
     tracing::info!("storage {}", storage.display());
     if !storage.is_dir() {
-        tracing::warn!(
-            "{} がありません。`cargo artisan storage:init` を実行してください",
-            storage.display()
-        );
+        tracing::warn!("{}", crate::paths::missing_storage_message(storage));
     }
 }
 
@@ -127,6 +124,15 @@ mod tests {
         let root = Path::new("/tmp/storage");
         assert_eq!(join(root, "app"), root.join("app"));
         assert_eq!(join(root, "framework/cache"), root.join("framework/cache"));
+    }
+
+    #[test]
+    fn storageが無いときの案内は本番でも打てる形にする() {
+        let text = crate::paths::missing_storage_message(Path::new("/opt/myapp/storage"));
+        assert!(text.contains("がありません"), "{text}");
+        assert!(text.contains("storage:init"), "{text}");
+        // 以前は `cargo artisan storage:init` だけで、本番（cargo が無い）で打てなかった。
+        assert!(text.contains("./<実行ファイル> storage:init"), "{text}");
     }
 
     #[test]

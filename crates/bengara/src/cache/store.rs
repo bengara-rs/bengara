@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::support::fs::{write_atomic, Access};
 use crate::support::lock::{is_stale, FileLock};
 use crate::support::time;
+use crate::support::MEMORY_GC_EVERY;
 
 /// キャッシュの置き場所。
 ///
@@ -217,10 +219,7 @@ impl FileCache {
         // storage/ そのものが無いなら、作らずに知らせる（決定記録 #023）。
         let storage = crate::paths::storage_path("");
         if !storage.is_dir() {
-            return Err(Error::msg(format!(
-                "{} がありません。デプロイのときに storage/ を作ってください",
-                storage.display()
-            )));
+            return Err(Error::msg(crate::paths::missing_storage_message(&storage)));
         }
         std::fs::create_dir_all(&self.dir)?;
         Ok(())
@@ -233,24 +232,23 @@ impl CacheStore for FileCache {
         let path = self.path_of(key);
         // 書いている途中の中身を読まれないよう、別の名前で書いてから置き換える。
         let temp = self.temp_path_of(key);
-        std::fs::write(&temp, Entry::encode(value, seconds))?;
-        // Windows では別のプロセスが開いている瞬間に失敗するので、少し待ってやり直す。
-        if let Err(e) = crate::session::rename_with_retry(&temp, &path) {
-            // 置き換えに失敗したら、書きかけを残さない。
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::Io(e));
-        }
+        // Windows の「使用中」のやり直しと、失敗時の片付けは `write_atomic` が持ちます。
+        let body = Entry::encode(value, seconds);
+        write_atomic(&temp, &path, body.as_bytes(), Access::Default)?;
         Ok(())
     }
 
     fn get(&self, key: &str) -> Result<Option<String>> {
         let path = self.path_of(key);
         let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
+            Ok(raw) => Some(raw),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // UTF-8 でない中身。`put` は文字列しか書かないので、これも壊れたファイルです。
+            // エラーで返すと、`has` は「無い」と答えるのに `get` だけ 500 になりました。
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => None,
             Err(e) => return Err(Error::Io(e)),
         };
-        let Some(entry) = Entry::decode(&raw) else {
+        let Some(entry) = raw.as_deref().and_then(Entry::decode) else {
             // 壊れていたら無かったことにする。落とすほどのことではない。
             tracing::warn!("キャッシュのファイルを読めませんでした: {}", path.display());
             let _ = std::fs::remove_file(&path);
@@ -383,7 +381,7 @@ impl CacheStore for MemoryCache {
     fn put(&self, key: &str, value: &str, seconds: Option<u64>) -> Result<()> {
         let mut entries = self.lock();
         let n = self.writes.fetch_add(1, Ordering::Relaxed);
-        if n % crate::session::MEMORY_GC_EVERY == crate::session::MEMORY_GC_EVERY - 1 {
+        if n % MEMORY_GC_EVERY == MEMORY_GC_EVERY - 1 {
             Self::collect_expired(&mut entries);
         }
         entries.insert(key.to_string(), Entry::encode(value, seconds));
@@ -486,7 +484,10 @@ fn read_expires_at(path: &Path) -> Option<i64> {
     std::str::from_utf8(&head[..end]).ok()?.trim().parse().ok()
 }
 
-/// 期限切れのファイルを消す。
+/// 期限切れのファイルを消して、消した件数を返す。
+///
+/// 壊れたファイルも期限切れとして数えます。古い一時ファイル（書き込みに
+/// 失敗した残骸）は消しますが、件数には入れません。
 ///
 /// 呼び出し元は [`FileCache::prune`]（`cache:prune`）だけです。
 /// `cache:clear` は `flush()` を通るので、ここは通りません。
@@ -505,8 +506,11 @@ fn sweep_expired(dir: &Path) -> Result<usize> {
         if is_temp_path(&path) {
             // 書き込み中かもしれないので**読まない**。十分古いものだけ残骸として消す。
             // 読んで「壊れている」と判断して消すと、向こうの `rename` が失敗します。
-            if is_stale(&path, TEMP_STALE_SECS) && std::fs::remove_file(&path).is_ok() {
-                removed += 1;
+            //
+            // **件数には入れません。** `cache:prune` は「期限切れのキャッシュを n 件」と
+            // 出すので、書き込みに失敗した残骸を混ぜると数が合いません。
+            if is_stale(&path, TEMP_STALE_SECS) {
+                let _ = std::fs::remove_file(&path);
             }
             continue;
         }
@@ -728,6 +732,68 @@ mod tests {
         assert!(std::fs::read_dir(&dir).unwrap().flatten().count() == 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf8でない中身も壊れたファイルとして消す() {
+        let dir = temp_dir("getinvalid");
+        let store = FileCache::new(&dir);
+
+        // 期限の部分から UTF-8 でない。`has` は「無い」と答える。
+        std::fs::write(store.path_of("bad"), [0xff, 0xfe, b'|', 0xff]).unwrap();
+        assert!(!store.has("bad").unwrap(), "`has` は無いと答える");
+
+        // 以前は `Err(Io)` が返り、リクエストが 500 になっていた。
+        assert_eq!(store.get("bad").unwrap(), None, "`get` も無いと答える");
+        assert!(!store.path_of("bad").exists(), "壊れたファイルは消す");
+
+        // 値だけが UTF-8 でないものも、読めないので同じ扱い。
+        std::fs::write(store.path_of("half"), [b'0', b'|', 0xff, 0xfe]).unwrap();
+        assert_eq!(store.get("half").unwrap(), None);
+        assert!(!store.path_of("half").exists());
+
+        // 消えたあとは普通に書ける。
+        store.put("bad", "値", None).unwrap();
+        assert_eq!(store.get("bad").unwrap().as_deref(), Some("値"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 掃除の件数に古い一時ファイルを混ぜない() {
+        let dir = temp_dir("prunetemp");
+        let store = FileCache::new(&dir);
+
+        store.put("gone", "1", Some(0)).unwrap();
+        // 書き込みに失敗した残骸。更新時刻を十分古くする。
+        let stale = store.temp_path_of("key");
+        std::fs::write(&stale, "残骸").unwrap();
+        let old =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(TEMP_STALE_SECS + 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        // 以前は 2 件と数え、「期限切れのキャッシュを 2 件」と出していた。
+        assert_eq!(sweep_expired(&dir).unwrap(), 1, "期限切れの 1 件だけ数える");
+        assert!(!stale.exists(), "残骸は消す");
+        assert!(!store.path_of("gone").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storageが無いときの案内はコマンドの呼び方を言う() {
+        // `Storage`（`storage.rs`）と同じ文。開発と本番の両方の呼び方を言う。
+        // 以前は「デプロイのときに storage/ を作ってください」だけだった。
+        let text = crate::paths::missing_storage_message(Path::new("/srv/app/storage"));
+        assert!(text.contains("がありません"), "{text}");
+        assert!(text.contains("cargo artisan storage:init"), "{text}");
+        assert!(text.contains("./<実行ファイル> storage:init"), "{text}");
+        assert!(text.ends_with("を実行してください"), "{text}");
     }
 
     #[test]
@@ -953,7 +1019,7 @@ mod tests {
     #[test]
     fn メモリの置き場所は期限切れをまとめて落とす() {
         let store = MemoryCache::new();
-        let every = crate::session::MEMORY_GC_EVERY;
+        let every = MEMORY_GC_EVERY;
         for i in 0..every {
             // 秒 0 はその場で期限切れ。読まなければ残り続けていた。
             store.put(&format!("k{i}"), "v", Some(0)).unwrap();

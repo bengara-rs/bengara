@@ -15,13 +15,13 @@ authors.workspace = true
 default = ["log-filter"]
 # RUST_LOG による細かい絞り込み（`RUST_LOG=myapp=debug` のような書き方）。
 # 外すと依存クレートが3つ減り（matchers / regex-automata / regex-syntax）、
-# RUST_LOG は trace/debug/info/warn/error の1語だけになる。
+# RUST_LOG は trace/debug/info/warn/error/off の1語だけになる。
 log-filter = ["tracing-subscriber/env-filter"]
 
 # データベース。既定では入りません。使うドライバを利用者が選びます。
 #   bengara = { version = "0.1", features = ["sqlite"] }
 # フラグが無いときも database モジュールはコンパイルされ、実際に接続しようとした
-# ときだけ「features = ["sqlite"] を付けてください」というエラーになります。
+# ときだけ「features に "sqlite" を足してください」というエラーになります。
 sqlite = ["database", "sqlx/sqlite"]
 # MySQL と MariaDB。同じドライバで両方につながります。
 # 日付の列を読むために sqlx/time、JSON の列のために sqlx/json を使います。
@@ -54,7 +54,7 @@ encryption = ["chacha20poly1305"]
 
 # SMTP でメールを送る。既定では入りません。
 # フラグが無いときも mail モジュールはコンパイルされ、MAIL_DRIVER=smtp に
-# したときだけ「features = ["mail"] を付けてください」というエラーになります。
+# したときだけ「features に "mail" を足してください」というエラーになります。
 mail = ["lettre"]
 
 [dependencies]

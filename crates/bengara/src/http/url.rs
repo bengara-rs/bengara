@@ -78,7 +78,7 @@ pub fn temporary_signed_url(
 ) -> Result<String> {
     // 足し算はあふれない形にする。`u64::MAX` 秒を渡されても、デバッグでパニックせず、
     // リリースで巻き戻って「作った瞬間に期限切れ」の URL にもならない。
-    let expires = now().saturating_add(valid_for_secs);
+    let expires = crate::support::time::now_seconds_u64().saturating_add(valid_for_secs);
     build_signed(path, params, Some(expires))
 }
 
@@ -184,7 +184,7 @@ fn verify_signature(key: &[u8], path: &str, pairs: &[(String, String)], given: &
     // 期限が入っていれば、まず時間を見る。
     if let Some((_, expires)) = pairs.iter().find(|(k, _)| k == EXPIRES) {
         match expires.parse::<u64>() {
-            Ok(expires) if expires > now() => {}
+            Ok(expires) if expires > crate::support::time::now_seconds_u64() => {}
             _ => return false,
         }
     }
@@ -255,13 +255,6 @@ fn encode(input: &str) -> String {
     super::percent::encode(input, super::percent::unreserved)
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +319,18 @@ mod tests {
             }
         }
         verify_signature(KEY, request_path, &pairs, &given)
+    }
+
+    #[test]
+    fn 非asciiの固定文字とパス引数が同じ区間でも署名が通る() {
+        // `Route::get("/記事-{id}", ..)` の登録パスは `/%E8%A8%98%E4%BA%8B-{id}`。
+        // `route_with` が埋めた結果は符号化済みなので、そのまま署名にでき、
+        // ブラウザが送る同じ形で確かめられる（登録・埋め込み・署名が食い違わない）。
+        let pattern = crate::http::routing::register_path("/記事-{id}");
+        assert_eq!(pattern, "/%E8%A8%98%E4%BA%8B-{id}");
+        let path = pattern.replace("{id}", "12");
+        assert!(check_signable_path(&path).is_ok());
+        assert!(roundtrip(&path));
     }
 
     #[test]

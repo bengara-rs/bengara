@@ -1,10 +1,11 @@
 # Laravel と違う点
 
-bengara は Laravel の構成と書き味に寄せています。ただし同じではありません。
-このページは対応表です。 **今あるものの範囲**での違いを挙げます。
-まだ無い機能は [backlog.md](backlog.md) にまとめてあります。
+Laravel から移ってきた人が、どこを考え直せばいいかが分かります。
+bengara は Laravel の構成と書き味に寄せていますが、同じではありません。
 
-表の「同じ」は、Laravel から移してきたときに考え直さなくていいところです。
+- このページは対応表です。**今あるものの範囲**での違いを挙げます。
+- 表の「同じ」は、考え直さなくていいところです。
+- まだ無い機能は [backlog.md](backlog.md) にまとめてあります。
 
 ## 置き場所と参照
 
@@ -20,14 +21,19 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 
 ## コマンド
 
-| Laravel                              | bengara                                                       |
-|--------------------------------------|---------------------------------------------------------------|
-| `php artisan ...`                    | `cargo artisan ...`                                           |
-| `route:list`                         | 同じ                                                          |
-| `make:controller` などの生成コマンド | **ありません。** 基本的なコードは AI で生成できます            |
-| `serve` はビルド不要                 | ビルドしてから起動します。変更があれば作り直します            |
-| `serve` が見張る対象は広い           | `app` `bootstrap` `config` `database` `routes` `resources` の中だけ（`tests/` は見張りません）|
-| コマンドの旗は共通で緩い             | **旗はコマンドごとに分かれています。** 知らない旗はエラーです  |
+| Laravel                              | bengara                                                                  |
+|--------------------------------------|--------------------------------------------------------------------------|
+| `php artisan ...`                    | `cargo artisan ...`（本番は `./myapp ...`）                              |
+| `route:list`                         | 同じ                                                                     |
+| `make:controller` などの生成コマンド | **ありません。** 基本的なコードは AI で生成できます                      |
+| `serve` はビルド不要                 | ビルドしてから起動します。ソースが変わると作り直します                   |
+| コマンドの旗は共通で緩い             | **旗はコマンドごとに決まっています。** 知らない旗や余分な引数はエラーです |
+| フレームワークと同じ名前の自作コマンド | **フレームワークのコマンドが必ず先です。** 自作のほうは呼ばれず、警告が出ます |
+| `migrate --force`（本番で必要）      | `migrate` と `db:seed` は本番でも `--force` が要りません（付けても通ります） |
+| `migrate:fresh` などは本番で確認する | `--force` が無いと止まります。対象は 5 つです                            |
+| `schedule:run`                       | 同じ名前。**失敗が 1 件でもあれば終了コード 1** です                     |
+
+旗の一覧と `serve` が見張るものは [artisan.md](artisan.md) にあります。
 
 ## 設定
 
@@ -39,27 +45,29 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | 設定ファイルを本番に置く          | 設定はコードなので実行ファイルに入ります                     |
 | `config:cache` / `optimize`       | **要りません。** 起動時に組み立てて固定します                |
 | サービスコンテナ・プロバイダ      | ありません。設定は型をキーにした保管だけです                 |
-| ファサード                        | ありません。`use bengara::prelude::*;` の自由関数を使います  |
+| ファサード                        | ありません。`use bengara::prelude::*;` の関数を使います      |
 
 ## ルーティングと URL
 
-| Laravel                                             | bengara                                                                               |
-|-----------------------------------------------------|---------------------------------------------------------------------------------------|
-| `Route::get('/', [HomeController::class, 'index'])` | `Route::get("/", HomeController::index)`                                              |
-| `/posts/{post}`                                     | 同じ。末尾の全取りは `/files/{*path}`                                                 |
-| `route('posts.show', $post)`                        | `route_with("posts.show", &[("post", "12")])?` を使います                             |
-| 可変長引数が使える                                  | ありません。引数はスライスで渡します                                                  |
-| パスに無い引数はクエリになる                        | 同じ。`route_with("posts.index", &[("page", "2")])` は `/posts?page=2`                |
-| `route()` はパス引数をそのまま置く                  | **パーセント符号化します。** `/` も `%2F` になります                                  |
-| `Route::group` / `prefix`                           | `Route::prefix("admin").group(...)`。`name` の点は自分で書きます                      |
-| `Route::middleware(...)`                            | `Route::get(...).middleware("admin")` と後ろに付けます                                |
-| ルートの重複は後勝ち                                | **起動時にパニックします**（パスの重複、ルート名の重複）                              |
-| `URL::signedRoute(...)`                             | `signed_url("/unsubscribe", &[("user", "12")])?` — **ルート名ではなくパス**を渡します |
-| `$request->hasValidSignature()`                     | `has_valid_signature(&req)?`                                                          |
-| ミドルウェア `signed` が自動で止める                | **止まりません。** 自分で確かめて返し方を決めます                                     |
-| メソッドは大文字にそろえてから照合する              | **大文字小文字を区別します。** `get /x` は 405（`allow: GET, HEAD`）。`req.method()` も届いたままを返します |
-| 末尾の `/` は 301 で寄せる                          | **無視します。** `/posts` と `/posts/` は同じルートに当たります（署名付き URL も同じ規則） |
-| （Laravel には無い）                                | `signed_url()` は、URL にそのまま書けない文字（空白・`?`・`#`・`<`・`>`・`\`・非 ASCII など）を含むパスを断ります |
+| Laravel                                             | bengara                                                                |
+|-----------------------------------------------------|------------------------------------------------------------------------|
+| `Route::get('/', [HomeController::class, 'index'])` | `Route::get("/", HomeController::index)`                               |
+| `/posts/{post}`                                     | 同じ。末尾の全取りは `/files/{*path}`                                  |
+| `route('posts.show', $post)`                        | `route_with("posts.show", &[("post", "12")])?`                         |
+| 可変長引数が使える                                  | ありません。引数はスライスで渡します                                   |
+| パスに無い引数はクエリになる                        | 同じ。`route_with("posts.index", &[("page", "2")])` は `/posts?page=2` |
+| `route()` はパス引数をそのまま置く                  | **パーセント符号化します。** `/` も `%2F` になります                   |
+| `Route::group` / `prefix`                           | `Route::prefix("admin").group(...)`。`name` の点は自分で書きます       |
+| `Route::middleware(...)`                            | `Route::get(...).middleware("admin")` と後ろに付けます                 |
+| ルートの重複は後勝ち                                | **起動時にパニックします**（パスの重複、ルート名の重複）               |
+| `URL::signedRoute(...)`                             | `signed_url("/unsubscribe", &[("user", "12")])?`。**ルート名ではなくパス**を渡します |
+| `$request->hasValidSignature()`                     | `has_valid_signature(&req)?`                                           |
+| ミドルウェア `signed` が自動で止める                | **止まりません。** 自分で確かめて返し方を決めます                      |
+| メソッドは大文字にそろえてから照合する              | **大文字小文字を区別します。** `get /x` は 405 です                    |
+| 末尾の `/` は 301 で寄せる                          | **無視します。** `/posts` と `/posts/` は同じルートに当たります        |
+
+`signed_url()` は、URL にそのまま書けない文字（空白・`?`・`#`・非 ASCII など）を含むパスを断ります。
+くわしくは [routing.md](routing.md) にあります。
 
 ## コントローラとレスポンス
 
@@ -70,32 +78,34 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 |--------------------------------|------------------------------------------------------------------------------------------|
 | 引数の型からコンテナが注入する | **自動解決はありません。** 受け付ける形は上の 2 つだけです                               |
 | `Request` から何でも取れる     | メソッドは決まった一覧だけです（[requests-and-responses.md](requests-and-responses.md)） |
+| `$request->route('post')`      | `req.param("post")`。型を変えるなら `req.param_as::<i64>("post")?`                       |
+| パス引数の型が合わない         | `param_as` は **404** を返します。ルートに無い名前を書いたときは **500** です            |
 | `view("welcome")`              | **テンプレートはありません。** `html(...)` か JSON を返します                            |
-| `response()->json($data)`      | `json(&data)` — `Result<Response>`                                                       |
-| `redirect('/login')`           | `redirect().to("/login")` — `Result<Response>`                                           |
+| `response()->json($data)`      | `json(&data)`                                                                            |
+| `redirect('/login')`           | `redirect().to("/login")`                                                                |
 | 行き先の文字は検査しない       | **制御文字（改行など）が入っていると `Err` を返します**                                  |
 | `abort(403)`                   | `return abort(403);` と書きます                                                          |
-| 例外を投げる                   | `Err` を返します。`Error::Http` ならそのステータスです                                   |
+| 例外を投げる                   | `Err` を返します。状態コードを持つエラーならそのコードです                               |
 
 ## 入力とバリデーション
 
-| Laravel                                  | bengara                                                   |
-|------------------------------------------|-----------------------------------------------------------|
-| `$request->input('title')`               | `req.input("title")` — `Option<String>`                   |
-| `$request->validate([...])`              | `req.validate(&[("title", "required\|max:255")])?`        |
-| 規則は配列でも文字列でも書ける           | **文字列だけ**です                                        |
+| Laravel                                  | bengara                                                    |
+|------------------------------------------|------------------------------------------------------------|
+| `$request->input('title')`               | `req.input("title")`（`Option<String>`）                   |
+| `$request->validate([...])`              | `req.validate(&[("title", "required\|max:255")])?`         |
+| 規則は配列でも文字列でも書ける           | **文字列だけ**です                                         |
 | `TrimStrings` が値の前後の空白を落とす   | 同じ。落とさないのも同じ 3 つ（`current_password` / `password` / `password_confirmation`） |
-| 空白を落とすのは全部の入力               | **検査する値だけ**です。`req.input()` は落としません      |
-| `min` / `max` / `between` の決め方       | 同じ。`numeric` か `integer` が付いた項目だけ値で比べます |
-| 空文字の扱い                             | 同じ。飛ばすのは未送信のときと `nullable` のときだけです  |
-| `nullable` で飛ばした値はそのまま残る    | **空文字が入ります。** 来た値は残しません                 |
-| `alpha` 系は空文字を通す                 | **落とします**（`alpha` / `alpha_num` / `alpha_dash`）    |
-| `in:admin,user,` の末尾のカンマ          | 空の許可値は落とします。1 つも残らなければ **500**        |
-| 落ちると例外 → リダイレクトか JSON       | 落ちると `Error::Validation` → 422。`Accept` で分かれます |
-| `old('title')`                           | `req.session().old("title")`                              |
-| `regex:` / `unique:` / `exists:`         | ありません。`exists()` をクエリで書きます                 |
+| 空白を落とすのは全部の入力               | **検査する値だけ**です。`req.input()` は落としません       |
+| `min` / `max` / `between` の決め方       | 同じ。`numeric` か `integer` が付いた項目だけ値で比べます  |
+| 空文字の扱い                             | 同じ。飛ばすのは未送信のときと `nullable` のときだけです   |
+| `nullable` で飛ばした値はそのまま残る    | **空文字が入ります。** 来た値は残しません                  |
+| `alpha` 系は空文字を通す                 | **落とします**（`alpha` / `alpha_num` / `alpha_dash`）     |
+| `in:admin,user,` の末尾のカンマ          | 空の許可値は落とします。1 つも残らなければ **500**         |
+| 落ちると例外 → リダイレクトか JSON       | 落ちると 422。JSON を求めた相手には JSON で返します        |
+| `old('title')`                           | `req.session().old("title")`                               |
+| `regex:` / `unique:` / `exists:`         | ありません。`exists()` をクエリで書きます                  |
 | 重なりは `unique:` で止める              | 表の `unique` が砦です。`is_unique_violation` で見分けます |
-| フォームリクエスト（`StorePostRequest`） | ありません                                                |
+| フォームリクエスト（`StorePostRequest`） | ありません                                                 |
 
 くわしくは [validation.md](validation.md) にあります。
 
@@ -105,10 +115,11 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 |-------------------------------------------|------------------------------------------------------------|
 | `session(['k' => 'v'])`                   | `req.session().put("k", "v")`                              |
 | `session()->flash('k', 'v')`              | `req.session().flash("k", "v")`                            |
-| `SESSION_DRIVER=file`（既定）             | 同じ。`memory` も選べます（テスト用）                      |
+| `SESSION_DRIVER=file`                     | 同じ。`memory` も選べます（テスト用）                      |
 | 毎リクエスト保存して期限を延ばす          | **残りが半分を切ったときだけ**書き直します                 |
-| 同じ鍵の `put` と `flash` は後勝ち        | 同じ。`flash` を先に見ます                                 |
+| 同じ鍵の `put` と `flash` は後勝ち        | **書いた順に関係なく `flash` が読めます**                  |
 | Cookie は暗号化される                     | **署名だけ。** 中身はサーバー側に置きます                  |
+| ログアウトのあと新しいセッションを配る    | **Cookie を消します。** 空のセッションは作りません         |
 | `regenerate()` が CSRF トークンも作り直す | 同じ。ログイン前のトークンはログイン後に使えません         |
 | `@csrf` が隠しフィールドを出す            | テンプレートが無いので `req.csrf_token()` を自分で埋めます |
 | `X-CSRF-TOKEN` ヘッダー                   | 同じ                                                       |
@@ -117,70 +128,82 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | （Laravel には無い）                      | `except_route("api.*")` でルート名で外せます。**勧める形** |
 | `except` にまとめ書きする                 | **しないでください。** 外していいのは Cookie を使わない API だけです |
 
+`__` で始まる鍵は内部用です。自分の値には使わないでください（[session.md](session.md)）。
+
 ## ミドルウェア・エラー・回数の制限
 
-| Laravel                                 | bengara                                                   |
-|-----------------------------------------|-----------------------------------------------------------|
-| 共通のミドルウェアが 404 にも掛かる     | 同じ。ただしルートが無いときは CSRF を確かめません        |
-| `bootstrap/app.php` の `withExceptions` | `with_exceptions(\|e\| e.render(...))`                    |
-| `throttle:60,1`                         | `Throttle::from_spec("60,1")?` を `alias` に登録します    |
-| 制限はキャッシュで共有される            | **プロセスごとに数えます**（2 プロセスなら上限は約 2 倍） |
-| 数えるのは「人かアドレス」               | 同じ。ログイン中はその人、していなければ接続元のアドレス  |
-| 数える単位はルート                      | **ルート名**と組にします。名前が無いときだけパス           |
-| `X-Forwarded-For` を見る                | **下の行の相手からのものだけ**見ます                      |
-| `TrustProxies` ミドルウェア             | 環境変数 `TRUSTED_PROXIES`。範囲指定（CIDR）は書けません  |
-| 転送元は右端から探す                    | 同じ。読めない値は捨てます                                |
+| Laravel                                 | bengara                                                    |
+|-----------------------------------------|------------------------------------------------------------|
+| 共通のミドルウェアが 404 にも掛かる     | 同じ。静的ファイルにも掛かります                           |
+| （ルートに当たらないリクエスト）        | **CSRF を確かめません。セッションは読むだけ**です。flash も消費しません |
+| `bootstrap/app.php` の `withExceptions` | `with_exceptions(\|e\| e.render(...))`                     |
+| `throttle:60,1`                         | `Throttle::from_spec("60,1")?` を `alias` に登録します     |
+| 制限はキャッシュで共有される            | **プロセスごとに数えます**（2 プロセスなら上限は約 2 倍）  |
+| 数える相手は「人かアドレス」            | 同じ。ログイン中はその人、していなければ接続元のアドレス   |
+| 数える単位                              | **相手とルート名の組**です。名前が無ければ登録したパス（`/posts/{id}` の形） |
+| `X-Forwarded-For` を見る                | **下の行の相手からのものだけ**見ます                       |
+| `TrustProxies` ミドルウェア             | 環境変数 `TRUSTED_PROXIES`。範囲指定（CIDR）は書けません   |
+| 転送元は右端から探す                    | 同じ。読めない値は捨てます                                 |
+
+くわしくは [middleware.md](middleware.md) にあります。
 
 ## データベース
 
-| Laravel                                            | bengara                                                      |
-|----------------------------------------------------|--------------------------------------------------------------|
-| `DB::table('posts')->where('status', 'published')` | `DB::table("posts").where_("status", "published")`           |
-| `->where('views', '>', 100)`                       | `.where_op("views", ">", 100)`（引数の数では分けられません） |
-| `->where(function ($q) {...})`                     | `.where_group(\|q\| ...)`                                    |
-| `->orderBy()` に式を書ける                         | **列名は英数字と `_` `.` だけ。** 式は `order_by_raw` です   |
-| `->limit(1)->update([...])` が効く                 | **エラーになります。** 黙って全件に当てないためです          |
-| `->groupBy()` ＋ `->count()`                       | **グループの数**を返します                                   |
-| `->groupBy()` ＋ `->sum()` など                    | **併用できません**（エラー）                                 |
-| `->increment('views')`                             | `.increment("views", 1)`（量は必ず書きます）                 |
-| `->paginate(15)` が `?page=` を見る                | `.paginate(15, req.page())`（**引数で渡します**）            |
-| `->get()` が Collection を返す                     | `.get().await?` が `Vec<Row>` を返します                     |
-| `$row->title`                                      | `row.get::<String>("title")?`                                |
-| `DB::transaction(fn () => ...)`                    | `let tx = DB::begin().await?;` … `tx.commit().await?;`       |
+| Laravel                                            | bengara                                                       |
+|----------------------------------------------------|---------------------------------------------------------------|
+| `DB::table('posts')->where('status', 'published')` | `DB::table("posts").where_("status", "published")`            |
+| `->where('views', '>', 100)`                       | `.where_op("views", ">", 100)`（引数の数では分けられません）  |
+| `->where('deleted_at', null)` は `is null`         | 同じ。`.where_("deleted_at", None::<String>)` は `is null` です |
+| `->where(function ($q) {...})`                     | `.where_group(\|q\| ...)`                                     |
+| `->orderBy()` に式を書ける                         | **列名は英数字と `_` `.` だけ。** 式は `order_by_raw` です    |
+| `->limit(1)->update([...])` が効く                 | **エラーになります。** 黙って全件に当てないためです           |
+| `->groupBy()` ＋ `->count()`                       | **グループの数**を返します                                    |
+| `->groupBy()` ＋ `->sum()` など                    | **併用できません**（エラー）                                  |
+| `->increment('views')`                             | `.increment("views", 1)`（量は必ず書きます）                  |
+| `->paginate(15)` が `?page=` を見る                | `.paginate(15, req.page())`（**引数で渡します**）             |
+| `->get()` が Collection を返す                     | `.get().await?` が `Vec<Row>` を返します                      |
+| `$row->title`                                      | `row.get::<String>("title")?`                                 |
+| `DB::transaction(fn () => ...)`                    | `let tx = DB::begin().await?;` … `tx.commit().await?;`        |
 | MySQL / PostgreSQL / SQLite / SQL Server           | **SQL Server 以外**（機能フラグ `sqlite` / `mysql` / `postgres`） |
-| `$table->timestamp('at')` が PostgreSQL で `timestamp`  | PostgreSQL では **`text` 列**になります（日時は文字列のため）  |
-| `decimal` の値が文字列で返る                       | MySQL / PostgreSQL では `Value::Text`。末尾の 0 は落ちます    |
-| `decimal` に文字列を渡して書ける                   | **読みと書きが非対称です。** 書くときは数（`Value::Float` / `Int`）を渡します。PostgreSQL は文字列を受け取りません。桁を落とさず書くなら `DB::statement` で `$1::numeric`（ビルダーの `*_raw` は PostgreSQL で `$` を断ります） |
+| `$table->timestamp('at')` が PostgreSQL で `timestamp` | PostgreSQL では **`text` 列**になります（日時は文字列のため） |
+| `decimal` の値が文字列で返る                       | MySQL / PostgreSQL では文字列（`Value::Text`）。末尾の 0 は落ちます |
+| `decimal` に文字列を渡して書ける                   | **書くときは数を渡します。** 読みと書きが非対称です（下の注） |
 | MySQL の `$table->float()` は 4 バイト             | **どのドライバでも 8 バイト**です（MySQL は `float(53)`）     |
-| `charset` / `collation` の指定                      | **ありません。** サーバの既定に従います                       |
-| 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作ります |
+| `charset` / `collation` の指定                     | **ありません。** サーバの既定に従います                       |
+| 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作ります  |
 
-`update` / `delete` / `truncate` に付けられない指定の一覧は、
-[database.md](database.md) の「できないこと・エラーになること」にあります。
+- `is` / `is not` に渡せるのは `NULL` だけです。値を比べるなら `=` / `!=` を使います。
+- PostgreSQL は `decimal` の列に文字列を受け取りません。桁を落とさず書くなら、`DB::statement` で
+  `$1::numeric` と書きます。クエリビルダの生の式（`*_raw`）は、PostgreSQL で `$` を断ります。
+- `update` / `delete` / `truncate` に付けられない指定の一覧は、
+  [database.md](database.md) の「できないこと・エラーになること」にあります。
 
 ## モデルとマイグレーション
 
-| Laravel                                    | bengara                                                           |
-|--------------------------------------------|-------------------------------------------------------------------|
-| `class Post extends Model`                 | `#[derive(Model)]` ＋ `#[model(table = "posts")]`                 |
-| 表の名前はクラス名から推測                 | **書きます。** 推測しません                                       |
-| `$keyType = 'string'`（文字列の主キー）    | **使えません**（コンパイルエラー）。`Model` を手で実装します      |
-| `$post->comments` で自動的に読む           | `post.comments().get().await?`（遅延ロードはありません）          |
-| `with('comments')` でまとめ読み            | `where_in` で 2 回に分けます                                      |
-| `Post::create([...])`                      | 構造体を作って `post.save().await?`                               |
-| `save()` が 0 件の更新でも成功を返す       | **`Err` になります。** 書き込みが静かに消えないようにしています    |
-| `save()` は変わった属性だけを書く          | **更新のときは `created_at` 以外の全列を書き戻します**（下の節）   |
-| `$table->dropIndex(['user_id'])`           | `Schema::drop_index("posts", &["user_id"])`。名前で消すなら `Schema::drop_index_named(表, 名前)` |
-| `DB::transaction` の中で `$model->save()`  | `post.save_using(&tx).await?` を使います                          |
-| `$casts` で型を変える                      | 構造体の宣言がそのまま型です                                      |
-| `Post::factory()->count(3)->create()`      | `database/factories/` のただの関数                                |
-| `up()` / `down()` は `Schema::create(...)` | 同じ。ただし**同期の関数**です                                    |
-| `$table->string('title')->change()`        | **ありません**（SQLite が苦手なため）                             |
-| `php artisan migrate`                      | `cargo artisan migrate`（本番は `./myapp migrate`）               |
+| Laravel                                    | bengara                                                          |
+|--------------------------------------------|------------------------------------------------------------------|
+| `class Post extends Model`                 | `#[derive(Model)]` ＋ `#[model(table = "posts")]`                |
+| 表の名前はクラス名から推測                 | **書きます。** 推測しません                                      |
+| `$keyType = 'string'`（文字列の主キー）    | **使えません**（コンパイルエラー）。`Model` を手で実装します     |
+| `/posts/abc` で整数の主キーを引く          | **問い合わせずに「無い」**として扱います（`req.model` は 404）   |
+| `$post->comments` で自動的に読む           | `post.comments().get().await?`（遅延ロードはありません）         |
+| `with('comments')` でまとめ読み            | `where_in` で 2 回に分けます                                     |
+| `Post::create([...])`                      | 構造体を作って `post.save().await?`                              |
+| `save()` が 0 件の更新でも成功を返す       | **`Err` になります。** 書き込みが静かに消えないようにしています  |
+| `save()` は変わった属性だけを書く          | **更新のときは `created_at` 以外の全列を書き戻します**（下の注） |
+| `DB::transaction` の中で `$model->save()`  | `post.save_using(&tx).await?` を使います                         |
+| `$casts` で型を変える                      | 構造体の宣言がそのまま型です                                     |
+| `Post::factory()->count(3)->create()`      | `database/factories/` のただの関数                               |
+| `up()` / `down()` は `Schema::create(...)` | 同じ。ただし**同期の関数**です                                   |
+| `->unique()` の索引は `users_email_unique` | 同じ名前です。作るときも、後から足すときも同じです               |
+| `$table->dropUnique(['email'])`            | `Schema::drop_unique("users", &["email"])`                       |
+| `$table->dropIndex(['user_id'])`           | `Schema::drop_index("posts", &["user_id"])`。名前で消すなら `drop_index_named` |
+| `$table->string('title')->change()`        | **ありません**（SQLite が苦手なため）                            |
+| `php artisan migrate`                      | `cargo artisan migrate`（本番は `./myapp migrate`）              |
+| シーダーを `--database=` の接続に流す      | **既定の接続だけ**です。別の接続を指すとエラーになります         |
 
-**`save()` の書き戻しは Laravel と大きく違います。** Laravel は変わった属性だけを
-書きますが、bengara は **`created_at` 以外の全列**を書き戻すので、読んでから別の場所で
-増えた列（`views` など）は古い値に巻き戻ります。変える列だけを書きたいときは
+**`save()` の書き戻しは Laravel と大きく違います。** 読んでから別の場所で増えた列
+（`views` など）は、古い値に巻き戻ります。変える列だけを書きたいときは
 クエリビルダを使ってください（[models.md](models.md)）。
 
 ## 認証と認可
@@ -196,6 +219,8 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `Auth::logoutOtherDevices($password)`              | `req.auth().logout_other_devices_async().await?`。パスワードの確認は自分で行います |
 | （利用者を指定して切る口は無い）                   | `logout_all_devices()` / `logout_user(id)` があります                     |
 | `auth` ミドルウェア                                | `Authenticate::new()` を `alias("auth", ..)` で登録します                 |
+| `auth` が元の URL を覚える（GET のときだけ）       | 同じ。覚えるのは `GET` と `HEAD` のときだけです                           |
+| `redirect()->intended('/')`                        | `req.session().intended()` を読んで、自分で転送します                     |
 | `class User extends Authenticatable`               | `#[derive(Model)]` ＋ `impl Authenticatable`                              |
 | remember me の Cookie                              | **ありません**                                                            |
 | 複数の guard                                       | **ありません。** セッション 1 本です                                      |
@@ -209,15 +234,16 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 
 ## テスト
 
-| Laravel                         | bengara                                                              |
-|---------------------------------|----------------------------------------------------------------------|
-| `php artisan test` / PHPUnit    | `cargo test`                                                         |
-| `phpunit.xml` がテストの場所を決める | `Cargo.toml` に `autotests = false`（`init` が書きます）。置き場所は `tests/Feature/` と `tests/Unit/` |
-| `$this->get('/')->assertOk()`   | `get("/").await.assert_ok()`                                         |
-| トレイトを使う宣言が必要        | `#[bengara::test]` が道具を注入します。`use` は不要です              |
-| `RefreshDatabase` トレイト      | `let db = refresh_database().await;`                                 |
-| `$this->seed()`                 | `seed_database(&db).await;`（`refresh_database()` の戻りを渡します） |
-| HTTP サーバーを立てる構成もある | ソケットを開きません。接続元は `127.0.0.1` 扱いです                  |
+| Laravel                              | bengara                                                              |
+|--------------------------------------|----------------------------------------------------------------------|
+| `php artisan test` / PHPUnit         | `cargo test`                                                         |
+| `phpunit.xml` がテストの場所を決める | 置き場所は `tests/Feature/` と `tests/Unit/` です（`init` が設定します） |
+| `$this->get('/')->assertOk()`        | `get("/").await.assert_ok()`                                         |
+| トレイトを使う宣言が必要             | `#[bengara::test]` が道具を注入します。`use` は不要です              |
+| `RefreshDatabase` トレイト           | `let db = refresh_database().await;`                                 |
+| `$this->seed()`                      | `seed_database(&db).await;`（`refresh_database()` の戻りを渡します） |
+| `$response->json()`                  | `res.json()`。**JSON でない本文はパニックします**                    |
+| HTTP サーバーを立てる構成もある      | ソケットを開きません。接続元は `127.0.0.1` 扱いです                  |
 
 ## 周辺の機能
 
@@ -226,21 +252,26 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `Cache::remember('k', 60, fn() => ...)`   | `Cache::remember("k", 60, \|\| async { ... }).await?`                    |
 | `Cache::increment` が期限を引き継ぐ       | **引き継ぎません。** 期限なしで書き直します                              |
 | `Cache::tags([...])`                      | ありません。鍵に頭を付けます                                             |
-| 鍵が `user:1` のようにコロンを含む        | 動きますが、**ファイル名はハッシュ**になります（`:` を含む鍵、大文字を含む鍵が対象） |
+| 鍵が `user:1` のようにコロンを含む        | 動きますが、**ファイル名はハッシュ**になります                           |
 | （期限切れの掃除コマンドは無い）          | `Cache::prune()` と `cargo artisan cache:prune`                          |
 | `Storage::disk('s3')`                     | `storage/` の下だけです。S3 はありません                                 |
 | `Storage::url($path)` / `storage:link`    | ありません。`/storage/` ＋ パスを組み立てます                            |
 | ジョブのクラス＋`SendWelcome::dispatch()` | `app/Jobs/SendWelcome.rs` の関数＋`Queue::push("SendWelcome", &payload)` |
 | `$job->handle()` に型つきの引数           | `handle(payload: String)` の 1 つだけです                                |
-| `config/queue.php` の `retry_after`       | `cargo artisan queue:work --retry-after=`（既定 90 秒）。設定ファイルはありません |
+| `->onQueue()` / `->delay()`               | `Queue::push_on` / `Queue::later` / `Queue::later_on`                    |
+| `config/queue.php` の `retry_after`       | `queue:work --retry-after=`（既定 90 秒）。設定ファイルはありません      |
+| `queue:work --timeout=60`                 | 同じ既定です。`0` は無制限です                                           |
+| 時間切れでワーカーごと落とす              | **そのジョブだけを失敗にします。** ワーカーは次へ進みます                |
+| ジョブごとの `$timeout`                   | ありません。ワーカー単位だけです                                         |
 | `Redis` のキュー・キャッシュ              | ありません。キューは DB、キャッシュはファイルです                        |
 | `->everyMinute()` / `->cron('0 3 * * 1')` | `Every::Minute` などの列挙。cron の式は読みません                        |
 | 間隔は分の頭で判定する                    | 前回から数えます。**30 秒の遅れは許します**（間隔が 1 分以上のとき）     |
 | `schedule:work`                           | ありません。cron から `schedule:run` を 1 分ごとに呼びます               |
 | 前回の実行時刻はキャッシュに置く          | `storage/framework/schedule/` のファイルに置きます                       |
 | イベントクラス＋`EventServiceProvider`    | 名前は文字列。登録は `bootstrap/app.rs` の `with_events`                 |
+| 聞く側の例外は呼び元まで届く              | 同じ。404 や 422 のエラーは、そのままの状態コードで返ります              |
 | `Mail::to(...)->send(new WelcomeMail)`    | `Mail::to(..).subject(..).text(..).send().await?`                        |
-| SMTP での送信                             | **あります**（機能フラグ `mail`）。ほかに `log` と `array`                |
+| SMTP での送信                             | **あります**（機能フラグ `mail`）。ほかに `log` と `array`               |
 | `Notification`                            | 作りません。`Mail` を直接使います                                        |
 | `__('messages.welcome')`                  | 同じ名前（`__`）。`:name` の差し替えは `__with`                          |
 | `App::setLocale()`                        | `Lang::set`（プロセス全体）。リクエストごとに変えるなら `Lang::with`     |
@@ -248,6 +279,8 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `trans_choice`（複数形）                  | ありません。鍵を分けます                                                 |
 | `make:command` ＋ `$signature`            | `app/Console/Commands/*.rs` に `DESCRIPTION` と `handle`                 |
 | コマンド名は自分で書く                    | ファイル名から作ります。使える文字は英数字と `_` `-` だけ                |
+
+時間切れで止められるのは、非同期の待ちで固まったジョブだけです（[queue.md](queue.md)）。
 
 ## パスを返す関数
 
@@ -271,9 +304,11 @@ bengara は Laravel の構成と書き味に寄せています。ただし同じ
 | `php artisan optimize`                   | **要りません。** 設定は起動時に固定されます                     |
 | php-fpm のプロセス管理                   | 自分で 2 プロセス起動し、前段で振り分けます                     |
 | `composer install --no-dev`              | 要りません。実行ファイル 1 つです                               |
-| `storage/` を手で `mkdir`                | `cargo artisan storage:init`（**起動時には作りません**）        |
+| `storage/` を手で `mkdir`                | `./myapp storage:init`（**起動時には作りません**）              |
 | `migrate` の同時実行                     | **後から来たほうが止まります**（`migration_locks` 表の札）      |
 | `php artisan queue:restart`              | ありません。worker に停止の合図を送ってください                 |
+
+くわしくは [deployment.md](deployment.md) にあります。
 
 ## PHP 固有の機能は作らない
 
@@ -281,28 +316,21 @@ PHP の言語や実行の形に強く結びついた機能は作りません。
 
 | PHP 固有のもの                                     | bengara                                       |
 |----------------------------------------------------|-----------------------------------------------|
-| Blade のテンプレート文法                           | 作りません。Rust のエンジンは当面入れません   |
+| Blade のテンプレート文法                           | 作りません                                    |
 | 実行時に型や名前を調べる仕組み                     | ありません。Rust に無いためです               |
 | サービスコンテナによる依存の自動解決               | ありません。ハンドラの引数は 2 つの形だけです |
-| マジックメソッド（`__get` / `__call`）の遅延ロード | ありません。読み込みはいつも明示します         |
+| マジックメソッド（`__get` / `__call`）の遅延ロード | ありません。読み込みはいつも明示します        |
 | `eval` 相当・実行時のコード生成                    | ありません                                    |
 | 緩い型比較（`==` の暗黙の変換）                    | ありません。Rust の型を使います               |
 
-次のものは **同じ役割を別の形で用意しています。**
-
-| PHP の仕組み                              | bengara                                         |
-|-------------------------------------------|-------------------------------------------------|
-| Composer のオートロード                   | `build.rs` の自動検出。ビルド時に宣言を作ります |
-| 連想配列を前提にした API（`config(...)`） | 型をキーにする `config::<AppConfig>()`          |
-| グローバル名前空間のヘルパ関数            | `use bengara::prelude::*;` の自由関数           |
-
-借りられるものは **Laravel と同じ名前のまま中身を Rust の形で作ります。**
+借りられるものは **Laravel と同じ名前のまま、中身を Rust の形で作ります。**
+自動検出・型をキーにした設定・`prelude` の関数がその例です。
 「作らない」と決めた理由は [decisions.md](decisions.md) にあります。
 
 ## その他
 
 - `GET` のルートは `HEAD` にも応答します（Laravel と同じ考え方）。
 - 405 の `Allow` には、`GET` があるとき `HEAD` も入ります。
-- 本文の上限は 2 MiB です。超えると 413 を返します。
+- 本文の上限は 2 MiB です。長さの申告が超えていると 413 を返します。
 - ハンドラがパニックしても 500 を返すだけです。プロセスは落ちません。
 - `APP_DEBUG=true` のときだけエラーページに詳細が出ます（Laravel と同じ考え方）。

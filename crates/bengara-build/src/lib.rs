@@ -334,7 +334,15 @@ impl Generator {
                 continue;
             }
             // 大きさを OS に聞くのはここだけ。埋め込む `public/` のためだけに使います。
-            let len = entry.path.metadata().map_or(0, |m| m.len());
+            let metadata = entry.path.metadata().ok();
+            // ディレクトリへのリンク（Windows のジャンクションも同じ）は埋め込まない。
+            // `is_dir` は偽なのでここまで来るが、`include_bytes!` に入れると
+            // 「ディレクトリは読めない」でリリースビルドだけが落ちる。
+            // 警告は一覧を作る所（`read_dir_sorted`）がリンクごとに出している。
+            if metadata.as_ref().is_some_and(|m| m.is_dir()) {
+                continue;
+            }
+            let len = metadata.map_or(0, |m| m.len());
             *total += len;
             if len > MAX_EMBED_FILE {
                 warn(&format!(
@@ -729,7 +737,17 @@ impl Generator {
                 // ファイル名をそのまま型の名前として書くので、識別子に使えるか確かめる。
                 // `My-Model.rs` はモジュール名にはできるが、型の名前にはできない。
                 if is_ident(stem) {
-                    let _ = writeln!(self.tree, "pub use crate::{flat}::{stem};");
+                    // 行末のコメントは、型が無かったときの案内です。ファイルの中身は
+                    // 解析しないので、型があるかはここでは分かりません。無いときは
+                    // rustc がこの行を「unresolved import」として**行ごと**見せるので、
+                    // 同じ行に直し方を書いておきます。`stem` は識別子と確かめた後なので、
+                    // コメントを壊す文字（改行）は入りません。
+                    let _ = writeln!(
+                        self.tree,
+                        "pub use crate::{flat}::{stem}; \
+                         // bengara: {stem}.rs に、ファイル名と同じ名前の型 `{stem}` を \
+                         pub で置いてください。型を置かないファイルは小文字で始めます"
+                    );
                 } else {
                     // ここはビルドを止めます。`.` や空白の入った名前は控えとして
                     // 先に外れているので、ここまで来るのは `My-Model.rs` のように
@@ -785,11 +803,20 @@ impl Generator {
                     ));
                 } else {
                     match to_command_name(stem) {
-                        Ok(name) => self.commands.push(Item {
-                            name,
-                            flat: flat.clone(),
-                            path: path.clone(),
-                        }),
+                        Ok(name) => {
+                            // フレームワークのコマンドが必ず先に照合されるので、
+                            // 同じ名前の自作コマンドは呼ばれない。本体も起動のときに
+                            // 知らせるが、ビルドの時点で気づけるようにここでも出す。
+                            // 一覧には今までどおり入れる（止めはしない）。
+                            if let Some(message) = reserved_command_message(&path, &name) {
+                                warn(&message);
+                            }
+                            self.commands.push(Item {
+                                name,
+                                flat: flat.clone(),
+                                path: path.clone(),
+                            });
+                        }
                         Err(reason) => self.errors.push(format!(
                             "{} はコマンドの名前にできません（{reason}）",
                             path.display()
@@ -1043,9 +1070,12 @@ impl Generator {
     /// 言語の表を Rust の定数として書き出す。
     ///
     /// ```ignore
-    /// static __BENGARA_LANG_JA: &[(&str, &str)] = &[("messages.welcome", "ようこそ")];
-    /// static __BENGARA_LANG: ::bengara::LangTable = &[("ja", __BENGARA_LANG_JA)];
+    /// static __BENGARA_LANG_0: &[(&str, &str)] = &[("messages.welcome", "ようこそ")];
+    /// static __BENGARA_LANG: ::bengara::LangTable = &[("ja", __BENGARA_LANG_0)];
     /// ```
+    ///
+    /// 表の名前は連番です（言語名の昇順に `_0`、`_1`、…）。言語名（`pt-BR` など）は
+    /// Rust の名前に使えない文字を含むことがあるので、名前には入れません。
     ///
     /// **並びの約束**：鍵の表は鍵の昇順、言語の表は言語名の昇順です。
     /// 実行時の引き当て（`lang.rs`）がこの並びを前提にします。
@@ -1317,6 +1347,32 @@ fn to_command_name(stem: &str) -> Result<String, &'static str> {
     Ok(out)
 }
 
+/// フレームワークのコマンドのうち、自作コマンドの名前になりうるもの。
+///
+/// 自作コマンドの名前は [`to_command_name`] が作るので、`:` を含みません。
+/// だから `route:list` や `migrate:fresh` とは重なりようがなく、ここに並べるのは
+/// **`:` の無い名前だけ**で足ります。
+///
+/// 出どころは本体（`bengara` クレート）です。このクレートは依存を持てないので、
+/// 一覧を写して持ちます。ずれは下のテスト
+/// （`フレームワークのコマンド名の写しが本体とそろっている`）が本体のソースと
+/// 突き合わせて見つけます。本体に `:` の無いコマンドを足したら、ここにも足してください。
+const RESERVED_COMMANDS: &[&str] = &[
+    "about", "help", "init", "list", "migrate", "serve", "version",
+];
+
+/// 自作コマンドの名前がフレームワークのコマンドと同じなら、知らせる文を返す。
+fn reserved_command_message(path: &Path, name: &str) -> Option<String> {
+    if !RESERVED_COMMANDS.contains(&name) {
+        return None;
+    }
+    Some(format!(
+        "{} は呼ばれません。コマンド名 `{name}` はフレームワークのコマンドと同じです。\
+         ファイル名を変えてください",
+        path.display()
+    ))
+}
+
 fn starts_digit(stem: &str) -> bool {
     stem.starts_with(|c: char| c.is_ascii_digit())
 }
@@ -1355,6 +1411,65 @@ mod tests {
 
     fn stack_of(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// ディレクトリへのリンクを作る。作れない環境では `false`。
+    ///
+    /// Windows は権限（開発者モード）が無いと作れません。そのときはテストを飛ばします。
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(target, link).is_ok();
+        #[cfg(windows)]
+        return std::os::windows::fs::symlink_dir(target, link).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    #[test]
+    fn publicの中のディレクトリへのリンクは埋め込まない() {
+        // 以前はファイルとして `include_bytes!` に入り、リリースビルドだけが落ちた
+        // （`public/storage` → `storage/app/public` のリンクが典型）。
+        let root = temp_root("public_link");
+        let public = root.join("public");
+        touch(&public.join("robots.txt"), "User-agent: *\n");
+        touch(&public.join("css/app.css"), "body {}\n");
+        touch(&root.join("storage/app/public/a.txt"), "a");
+        if !link_dir(&root.join("storage/app/public"), &public.join("storage")) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let mut generator = Generator::default();
+        let mut total = 0;
+        generator.collect_public(&public, "", &mut total, 0);
+
+        let keys: Vec<&str> = generator.public.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["css/app.css", "robots.txt"]);
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        // リンクの先の中身は数えない。
+        assert_eq!(total, 14 + 8);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn publicの中のふつうのファイルは今までどおり埋め込む() {
+        let root = temp_root("public_plain");
+        let public = root.join("public");
+        touch(&public.join("robots.txt"), "User-agent: *\n");
+        touch(&public.join("img/logo.svg"), "<svg/>");
+        touch(&public.join(".hidden"), "x");
+
+        let mut generator = Generator::default();
+        let mut total = 0;
+        generator.collect_public(&public, "", &mut total, 0);
+
+        let keys: Vec<&str> = generator.public.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["img/logo.svg", "robots.txt"]);
+        assert_eq!(total, 6 + 14);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1836,6 +1951,164 @@ mod tests {
         assert!(to_command_name("My Report").is_err());
         assert!(to_command_name("Send.Report").is_err());
         assert!(to_command_name("日本語").is_err());
+    }
+
+    #[test]
+    fn フレームワークと同じ名前の自作コマンドは知らせる() {
+        let path = Path::new("app/Console/Commands/List.rs");
+        // ファイル名から作った名前で比べる（`List` → `list`）。
+        let name = to_command_name("List").unwrap();
+        let message = reserved_command_message(path, &name).expect("知らせる文がありません");
+        assert!(message.contains("List.rs"), "{message}");
+        assert!(message.contains("`list`"), "{message}");
+        for stem in ["Help", "Init", "Serve", "Migrate", "Version", "About"] {
+            let name = to_command_name(stem).unwrap();
+            assert!(reserved_command_message(path, &name).is_some(), "{stem}");
+        }
+        // 重ならない名前には何も言わない。
+        for stem in ["SendReport", "Listing", "MigrateUsers", "Cleanup"] {
+            let name = to_command_name(stem).unwrap();
+            assert!(reserved_command_message(path, &name).is_none(), "{stem}");
+        }
+    }
+
+    #[test]
+    fn 同じ名前の自作コマンドも一覧には入れる() {
+        // 警告を出すだけで、ビルドは止めない（生成コードの形も変えない）。
+        let root = temp_root("reserved_command");
+        touch(&root.join("app/Console/Commands/List.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let code = generator.finish();
+        assert!(code.contains("name: \"list\""), "{code}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 行の最初の文字列リテラルの中身（`"..."` の間）。
+    fn first_literal(line: &str) -> Option<&str> {
+        let rest = line.split_once('"')?.1;
+        Some(rest.split_once('"')?.0)
+    }
+
+    /// 自作コマンドの名前になりうる形か（[`to_command_name`] が作る形）。
+    ///
+    /// ファイル名は大文字で始まるので、名前は必ず小文字で始まります
+    /// （`--help` や `-h` とは重なりません）。
+    fn is_command_shaped(name: &str) -> bool {
+        name.starts_with(|c: char| c.is_ascii_lowercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
+    /// 本体のソースの `const COMMANDS` の表から、名前を取り出す。
+    fn names_in_commands_table(source: &str) -> Vec<String> {
+        let Some(start) = source.find("const COMMANDS") else {
+            return Vec::new();
+        };
+        source[start..]
+            .lines()
+            .skip(1)
+            .take_while(|line| line.trim() != "];")
+            .filter(|line| {
+                let line = line.trim();
+                line.starts_with("(\"") || line.starts_with('"')
+            })
+            .filter_map(first_literal)
+            // 説明の行（日本語と空白を含む）は、名前の形ではないので落ちる。
+            .filter(|name| {
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == ':')
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// 本体の `kernel_impl.rs` の表（`names: &[..]`）から、名前を取り出す。
+    fn names_in_kernel_table(source: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for part in source.split("names: &[").skip(1) {
+            let Some((inside, _)) = part.split_once(']') else {
+                continue;
+            };
+            names.extend(inside.split('"').skip(1).step_by(2).map(str::to_string));
+        }
+        names
+    }
+
+    #[test]
+    fn フレームワークのコマンド名の写しが本体とそろっている() {
+        // このクレートは依存を持てないので、本体のコマンド名を写して持っている。
+        // ここで本体のソースと突き合わせて、ずれを見つける。
+        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bengara");
+        if !core.join("Cargo.toml").is_file() {
+            // crates.io から取り出した単体では、隣に本体が無い。確かめようがない。
+            eprintln!("本体のソースが隣に無いので、突き合わせを飛ばします");
+            return;
+        }
+        let read = |relative: &str| {
+            let path = core.join(relative);
+            fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{} を読めません（{e}）。コマンドの表の置き場所が変わったなら、\
+                     このテストの読む先を直してください",
+                    path.display()
+                )
+            })
+        };
+
+        let kernel = names_in_kernel_table(&read("src/kernel_impl.rs"));
+        let extra = names_in_commands_table(&read("src/commands.rs"));
+        let database = names_in_commands_table(&read("src/database/commands.rs"));
+        // 取り出し方が合っているかを、必ずある名前で確かめる。
+        // ここで落ちたら、本体の表の書き方が変わっている。
+        assert!(kernel.iter().any(|n| n == "route:list"), "{kernel:?}");
+        assert!(extra.iter().any(|n| n == "queue:work"), "{extra:?}");
+        assert!(
+            database.iter().any(|n| n == "migrate:fresh"),
+            "{database:?}"
+        );
+
+        let mut expected: Vec<String> = kernel
+            .into_iter()
+            .chain(extra)
+            .chain(database)
+            .filter(|name| is_command_shaped(name))
+            .collect();
+        expected.sort();
+        expected.dedup();
+
+        let mut copied: Vec<String> = RESERVED_COMMANDS.iter().map(|n| n.to_string()).collect();
+        copied.sort();
+        assert_eq!(
+            copied, expected,
+            "RESERVED_COMMANDS を、本体の `:` の無いコマンド名に合わせてください"
+        );
+    }
+
+    #[test]
+    fn 型の再エクスポートの行に直し方を添える() {
+        // 型が無いと rustc はこの行を「unresolved import」として行ごと見せる。
+        // 中身は解析しないので、直し方は同じ行のコメントで伝える。
+        let root = temp_root("reexport_hint");
+        touch(&root.join("app/Models/Post.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+        let code = generator.finish();
+
+        let line = code
+            .lines()
+            .find(|line| line.starts_with("pub use crate::__bengara_app_models_post::Post;"))
+            .unwrap_or_else(|| panic!("再エクスポートの行がありません: {code}"));
+        assert!(line.contains("// bengara: Post.rs に"), "{line}");
+        assert!(line.contains("型 `Post`"), "{line}");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

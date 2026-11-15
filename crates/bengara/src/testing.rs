@@ -145,7 +145,10 @@ impl TestClient {
     /// `""` を送り、テストの失敗は「419」や「500」として遠い場所に出ていました。
     pub async fn csrf_token(&self, token_uri: &str) -> String {
         let res = self.get(token_uri).await;
-        match res.json()["token"].as_str() {
+        // `json()` は読めない本文でパニックする。ここでは下の文
+        //（どのルートを指定すればよいか）で知らせたいので、読めなければ `Null` にする。
+        let json = res.try_json().unwrap_or(serde_json::Value::Null);
+        match json["token"].as_str() {
             Some(token) if !token.is_empty() => token.to_string(),
             _ => panic!(
                 "GET {token_uri} が CSRF トークンを返しませんでした（{} / 本文: {}）。\
@@ -321,8 +324,31 @@ impl TestResponse {
     }
 
     /// 本文を JSON として読む。
+    ///
+    /// # パニック
+    ///
+    /// **本文が JSON として読めないときはパニックします。** URI・ステータス・
+    /// 本文の先頭を付けて知らせます。以前は黙って `Null` を返していたので、
+    /// HTML のエラー画面が返っているテストで `res.json()["x"]` が `Null` になり、
+    /// 原因が見えませんでした。
+    ///
+    /// JSON でない本文を見たいときは [`TestResponse::body`] を使ってください。
+    #[track_caller]
     pub fn json(&self) -> serde_json::Value {
-        serde_json::from_slice(self.inner.body()).unwrap_or(serde_json::Value::Null)
+        match self.try_json() {
+            Ok(value) => value,
+            Err(e) => panic!(
+                "{} の本文を JSON として読めません（ステータス {}）: {e}\n本文: {}",
+                self.uri,
+                self.inner.status(),
+                self.body_preview()
+            ),
+        }
+    }
+
+    /// 本文を JSON として読む。読めなければエラーを返す（[`TestResponse::json`] の中身）。
+    fn try_json(&self) -> std::result::Result<serde_json::Value, serde_json::Error> {
+        serde_json::from_slice(self.inner.body())
     }
 
     /// ヘッダーの値。
@@ -397,6 +423,20 @@ fn check_reentrant(held: &'static std::thread::LocalKey<std::cell::Cell<bool>>, 
     }
 }
 
+/// テスト用のデータベースにつなげなかったときのパニックの文。
+///
+/// 機能フラグは「features に足す」と言います。以前は `features = ["sqlite"]` と
+/// 1 行まるごと見せていたので、そのまま写すと他のフラグが落ちました。
+/// MySQL や PostgreSQL を使う人にも合うように、`sqlite` と決めつけません。
+fn connect_failure(cause: &dyn std::fmt::Display) -> String {
+    format!(
+        "テスト用のデータベースにつなげません: {cause}\n\
+         使うデータベースの機能フラグ（\"sqlite\" / \"mysql\" / \"postgres\"）が \
+         Cargo.toml の bengara の features に入っているか確かめてください。\
+         無ければ足してください（いまある機能フラグは残します）"
+    )
+}
+
 /// テスト用のデータベースを空から作り直す。
 ///
 /// ```ignore
@@ -427,12 +467,7 @@ pub async fn refresh_database() -> DatabaseGuard {
 
     crate::database::connect_for_tests()
         .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "テスト用のデータベースにつなげません: {e}\n\
-                 Cargo.toml に features = [\"sqlite\"] が入っているか確かめてください"
-            )
-        });
+        .unwrap_or_else(|e| panic!("{}", connect_failure(&e)));
 
     let hooks = kernel_impl::test_hooks();
     let migrations = (hooks.migrations)();
@@ -579,6 +614,19 @@ mod tests {
     }
 
     #[test]
+    fn つなげないときの文は機能フラグを足す形で案内する() {
+        // 以前は `features = ["sqlite"]` と 1 行まるごと見せていた。そのまま写すと
+        // 他のフラグが落ち、MySQL や PostgreSQL を使う人には見当違いだった。
+        let message = connect_failure(&"原因");
+        assert!(message.contains("原因"), "{message}");
+        assert!(message.contains("足してください"), "{message}");
+        assert!(!message.contains("features = ["), "{message}");
+        for flag in ["\"sqlite\"", "\"mysql\"", "\"postgres\""] {
+            assert!(message.contains(flag), "{message}");
+        }
+    }
+
+    #[test]
     fn 旗を立てるのは呼び元なので失敗しても残らない() {
         // `check_reentrant` 自体は旗に触らない。錠やマイグレーションが途中で
         // 失敗しても、旗が立ったまま残らないことを確かめる。
@@ -636,6 +684,96 @@ mod tests {
         let client = TestClient::new(echo_app());
         let body = client.delete("/echo").await.assert_ok().body();
         assert_eq!(body, "DELETE - ");
+    }
+
+    /// JSON と、JSON でない本文を返すアプリ。
+    fn json_app() -> Application {
+        use crate::http::Route;
+
+        async fn good(_req: Request) -> crate::Result<Response> {
+            Response::json(&serde_json::json!({ "id": 7, "none": null }))
+        }
+        async fn html(_req: Request) -> crate::Result<Response> {
+            Ok(Response::html("<h1>エラーの画面</h1>").with_status(500))
+        }
+        async fn empty(_req: Request) -> crate::Result<Response> {
+            Ok(Response::text(""))
+        }
+
+        Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/good", good);
+                    Route::get("/html", html);
+                    Route::get("/empty", empty);
+                })
+            })
+            .create()
+    }
+
+    #[tokio::test]
+    async fn jsonは読める本文をそのまま返す() {
+        let client = TestClient::new(json_app());
+        let json = client.get("/good").await.assert_ok().json();
+        assert_eq!(json["id"], 7);
+        // 本文に書かれた `null` と、無い鍵はどちらも `Null`（今までどおり）。
+        assert!(json["none"].is_null());
+        assert!(json["missing"].is_null());
+    }
+
+    #[tokio::test]
+    async fn jsonは読めない本文でパニックする() {
+        let client = TestClient::new(json_app());
+
+        // 以前は黙って `Null` を返し、`res.json()["x"]` が `Null` になるだけだった。
+        for path in ["/html", "/empty"] {
+            let res = client.get(path).await;
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.json()));
+            let payload = caught.expect_err("読めない本文はパニックする");
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            assert!(message.contains(path), "URI が出る: {message}");
+            assert!(message.contains("JSON として読めません"), "{message}");
+        }
+
+        // ステータスと本文の先頭も出る。
+        let res = client.get("/html").await;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.json()));
+        let message = caught
+            .expect_err("パニックする")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(message.contains("500"), "{message}");
+        assert!(message.contains("エラーの画面"), "{message}");
+    }
+
+    #[test]
+    fn トークンの口がjsonでなくても案内の文で知らせる() {
+        // `json()` がパニックするようになっても、`csrf_token` は
+        // 「どのルートを指定すればよいか」の文で知らせる。
+        // 非同期の中のパニックを捕まえるので、ランタイムを自分で持つ。
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let client = TestClient::new(json_app());
+                client.csrf_token("/html").await
+            })
+        }));
+        let payload = caught.expect_err("パニックする");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("CSRF トークンを返しませんでした"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

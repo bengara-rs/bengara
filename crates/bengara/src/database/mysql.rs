@@ -32,9 +32,11 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
         .connect_with(options)
         .await
         .map_err(|e| {
+            // `url` でつないでいるときに host / port を出すと、使っていない既定値
+            // （`127.0.0.1:3306`）を見せる。
             Error::msg(format!(
-                "MySQL につなげません（{}:{} / {}）: {e}",
-                settings.host, settings.port, settings.database
+                "MySQL につなげません（{}）: {e}",
+                super::connection_target(settings)
             ))
         })?;
     Ok(Arc::new(MySqlBackend { pool }))
@@ -46,8 +48,9 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
 /// password / database から組み立てます。
 fn build_options(settings: &ConnectionConfig) -> Result<MySqlConnectOptions> {
     if !settings.url.is_empty() {
+        // 接続文字列そのものは出さない（`unreadable_url` の説明を参照）。
         return MySqlConnectOptions::from_str(&settings.url)
-            .map_err(|e| Error::msg(format!("接続文字列が読めません（{}）: {e}", settings.url)));
+            .map_err(|e| super::unreadable_url(settings, e));
     }
     let mut options = MySqlConnectOptions::new()
         .host(&settings.host)
@@ -230,19 +233,30 @@ fn convert_value(row: &MySqlRow, index: usize, name: &str) -> Result<Value> {
     match type_name.as_str() {
         // `tinyint(1)` は MySQL では真偽値の置き場所。sqlx が BOOLEAN として伝えます。
         "BOOLEAN" => read::<bool>(row, index, name).map(Value::Bool),
-        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "YEAR" | "TINYINT UNSIGNED"
-        | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" => {
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => {
             read::<i64>(row, index, name).map(Value::Int)
         }
+        // 符号なしの整数は `u64` で読みます。sqlx の `i64` は UNSIGNED の旗が付いた列を
+        // 断るので（sqlx-mysql `types/int.rs` の `int_compatible`）、以前はここで
+        // 「列を読めません」になり、**その列を含む行ごと**読めませんでした。
+        // bengara が作る表は `bigint unsigned` だけですが、既にある表
+        // （Laravel の `unsignedInteger` など）で当たります。
+        //
         // `bigint unsigned` は `i64` の上限を超えられます。
         // 超えたときは丸めずに文字列で返します。
-        "BIGINT UNSIGNED" => {
-            let v = read::<u64>(row, index, name)?;
-            Ok(match i64::try_from(v) {
-                Ok(fits) => Value::Int(fits),
-                Err(_) => Value::Text(v.to_string()),
-            })
-        }
+        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED"
+        | "BIGINT UNSIGNED" => read::<u64>(row, index, name).map(unsigned_value),
+        // `year` と `bit` も `u64` で読みます。照合はしません。
+        //
+        // sqlx の `u64` が受けるのは UNSIGNED の旗が付いているときだけです
+        // （`types/uint.rs` の `uint_compatible`）。旗が付くかはサーバ次第なので、
+        // 旗に頼らず中身だけを読みます。読み方は型で決まっています（`uint_decode`）。
+        //
+        // | 型     | 中身                                          | 返す値                |
+        // |--------|-----------------------------------------------|-----------------------|
+        // | `year` | 数（文字列なら数字、バイナリなら 2 バイト）   | `Value::Int(2026)`    |
+        // | `bit`  | 上の桁から並んだバイト列（最大 64 ビット）    | `Value::Int`（数として） |
+        "YEAR" | "BIT" => read_unchecked::<u64>(row, index, name).map(unsigned_value),
         "FLOAT" | "DOUBLE" => read::<f64>(row, index, name).map(Value::Float),
         // `decimal` は MySQL が文字列で送ってきます。桁を落とさないため、
         // 浮動小数にせず文字列のまま渡します。
@@ -261,8 +275,14 @@ fn convert_value(row: &MySqlRow, index: usize, name: &str) -> Result<Value> {
             .map(|v| Value::Text(temporal::time_string(v))),
         "DATETIME" | "TIMESTAMP" => read::<sqlx::types::time::PrimitiveDateTime>(row, index, name)
             .map(|v| Value::Text(temporal::date_time_string(v))),
-        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BIT"
-        | "GEOMETRY" => read::<Vec<u8>>(row, index, name).map(Value::Bytes),
+        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
+            read::<Vec<u8>>(row, index, name).map(Value::Bytes)
+        }
+        // 空間の型（`geometry` / `point` など）は、MySQL の内部の形のバイト列で届きます
+        // （先頭 4 バイトが SRID、その後ろが WKB）。sqlx の `Vec<u8>` は型の照合で
+        // `Geometry` を受けないので（`types/bytes.rs`）、照合をせずに取り出します。
+        // 中身の解釈はしません。読みたい形があるときは `st_astext(列)` を SQL に書きます。
+        "GEOMETRY" => read_unchecked::<Vec<u8>>(row, index, name).map(Value::Bytes),
         "NULL" => Ok(Value::Null),
         other => Err(unsupported_column(name, other)),
     }
@@ -277,9 +297,24 @@ where
         .map_err(|e| Error::msg(format!("列 `{name}` を読めません: {e}")))
 }
 
-/// 型の照合をせずに取り出す。`decimal` と `json` だけで使います。
+/// 符号なしの整数を `Value` に直す。
 ///
-/// どちらも中身は文字列で送られてきますが、`String` の型照合では弾かれます。
+/// `i64` に収まれば `Value::Int`、収まらなければ**丸めずに** `Value::Text` にします
+/// （`bigint unsigned` と 64 ビットの `bit` だけが超えられます）。
+fn unsigned_value(v: u64) -> Value {
+    match i64::try_from(v) {
+        Ok(fits) => Value::Int(fits),
+        Err(_) => Value::Text(v.to_string()),
+    }
+}
+
+/// 型の照合をせずに取り出す。sqlx の照合が受けない組み合わせで使います。
+///
+/// | 列の型             | 取り出す型 | 照合が通らない理由                       |
+/// |--------------------|------------|------------------------------------------|
+/// | `decimal` / `json` | `String`   | 中身は文字列だが、`String` の照合に無い  |
+/// | `year` / `bit`     | `u64`      | UNSIGNED の旗が付いているときしか通らない |
+/// | `geometry`         | `Vec<u8>`  | `Vec<u8>` の照合に無い                   |
 fn read_unchecked<'r, T>(row: &'r MySqlRow, index: usize, name: &str) -> Result<T>
 where
     T: sqlx::Decode<'r, MySql>,
@@ -429,6 +464,174 @@ mod tests {
         assert_eq!(row.value("blob"), Some(&Value::Bytes(vec![1, 2, 3])));
 
         assert!(db.table_names().await.unwrap().contains(&table.to_string()));
+    }
+
+    #[test]
+    fn 符号なしの整数は収まれば整数_超えたら文字列で返す() {
+        assert_eq!(unsigned_value(0), Value::Int(0));
+        assert_eq!(unsigned_value(255), Value::Int(255));
+        assert_eq!(unsigned_value(i64::MAX as u64), Value::Int(i64::MAX));
+        // `i64` を超えたら丸めない。
+        assert_eq!(
+            unsigned_value(i64::MAX as u64 + 1),
+            Value::Text("9223372036854775808".into())
+        );
+        assert_eq!(unsigned_value(u64::MAX), Value::Text(u64::MAX.to_string()));
+    }
+
+    #[test]
+    fn 読めない接続文字列をエラー文に出さない() {
+        // パスワードに `#` をそのまま書くと、ポートが読めなくなる典型の形。
+        // 以前は `接続文字列が読めません（{url}）` とパスワードごと出していた。
+        let url = "mysql://app:p4ss#word@db.example.com:3306/shop";
+        let settings = ConnectionConfig::mysql("mysql", "").url(url);
+        let message = build_options(&settings).expect_err("読めない").to_string();
+        assert!(message.contains("`mysql`"), "{message}");
+        assert!(message.contains("読めません"), "{message}");
+        assert!(!message.contains("p4ss"), "{message}");
+        assert!(!message.contains("word"), "{message}");
+        assert!(!message.contains("db.example.com"), "{message}");
+    }
+
+    /// 符号なしの小さい整数・`year`・`bit`・空間の型が読めること。
+    ///
+    /// bengara の `Schema` はこれらの型を作りません。既にある表
+    /// （Laravel の `unsignedInteger` など）につないだときに当たるので、型を手で書きます。
+    /// 以前は 1 列でも含むと、行ごと「列を読めません」になっていました。
+    #[tokio::test]
+    async fn 符号なしの整数と_year_と_bit_と空間の型を読める() {
+        let Some(db) = db().await else { return };
+        let table = "bengara_unsigned";
+        db.execute(&format!("drop table if exists `{table}`"), &[])
+            .await
+            .unwrap();
+        db.execute(
+            &format!(
+                "create table `{table}` (\
+                 `t` tinyint unsigned, `s` smallint unsigned, `m` mediumint unsigned, \
+                 `i` int unsigned, `b` bigint unsigned, `big` bigint unsigned, \
+                 `y` year, `flag` bit(1), `bits` bit(12), `wide` bit(64), \
+                 `p` point)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            &format!(
+                "insert into `{table}` values (\
+                 255, 65535, 16777215, 4294967295, 7, 18446744073709551615, \
+                 2026, b'1', b'101000000001', b'1{}', \
+                 st_geomfromtext('POINT(1 2)'))",
+                "0".repeat(63)
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let rows = db
+            .fetch_all(&format!("select * from `{table}`"), &[])
+            .await
+            .expect("行ごと読める");
+        let row = &rows[0];
+        assert_eq!(row.value("t"), Some(&Value::Int(255)));
+        assert_eq!(row.value("s"), Some(&Value::Int(65535)));
+        assert_eq!(row.value("m"), Some(&Value::Int(16_777_215)));
+        assert_eq!(
+            row.value("i"),
+            Some(&Value::Int(4_294_967_295)),
+            "int unsigned の上限は i32 を超える"
+        );
+        assert_eq!(row.value("b"), Some(&Value::Int(7)));
+        assert_eq!(
+            row.value("big"),
+            Some(&Value::Text("18446744073709551615".into())),
+            "i64 を超えたら丸めずに文字列"
+        );
+        assert_eq!(row.value("y"), Some(&Value::Int(2026)));
+        assert_eq!(row.value("flag"), Some(&Value::Int(1)));
+        assert_eq!(row.value("bits"), Some(&Value::Int(0b1010_0000_0001)));
+        assert_eq!(
+            row.value("wide"),
+            Some(&Value::Text((1u64 << 63).to_string())),
+            "64 ビットの bit も丸めない"
+        );
+        // 空間の型は中身を解釈しない。先頭 4 バイトが SRID、後ろが WKB（点は 21 バイト）。
+        match row.value("p") {
+            Some(Value::Bytes(bytes)) => assert_eq!(bytes.len(), 25, "{bytes:?}"),
+            other => panic!("バイト列で返る: {other:?}"),
+        }
+
+        db.execute(&format!("drop table if exists `{table}`"), &[])
+            .await
+            .unwrap();
+    }
+
+    /// 列の `unique()` で作った索引を、名前で落とせること。
+    ///
+    /// 以前は列の指定に `unique` と書いていたので、MySQL は索引の名前を列の名前
+    /// （`email`）にしていました。`drop_index_named(表, "表_email_unique")` は
+    /// 「索引がありません」で失敗していました。
+    #[tokio::test]
+    async fn 列の_unique_で作った索引を名前で落とせる() {
+        let Some(db) = db().await else { return };
+        let table = "bengara_unique_named";
+        fresh(&db, table, |t| {
+            t.id();
+            t.string("email").unique();
+        })
+        .await;
+
+        let sql = format!("insert into `{table}` (`email`) values (?)");
+        let value = [Value::Text("a@example.com".into())];
+        db.execute(&sql, &value).await.expect("1件目は入る");
+        assert!(db.execute(&sql, &value).await.is_err(), "重なりは断る");
+
+        let mut schema = Schema::new(Driver::MySql);
+        schema.drop_unique(table, &["email"]);
+        for statement in schema.into_statements() {
+            db.execute(&statement, &[]).await.expect("名前で落とせる");
+        }
+        db.execute(&sql, &value)
+            .await
+            .expect("索引を落としたので重なっても入る");
+
+        db.execute(&format!("drop table if exists `{table}`"), &[])
+            .await
+            .unwrap();
+    }
+
+    /// 表を消すのに失敗しても、外部キーの確かめを止めたままの接続がプールに戻らないこと。
+    ///
+    /// 接続を 1 本にして、失敗の後に同じ接続を借り直して確かめます。
+    #[tokio::test]
+    async fn 表を消すのに失敗しても外部キーの確かめは戻っている() {
+        let Some(url) = url() else { return };
+        let settings = ConnectionConfig::mysql("test", "")
+            .url(url)
+            .max_connections(1);
+        let db = connect(&settings).await.expect("MySQL につながる");
+
+        let (before, after) = super::super::grammar::defer_foreign_keys(Driver::MySql);
+        // `if exists` の無い文で、無い表を消そうとして失敗させる。
+        let statements = vec!["drop table `bengara_no_such_table_for_drop`".to_string()];
+        let mut tx = db.begin().await.unwrap();
+        let result =
+            super::super::migrator::drop_with_checks_off(tx.as_mut(), before, &statements, after)
+                .await;
+        assert!(result.is_err(), "消す文は失敗する");
+        drop(tx);
+
+        let rows = db
+            .fetch_all("select @@session.foreign_key_checks as v", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get::<i64>("v").unwrap(),
+            1,
+            "確かめを止めたままの接続がプールに戻っています"
+        );
     }
 
     #[tokio::test]

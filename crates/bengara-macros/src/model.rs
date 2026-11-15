@@ -5,6 +5,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, LitStr};
 
@@ -205,6 +206,7 @@ fn table_name(input: &DeriveInput) -> syn::Result<String> {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("table") {
                 let value: LitStr = meta.value()?.parse()?;
+                check_name(&value, NameKind::Table)?;
                 table = Some(value.value());
                 return Ok(());
             }
@@ -241,7 +243,10 @@ fn collect_fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
             .clone()
             .ok_or_else(|| syn::Error::new(field.span(), "フィールドに名前がありません"))?;
         let mut info = Field {
-            column: ident.to_string(),
+            // `r#type` のような生の識別子は、`r#` を外した名前を列名にする。
+            // そのまま文字にすると列名が `r#type` になり、読み出しは「列がありません」、
+            // 保存は「列名は使えません」で落ちていた。
+            column: ident.unraw().to_string(),
             ident,
             ty: field.ty.clone(),
             primary: false,
@@ -262,6 +267,7 @@ fn collect_fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
                 }
                 if meta.path.is_ident("column") {
                     let value: LitStr = meta.value()?.parse()?;
+                    check_name(&value, NameKind::Column)?;
                     info.column = value.value();
                     return Ok(());
                 }
@@ -282,6 +288,74 @@ fn collect_fields(input: &DeriveInput) -> syn::Result<Vec<Field>> {
         out.push(info);
     }
     Ok(out)
+}
+
+/// 検査する名前の種類。
+#[derive(Clone, Copy)]
+enum NameKind {
+    /// `#[model(table = "..")]`。`スキーマ.表` の形（`.` 区切り）も通します。
+    Table,
+    /// `#[model(column = "..")]`。`.` は通しません。
+    Column,
+}
+
+/// `table` / `column` に書いた名前を、コンパイルのときに確かめる。
+///
+/// 規則は実行時の検査（`bengara` の `database/grammar.rs`）と同じです。
+/// 実行時の検査は最初の問い合わせまで走らないので、書き間違いをビルドで止めます。
+///
+/// | 名前 | 実行時の関数 | 通すもの |
+/// |---|---|---|
+/// | 表 | `is_plain_identifier` | 英数字（Unicode）と `_`。`.` 区切り（各部は空にできない） |
+/// | 列 | `is_bare_identifier` | 英数字（Unicode）と `_`。`.` は通さない |
+///
+/// 実行時と違うのは1点だけです。**前後の空白も断ります。** 実行時は前後の空白を
+/// 見ずに通しますが、そのまま引用符でくくるので `" posts"` という別の名前になり、
+/// 必ず「表がありません」で終わります。
+///
+/// 別のクレートなので関数は共有できません（マクロのクレートは本体に依存できない）。
+/// 規則を変えるときは両方を直してください。
+fn check_name(literal: &LitStr, kind: NameKind) -> syn::Result<()> {
+    match name_problem(&literal.value(), kind) {
+        Some(problem) => Err(syn::Error::new(literal.span(), problem)),
+        None => Ok(()),
+    }
+}
+
+/// 名前に問題があれば、その説明を返す。
+fn name_problem(name: &str, kind: NameKind) -> Option<String> {
+    let (what, example) = match kind {
+        NameKind::Table => ("表の名前", "#[model(table = \"posts\")]"),
+        NameKind::Column => ("列の名前", "#[model(column = \"title\")]"),
+    };
+    if name.is_empty() {
+        return Some(format!(
+            "{what}が空です。`{example}` のように書いてください"
+        ));
+    }
+    let allow_dot = matches!(kind, NameKind::Table);
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || *c == '_' || (allow_dot && *c == '.')))
+    {
+        let hint = match (kind, bad) {
+            (NameKind::Column, '.') => {
+                "列の名前に表の名前は付けられません。列の名前だけを書いてください"
+            }
+            (NameKind::Table, _) => "使えるのは英数字と `_`、スキーマを分ける `.` だけです",
+            (NameKind::Column, _) => "使えるのは英数字と `_` だけです",
+        };
+        return Some(format!(
+            "{what} `{name}` に使えない文字 `{}` が入っています。{hint}",
+            bad.escape_debug()
+        ));
+    }
+    if name.split('.').any(str::is_empty) {
+        return Some(format!(
+            "{what} `{name}` の `.` の前後が空です。`スキーマ.表` の形で書いてください"
+        ));
+    }
+    None
 }
 
 /// 同じ列名が2回出てこないか。
@@ -365,4 +439,167 @@ fn pick_primary<'a>(fields: &[&'a Field], input: &DeriveInput) -> syn::Result<&'
                  `#[model(primary)]` を付けてください",
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 構造体の定義を展開する。成功なら生成コード（文字）、失敗ならエラーの文。
+    ///
+    /// 手続きマクロの入口（`derive`）はコンパイラの中でしか動かないので、
+    /// その1つ内側の `expand` を試します。
+    fn run(source: &str) -> Result<String, String> {
+        let input: DeriveInput =
+            syn::parse_str(source).expect("テストの入力が構文として読めません");
+        expand(input)
+            .map(|tokens| tokens.to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    /// 生成コードから、空白の違いを消す（`quote` の出す空白に頼らないため）。
+    fn squeeze(code: &str) -> String {
+        code.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn 表と列の対応を作る() {
+        let code = squeeze(
+            &run(
+                "#[model(table = \"posts\")] struct Post { id: i64, title: String, \
+                  #[model(column = \"body_text\")] body: String, #[model(skip)] cache: u8 }",
+            )
+            .unwrap(),
+        );
+        assert!(code.contains("constTABLE:&'staticstr=\"posts\";"), "{code}");
+        assert!(
+            code.contains("constPRIMARY_KEY:&'staticstr=\"id\";"),
+            "{code}"
+        );
+        // `skip` は列に入らない。`column` は列名だけを変える。
+        assert!(code.contains("&[\"id\",\"title\",\"body_text\"]"), "{code}");
+        assert!(code.contains("body:__row.get(\"body_text\")?"), "{code}");
+        assert!(
+            code.contains("cache:::core::default::Default::default()"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn 生の識別子は印を外した名前を列名にする() {
+        // 以前は列名が `r#type` になり、読み出しも保存も実行時に落ちていた。
+        let code = squeeze(
+            &run("#[model(table = \"posts\")] struct Post { id: i64, r#type: String }").unwrap(),
+        );
+        assert!(code.contains("&[\"id\",\"type\"]"), "{code}");
+        // フィールドの側は `r#type` のまま使う（予約語なので外せない）。
+        assert!(code.contains("r#type:__row.get(\"type\")?"), "{code}");
+        assert!(code.contains("(\"type\","), "{code}");
+        assert!(code.contains("&self.r#type"), "{code}");
+        assert!(!code.contains("\"r#type\""), "{code}");
+    }
+
+    #[test]
+    fn 生の識別子の主キーも列名で見つける() {
+        // `r#id` と書いても、列名 `id` として主キーになる。
+        let code = squeeze(
+            &run("#[model(table = \"posts\")] struct Post { r#id: i64, title: String }").unwrap(),
+        );
+        assert!(
+            code.contains("constPRIMARY_KEY:&'staticstr=\"id\";"),
+            "{code}"
+        );
+    }
+
+    #[test]
+    fn 使える名前はそのまま通す() {
+        for table in ["posts", "main.posts", "記事", "posts_2"] {
+            assert_eq!(name_problem(table, NameKind::Table), None, "{table}");
+        }
+        for column in ["title", "題名", "views_2", "_hidden"] {
+            assert_eq!(name_problem(column, NameKind::Column), None, "{column}");
+        }
+    }
+
+    #[test]
+    fn 使えない名前はビルドで止める() {
+        // 実行時の `is_plain_identifier`（表）と `is_bare_identifier`（列）が断る形。
+        for table in [
+            "",
+            "my posts",
+            "posts;",
+            "\"posts\"",
+            "po-sts",
+            "count(*)",
+            ".posts",
+            "posts.",
+            "a..b",
+            " posts",
+            "posts\n",
+        ] {
+            assert!(name_problem(table, NameKind::Table).is_some(), "{table:?}");
+        }
+        for column in [
+            "",
+            "posts.title",
+            "ti tle",
+            "title`",
+            "r#type",
+            "*",
+            "title ",
+        ] {
+            assert!(
+                name_problem(column, NameKind::Column).is_some(),
+                "{column:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 名前のエラーは何が悪いかを言う() {
+        let error =
+            run("#[model(table = \"\")] struct Post { id: i64, title: String }").unwrap_err();
+        assert!(error.contains("表の名前が空です"), "{error}");
+
+        let error = run("#[model(table = \"my posts\")] struct Post { id: i64, title: String }")
+            .unwrap_err();
+        assert!(error.contains("`my posts`"), "{error}");
+        assert!(error.contains("使えない文字 ` `"), "{error}");
+
+        let error = run("#[model(table = \"posts\")] struct Post { id: i64, \
+                         #[model(column = \"posts.title\")] title: String }")
+        .unwrap_err();
+        assert!(error.contains("列の名前 `posts.title`"), "{error}");
+        assert!(error.contains("表の名前は付けられません"), "{error}");
+
+        let error = run("#[model(table = \"posts\")] struct Post { id: i64, \
+                         #[model(column = \"\")] title: String }")
+        .unwrap_err();
+        assert!(error.contains("列の名前が空です"), "{error}");
+
+        let error =
+            run("#[model(table = \"a..b\")] struct Post { id: i64, title: String }").unwrap_err();
+        assert!(error.contains("前後が空"), "{error}");
+    }
+
+    #[test]
+    fn 今までの検査はそのまま効く() {
+        let error = run("struct Post { id: i64, title: String }").unwrap_err();
+        assert!(error.contains("表の名前が決まっていません"), "{error}");
+
+        let error = run("#[model(table = \"posts\")] struct Post { id: String, title: String }")
+            .unwrap_err();
+        assert!(error.contains("整数ではありません"), "{error}");
+
+        let error = run(
+            "#[model(table = \"posts\")] struct Post { id: i64, title: String, \
+                         #[model(column = \"title\")] other: String }",
+        )
+        .unwrap_err();
+        assert!(error.contains("2回出てきます"), "{error}");
+
+        let error =
+            run("#[model(table = \"posts\")] struct Post<T> { id: i64, title: T }").unwrap_err();
+        assert!(error.contains("型引数"), "{error}");
+    }
 }

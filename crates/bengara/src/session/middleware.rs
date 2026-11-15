@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Session, SessionStore};
 use crate::error::{Error, Result};
-use crate::http::{BoxFuture, Cookie, Middleware, Next, Request, SameSite};
+use crate::http::{BoxFuture, Cookie, Middleware, Next, Request, Response, SameSite};
 use crate::support::crypto;
 
 /// セッションの設定。
@@ -71,9 +71,34 @@ impl SessionConfig {
 /// 次の POST が 419 になりました。
 ///
 /// そこで **ID ごとに錠を取り、読み込みから保存までを押さえます。**
-/// 同じセッション ID のリクエストは順番に処理されます（Laravel も
-/// セッションのファイルを錠で押さえます）。別のセッションどうしは待ちません。
-/// 長くかかるハンドラは、同じ利用者の次のリクエストを待たせます。
+/// 同じセッション ID のリクエストは順番に処理されます。別のセッションどうしは
+/// 待ちません。長くかかるハンドラは、同じ利用者の次のリクエストを待たせます。
+///
+/// Laravel の既定とは違います。Laravel がファイルに錠を掛けるのは読み書きの
+/// 瞬間だけで、リクエスト全体を順番にするのは、ルートに `block()` を付けたときの
+/// 任意の機能です。bengara はいつも順番にします。
+///
+/// **錠はプロセスの中だけです。** プロセスを 2 つ以上動かすと、別々のプロセスに
+/// 入った同じセッションのリクエストは並んで走り、後から保存したほうが勝ちます。
+///
+/// # ルートに当たらなかったリクエストは「読むだけ」です
+///
+/// 共通のミドルウェアは、静的ファイル・404・405 にも掛かります。そこで毎回
+/// 錠を取って書き戻すと、画面 1 枚と CSS・画像 20 本が 1 本ずつになり、
+/// まだ画面に出していない flash が CSS を返しただけで消えます。
+/// `req.route_matched()` が偽のときは、次のようにします。
+///
+/// | こと | ルートあり | ルートなし |
+/// |---|---|---|
+/// | ID の錠 | 読み込みから保存まで | 取らない（書き換えたときだけ、保存の瞬間に取る） |
+/// | 期限の延長 | する | しない |
+/// | 持ち越しの flash | 読めて、消費する | 読めるが、**消費しない** |
+/// | Cookie | 返す | 書き換えたときだけ返す |
+///
+/// セッションそのものは載せるので、`req.session()` と `req.auth()` は使えます。
+/// ミドルウェアが書き換えたときは、**置き場所を読み直して、変えた鍵だけを
+/// 当ててから**保存します（錠を持たずに読んだ中身を丸ごと書き戻すと、
+/// そのあいだに保存された別のリクエストの値を消してしまうため）。
 pub struct StartSession {
     store: Arc<dyn SessionStore>,
     config: SessionConfig,
@@ -138,6 +163,9 @@ impl StartSession {
     /// | `memory` | プロセスのメモリ。**テストと手元の確認用** |
     ///
     /// `SESSION_LIFETIME` は分で指定します（既定 120）。
+    ///
+    /// 知らない `SESSION_DRIVER`（`redis` や書き間違い）は、**警告を出してから**
+    /// `file` にします。
     pub fn from_env() -> Self {
         let minutes: u64 = crate::env("SESSION_LIFETIME", 120u64);
         let config = SessionConfig {
@@ -145,12 +173,22 @@ impl StartSession {
             ..SessionConfig::default()
         };
         let driver: String = crate::env("SESSION_DRIVER", "file");
-        match driver.as_str() {
+        Self::from_driver(&driver, config)
+    }
+
+    /// 置き場所の名前から作る（`from_env` の中身）。
+    fn from_driver(driver: &str, config: SessionConfig) -> Self {
+        match driver {
             "memory" | "array" => {
                 let store = Arc::new(super::MemoryStore::new(config.lifetime_secs));
                 Self::of(store, config, StoreKind::Memory)
             }
-            _ => {
+            other => {
+                // 黙って file にすると、`redis` のつもりで動かしていても気づけない。
+                // 文面は `CACHE_DRIVER` とそろえてあります。
+                if other != "file" {
+                    tracing::warn!("SESSION_DRIVER `{other}` は知りません。file を使います");
+                }
                 let store = Arc::new(super::FileStore::default_path(config.lifetime_secs));
                 Self::of(store, config, StoreKind::File)
             }
@@ -189,176 +227,330 @@ impl StartSession {
 }
 
 impl Middleware for StartSession {
-    fn handle(&self, mut req: Request, next: Next) -> BoxFuture {
+    fn handle(&self, req: Request, next: Next) -> BoxFuture {
         let store = self.store.clone();
         // 設定は組み立てたときにそろえてある。ここではクローンだけ。
         let config = self.config.clone();
 
         Box::pin(async move {
             let key = signing_key()?;
+            serve(store, config, key, req, next).await
+        })
+    }
+}
 
-            // 1. Cookie から ID を読む。署名が合わないものは無かったことにする。
-            let incoming = req.cookie(&config.cookie).and_then(|raw| unsign(&raw, key));
+/// 1 リクエストぶんの本体。
+///
+/// 署名の鍵を引数で受け取ります。`APP_KEY` を設定していないテストからも、
+/// 読み込みから Cookie までを通しで確かめられるようにするためです。
+async fn serve(
+    store: Arc<dyn SessionStore>,
+    config: SessionConfig,
+    key: &[u8],
+    mut req: Request,
+    next: Next,
+) -> Result<Response> {
+    // 1. Cookie から ID を読む。署名が合わないものは無かったことにする。
+    let raw = req.cookie(&config.cookie);
+    // 署名が合わなくても「この名前の Cookie は持っていた」。
+    // ログアウトのあとで、消す Cookie を返すかどうかに使います。
+    let had_cookie = raw.is_some();
+    let incoming = raw.and_then(|raw| unsign(&raw, key));
 
-            // 置き場所から**実際に読めたか**。署名は合うが中身が無い Cookie
-            // （期限切れ・ログアウト後）を持っている人に、保存していない新しい ID を
-            // 毎リクエスト配り続けないための目印です。
-            let mut loaded = false;
+    // ルートに当たったか。当たらなかったリクエスト（静的ファイル・404・405）は
+    // 「読むだけ」として扱います（`StartSession` の説明を参照）。
+    let matched = req.route_matched();
 
-            // 1.5. 同じ ID のリクエストを直列にする錠を取る。
-            //
-            // **読み込みから保存までを押さえます。** 押さえないと、同時に来た2本が
-            // それぞれマップ全体を読んで書き戻すので後勝ちになり、片方の値が消えます。
-            // 新しく作る ID（Cookie が無い・読めなかったとき）は誰とも重ならないので、
-            // Cookie から読めた ID のときだけ取ります。
-            let id_lock = match &incoming {
-                Some(id) => Some(IdLock::acquire(id).await),
-                None => None,
-            };
+    // 置き場所から**実際に読めたか**。署名は合うが中身が無い Cookie
+    // （期限切れ・ログアウト後）を持っている人に、保存していない新しい ID を
+    // 毎リクエスト配り続けないための目印です。
+    let mut loaded = false;
 
-            // 2. 置き場所から中身を読む。
-            let session = match incoming {
-                Some(id) => {
-                    let found = {
-                        let store = store.clone();
-                        let id = id.clone();
-                        tokio::task::spawn_blocking(move || store.read(&id))
-                            .await
-                            .map_err(|_| Error::msg("セッションの読み込みが中断されました"))??
-                    };
-                    match found {
-                        Some(stored) => {
-                            loaded = true;
-                            let (data, old_flash) = Session::split_flash(stored);
-                            Session::new(id, data, old_flash).mark_loaded()
-                        }
-                        // ID はあるが中身が無い（期限切れなど）。同じ ID で作り直さない。
-                        None => Session::empty(),
-                    }
-                }
-                None => Session::empty(),
-            };
-            // 置き場所をこのセッションに結びつける。
-            // `Auth::logout_other_devices()` が、同じ利用者のほかのセッションを消せるようになる。
-            let session = session.with_store(store.clone());
+    // 1.5. 同じ ID のリクエストを直列にする錠を取る。
+    //
+    // **読み込みから保存までを押さえます。** 押さえないと、同時に来た2本が
+    // それぞれマップ全体を読んで書き戻すので後勝ちになり、片方の値が消えます。
+    // 新しく作る ID（Cookie が無い・読めなかったとき）は誰とも重ならないので、
+    // Cookie から読めた ID のときだけ取ります。
+    //
+    // **ルートに当たらなかったときは取りません。** 取ると、同じブラウザの
+    // 画面 1 枚と CSS・画像の 20 本が 1 本ずつになります。
+    let mut id_lock = match &incoming {
+        Some(id) if matched => Some(IdLock::acquire(id).await),
+        _ => None,
+    };
 
-            let id_before = session.id();
-            req.set_session(session.clone());
+    // ルートに当たらなかったときに読んだ、**書き換える前の**中身。
+    // あとで保存が要ると分かったときに、「どの鍵を変えたか」を出すのに使います。
+    let mut base: Option<BTreeMap<String, String>> = None;
 
-            // 3. ハンドラへ。
-            let response = next.run(req).await?;
-
-            // 4. 要るときだけ保存する。
-            //
-            // 中身のクローン（`snapshot_for_save`）は、保存が要ると決まってから行う。
-            // 読むだけのリクエストでクローンしても捨てるだけです。
-            let id_after = session.id();
-            // ID を作り直したかどうかは「古いファイルを消すか」の判定に使う。
-            // `regenerate()` が `dirty` を立てるので、保存の判定には足しません。
-            let id_changed = id_before != id_after;
-            let saved = session.should_save();
-            let mut after = after_request(saved, loaded);
-
-            if after == AfterRequest::Save {
-                let data = session.snapshot_for_save();
-
-                // 4.0. 処理中に、この利用者のセッションが別の所から切られていないか。
-                //
-                // `logout_other_devices` / `logout_user` はファイルを消すだけです。
-                // その瞬間に処理中だったこのリクエストが保存すると、消したはずの
-                // セッションが同じ ID で復活します。置き場所が持つ「切った」印が
-                // **このセッションがログインした時刻**より新しければ、保存せずに
-                // **消す側**に倒します。比べるのはログインの時刻（ミリ秒）です。
-                // 読み込んだ時刻で比べると、切った直後に別人として同じ利用者 ID で
-                // ログインし直したセッションまで同じ秒の中で巻き込みます。
-                //
-                // **ID を作り直したかどうかは見ません。** `regenerate()` は ID だけを
-                // 変えて `AUTH_AT_KEY` を引き継ぐので、「ログインし直し」の代わりに
-                // なりません。見ないでおくと、切っている最中に `regenerate()` を
-                // 通ったリクエストが、切ったはずのセッションを新しい ID で
-                // 生き残らせます。本物のログインし直し（`Auth::login_using_id`）は
-                // `AUTH_AT_KEY` を更新するので、`at > logged_in_at` の比較が守ります。
-                let revoke_check = if loaded {
-                    session.get(crate::auth::AUTH_ID_KEY).map(|user| {
-                        // 印より前にログインしたものだけが対象。時刻が無い古い
-                        // セッションは 0 として、印があれば切る側に倒す。
-                        let logged_in_at = session
-                            .get(crate::auth::AUTH_AT_KEY)
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        (user, logged_in_at)
-                    })
-                } else {
-                    None
-                };
-                let flushed = session.was_flushed() && data.is_empty();
-                // 作り直す前の ID。切られたときも、保存したときも残しません。
-                let old = id_changed.then(|| id_before.clone());
-
+    // 2. 置き場所から中身を読む。
+    //
+    // ルートに当たったときは、**同じ読みで期限も延ばします**
+    // （`read_and_touch`。残りが半分を切ったときだけ書く）。
+    // `expires_at` は「最後に書いたとき」から数えるので、延ばさないと GET の
+    // 画面を見て回っていた人が、ログインや POST から `SESSION_LIFETIME` で
+    // 突然ログアウトされます。終わりに `touch` を別に呼んでいたころは、
+    // 期限を知るためだけに同じファイルをもう 1 回読んで解析していました。
+    //
+    // ルートに当たらなかったときは読むだけです。CSS を配るたびに期限を
+    // 延ばす必要はありません。
+    let session = match incoming {
+        Some(id) => {
+            let found = {
                 let store = store.clone();
-                let id = id_after.clone();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    save_session(&*store, &id, &data, revoke_check, flushed, old.as_deref())
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if matched {
+                        store.read_and_touch(&id)
+                    } else {
+                        store.read(&id)
+                    }
                 })
                 .await
-                .map_err(|_| Error::msg("セッションの保存が中断されました"))??;
-
-                if outcome == SaveOutcome::Revoked {
-                    tracing::info!("切られたセッションなので保存しません");
-                    after = AfterRequest::Nothing;
+                .map_err(|_| Error::msg("セッションの読み込みが中断されました"))??
+            };
+            match found {
+                Some(stored) => {
+                    loaded = true;
+                    if !matched {
+                        base = Some(stored.clone());
+                    }
+                    let (data, old_flash) = Session::split_flash(stored);
+                    Session::new(id, data, old_flash).mark_loaded()
                 }
+                // ID はあるが中身が無い（期限切れなど）。同じ ID で作り直さない。
+                None => Session::empty(),
             }
+        }
+        None => Session::empty(),
+    };
+    // 置き場所をこのセッションに結びつける。
+    // `Auth::logout_other_devices()` が、同じ利用者のほかのセッションを消せるようになる。
+    let session = session.with_store(store.clone());
 
-            // 4.5. 保存は要らないが、置き場所から読めていたとき。
-            //
-            // **置き場所の期限も延ばします。** `expires_at` は「最後に書いたとき」から
-            // 数えるので、延ばさないと GET の画面を見て回っていた人が、
-            // ログインや POST から `SESSION_LIFETIME` で突然ログアウトされます。
-            // Cookie の `Max-Age` を延ばしても、サーバー側が切れていれば読めません。
-            //
-            // 毎リクエスト書かないよう、**延ばすかどうかは置き場所が決めます**
-            // （`SessionStore::touch`。残りが半分を切ったときだけ書く）。
-            // 延ばせなくても応答は返します。致命的ではありません。
-            if after == AfterRequest::Touch {
-                let store = store.clone();
-                let id = id_after.clone();
-                match tokio::task::spawn_blocking(move || store.touch(&id)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!("セッションの期限を延ばせませんでした: {e}"),
-                    Err(_) => tracing::warn!("セッションの期限の延長が中断されました"),
-                }
-            }
+    let id_before = session.id();
+    req.set_session(session.clone());
 
-            // 4.9. 錠を放す。保存も期限の延長も終わっているので、
-            // Cookie を組み立てるあいだ押さえておく必要はありません。
-            drop(id_lock);
+    // 3. ハンドラへ。
+    let response = next.run(req).await?;
 
-            // 5. Cookie を返す。
-            //
-            // 保存したときと、**置き場所から実際に読めたとき**（期限を延ばす）だけです。
-            // 「署名の合う Cookie を持っていた」だけで配ると、置き場所に中身が無い人に
-            // 保存していない新しい ID を毎リクエスト配り続けます。
-            if after != AfterRequest::Nothing {
-                let cookie = Cookie::new(&config.cookie, sign(&id_after, key))
-                    .with_path(&config.path)
-                    .with_max_age(i64::try_from(config.lifetime_secs).unwrap_or(i64::MAX))
-                    .with_secure(config.secure)
-                    .with_http_only(true)
-                    .with_same_site(config.same_site);
-                return Ok(response.with_cookie(&cookie));
-            }
-            Ok(response)
+    // 4. 要るときだけ保存する。
+    //
+    // 中身のクローン（`snapshot_for_save`）は、保存が要ると決まってから行う。
+    // 読むだけのリクエストでクローンしても捨てるだけです。
+    let id_after = session.id();
+    // ID を作り直したかどうかは「古いファイルを消すか」の判定に使う。
+    // `regenerate()` が `dirty` を立てるので、保存の判定には足しません。
+    let id_changed = id_before != id_after;
+    // ルートに当たらなかったときは、**書き換えたときだけ**保存する。
+    // 持ち越しの flash を抱えているだけでは保存しません（保存すると消費する）。
+    let saved = if matched {
+        session.should_save()
+    } else {
+        session.is_dirty()
+    };
+    let mut after = after_request(saved, loaded, matched);
+
+    if after == AfterRequest::Save {
+        // ルートに当たらなかったときは、持ち越しの flash を残す形で写し取る。
+        let data = if matched {
+            session.snapshot_for_save()
+        } else {
+            session.snapshot_keeping_flash()
+        };
+
+        // 4.0. 処理中に、この利用者のセッションが別の所から切られていないか。
+        //
+        // `logout_other_devices` / `logout_user` はファイルを消すだけです。
+        // その瞬間に処理中だったこのリクエストが保存すると、消したはずの
+        // セッションが同じ ID で復活します。置き場所が持つ「切った」印が
+        // **このセッションがログインした時刻**より新しければ、保存せずに
+        // **消す側**に倒します。比べるのはログインの時刻（ミリ秒）です。
+        // 読み込んだ時刻で比べると、切った直後に別人として同じ利用者 ID で
+        // ログインし直したセッションまで同じ秒の中で巻き込みます。
+        //
+        // **ID を作り直したかどうかは見ません。** `regenerate()` は ID だけを
+        // 変えて `AUTH_AT_KEY` を引き継ぐので、「ログインし直し」の代わりに
+        // なりません。見ないでおくと、切っている最中に `regenerate()` を
+        // 通ったリクエストが、切ったはずのセッションを新しい ID で
+        // 生き残らせます。本物のログインし直し（`Auth::login_using_id`）は
+        // `AUTH_AT_KEY` を更新するので、`at > logged_in_at` の比較が守ります。
+        //
+        // `Auth::logout_other_devices()` も、**呼んだ本人の** `AUTH_AT_KEY` を
+        // 印より新しい時刻に進めます。本人のセッションは、そのあと ID を
+        // 何度作り直しても、この比較で残ります。
+        let revoke_check = if loaded {
+            session.get(crate::auth::AUTH_ID_KEY).map(|user| {
+                // 印より前にログインしたものだけが対象。時刻が無い古い
+                // セッションは 0 として、印があれば切る側に倒す。
+                let logged_in_at = session
+                    .get(crate::auth::AUTH_AT_KEY)
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0);
+                (user, logged_in_at)
+            })
+        } else {
+            None
+        };
+        let flushed = session.was_flushed() && data.is_empty();
+        // 作り直す前の ID。切られたときも、保存したときも残しません。
+        let old = id_changed.then(|| id_before.clone());
+
+        // 4.1. ルートに当たらなかったリクエストが書き換えたとき。
+        //
+        // 錠を持たずに読んだ中身なので、丸ごと書き戻すと、そのあいだに
+        // 保存された別のリクエストの値（作ったばかりの CSRF トークンなど）を
+        // 消します。**ここで錠を取り、置き場所を読み直して、変えた鍵だけを
+        // 当てます**（`save_merged`）。ハンドラのあいだは押さえていないので、
+        // 待たせるのは保存の一瞬だけです。
+        //
+        // 中身を捨てたとき（ログアウト）は消すだけなので、読み直しません。
+        let merge = if flushed { None } else { base.take() };
+        if merge.is_some() {
+            id_lock = Some(IdLock::acquire(&id_before).await);
+        }
+
+        let store = store.clone();
+        let id = id_after.clone();
+        let before = id_before.clone();
+        let outcome = tokio::task::spawn_blocking(move || match merge {
+            Some(base) => save_merged(
+                &*store,
+                &before,
+                &base,
+                &id,
+                &data,
+                revoke_check,
+                old.as_deref(),
+            ),
+            None => save_session(&*store, &id, &data, revoke_check, flushed, old.as_deref()),
         })
+        .await
+        .map_err(|_| Error::msg("セッションの保存が中断されました"))??;
+
+        match outcome {
+            SaveOutcome::Done => {}
+            // ログアウト。置き場所には何も残していないので、新しい ID は配らない。
+            // ブラウザに残った古い Cookie は、持っていたときだけ消す。
+            SaveOutcome::Destroyed => {
+                after = if had_cookie {
+                    AfterRequest::Forget
+                } else {
+                    AfterRequest::Nothing
+                };
+            }
+            SaveOutcome::Revoked => {
+                tracing::info!("切られたセッションなので保存しません");
+                after = AfterRequest::Nothing;
+            }
+            SaveOutcome::Gone => {
+                tracing::debug!("処理中にセッションが消えたので、書き換えを保存しません");
+                after = AfterRequest::Nothing;
+            }
+        }
+    }
+
+    // 4.9. 錠を放す。保存は終わっているので、
+    // Cookie を組み立てるあいだ押さえておく必要はありません。
+    drop(id_lock);
+
+    // 5. Cookie を返す。
+    //
+    // 保存したときと、**ルートに当たって置き場所から実際に読めたとき**
+    // （Cookie の期限を延ばす）だけです。
+    // 「署名の合う Cookie を持っていた」だけで配ると、置き場所に中身が無い人に
+    // 保存していない新しい ID を毎リクエスト配り続けます。
+    match after {
+        AfterRequest::Nothing => Ok(response),
+        AfterRequest::Touch | AfterRequest::Save => {
+            let cookie = Cookie::new(&config.cookie, sign(&id_after, key))
+                .with_path(&config.path)
+                .with_max_age(i64::try_from(config.lifetime_secs).unwrap_or(i64::MAX))
+                .with_secure(config.secure)
+                .with_http_only(true)
+                .with_same_site(config.same_site);
+            Ok(response.with_cookie(&cookie))
+        }
+        // ログアウトした。同じ名前・同じパスの Cookie を、期限切れで上書きする。
+        //
+        // 以前は、置き場所から消したあとも**保存していない新しい ID** の Cookie を
+        // 返していました。次のリクエストは「署名は合うが中身が無い」扱いになり、
+        // 錠と空振りの読みが 1 回ずつ余計に走ります。Laravel は空のセッションを
+        // 必ず保存して新しい ID を返しますが、bengara は空のセッションを
+        // 置き場所に作らないので、Cookie のほうを消します。
+        AfterRequest::Forget => {
+            let cookie = Cookie::removal(&config.cookie)
+                .with_path(&config.path)
+                .with_secure(config.secure)
+                .with_http_only(true)
+                .with_same_site(config.same_site);
+            Ok(response.with_cookie(&cookie))
+        }
     }
 }
 
 /// 保存の経路で何をしたか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SaveOutcome {
-    /// 保存した（ログアウトの経路では消した）。
+    /// 保存した。
     Done,
+    /// ログアウトの経路。書かずに消した。
+    Destroyed,
     /// 処理中に切られていたので、保存せずに消した。
     Revoked,
+    /// ルートに当たらなかったリクエストが保存しようとしたが、読み直したら
+    /// 置き場所から消えていた（ログアウト・期限切れなど）。書いていない。
+    Gone,
+}
+
+/// ルートに当たらなかったリクエストの書き換えを保存する。
+///
+/// そのリクエストは錠を持たずに読んでいます。読んだ中身（`base`）と保存したい中身
+/// （`ours`）を比べ、**変えた鍵だけ**を、いま置き場所にある中身に当てます。
+/// 呼ぶ側が ID の錠を取ってから呼びます。
+///
+/// 読み直して無ければ書きません。そのあいだにログアウトしたか、期限が切れたか、
+/// 別のリクエストが ID を作り直しています。書くと、消したセッションが復活します。
+///
+/// 引数の `id_before` は読んだときの ID、`id` は保存する ID です
+/// （作り直していなければ同じ）。残りは [`save_session`] と同じです。
+fn save_merged(
+    store: &dyn SessionStore,
+    id_before: &str,
+    base: &BTreeMap<String, String>,
+    id: &str,
+    ours: &BTreeMap<String, String>,
+    revoke_check: Option<(String, i64)>,
+    old: Option<&str>,
+) -> Result<SaveOutcome> {
+    let Some(fresh) = store.read(id_before)? else {
+        return Ok(SaveOutcome::Gone);
+    };
+    let merged = merge_changes(base, ours, fresh);
+    save_session(store, id, &merged, revoke_check, false, old)
+}
+
+/// `base` から `ours` への変更（入れた・変えた・消した鍵）を `fresh` に当てる。
+///
+/// 触っていない鍵は `fresh` の値を残します。同じ鍵を両方が変えていたら、
+/// あとから保存するこちらが勝ちます。
+fn merge_changes(
+    base: &BTreeMap<String, String>,
+    ours: &BTreeMap<String, String>,
+    mut fresh: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    for (key, value) in ours {
+        if base.get(key) != Some(value) {
+            fresh.insert(key.clone(), value.clone());
+        }
+    }
+    for key in base.keys() {
+        if !ours.contains_key(key) {
+            fresh.remove(key);
+        }
+    }
+    fresh
 }
 
 /// 「切られていないか確認 → 保存または削除」をひとまとめに行う。
@@ -416,9 +608,9 @@ fn save_session(
         // 握り潰すと 200 を返しながら中身が残り、盗まれた Cookie が
         // 期限まで使えてしまいます。
         store.destroy(id)?;
-    } else {
-        store.write(id, data)?;
+        return Ok(SaveOutcome::Destroyed);
     }
+    store.write(id, data)?;
     Ok(SaveOutcome::Done)
 }
 
@@ -445,10 +637,24 @@ struct IdLock {
 impl IdLock {
     /// その ID の錠を取る。すでに誰かが持っていれば、放されるまで待ちます。
     async fn acquire(id: &str) -> Self {
-        let lock_arc = {
+        // **確保は地図の錠を取る前に済ませます。** 地図はプロセス全体で 1 つなので、
+        // Cookie つきの全リクエストがここを通ります。錠の中で `String` と `Arc` を
+        // 確保していたころは、アロケータの時間ぶんだけ全員を待たせていました。
+        // すでに組があるとき（同じセッションの 2 本目）は使わずに捨てます。
+        let key = id.to_string();
+        let fresh: Arc<tokio::sync::Mutex<()>> = Arc::default();
+        let (lock_arc, unused) = {
             let mut map = id_locks().lock().unwrap_or_else(|e| e.into_inner());
-            map.entry(id.to_string()).or_default().clone()
+            match map.get(id) {
+                Some(found) => (found.clone(), Some((key, fresh))),
+                None => {
+                    map.insert(key, fresh.clone());
+                    (fresh, None)
+                }
+            }
         };
+        // 使わなかったぶんの解放も、錠の外で。
+        drop(unused);
         // 地図の錠はここで放してある。`await` を越えて持たない。
         //
         // **`await` より前に `IdLock` を作ります。** 地図に組を入れてから
@@ -472,14 +678,17 @@ impl Drop for IdLock {
         // **先に錠を放します。** 放す前に数えると、自分が持っているぶんで
         // 必ず 2 以上になり、いつまでも片付けられません。
         self.guard = None;
-        let mut map = id_locks().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(found) = map.get(&self.id) {
+        let removed = {
+            let mut map = id_locks().lock().unwrap_or_else(|e| e.into_inner());
             // 地図のぶんだけなら、待っている人はいない。
             // 待っている人は地図の錠を取ってから複製するので、ここで数え漏らしません。
-            if Arc::strong_count(found) == 1 {
-                map.remove(&self.id);
+            match map.get(&self.id) {
+                Some(found) if Arc::strong_count(found) == 1 => map.remove_entry(&self.id),
+                _ => None,
             }
-        }
+        };
+        // 外した組（鍵の文字列と `Arc`）の解放は、地図の錠の外で。
+        drop(removed);
     }
 }
 
@@ -488,25 +697,36 @@ impl Drop for IdLock {
 enum AfterRequest {
     /// 何もしない。Cookie も返しません。
     Nothing,
-    /// 期限だけ延ばして、Cookie を返す。
+    /// 保存はしないが、Cookie を返して期限を延ばす。
+    ///
+    /// 置き場所の期限は、読んだときに延ばしてあります（`read_and_touch`）。
     Touch,
     /// 保存して、Cookie を返す。
     Save,
+    /// ログアウトした。置き場所から消したので、Cookie も消す。
+    ///
+    /// [`after_request`] は返しません。保存の経路で消したと分かってから決めます。
+    Forget,
 }
 
-/// 保存が要るか・置き場所から読めたかで、終わりにすることを決める。
+/// 保存が要るか・置き場所から読めたか・ルートに当たったかで、終わりにすることを決める。
 ///
-/// | 保存が要る | 読めた | すること |
-/// |---|---|---|
-/// | はい | - | 保存して Cookie |
-/// | いいえ | はい | 期限を延ばして Cookie |
-/// | いいえ | いいえ | 何もしない |
+/// | 保存が要る | 読めた | ルート | すること |
+/// |---|---|---|---|
+/// | はい | - | - | 保存して Cookie |
+/// | いいえ | はい | あり | Cookie を返す（期限を延ばす） |
+/// | いいえ | はい | なし | 何もしない |
+/// | いいえ | いいえ | - | 何もしない |
 ///
 /// **「Cookie を持っていた」ではなく「置き場所から読めた」で決めます。**
 /// 署名は合うが中身が無い Cookie（期限切れ・ログアウト後）の人に Cookie を返すと、
 /// 保存していない新しい ID を毎リクエスト配り続けることになります。
-fn after_request(saved: bool, loaded: bool) -> AfterRequest {
-    match (saved, loaded) {
+///
+/// **ルートに当たらなかったときは、書き換えていなければ何もしません。**
+/// 静的ファイルの応答に `Set-Cookie` を付ける意味はありません
+/// （「保存が要る」の中身もルートの有無で違います。呼ぶ側を参照）。
+fn after_request(saved: bool, loaded: bool, matched: bool) -> AfterRequest {
+    match (saved, loaded && matched) {
         (true, _) => AfterRequest::Save,
         (false, true) => AfterRequest::Touch,
         (false, false) => AfterRequest::Nothing,
@@ -727,7 +947,8 @@ pub(crate) fn ensure_token(session: &Session) -> String {
         }
     }
     let token = crypto::random_token();
-    session.put(CSRF_KEY, token.clone());
+    // 内部の鍵（`__` 始まり）なので、警告を出さない口から入れる。
+    session.put_internal(CSRF_KEY, token.clone());
     token
 }
 
@@ -968,12 +1189,60 @@ mod tests {
     fn 置き場所に無いcookieには何も返さない() {
         // 署名は合うが中身が無い Cookie（期限切れ・ログアウト後）の人に、
         // 保存していない新しい ID を毎リクエスト配らない。
-        assert_eq!(after_request(false, false), AfterRequest::Nothing);
+        assert_eq!(after_request(false, false, true), AfterRequest::Nothing);
         // 読めたときは、読むだけのリクエストでも期限を延ばす。
-        assert_eq!(after_request(false, true), AfterRequest::Touch);
+        assert_eq!(after_request(false, true, true), AfterRequest::Touch);
         // 保存が要るときは保存する。
-        assert_eq!(after_request(true, false), AfterRequest::Save);
-        assert_eq!(after_request(true, true), AfterRequest::Save);
+        assert_eq!(after_request(true, false, true), AfterRequest::Save);
+        assert_eq!(after_request(true, true, true), AfterRequest::Save);
+    }
+
+    #[test]
+    fn ルートに当たらなければ書き換えたときだけcookieを返す() {
+        // 静的ファイル・404・405 の応答に、読めたというだけで `Set-Cookie` を付けない。
+        assert_eq!(after_request(false, true, false), AfterRequest::Nothing);
+        assert_eq!(after_request(false, false, false), AfterRequest::Nothing);
+        // ミドルウェアが書き換えたときは保存する。
+        assert_eq!(after_request(true, true, false), AfterRequest::Save);
+        assert_eq!(after_request(true, false, false), AfterRequest::Save);
+    }
+
+    #[test]
+    fn 知らない置き場所の名前はfileにする() {
+        // 警告を出してから file にする（黙って file にしていた）。
+        let kind = |driver: &str| StartSession::from_driver(driver, SessionConfig::default()).kind;
+        assert_eq!(kind("file"), StoreKind::File);
+        assert_eq!(kind("memory"), StoreKind::Memory);
+        assert_eq!(kind("array"), StoreKind::Memory);
+        assert_eq!(kind("redis"), StoreKind::File, "知らない値");
+        assert_eq!(kind("flie"), StoreKind::File, "書き間違い");
+        assert_eq!(kind(""), StoreKind::File);
+    }
+
+    #[test]
+    fn 変えた鍵だけを当てる() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // 読んだとき。
+        let base = map(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        // こちらは b を変え、c を消し、d を足した。a は触っていない。
+        let ours = map(&[("a", "1"), ("b", "9"), ("d", "4")]);
+        // そのあいだに、別のリクエストが a を変え、e を足して保存していた。
+        let fresh = map(&[("a", "7"), ("b", "2"), ("c", "3"), ("e", "5")]);
+
+        assert_eq!(
+            merge_changes(&base, &ours, fresh),
+            map(&[("a", "7"), ("b", "9"), ("d", "4"), ("e", "5")]),
+            "触っていない鍵は置き場所の値を残す"
+        );
+
+        // 何も変えていなければ、置き場所の中身のまま。
+        let fresh = map(&[("a", "7")]);
+        assert_eq!(merge_changes(&base, &base, fresh.clone()), fresh);
     }
 
     #[test]
@@ -1162,7 +1431,9 @@ mod tests {
         store.write("aaa", &logged_in(1_000)).unwrap();
 
         let outcome = save_session(&store, "aaa", &BTreeMap::new(), None, true, None).unwrap();
-        assert_eq!(outcome, SaveOutcome::Done);
+        // 「保存した」と分けて返す。呼ぶ側が、新しい ID の Cookie を配らずに
+        // 古い Cookie を消すと決められるようにするため。
+        assert_eq!(outcome, SaveOutcome::Destroyed);
         assert!(store.read("aaa").unwrap().is_none());
     }
 
@@ -1207,6 +1478,540 @@ mod tests {
                 .contains_key(&id),
             "落とされた側の組も片付く"
         );
+    }
+
+    // ---- ここから下は、読み込みから Cookie までを通しで確かめます ----
+
+    use crate::http::handler::{Erased, ErasedHandler};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TEST_KEY: &[u8] = b"test-key";
+
+    /// 呼ばれた回数を数える置き場所。中身は `MemoryStore` に任せます。
+    struct Counting {
+        inner: crate::session::MemoryStore,
+        reads: AtomicUsize,
+        reads_with_touch: AtomicUsize,
+        touches: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    impl Counting {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: crate::session::MemoryStore::new(60),
+                reads: AtomicUsize::new(0),
+                reads_with_touch: AtomicUsize::new(0),
+                touches: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            })
+        }
+
+        /// (`read`, `read_and_touch`, `touch`, `write`) の回数。
+        fn counts(&self) -> (usize, usize, usize, usize) {
+            (
+                self.reads.load(Ordering::Relaxed),
+                self.reads_with_touch.load(Ordering::Relaxed),
+                self.touches.load(Ordering::Relaxed),
+                self.writes.load(Ordering::Relaxed),
+            )
+        }
+
+        /// 数えずに中身を見る（テストの確認用）。
+        fn peek(&self, id: &str) -> Option<BTreeMap<String, String>> {
+            self.inner.read(id).unwrap()
+        }
+
+        /// 数えずに中身を置く（テストの準備用）。
+        fn seed(&self, id: &str, pairs: &[(&str, &str)]) {
+            self.inner.write(id, &pairs_to_map(pairs)).unwrap();
+        }
+    }
+
+    impl SessionStore for Counting {
+        fn read(&self, id: &str) -> Result<Option<BTreeMap<String, String>>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read(id)
+        }
+        fn write(&self, id: &str, data: &BTreeMap<String, String>) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write(id, data)
+        }
+        fn destroy(&self, id: &str) -> Result<()> {
+            self.inner.destroy(id)
+        }
+        fn touch(&self, id: &str) -> Result<()> {
+            self.touches.fetch_add(1, Ordering::Relaxed);
+            self.inner.touch(id)
+        }
+        fn read_and_touch(&self, id: &str) -> Result<Option<BTreeMap<String, String>>> {
+            self.reads_with_touch.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_and_touch(id)
+        }
+        fn destroy_for_user(&self, user_id: &str) -> Result<usize> {
+            self.inner.destroy_for_user(user_id)
+        }
+        fn destroy_for_user_except(&self, user_id: &str, keep_id: &str) -> Result<usize> {
+            self.inner.destroy_for_user_except(user_id, keep_id)
+        }
+        fn mark_revoked(&self, user_id: &str, except: Option<&str>) {
+            self.inner.mark_revoked(user_id, except);
+        }
+        fn revoked_at(&self, user_id: &str, session_id: &str) -> Option<i64> {
+            self.inner.revoked_at(user_id, session_id)
+        }
+    }
+
+    fn pairs_to_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// ハンドラを 1 つ包む。
+    fn handler<F, Fut>(f: F) -> Arc<dyn ErasedHandler>
+    where
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Response>> + Send + 'static,
+    {
+        Arc::new(Erased::<F, (Request,)>::new(f))
+    }
+
+    /// 何もしないハンドラ。
+    fn idle() -> Arc<dyn ErasedHandler> {
+        handler(|_req: Request| async { Ok(Response::text("ok")) })
+    }
+
+    /// 1 リクエストを `StartSession` の本体に通す。
+    ///
+    /// `cookie` はセッションの Cookie の値です（前の応答から取り出したもの）。
+    /// `matched` はルートに当たったことにするかどうかです。
+    async fn send(
+        store: &Arc<Counting>,
+        cookie: Option<&str>,
+        matched: bool,
+        handler: Arc<dyn ErasedHandler>,
+    ) -> Response {
+        let mut req = Request::new("GET", "/");
+        if let Some(cookie) = cookie {
+            req = req.with_headers(vec![(
+                "cookie".to_string(),
+                format!("bengara_session={cookie}"),
+            )]);
+        }
+        if matched {
+            req.mark_matched();
+        }
+        let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+        let next = Next::new(
+            stack,
+            handler,
+            crate::http::response::RenderOptions::new(false, false),
+        );
+        serve(store.clone(), SessionConfig::default(), TEST_KEY, req, next)
+            .await
+            .expect("応答が返る")
+    }
+
+    /// 応答の `Set-Cookie` から、セッションの Cookie の値を取り出す。
+    fn cookie_of(response: &Response) -> Option<String> {
+        let header = response.header("set-cookie")?;
+        let (_, value) = header.split(';').next()?.split_once('=')?;
+        Some(value.to_string())
+    }
+
+    /// ログイン中の利用者 ID を本文で返すハンドラ（いなければ空）。
+    fn whoami() -> Arc<dyn ErasedHandler> {
+        handler(
+            |req: Request| async move { Ok(Response::text(req.auth().id().unwrap_or_default())) },
+        )
+    }
+
+    #[tokio::test]
+    async fn 他の端末を切ってidを作り直しても次の保存で落ちない() {
+        // `logout_other_devices()` の印は「切った時刻・除外は切ったときの ID」。
+        // そのあと `regenerate()` すると新しい ID は除外に当たらず、ログインの時刻も
+        // 古いままなので、**次のリクエストの保存**で本人が切られていた
+        // （切ったリクエストの保存は、作り直す前の ID が除外に当たって助かる）。
+        let store = Counting::new();
+
+        // 1. ログインする。
+        let res = send(
+            &store,
+            None,
+            true,
+            handler(|req: Request| async move {
+                req.auth().login_using_id(7)?;
+                Ok(Response::text("ok"))
+            }),
+        )
+        .await;
+        let first = cookie_of(&res).expect("ログインで Cookie が出る");
+
+        // 別の端末のセッション。
+        store.seed(
+            "other",
+            &[
+                (crate::auth::AUTH_ID_KEY, "7"),
+                (crate::auth::AUTH_AT_KEY, "1000"),
+            ],
+        );
+        // 印の時刻がログインの時刻より確実に後になるようにする。
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // 2. 他の端末を切って、ID を作り直す（パスワード変更の流れ）。
+        let res = send(
+            &store,
+            Some(&first),
+            true,
+            handler(|req: Request| async move {
+                let removed = req.auth().logout_other_devices_async().await?;
+                req.session().regenerate();
+                Ok(Response::text(removed.to_string()))
+            }),
+        )
+        .await;
+        assert_eq!(res.body_text(), "1", "他の端末は切れる");
+        assert!(store.peek("other").is_none());
+        let second = cookie_of(&res).expect("作り直した ID の Cookie");
+        assert_ne!(second, first);
+
+        // 3. 次のリクエストが保存する（CSRF トークンを作り直す GET に当たる）。
+        let res = send(
+            &store,
+            Some(&second),
+            true,
+            handler(|req: Request| async move {
+                req.session().put("visited", "1");
+                Ok(Response::text(req.auth().id().unwrap_or_default()))
+            }),
+        )
+        .await;
+        assert_eq!(res.body_text(), "7");
+        assert!(
+            cookie_of(&res).is_some(),
+            "保存できている（切られていない）"
+        );
+
+        // 4. その次も、本人はログインしたまま。
+        let res = send(&store, Some(&second), true, whoami()).await;
+        assert_eq!(res.body_text(), "7", "呼んだ本人は残る");
+
+        // 5. もう一度作り直しても残る。
+        let res = send(
+            &store,
+            Some(&second),
+            true,
+            handler(|req: Request| async move {
+                req.session().regenerate();
+                Ok(Response::text("ok"))
+            }),
+        )
+        .await;
+        let third = cookie_of(&res).expect("作り直した ID の Cookie");
+        let res = send(&store, Some(&third), true, whoami()).await;
+        assert_eq!(res.body_text(), "7", "ID を何度作り直しても残る");
+    }
+
+    #[tokio::test]
+    async fn 読むだけのgetは置き場所を一度しか読まない() {
+        // 終わりに `touch` を別に呼んでいたころは、期限を知るためだけに
+        // 同じ中身をもう 1 回読んでいた（裏のスレッドへの往復も 2 回）。
+        let store = Counting::new();
+        store.seed("s1", &[("cart", "1")]);
+        let cookie = sign("s1", TEST_KEY);
+
+        let res = send(&store, Some(&cookie), true, idle()).await;
+        assert_eq!(
+            store.counts(),
+            (0, 1, 0, 0),
+            "読みと期限の延長を 1 回で済ませる"
+        );
+        // Cookie は返す（ブラウザ側の期限を延ばす）。ID は変わらない。
+        assert_eq!(cookie_of(&res).as_deref(), Some(cookie.as_str()));
+    }
+
+    #[tokio::test]
+    async fn ルートに当たらないリクエストは読むだけ() {
+        // 静的ファイル・404・405。持ち越しの flash を消費せず、書かず、
+        // 期限も延ばさず、Cookie も返さない。
+        let store = Counting::new();
+        store.seed("s1", &[("cart", "1"), ("__flash:status", "保存しました")]);
+        let cookie = sign("s1", TEST_KEY);
+        let status = || {
+            handler(
+                |req: Request| async move { Ok(Response::text(req.session().get_or("status", ""))) },
+            )
+        };
+
+        // セッションは載っている（`req.session()` がパニックしない）。flash も読める。
+        let res = send(&store, Some(&cookie), false, status()).await;
+        assert_eq!(res.body_text(), "保存しました");
+        assert!(res.header("set-cookie").is_none(), "Cookie を返さない");
+        assert_eq!(store.counts(), (1, 0, 0, 0), "読むだけ。延ばさず、書かない");
+        assert_eq!(
+            store
+                .peek("s1")
+                .unwrap()
+                .get("__flash:status")
+                .map(String::as_str),
+            Some("保存しました"),
+            "flash は消費していない"
+        );
+
+        // 次の、ルートに当たるリクエストで読めて、そこで消費する。
+        let res = send(&store, Some(&cookie), true, status()).await;
+        assert_eq!(res.body_text(), "保存しました", "画面で 1 回読める");
+        let res = send(&store, Some(&cookie), true, status()).await;
+        assert_eq!(res.body_text(), "", "その次には残らない");
+
+        // Cookie を持たない人には、ルートが無ければ何も起きない。
+        let before = store.counts();
+        let res = send(&store, None, false, idle()).await;
+        assert!(res.header("set-cookie").is_none());
+        assert_eq!(store.counts(), before, "置き場所に触らない");
+    }
+
+    #[tokio::test]
+    async fn ルートに当たらないリクエストは錠を待たない() {
+        // 同じブラウザの画面 1 枚と CSS・画像が 1 本ずつにならないこと。
+        let store = Counting::new();
+        store.seed("locked", &[("cart", "1")]);
+        let cookie = sign("locked", TEST_KEY);
+
+        // 同じセッションの、長くかかるリクエストが錠を持っている。
+        let held = IdLock::acquire("locked").await;
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send(&store, Some(&cookie), false, idle()),
+        )
+        .await
+        .expect("錠を待たずに返る");
+        assert_eq!(res.status(), 200);
+
+        // ルートに当たるリクエストは、今までどおり待つ。
+        let waiting = {
+            let store = store.clone();
+            let cookie = cookie.clone();
+            tokio::spawn(async move { send(&store, Some(&cookie), true, idle()).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "放すまで待つ");
+        drop(held);
+        waiting.await.expect("待っていたほうが返る");
+    }
+
+    #[tokio::test]
+    async fn ルートに当たらないリクエストの書き換えは変えた鍵だけ保存する() {
+        // 錠を持たずに読んでいるので、丸ごと書き戻すと、そのあいだに保存された
+        // 別のリクエストの値（作ったばかりの CSRF トークンなど）を消してしまう。
+        let store = Counting::new();
+        store.seed(
+            "s1",
+            &[("a", "1"), ("b", "2"), ("__flash:status", "保存しました")],
+        );
+        let cookie = sign("s1", TEST_KEY);
+
+        let res = {
+            let shared = store.clone();
+            send(
+                &store,
+                Some(&cookie),
+                false,
+                handler(move |req: Request| {
+                    let shared = shared.clone();
+                    async move {
+                        // 読んだあとで、別のリクエストがトークンを足して保存した。
+                        shared.seed(
+                            "s1",
+                            &[
+                                ("a", "1"),
+                                ("b", "2"),
+                                (CSRF_KEY, "別のリクエストのトークン"),
+                                ("__flash:status", "保存しました"),
+                            ],
+                        );
+                        // こちらは b を変え、a を消す。
+                        req.session().put("b", "9");
+                        req.session().forget("a");
+                        Ok(Response::text("ok"))
+                    }
+                }),
+            )
+            .await
+        };
+        assert!(cookie_of(&res).is_some(), "書き換えたので Cookie を返す");
+        assert_eq!(
+            store.peek("s1").unwrap(),
+            pairs_to_map(&[
+                ("b", "9"),
+                (CSRF_KEY, "別のリクエストのトークン"),
+                ("__flash:status", "保存しました"),
+            ]),
+            "変えた鍵だけ当てる。別のリクエストの値と flash は残す"
+        );
+        // 使い終わった錠は地図に残さない。
+        assert!(!id_locks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key("s1"));
+
+        // 処理中にセッションが消えていたら、書き戻さない（ログアウトを取り消さない）。
+        let res = {
+            let shared = store.clone();
+            send(
+                &store,
+                Some(&cookie),
+                false,
+                handler(move |req: Request| {
+                    let shared = shared.clone();
+                    async move {
+                        shared.destroy("s1")?;
+                        req.session().put("b", "10");
+                        Ok(Response::text("ok"))
+                    }
+                }),
+            )
+            .await
+        };
+        assert!(res.header("set-cookie").is_none());
+        assert!(store.peek("s1").is_none(), "消えたセッションを復活させない");
+
+        // 新しいセッション（Cookie なし）でも、書き換えれば保存して Cookie を返す。
+        let res = send(
+            &store,
+            None,
+            false,
+            handler(|req: Request| async move {
+                req.session().put("locale", "ja");
+                Ok(Response::text("ok"))
+            }),
+        )
+        .await;
+        let fresh = cookie_of(&res).expect("新しいセッションの Cookie");
+        let res = send(
+            &store,
+            Some(&fresh),
+            true,
+            handler(|req: Request| async move {
+                Ok(Response::text(req.session().get_or("locale", "")))
+            }),
+        )
+        .await;
+        assert_eq!(res.body_text(), "ja");
+    }
+
+    #[tokio::test]
+    async fn ログアウトしたら新しいidを配らずcookieを消す() {
+        // 以前は、置き場所から消したあとも保存していない新しい ID の Cookie を返していた。
+        let store = Counting::new();
+        let logout = || {
+            handler(|req: Request| async move {
+                req.auth().logout()?;
+                Ok(Response::text("ok"))
+            })
+        };
+
+        let res = send(
+            &store,
+            None,
+            true,
+            handler(|req: Request| async move {
+                req.auth().login_using_id(7)?;
+                Ok(Response::text("ok"))
+            }),
+        )
+        .await;
+        let cookie = cookie_of(&res).expect("ログインで Cookie が出る");
+
+        let res = send(&store, Some(&cookie), true, logout()).await;
+        let header = res.header("set-cookie").expect("消す Cookie を返す");
+        assert!(header.starts_with("bengara_session=;"), "{header}");
+        assert!(header.contains("Max-Age=0"), "{header}");
+        assert!(header.contains("Path=/"), "{header}");
+        assert!(header.contains("HttpOnly"), "{header}");
+
+        // 古い Cookie を送り直しても、ログインしていない。Cookie も返らない。
+        let res = send(&store, Some(&cookie), true, whoami()).await;
+        assert_eq!(res.body_text(), "");
+        assert!(res.header("set-cookie").is_none());
+
+        // Cookie を持っていない人のログアウトには、何も返さない。
+        let res = send(&store, None, true, logout()).await;
+        assert!(res.header("set-cookie").is_none());
+
+        // ログアウトのあとで値を入れたとき（「ログアウトしました」の flash など）は、
+        // 新しい ID で保存して、その Cookie を返す。
+        let res = send(
+            &store,
+            None,
+            true,
+            handler(|req: Request| async move {
+                req.auth().login_using_id(7)?;
+                Ok(Response::text("ok"))
+            }),
+        )
+        .await;
+        let cookie = cookie_of(&res).unwrap();
+        let res = send(
+            &store,
+            Some(&cookie),
+            true,
+            handler(|req: Request| async move {
+                req.auth().logout()?;
+                req.session().flash("status", "ログアウトしました");
+                Ok(Response::text("ok"))
+            }),
+        )
+        .await;
+        let after = cookie_of(&res).expect("新しい ID の Cookie");
+        assert_ne!(after, cookie);
+        assert!(!after.is_empty());
+        let res = send(
+            &store,
+            Some(&after),
+            true,
+            handler(|req: Request| async move {
+                Ok(Response::text(format!(
+                    "{}/{}",
+                    req.auth().id().unwrap_or_default(),
+                    req.session().get_or("status", "")
+                )))
+            }),
+        )
+        .await;
+        assert_eq!(res.body_text(), "/ログアウトしました");
+    }
+
+    #[tokio::test]
+    async fn 錠の地図は確保を外に出しても片付く() {
+        // 組を先に作ってから地図に入れる形にしても、数え方（地図のぶんだけなら
+        // 待っている人はいない）が崩れていないこと。
+        let id = format!("test-{}", crypto::random_token());
+        let in_map = |id: &str| {
+            id_locks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(id)
+        };
+
+        let first = IdLock::acquire(&id).await;
+        assert!(in_map(&id), "持っているあいだは地図にある");
+        // 2 本目は、先に作った組を捨てて、地図の組を使う。
+        let waiting = {
+            let id = id.clone();
+            tokio::spawn(async move { IdLock::acquire(&id).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "同じ組を待っている");
+
+        drop(first);
+        assert!(in_map(&id), "待っている人がいるあいだは片付けない");
+        let second = waiting.await.expect("待っていたほうが取れる");
+        drop(second);
+        assert!(!in_map(&id), "最後の 1 人が放したら片付ける");
     }
 
     #[test]

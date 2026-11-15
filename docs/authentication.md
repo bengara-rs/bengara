@@ -1,6 +1,12 @@
 # 認証
 
-パスワードの保存・ログイン・パスワードの再設定・暗号化の書き方です。
+ログインの仕組みです。このページで分かることは 4 つです。
+
+- パスワードの保存と、ログイン・ログアウトの書き方
+- ルートをログイン必須にする方法
+- パスワードの再設定
+- 値の暗号化
+
 誰に何を許すかは [authorization.md](authorization.md) にあります。
 
 ## 用意するもの
@@ -36,7 +42,7 @@ pub fn down(schema: &mut Schema) {
 ### 2. モデル
 
 書くのは `password_hash()` の 1 つだけです。
-表の名前と主キーは `#[derive(Model)]` から受け継ぎます。
+表の名前と主キーは `#[derive(Model)]` から受け継ぎます（[models.md](models.md)）。
 
 ```rust
 // app/Models/User.rs
@@ -62,9 +68,6 @@ impl Authenticatable for User {
 }
 ```
 
-> `#[derive(Model)]` が使えるのは、**自動で番号が振られる整数の主キー**だけです。
-> 詳しくは [models.md](models.md) にあります。
-
 ### 3. 登録
 
 ```rust
@@ -74,6 +77,8 @@ impl Authenticatable for User {
         .alias("auth", Authenticate::new())
 })
 ```
+
+セッションの準備（`APP_KEY` など）は [session.md](session.md) にあります。
 
 ## パスワードを保存する
 
@@ -93,45 +98,45 @@ pub async fn register(name: &str, email: &str, password: &str) -> Result<User> {
 
 | 関数                                  | すること                                     |
 |---------------------------------------|----------------------------------------------|
-| `Hash::make_async(平文)`              | 保存する形に変える。**非同期の中ではこちら** |
-| `Hash::check_async(平文, 保存した値)` | 合っているか。**非同期の中ではこちら**       |
-| `Hash::make(平文)`                    | 同期版。**同じ平文でも毎回違う値**になります |
-| `Hash::check(平文, 保存した値)`       | 同期版                                       |
+| `Hash::make_async(平文)`              | 保存する形に変える。**同じ平文でも毎回違う値**になる |
+| `Hash::check_async(平文, 保存した値)` | 合っているか                                 |
+| `Hash::make(平文)` / `Hash::check(..)` | 上の 2 つの同期版                           |
+| `Hash::make_with(平文, 回数)`         | 回数を指定して変える（同期）                 |
 | `Hash::needs_rehash(保存した値)`      | 回数の設定を上げた後、作り直すべきか         |
-
-### 登録の検査に `max:1024` を**例外なく**付ける
-
-```rust
-("password", "required|min:8|max:1024|confirmed")
-```
-
-**照合に渡せる平文は 1024 バイトまでです。** それより長い値は計算せずに偽を返します。
-
-**`Hash::make` / `Hash::make_async` には上限がありません。**
-1024 バイトを超える平文でも、そのままハッシュを作ります。
-**そのハッシュは `check` が必ず偽を返すので、その人は二度とログインできません。**
-
-- パスワードを受け取る口は、**ひとつ残らず** `max:1024` を付けてください。
-  登録・変更・再設定の 3 か所です。
-- 1024 バイトを超えた平文を `make` に渡すと、ログに `error` が出ます。
-  **出たら、その利用者はもうログインできません。** 作り直してください。
 
 ### 同期版と非同期版の使い分け
 
 | 場面                                             | 使うもの                     |
 |--------------------------------------------------|------------------------------|
-| コントローラ・ジョブ・コマンドの `async fn` の中 | `make_async` / `check_async` |
-| モデルの `async fn` の中                         | `make_async` / `check_async` |
+| コントローラ・ジョブ・コマンド・モデルの `async fn` の中 | `make_async` / `check_async` |
 | 同期の関数（シーダの組み立て、テストの準備など） | `make` / `check`             |
 
-同期版は 0.2 秒のあいだスレッドを塞ぎ、同じスレッドのほかのリクエストを止めます。
-`req.auth().attempt(...)` は中で裏のスレッドに逃がしているので、そのまま呼んで大丈夫です。
+- 同期版は約 0.2 秒のあいだスレッドを塞ぎ、同じスレッドのほかのリクエストを止めます。
+- `req.auth().attempt(...)` は、そのまま呼んで大丈夫です。中で裏のスレッドに回しています。
+
+### パスワードの検査に `max:1024` を必ず付ける
+
+```rust
+("password", "required|min:8|max:1024|confirmed")
+```
+
+| 関数    | 1024 バイトを超える平文を渡すと                   |
+|---------|---------------------------------------------------|
+| `check` | 計算せずに偽を返す                                |
+| `make`  | **そのままハッシュを作る**。ログに `error` が出る |
+
+**そのハッシュは `check` が必ず偽を返すので、その人は二度とログインできません。**
+パスワードを受け取る口は、ひとつ残らず `max:1024` を付けます。
+登録・変更・再設定の 3 か所です。
 
 ## ログインする
 
 ```rust
 pub async fn login(req: Request) -> Result<Response> {
-    let input = req.validate(&[("email", "required|email"), ("password", "required")])?;
+    let input = req.validate(&[
+        ("email", "required|email"),
+        ("password", "required|max:1024"),
+    ])?;
 
     let ok = req
         .auth()
@@ -142,12 +147,11 @@ pub async fn login(req: Request) -> Result<Response> {
         // どちらが違うかは言わない（登録の有無が漏れないように）
         return abort_with(422, "メールアドレスかパスワードが違います");
     }
-    json(&bengara::serde_json::json!({ "id": req.auth().id() }))
+    json(&json!({ "id": req.auth().id() }))
 }
 ```
 
-`attempt` の第 1 引数は **照合に使う列**です。
-メールアドレス以外でもログインさせられます。
+`attempt` の第 1 引数は **照合に使う列**です。メールアドレス以外でもログインさせられます。
 
 | メソッド                                    | すること                                          |
 |---------------------------------------------|---------------------------------------------------|
@@ -160,16 +164,21 @@ pub async fn login(req: Request) -> Result<Response> {
 | `user_or_fail::<U>()`                       | 同じ。いなければ 401 のエラー                     |
 | `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする                        |
 
-- `attempt` と `login` は **セッション ID を作り直します。**
-  **CSRF トークンも作り直されるので、ログイン後の画面で取り直してください**
-  （[session.md](session.md)）。
-- **`user()` は呼ぶたびに DB を引きます。** 何度も使うときは変数に入れてください。
+- **ログインするとセッション ID を作り直します。CSRF トークンも変わります。**
+  ログイン後の画面で取り直します（[session.md](session.md)）。
+- **`user()` は呼ぶたびに DB を引きます。** 何度も使うときは変数に入れます。
+  セッションに入っている主キーの値が整数に読めないときだけは、問い合わせずに `None` を返します
+  （[models.md](models.md)）。
+- **`check()` / `guest()` / `id()` と `auth` ミドルウェアは DB を引きません。**
+  見るのはセッションだけです。利用者の行を消しても、セッションが残っているあいだは
+  `auth` を通ります。**利用者を消したら `logout_user(id)` を呼びます。**
 - 利用者が見つからないときも、`attempt` は **照合と同じだけ時間をかけます。**
   応答の速さから登録の有無が分かるのを防ぐためです。
+- **`Auth::user()` のように、どこからでも読める形はありません。** `req` から取ります。
 
 ### ログインの回数を制限する
 
-既存の `Throttle` を重ねるだけです。**総当たりを防ぐために、必ず付けてください**
+**総当たりを防ぐために、ログインの口には必ず回数の制限を付けます**
 （[middleware.md](middleware.md)）。
 
 ```rust
@@ -180,18 +189,14 @@ Route::post("/api/login", AuthController::login).middleware("throttle");
 
 切る範囲が 4 つに分かれています。
 
-| メソッド                 | 切る範囲                         | 返るもの     | 使う場面                    |
-|--------------------------|----------------------------------|--------------|-----------------------------|
-| `logout()`               | **いまのセッションだけ**         | `Result<()>` | 画面の「ログアウト」ボタン  |
-| `logout_other_devices()` | 同じ利用者の、いま以外のすべて   | 消した数     | パスワードを変えたあと      |
-| `logout_all_devices()`   | 同じ利用者のすべて（自分も切る） | 消した数     | 「全部の端末からログアウト」|
-| `logout_user(id)`        | **指定した利用者**のすべて       | 消した数     | パスワードの再設定          |
+| メソッド                 | 切る範囲                         | 使う場面                         |
+|--------------------------|----------------------------------|----------------------------------|
+| `logout()`               | **いまのセッションだけ**         | 画面の「ログアウト」ボタン       |
+| `logout_other_devices()` | 同じ利用者の、いま以外のすべて   | パスワードを変えたあと           |
+| `logout_all_devices()`   | 同じ利用者のすべて（自分も切る） | 「全部の端末からログアウト」     |
+| `logout_user(id)`        | **指定した利用者**のすべて       | パスワードの再設定、利用者の削除 |
 
-**非同期の処理の中では `*_async` を使ってください**
-（`logout_other_devices_async()` / `logout_all_devices_async()` /
-`logout_user_async(id)`）。同期版は置き場所の中をそのスレッドで全部見るので、
-セッションが数千本あるとほかのリクエストが止まります。
-`logout()` は 1 本だけなので同期のままでよいです。
+`logout()` は `Result<()>` を返します。ほかの 3 つは消した数を返します。
 
 ```rust
 // パスワードを書き換えたあとで、ほかの端末を切る
@@ -200,52 +205,66 @@ user.save().await?;
 req.auth().logout_other_devices_async().await?;
 ```
 
-- **パスワードを変えたら `logout_other_devices()` を呼んでください。**
+**`async fn` の中では、名前の後ろに `_async` を付けたものを使います**
+（`logout_other_devices_async()` / `logout_all_devices_async()` / `logout_user_async(id)`）。
+同期版は置き場所の中を全部見るので、セッションが多いとほかのリクエストが止まります。
+`logout()` は 1 本だけなので、同期のままで構いません。
+
+- **パスワードを変えたら `logout_other_devices()` を呼びます。**
   変えただけでは、盗まれたセッションが期限まで生き残ります。
-- パスワードの再設定で `logout_user(id)` を使うのは、本人がログインしていないからです。
-- **`logout_other_devices()` のあとに `regenerate()` を呼んでも、
-  呼んだ本人は残ります。**
-- 切った瞬間に処理中だった別の端末のリクエストも復活しません。
-- ログインしていなければ、何もせず `0` が返ります。
-- 置き場所の中を全部見ます。**時間のかかる操作です。** 呼ぶ回数は少なくしてください。
-- 自分で作った `SessionStore` では、`destroy_for_user` と `destroy_for_user_except`
-  を実装していなければ警告が出て `0` が返ります（[session.md](session.md)）。
+- **利用者を消したときも `logout_user(id)` を呼びます。**
+- `logout_other_devices()` を呼んだ本人は残ります。
+  そのあと `regenerate()` で ID を作り直しても残ります。
+- `logout()` と `logout_all_devices()` は、セッションの Cookie も消します。
+- 切った瞬間に処理中だった別の端末のリクエストも、復活しません。
+- ログインしていなければ、何もせず `0` が返ります（`logout_user` を除く）。
+- 置き場所の中を全部見るので、**時間のかかる操作です。** 呼ぶ回数は少なくします。
 
 ## ログイン必須にする
 
 ```rust
-// bootstrap/app.rs
-.alias("auth", Authenticate::new())
-```
-
-```rust
 // routes/web.rs
-Route::get("/api/me", UserController::me).middleware("auth");
+Route::get("/api/me", AuthController::me).middleware("auth");
 
 // グループにまとめて掛ける
-Route::prefix("api/my").middleware("auth").group(|| {
-    Route::get("/articles", MyArticleController::index);
+Route::prefix("api/my/articles").middleware("auth").group(|| {
+    Route::get("/", MyArticleController::index);
 });
 ```
 
-| 書き方                                | ログインしていないとき                       |
+| 登録の書き方                          | ログインしていないとき                       |
 |---------------------------------------|----------------------------------------------|
 | `Authenticate::new()`                 | 401                                          |
 | `Authenticate::redirect_to("/login")` | 302（JSON を期待しているリクエストには 401） |
 
-### 止めたときの行き先
+### 今ログインしている人を使う
 
-`req.session().intended()` で取り出せます。読むと消えます。
+```rust
+pub async fn me(req: Request) -> Result<Response> {
+    let user = req.auth().user_or_fail::<User>().await?;   // 401 か User
+    json(&json!({ "name": user.name }))
+}
+```
+
+### ログイン後に元のページへ戻す
+
+`redirect_to` で転送したときは、もとのパスをセッションに覚えます。
+`req.session().intended()` で取り出します。読むと消えます。
 
 ```rust
 let back = req.session().intended().unwrap_or_else(|| "/".to_string());
 redirect().to(back)
 ```
 
-- 覚えるのは **302 で転送するときだけ**です。`Authenticate::new()`（401）や、
-  JSON を期待しているリクエストでは覚えません。
-- 覚えるのは **自分のサイトの中を指すパスだけ**です。断ったときは `None` が返り、
-  警告がログに出ます。
+覚えるのは、次の 3 つをすべて満たすときだけです。満たさなければ `None` が返ります。
+
+| 条件                         | 理由                                                 |
+|------------------------------|------------------------------------------------------|
+| 302 で転送した               | 401 を返すだけなら、戻る相手がいない                 |
+| メソッドが `GET` か `HEAD`   | ログイン後は `GET` で飛ぶ。`POST` 専用のパスは 405 になる |
+| 自分のサイトの中を指すパス   | よそのサイトへ飛ばさないため                         |
+
+自分のサイトの中かどうかは、次のように見ます。
 
 | 断るもの         | 例                       |
 |------------------|--------------------------|
@@ -254,24 +273,14 @@ redirect().to(back)
 | `\` を含む       | `/\evil.example`、`/a\b` |
 | 制御文字を含む   | 改行やタブが混ざったパス |
 
-`\` を断つのは、ブラウザがこれを `/` と同じに扱うためです。
-
-## 今ログインしている人を使う
-
-```rust
-pub async fn me(req: Request) -> Result<Response> {
-    let user = req.auth().user_or_fail::<User>().await?;   // 401 か User
-    json(&bengara::serde_json::json!({ "name": user.name }))
-}
-```
-
-`Auth::user()` のように **どこからでも読める形はありません。** `req` から取ります。
+`\` を断るのは、ブラウザがこれを `/` と同じに扱うためです。
 
 ## パスワードの再設定
 
-**文面と送信は自分で書きます。** bengara が作るのはトークンとリンクまでです。
+**文面と送信、画面は自分で書きます。** bengara が作るのはトークンとリンクまでです。
 送るときは `Mail` を使います（[mail.md](mail.md)）。
-SMTP で送るなら機能フラグ `mail` が要ります。
+
+トークンは `password_resets` という表に入れます。先に表を作ります。
 
 ```rust
 // database/migrations/..._create_password_resets_table.rs
@@ -293,33 +302,35 @@ if !PasswordReset::consume_if_valid(&email, &token).await? {
 // 3. パスワードを書き換えて、その人のセッションを全部切る
 user.password = Hash::make_async(&new_password).await?;
 user.save().await?;
-req.auth().logout_user_async(user.id).await?;
+req.auth().logout_user_async(user.key()).await?;
 ```
 
 | メソッド                      | すること                                           |
 |-------------------------------|----------------------------------------------------|
 | `create(email)`               | トークンを作って表に入れ、**平文のトークン**を返す |
+| `link(パス, email, 鍵, 秒)`   | 署名付き・期限つきの URL を作る（[routing.md](routing.md)） |
 | `consume_if_valid(email, 鍵)` | 照合して、合っていれば**その場で消す**             |
 | `verify(email, 鍵)`           | 照合だけする。**入力欄を出してよいかの下調べ用**   |
-| `consume(email)`              | トークンを消す                                     |
+| `consume(email)`              | トークンを消す。再設定をやめたときの片付け用       |
 | `sweep_expired()`             | 期限切れをまとめて消す                             |
-| `link(パス, email, 鍵, 秒)`   | 署名付き・期限つきの URL を作る                    |
-| `lifetime_minutes()`          | トークンが使える時間（分）。いまは 60 で固定       |
+| `lifetime_minutes()`          | トークンが使える時間（分）。60 で固定              |
 | `define(&mut Schema)`         | 表を作る定義                                       |
 
-**`consume_if_valid` を使ってください。**
-照合と削除を 1 つの文で行うので、トークンは 1 回しか使えません。
+**再設定の判定には、必ず `consume_if_valid` を使います。**
 `verify` で真を見てから `consume` を呼ぶ 2 段の書き方はやめてください。
 その間に別のリクエストが入ると、同じトークンが 2 回使えてしまいます。
 
+- トークンは 1 つのメールアドレスに 1 本です。作り直すと、前のものは使えなくなります。
 - 表に入るのは **トークンのハッシュ**です。表が漏れても、そのままでは使えません。
 - 期限は 60 分です。期限切れ・不一致・記録なしは、すべて同じ「偽」です。
-- **知らないメールアドレスを頼まれたときも、同じ応答を返してください。**
+- **知らないメールアドレスを頼まれたときも、同じ応答を返します。**
   応答が違うと、登録の有無が分かってしまいます。
+- リンクは `GET` で開かれます。同じパスに `GET` のルートも用意します。
 
 ## 暗号化
 
 値を他人に読めない形にします。機能フラグ `encryption` が必要です。
+無いまま呼ぶと、エラーが返ります。
 
 ```toml
 bengara = { version = "0.1", features = ["sqlite", "encryption"] }
@@ -330,11 +341,9 @@ let hidden = encrypt("ひみつ")?;     // 毎回違う文字列になる
 let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 ```
 
-- 鍵のもとは `APP_KEY` です。`cargo artisan key:generate` で作ってください。
-  実際に使う鍵は用途ごとに作り分けるので、セッションや署名付き URL とは
-  **別の鍵**になります（[configuration.md](configuration.md)）。
-- 改ざんも検出できます（中身を変えられたら復号がエラーになります）。
-- 署名だけで足りるなら `signed_url` を使ってください（[routing.md](routing.md)）。
+- 鍵のもとは `APP_KEY` です。セッションや署名付き URL とは**別の鍵**を作って使います
+  （[configuration.md](configuration.md)）。
+- 署名だけで足りるなら `signed_url` を使います（[routing.md](routing.md)）。
 
 ## パスワードの変換の細かい話
 
@@ -348,9 +357,9 @@ let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 $pbkdf2-sha256$i=120000$<塩>$<ハッシュ>
 ```
 
-方式と回数が入っているので、**あとから回数を上げても古いパスワードは照合できます。**
-照合に使う回数は保存されている値の `i=` から読み、**上限は 1,000 万回**です。
-上限を超える値は照合せずに偽とします。
+- 方式と回数が入っているので、**あとから回数を上げても古いパスワードは照合できます。**
+- 照合に使う回数は、保存されている値の `i=` から読みます。
+  **1,000 万回を超える値は、照合せずに偽とします。**
 
 ### 回数を変える
 
@@ -381,8 +390,7 @@ HASH_ITERATIONS=20000 cargo test
 ### 回数を上げたら作り直す
 
 **設定を上げただけでは、保存済みのパスワードは古い回数のままです。**
-目印は `Hash::needs_rehash` です。ログインできたついでに作り直します。
-古い回数と新しい回数が混ざった状態を長く放置しないでください。
+`Hash::needs_rehash` が真なら、ログインできたついでに作り直します。
 
 ```rust
 if ok && Hash::needs_rehash(&user.password) {
@@ -394,7 +402,6 @@ if ok && Hash::needs_rehash(&user.password) {
 ## まだ無いもの
 
 まだ無いものは [backlog.md](backlog.md) にまとめてあります。
-**再設定メールの文面と画面は自分で書きます**（送信は [mail.md](mail.md)）。
 
 ## 関連
 

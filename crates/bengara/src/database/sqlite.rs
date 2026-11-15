@@ -40,9 +40,10 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
     }
 
     let pool = pool.connect_with(options).await.map_err(|e| {
+        // `url` でつないでいるときに `database` を出すと、使っていない場所を見せる。
         Error::msg(format!(
             "SQLite につなげません（{}）: {e}",
-            settings.database
+            super::connection_target(settings)
         ))
     })?;
     Ok(Arc::new(SqliteBackend { pool }))
@@ -69,8 +70,9 @@ fn tune(options: SqliteConnectOptions, settings: &ConnectionConfig) -> SqliteCon
 /// 接続の指定を組み立てる。
 fn build_options(settings: &ConnectionConfig) -> Result<SqliteConnectOptions> {
     if !settings.url.is_empty() {
+        // 接続文字列そのものは出さない（`unreadable_url` の説明を参照）。
         let options = SqliteConnectOptions::from_str(&settings.url)
-            .map_err(|e| Error::msg(format!("接続文字列が読めません（{}）: {e}", settings.url)))?;
+            .map_err(|e| super::unreadable_url(settings, e))?;
         return Ok(tune(options, settings));
     }
 
@@ -490,6 +492,91 @@ mod tests {
         let db = connect(&settings).await.expect("つながる");
         let rows = db.fetch_all("pragma foreign_keys", &[]).await.unwrap();
         assert_eq!(rows[0].at(0), Some(&Value::Int(1)), "既定では効いている");
+    }
+
+    #[test]
+    fn 読めない接続文字列をエラー文に出さない() {
+        // 以前は `接続文字列が読めません（{url}）` と URL をそのまま出していた。
+        let url = "sqlite://secret-dir/app.db?mode=bogus";
+        let settings = ConnectionConfig::sqlite("main", "ignored").url(url);
+        let message = build_options(&settings).expect_err("読めない").to_string();
+        assert!(message.contains("`main`"), "{message}");
+        assert!(message.contains("読めません"), "{message}");
+        assert!(!message.contains("secret-dir"), "{message}");
+        assert!(!message.contains(url), "{message}");
+    }
+
+    #[tokio::test]
+    async fn url_でつないだときの失敗は_url_の指定と出す() {
+        // 以前は使っていない `database` の値を出していた。
+        // 無いディレクトリの下を読み取り専用で開くので、必ず失敗する。
+        let settings = ConnectionConfig::sqlite("main", "ignored-database-name")
+            .url("sqlite://bengara-no-such-dir-7f3a/x.db?mode=ro");
+        let message = connect(&settings)
+            .await
+            .err()
+            .expect("つながらない")
+            .to_string();
+        assert!(message.contains("SQLite につなげません"), "{message}");
+        assert!(message.contains("DB_URL"), "{message}");
+        assert!(!message.contains("ignored-database-name"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 列の_unique_で作った索引を名前で落とせる() {
+        // 以前は列の指定に `unique` と書いていたので、名前を SQLite が決めていた
+        // （`sqlite_autoindex_users_1`）。`drop_index_named("users", "users_email_unique")`
+        // は `drop index if exists` なので、黙って何もしなかった。
+        let db = memory().await;
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.create("users", |t| {
+            t.id();
+            t.string("email").unique();
+            t.string("name");
+        });
+        for sql in schema.into_statements() {
+            db.execute(&sql, &[]).await.expect("表が作れる");
+        }
+        let names = db
+            .fetch_all(
+                "select name from sqlite_master where type = 'index' and tbl_name = 'users'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(names.len(), 1, "自動で付く索引は無い");
+        assert_eq!(
+            names[0].get::<String>("name").unwrap(),
+            "users_email_unique"
+        );
+
+        // 重なりは断る。一意制約違反として見分けられる。
+        let insert = "insert into \"users\" (\"email\", \"name\") values (?, ?)";
+        let values = [Value::Text("a@example.com".into()), Value::Text("a".into())];
+        db.execute(insert, &values).await.expect("1件目は入る");
+        let error = db.execute(insert, &values).await.unwrap_err();
+        assert!(crate::database::is_unique_violation(&error), "{error}");
+
+        // 名前で落とす。2 つの書き方が同じ索引を指す。
+        let mut by_name = Schema::new(Driver::Sqlite);
+        by_name.drop_index_named("users", "users_email_unique");
+        let mut by_columns = Schema::new(Driver::Sqlite);
+        by_columns.drop_unique("users", &["email"]);
+        assert_eq!(by_name.to_sql(), by_columns.to_sql());
+        for sql in by_columns.into_statements() {
+            db.execute(&sql, &[]).await.expect("落とせる");
+        }
+        db.execute(insert, &values)
+            .await
+            .expect("索引を落としたので重なっても入る");
+
+        // 索引を落とした後なら、列も落とせる（rollback の「索引 → 列」の順）。
+        // 列の指定の `unique` だった頃は、SQLite がこの列の drop を断っていた。
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.drop_column("users", "email");
+        for sql in schema.into_statements() {
+            db.execute(&sql, &[]).await.expect("列を落とせる");
+        }
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("cache:prune", "期限切れのキャッシュだけ消す"),
     (
         "queue:work",
-        "キューのジョブを処理する（--once / --tries=3 / --sleep=1 / --retry-after=90 / --queue=名前）",
+        "キューのジョブを処理する（--once / --tries=3 / --sleep=1 / --timeout=60 / --retry-after=90 / --queue=名前）",
     ),
     ("queue:failed", "諦めたジョブの一覧"),
     ("queue:retry", "諦めたジョブをキューへ戻す（--id=1 で1件）"),
@@ -80,6 +80,7 @@ async fn execute(name: &str, options: &Options, hooks: Hooks) -> Result<()> {
                 sleep: options.sleep,
                 once: options.once,
                 retry_after: options.retry_after,
+                timeout: options.timeout,
             };
             crate::queue::work((hooks.jobs)(), &worker, stop).await?;
         }
@@ -100,11 +101,14 @@ async fn execute(name: &str, options: &Options, hooks: Hooks) -> Result<()> {
                 );
                 return Ok(());
             }
-            let done = crate::schedule::run_due(&schedule).await?;
-            if done.is_empty() {
-                println!("いま動かすものはありません。");
-            } else {
-                println!("{} 件動かしました。", done.len());
+            let outcome = crate::schedule::run_due(&schedule).await?;
+            if let Some(line) = schedule_summary(&outcome) {
+                println!("{line}");
+            }
+            // 失敗が 1 件でもあれば、残りを動かし終えたいま、終了コードを
+            // 0 以外にする。cron や監視の側で拾えるようにするため。
+            if let Some(error) = outcome.failure() {
+                return Err(error);
             }
         }
         "schedule:list" => {
@@ -112,7 +116,7 @@ async fn execute(name: &str, options: &Options, hooks: Hooks) -> Result<()> {
             crate::schedule::print_list(&schedule);
         }
         "lang:list" => {
-            crate::lang::install((hooks.lang)());
+            // 言語の表は `kernel_impl::main` が起動のときに固定してある。
             let available = crate::lang::Lang::available();
             if available.is_empty() {
                 println!("言語ファイルがありません（resources/lang/*.toml を置いてください）");
@@ -135,32 +139,43 @@ fn build_schedule(hooks: Hooks) -> crate::schedule::Schedule {
     schedule
 }
 
-/// Ctrl+C を受け取ったら真になる札。
+/// `schedule:run` の最後に出す 1 行。出すものが無ければ `None`。
+///
+/// 失敗したタスクがあるときは「いま動かすものはありません」と言いません。
+/// 動かそうとして失敗したので、その文は事実と違います（失敗の件数は、
+/// このあと返すエラーの文に出ます）。
+fn schedule_summary(outcome: &crate::schedule::Outcome) -> Option<String> {
+    if !outcome.done.is_empty() {
+        return Some(format!("{} 件動かしました。", outcome.done.len()));
+    }
+    if outcome.failed.is_empty() {
+        return Some("いま動かすものはありません。".to_string());
+    }
+    None
+}
+
+/// 停止の合図を受け取ったら真になる札。
 ///
 /// `queue:work` は、いま処理中のジョブを終えてから止まります。
 ///
-/// **2 回目以降も受け取ります。** 1 回待って終わると、2 回目が握り潰されて
+/// **見張りは `serve` と同じものを使います**（`server::watch_shutdown`）。
+/// ここで Ctrl+C（SIGINT）だけを見ていたころは、`systemctl stop` や
+/// `docker stop` が送る SIGTERM を受け取れず、処理中のジョブごと即死して
+/// いました。切れたジョブは `retry_after` の後に取り直され、試行回数が 1 つ減ります。
+///
+/// **2 回目も受け取ります。** 1 回待って終わると、2 回目が握り潰されて
 /// しまい、ジョブが固まったときに `kill` が必要になります。
 /// 2 回目は待たずに落とします（終了コードは 130。Ctrl+C の慣わしです）。
 fn stop_signal() -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let handle = stop.clone();
-    tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                // 合図を見張れなくなった。待ち続けても意味がない。
-                return;
-            }
-            if handle.swap(true, Ordering::Relaxed) {
-                eprintln!("\n強制終了します。");
-                std::process::exit(130);
-            }
-            println!(
-                "\n停止の合図を受けました。いまのジョブを終えてから止まります\
-                 （もう一度 Ctrl+C を押すと強制終了します）。"
-            );
-        }
-    });
+    tokio::spawn(crate::server::watch_shutdown(move || {
+        handle.store(true, Ordering::Relaxed);
+        println!(
+            "\n停止の合図を受けました。いまのジョブを終えてから止まります\
+             （もう一度合図を送ると強制終了します。Ctrl+C なら、もう一度押します）。"
+        );
+    }));
     stop
 }
 
@@ -220,6 +235,8 @@ struct Options {
     sleep: u64,
     once: bool,
     retry_after: i64,
+    /// `queue:work` が 1 本のジョブを待つ上限（秒）。0 は無制限。
+    timeout: u64,
     id: Option<i64>,
 }
 
@@ -231,6 +248,7 @@ impl Default for Options {
             sleep: 1,
             once: false,
             retry_after: crate::queue::DEFAULT_RETRY_AFTER,
+            timeout: crate::queue::DEFAULT_TIMEOUT,
             id: None,
         }
     }
@@ -247,6 +265,7 @@ fn allowed_flags(command: &str) -> &'static [&'static str] {
             "--queue=",
             "--tries=",
             "--sleep=",
+            "--timeout=",
             "--retry-after=",
             "--once",
         ],
@@ -280,6 +299,9 @@ impl Options {
                 options.tries = parse_number(value, "--tries")?;
             } else if let Some(value) = arg.strip_prefix("--sleep=") {
                 options.sleep = parse_number(value, "--sleep")?;
+            } else if let Some(value) = arg.strip_prefix("--timeout=") {
+                // 0 は「無制限」なので断らない（Laravel の `--timeout=0` と同じ）。
+                options.timeout = parse_number(value, "--timeout")?;
             } else if let Some(value) = arg.strip_prefix("--retry-after=") {
                 options.retry_after = parse_number(value, "--retry-after")?;
             } else if let Some(value) = arg.strip_prefix("--id=") {
@@ -297,6 +319,22 @@ impl Options {
         }
         Ok(options)
     }
+}
+
+/// 旗も引数も取らないコマンドの引数を確かめる。1 つでもあれば断ります。
+///
+/// このファイルの外のコマンド（`route:list` / `session:gc` / `storage:init` /
+/// `about`）が使います。以前は引数を見ておらず、`route:list --json` や
+/// `about --verbose` のような存在しない旗が黙って通っていました。
+///
+/// **仕組みは [`allowed_flags`] の許可表と同じです。** 表に無い名前は
+/// 「旗を取らない」扱いなので、同じ文面で断れます。
+pub(crate) fn no_flags(command: &str, args: &[String]) -> Result<()> {
+    debug_assert!(
+        allowed_flags(command).is_empty(),
+        "`{command}` は旗を取るコマンドです。`Options::parse` を使ってください"
+    );
+    Options::parse(command, args).map(|_| ())
 }
 
 /// 受け付ける旗を人が読む形にする。
@@ -330,6 +368,24 @@ mod tests {
         assert!(!options.once);
         assert_eq!(options.retry_after, 90);
         assert_eq!(options.id, None);
+    }
+
+    #[test]
+    fn queue_workのtimeoutを読める() {
+        // 既定は Laravel と同じ 60 秒。
+        let options = Options::parse("queue:work", &[]).unwrap();
+        assert_eq!(options.timeout, 60);
+
+        let options = Options::parse("queue:work", &args(&["--timeout=120"])).unwrap();
+        assert_eq!(options.timeout, 120);
+        // 0 は無制限。`--tries=0` と違って断らない。
+        let options = Options::parse("queue:work", &args(&["--timeout=0"])).unwrap();
+        assert_eq!(options.timeout, 0);
+
+        // 数でない値と負の値は断る。ほかのコマンドでは受け付けない。
+        assert!(Options::parse("queue:work", &args(&["--timeout=x"])).is_err());
+        assert!(Options::parse("queue:work", &args(&["--timeout=-1"])).is_err());
+        assert!(Options::parse("queue:retry", &args(&["--timeout=5"])).is_err());
     }
 
     #[test]
@@ -422,5 +478,75 @@ mod tests {
         assert!(!is_command("migrate"));
         assert!(!is_command("serve"));
         assert_eq!(COMMANDS.len(), 9);
+    }
+
+    #[test]
+    fn 旗を取らないコマンドは旗も余分な引数も断る() {
+        // 以前は引数を見ておらず、存在しない旗が黙って通っていた。
+        for command in ["route:list", "session:gc", "storage:init", "about"] {
+            assert!(no_flags(command, &[]).is_ok(), "{command}");
+
+            let error = no_flags(command, &args(&["--json"]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(command), "{error}");
+            assert!(error.contains("--json"), "{error}");
+            assert!(error.contains("旗を取りません"), "{error}");
+
+            // 旗の形をしていない余分な引数も同じ。
+            let error = no_flags(command, &args(&["extra"]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("extra"), "{error}");
+            // ほかのコマンドの旗も通さない。
+            assert!(no_flags(command, &args(&["--force"])).is_err());
+            assert!(no_flags(command, &args(&["--once"])).is_err());
+        }
+    }
+
+    /// テスト用の結果。
+    fn outcome(done: &[&str], failed: &[&str], busy: &[&str]) -> crate::schedule::Outcome {
+        crate::schedule::Outcome {
+            done: args(done),
+            failed: args(failed),
+            busy: args(busy),
+        }
+    }
+
+    #[test]
+    fn 定期処理の最後の1行() {
+        assert_eq!(
+            schedule_summary(&outcome(&["a", "b"], &[], &[])).as_deref(),
+            Some("2 件動かしました。")
+        );
+        assert_eq!(
+            schedule_summary(&outcome(&[], &[], &[])).as_deref(),
+            Some("いま動かすものはありません。")
+        );
+        // 錠が取れずに飛ばしただけなら、これまでどおり。
+        assert_eq!(
+            schedule_summary(&outcome(&[], &[], &["a"])).as_deref(),
+            Some("いま動かすものはありません。")
+        );
+        // 成功と失敗が混ざったら、成功した件数だけを言う。
+        assert_eq!(
+            schedule_summary(&outcome(&["a"], &["b"], &[])).as_deref(),
+            Some("1 件動かしました。")
+        );
+        // 失敗だけのときは「動かすものはありません」と言わない。
+        assert_eq!(schedule_summary(&outcome(&[], &["a"], &[])), None);
+    }
+
+    #[test]
+    fn 定期処理の失敗は終了コードに出す() {
+        // `run` はこのエラーをそのまま返し、`main` が終了コード 1 で終わる。
+        assert!(outcome(&["a"], &[], &[]).failure().is_none());
+        assert!(
+            outcome(&[], &[], &["a"]).failure().is_none(),
+            "錠は失敗ではない"
+        );
+        let error = outcome(&["a"], &["b"], &[]).failure().unwrap().to_string();
+        assert!(error.contains("1 件失敗"), "{error}");
+        assert!(error.contains('b'), "{error}");
     }
 }

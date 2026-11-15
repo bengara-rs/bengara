@@ -39,6 +39,14 @@ pub(crate) fn is_internal_path(path: &str) -> bool {
     !rest.starts_with('/')
 }
 
+/// 戻り先として覚えてよいメソッドか。
+///
+/// ログイン後の転送は `GET` です。`GET` で開けるパスだけを覚えます
+/// （`HEAD` は `GET` のルートで受けるので、同じ扱いにします）。
+fn remembers_intended(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD")
+}
+
 /// ログイン必須にするミドルウェア。
 ///
 /// | 状況 | 返すもの |
@@ -61,6 +69,9 @@ pub(crate) fn is_internal_path(path: &str) -> bool {
 ///
 /// 401 を返すだけの経路（JSON を期待しているとき、転送先を決めていないとき）では
 /// **覚えません。** 使う相手がいないのに、401 のたびにセッションを書くことになります。
+///
+/// **覚えるのは `GET` と `HEAD` のときだけです**（Laravel も `GET` のときだけ覚えます）。
+/// ログイン後の転送は `GET` で飛ぶので、`POST` 専用のパスを覚えても 405 になります。
 pub struct Authenticate {
     redirect_to: Option<String>,
 }
@@ -103,7 +114,10 @@ impl Middleware for Authenticate {
             // **自分のサイトの中だけ**を覚えます。
             // 401 を返すだけの経路で覚えても使い道が無く、401 のたびに
             // セッションの書き込みが増えるだけなので、転送するときに限ります。
-            if will_redirect {
+            //
+            // **`GET` と `HEAD` のときだけ覚えます。** ログイン後は `GET` で飛ばすので、
+            // `POST` 専用の口のパスを覚えると、ログインできた直後に 405 になります。
+            if will_redirect && remembers_intended(req.method()) {
                 if let Some(session) = req.try_session() {
                     let intended = req.full_path();
                     if is_internal_path(&intended) {
@@ -137,6 +151,53 @@ mod tests {
             Some("/login")
         );
         assert!(Authenticate::default().redirect_to.is_none());
+    }
+
+    /// 未ログインのリクエストを 1 本通し、状態と、覚えた戻り先を返す。
+    async fn stopped(mw: Authenticate, method: &str) -> (u16, Option<String>) {
+        use crate::http::handler::Erased;
+        use std::sync::Arc;
+
+        let session = crate::session::Session::empty();
+        let mut req = Request::new(method, "/profile").with_query("page=2");
+        req.set_session(session.clone());
+
+        let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+        let handler = Arc::new(Erased::<_, ()>::new(|| async {
+            Ok(crate::http::Response::text("ok"))
+        }));
+        let options = crate::http::response::RenderOptions::new(false, false);
+        let response = mw
+            .handle(req, Next::new(stack, handler, options))
+            .await
+            .expect("応答が返る");
+        (response.status(), session.get(INTENDED_KEY))
+    }
+
+    #[tokio::test]
+    async fn 戻り先はgetとheadのときだけ覚える() {
+        // ログイン後は GET で飛ばす。POST 専用の口を覚えると 405 になる。
+        for method in ["GET", "HEAD"] {
+            let (status, intended) = stopped(Authenticate::redirect_to("/login"), method).await;
+            assert_eq!(status, 302, "{method}");
+            assert_eq!(intended.as_deref(), Some("/profile?page=2"), "{method}");
+        }
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let (status, intended) = stopped(Authenticate::redirect_to("/login"), method).await;
+            assert_eq!(status, 302, "{method}: 転送はする");
+            assert_eq!(intended, None, "{method}: 戻り先は覚えない");
+        }
+
+        // 401 を返すだけの経路では、GET でも覚えない（今までどおり）。
+        let (status, intended) = stopped(Authenticate::new(), "GET").await;
+        assert_eq!(status, 401);
+        assert_eq!(intended, None);
+
+        assert!(remembers_intended("GET"));
+        assert!(remembers_intended("HEAD"));
+        // メソッドは大文字小文字を区別する（`get` はどのルートにも当たらない）。
+        assert!(!remembers_intended("get"));
+        assert!(!remembers_intended("OPTIONS"));
     }
 
     #[test]

@@ -38,20 +38,28 @@ const WATCH_DIRS: &[&str] = &[
 
 /// 見張るファイル。
 ///
-/// ビルドの入り口になるものを入れます。`Cargo.lock` は依存の版（`Cargo.toml` を
-/// 直さずに `cargo update` で動く）、`.cargo/config.toml` は rustflags と別名、
+/// ビルドの入り口になるものを入れます。`.cargo/config.toml` は rustflags と別名、
 /// `rust-toolchain.toml` は使うコンパイラそのものを決めます。どれも書き換えると
 /// できあがる実行ファイルが変わるので、見張らないと古い版が動き続けます。
+///
+/// `Cargo.lock` も見張りますが、ここには入れません（[`LOCK_FILE`]）。
 const WATCH_FILES: &[&str] = &[
     ".env",
     "Cargo.toml",
-    "Cargo.lock",
     ".cargo/config.toml",
     "rust-toolchain.toml",
     "build.rs",
     "main.rs",
     "artisan.rs",
 ];
+
+/// 依存の版を決めるファイル。`Cargo.toml` を直さずに `cargo update` でも動きます。
+///
+/// ほかのファイルと分けて持ちます（[`Snapshot::lock`]）。**ビルドそのものが
+/// 書き換える**ただ1つの見張り対象だからです。依存を足した直後のビルドは
+/// `Cargo.lock` を書き直すので、まとめて見張ると次の確認で「変更あり」になり、
+/// ビルドと再起動がもう1回走っていました。
+const LOCK_FILE: &str = "Cargo.lock";
 
 /// 掘らないディレクトリの名前。重いものと、ビルドに関係ないもの。
 const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "storage"];
@@ -68,6 +76,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
     let name = manifest
         .package_name()
         .ok_or_else(|| Error::msg("Cargo.toml の [package] に name がありません"))?;
+    // ビルドする bin の名前。`init` は `[[bin]] name = "server" path = "main.rs"` の
+    // ような、パッケージ名と違う名前を認めている。パッケージ名で決め打ちすると
+    // `cargo build --bin` が「no bin target」で止まる。
+    // `[[bin]]` が無いとき（cargo の自動検出に任せている形）はパッケージ名を使う。
+    let bin = super::main_bin(&manifest).unwrap_or_else(|| name.clone());
 
     // 置き場所は `storage:init` が作るが、無ければここで作る。
     // 中に入るのはアプリの実行ファイルそのものなので、所有者だけに絞る。
@@ -98,7 +111,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
     let mut child: Option<Running> = None;
     let mut watched = snapshot(root);
 
-    match build(root, &name) {
+    let built = build(root, &bin);
+    // ビルドが書き換えた `Cargo.lock` を、変更として数えない（`accept_lock` を参照）。
+    watched.accept_lock(root);
+    match built {
         Ok(exe) => {
             generation += 1;
             // 初回の失敗でも見張りは続ける。直せばまた試せる（2回目以降と同じ扱い）。
@@ -148,7 +164,10 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
         watched = current;
 
         println!("\n変更を検知しました。ビルドします…");
-        match build(root, &name) {
+        let built = build(root, &bin);
+        // 失敗したビルドも `Cargo.lock` を書き換えることがあるので、結果を見る前に取り直す。
+        watched.accept_lock(root);
+        match built {
             Ok(exe) => {
                 stop(&mut child);
                 // 止めた後なら、前の世代のコピーを消せる（Windows でも）。
@@ -175,6 +194,8 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
 }
 
 /// `cargo build` を実行し、できた実行ファイルのパスを返す。
+///
+/// `name` は bin の名前です（パッケージ名とは限りません）。
 fn build(root: &Path, name: &str) -> Result<PathBuf> {
     let cargo = cargo_command();
     let output = Command::new(&cargo)
@@ -352,15 +373,34 @@ fn clean_old_copies(run_dir: &Path, prefix: &str) {
 ///
 /// **割り切り**: 「数が同じで、最大の更新時刻も同じまま、中身だけが入れ替わった」
 /// 場合は取りこぼします。実用上は起きにくいので受け入れます。
+///
+/// `Cargo.lock` だけは別の欄（`lock`）で持ちます。理由は [`LOCK_FILE`] にあります。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Snapshot {
-    /// 見張っているファイルの数。
+    /// 見張っているファイルの数（`Cargo.lock` を除く）。
     count: usize,
-    /// 更新時刻のうち、いちばん新しいもの。
+    /// 更新時刻のうち、いちばん新しいもの（`Cargo.lock` を除く）。
     latest: Option<SystemTime>,
+    /// `Cargo.lock` の更新時刻。無いとき・読めないときは `None`。
+    lock: Option<SystemTime>,
 }
 
 impl Snapshot {
+    /// ビルドの直後に呼ぶ。`Cargo.lock` の時刻だけを、いまの値に取り直します。
+    ///
+    /// ビルドが `Cargo.lock` を書き換えても、それは自分で起こした変更なので、
+    /// もう1回ビルドする理由になりません。
+    ///
+    /// ほかの欄（数と最大時刻）は**ビルドの前**の値のまま残します。ビルド中に
+    /// 保存されたソースは、次の確認で今までどおり見つかります。
+    ///
+    /// **割り切り**: ビルドの最中に、外から `cargo update` などで `Cargo.lock` を
+    /// 書き換えた場合は取りこぼします（ビルド自身の書き換えと区別できません）。
+    /// 何かを保存するか、`serve` を立ち上げ直せば作り直されます。
+    fn accept_lock(&mut self, root: &Path) {
+        self.lock = lock_modified(root);
+    }
+
     /// 1ファイル数える。更新時刻が読めたときは最大を更新する。
     fn add(&mut self, modified: Option<SystemTime>) {
         self.count += 1;
@@ -383,7 +423,17 @@ fn snapshot(root: &Path) -> Snapshot {
             snapshot.add(metadata.modified().ok());
         }
     }
+    snapshot.lock = lock_modified(root);
     snapshot
+}
+
+/// `Cargo.lock` の更新時刻。無いとき・読めないときは `None`。
+///
+/// 「無い → ある」も `None` → `Some` の違いとして見つかります。
+fn lock_modified(root: &Path) -> Option<SystemTime> {
+    std::fs::metadata(root.join(LOCK_FILE))
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 fn walk(dir: &Path, snapshot: &mut Snapshot) {
@@ -578,6 +628,34 @@ mod tests {
         touched.add(Some(base));
         touched.add(Some(later + Duration::from_secs(1)));
         assert_ne!(a, touched);
+    }
+
+    #[test]
+    fn ビルドが書き換えたcargo_lockでは作り直さない() {
+        let root = std::env::temp_dir().join(format!("bengara-serve-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/a.rs"), b"").unwrap();
+
+        // ビルドの前に取った値。
+        let mut watched = snapshot(&root);
+        assert_eq!(watched.lock, None);
+
+        // ビルドが `Cargo.lock` を書いた。取り直さなければ「変更あり」になる
+        // （外から書き換えられたときは、これで見つかる）。
+        std::fs::write(root.join(LOCK_FILE), b"# lock").unwrap();
+        assert_ne!(snapshot(&root), watched);
+
+        // ビルドの直後に `Cargo.lock` だけ取り直すと、次の確認は「変更なし」。
+        watched.accept_lock(&root);
+        assert_eq!(snapshot(&root), watched);
+
+        // ビルド中に保存されたソースは、取り直した後でも見つかる
+        // （数と最大時刻はビルド前の値のまま）。
+        std::fs::write(root.join("app/b.rs"), b"").unwrap();
+        assert_ne!(snapshot(&root), watched);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -538,10 +538,17 @@ impl Row {
     }
 
     /// JSON のオブジェクトに直す。
+    ///
+    /// **同じ名前の列が2つあるときは、左を採ります。** `row.get()` と同じです。
+    /// `join` して `select` を書かないと、`posts.id` と `users.id` がどちらも
+    /// `id` で返ります。以前は後勝ちだったので、同じ行から `get("id")` と
+    /// JSON で別の値が出ていました。
     pub fn to_json(&self) -> serde_json::Value {
         let mut map = serde_json::Map::with_capacity(self.columns.len());
         for (name, value) in self.columns.iter().zip(&self.values) {
-            map.insert(name.clone(), value.to_json());
+            if !map.contains_key(name) {
+                map.insert(name.clone(), value.to_json());
+            }
         }
         serde_json::Value::Object(map)
     }
@@ -637,6 +644,23 @@ mod tests {
         assert!(row.get::<i64>("none").is_err());
         assert_eq!(row.try_get::<i64>("none"), None);
         assert_eq!(row.to_json()["title"], "やきそば");
+    }
+
+    #[test]
+    fn 同じ名前の列はjsonでも左を採る() {
+        // `join` して `select` を書かないと、`id` が2つ並ぶ。
+        let row = Row::new(
+            vec!["id".into(), "title".into(), "id".into()],
+            vec![Value::Int(1), Value::Text("やきそば".into()), Value::Int(9)],
+        );
+        // `get()` は左。JSON も同じ値を出す（以前は後勝ちで 9 だった）。
+        assert_eq!(row.get::<i64>("id").unwrap(), 1);
+        assert_eq!(row.to_json()["id"], 1);
+        let text = serde_json::to_string(&row).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["id"], 1, "Serialize も同じ");
+        assert_eq!(back["title"], "やきそば");
+        assert_eq!(back.as_object().unwrap().len(), 2);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! 本番にファイルを配る必要はありません。
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 /// `bengara-build` が渡す言語の表。
@@ -165,9 +166,43 @@ fn lookup_or_key(key: &str) -> &str {
                 return found;
             }
         }
-        tracing::warn!("言語の鍵 `{key}` が見つかりません（言語: {current}）");
+        if first_miss(&MISSING, current, key) {
+            tracing::warn!(
+                "言語の鍵 `{key}` が見つかりません（言語: {current}）。\
+                 同じ鍵の警告は続けて出しません"
+            );
+        }
         key
     })
+}
+
+/// 無い鍵を覚えておく表の大きさ。
+const MISSING_SLOTS: usize = 64;
+
+/// 警告を出した「言語と鍵」の印（ハッシュ値）。0 は空きです。
+///
+/// 画面に 1 つ抜けがあると、リクエストのたびに同じ警告が出続けました。
+/// **錠は取りません。** 原子的な読み書きだけで、置き場所も増えません。
+static MISSING: [AtomicU64; MISSING_SLOTS] = [const { AtomicU64::new(0) }; MISSING_SLOTS];
+
+/// その「言語と鍵」の警告を、いま出すべきか。
+///
+/// 表は小さく固定です。別の鍵が同じ枠に来たら上書きするので、**「1 回だけ」は
+/// 保証しません**（枠を取り合う 2 つの鍵が交互に来ると、そのたびに出ます）。
+/// 目的は出しすぎを抑えることなので、これで足ります。正確に 1 回にするには
+/// 鍵の集合を錠で守る必要があり、ホットパスに錠を増やすことになります。
+fn first_miss(seen: &[AtomicU64], locale: &str, key: &str) -> bool {
+    use std::hash::{Hash, Hasher};
+
+    // `DefaultHasher::new()` は種が固定なので、同じ入力はいつも同じ値になる。
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    locale.hash(&mut hasher);
+    key.hash(&mut hasher);
+    // 0 は空きの印なので、最下位を立てて避ける。
+    let mark = hasher.finish() | 1;
+
+    let slot = &seen[(mark >> 1) as usize % seen.len()];
+    slot.swap(mark, Ordering::Relaxed) != mark
 }
 
 /// `:name` の部分を差し替える（[`__with`] の本体）。
@@ -179,6 +214,9 @@ fn lookup_or_key(key: &str) -> &str {
 ///
 /// 名前の照合は**長い名前から**行います。`:name` を先に当てると、
 /// `:name_kanji` が `アリス_kanji` になります。
+///
+/// **空の名前は無視します。** `("", v)` は `starts_with("")` が常に真なので、
+/// ほかの名前が当たらない `:` が全部 `v` に化けていました（`10:30` が `10v30`）。
 fn replace_values(text: &str, values: &[(&str, &str)]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -189,7 +227,7 @@ fn replace_values(text: &str, values: &[(&str, &str)]) -> String {
         let after = &rest[at + 1..];
         let found = values
             .iter()
-            .filter(|(name, _)| after.starts_with(*name))
+            .filter(|(name, _)| !name.is_empty() && after.starts_with(*name))
             .max_by_key(|(name, _)| name.len());
         match found {
             Some((name, value)) => {
@@ -367,6 +405,39 @@ mod tests {
             replace_values("、:name（:other）", &[("name", "有栖")]),
             "、有栖（:other）"
         );
+    }
+
+    #[test]
+    fn 空の名前は無視する() {
+        // 以前は `starts_with("")` が常に真で、当たらない `:` が全部置き換わった。
+        assert_eq!(
+            replace_values("10:30 に :name さん", &[("", "x"), ("name", "有栖")]),
+            "10:30 に 有栖 さん"
+        );
+        // 空の名前だけを渡しても、何も変わらない。
+        assert_eq!(replace_values("あと: :name", &[("", "x")]), "あと: :name");
+    }
+
+    #[test]
+    fn 無い鍵の警告は同じ鍵で続けて出さない() {
+        // プロセス共通の表を使わず、このテストだけの表で確かめる。
+        let seen: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+        assert!(first_miss(&seen, "ja", "messages.none"), "最初は出す");
+        assert!(
+            !first_miss(&seen, "ja", "messages.none"),
+            "同じ鍵は出さない"
+        );
+        assert!(!first_miss(&seen, "ja", "messages.none"));
+        // 言語が違えば別の抜けとして出す。
+        assert!(first_miss(&seen, "en", "messages.none"));
+
+        // 枠は 1 つでも落ちない。別の鍵が来たら上書きするだけ。
+        let one: [AtomicU64; 1] = [const { AtomicU64::new(0) }];
+        assert!(first_miss(&one, "ja", "a"));
+        assert!(!first_miss(&one, "ja", "a"));
+        assert!(first_miss(&one, "ja", "b"), "別の鍵は出す");
+        assert!(first_miss(&one, "ja", "a"), "上書きされたら、もう一度出す");
     }
 
     #[test]

@@ -52,7 +52,12 @@ impl Validated {
         self.values.get(field).map(String::as_str).unwrap_or("")
     }
 
-    /// 値を取り出す。送られてこなかったときと区別したいとき。
+    /// 値を取り出す。**検査した項目に無ければ `None`。**
+    ///
+    /// 「送られてきたか」は分かりません。`nullable` を付けた項目は、
+    /// 送られてこなくても空文字で入るので `Some("")` になります。
+    /// `None` になるのは、規則を書かなかった項目と、`nullable` も `required` も
+    /// 無いまま送られてこなかった項目です。
     pub fn try_get(&self, field: &str) -> Option<&str> {
         self.values.get(field).map(String::as_str)
     }
@@ -69,7 +74,9 @@ impl Validated {
         &self.values
     }
 
-    /// 項目があるか。
+    /// 検査した項目に入っているか。
+    ///
+    /// [`Validated::try_get`] と同じで、`nullable` の項目は送られてこなくても真です。
     pub fn has(&self, field: &str) -> bool {
         self.values.contains_key(field)
     }
@@ -735,6 +742,31 @@ mod tests {
         let ok = validate(&input(&[("age", "")]), &[("age", "nullable|integer")]).unwrap();
         assert_eq!(ok.get("age"), "");
         assert!(ok.has("age"));
+    }
+
+    #[test]
+    fn try_getは検査した項目に無いときだけnoneを返す() {
+        // `try_get` で分かるのは「検査した項目に入ったか」で、
+        // 「送られてきたか」ではない。
+        let ok = validate(
+            &input(&[("title", "題"), ("extra", "x")]),
+            &[
+                ("title", "required"),
+                ("note", "nullable"),
+                ("memo", "max:10"),
+            ],
+        )
+        .unwrap();
+
+        // `nullable` の項目は、送られてこなくても空文字で入る。
+        assert_eq!(ok.try_get("note"), Some(""));
+        assert!(ok.has("note"));
+        // `nullable` が無く、送られてこなかった項目は入らない。
+        assert_eq!(ok.try_get("memo"), None);
+        assert!(!ok.has("memo"));
+        // 規則を書かなかった項目は、送られてきても入らない。
+        assert_eq!(ok.try_get("extra"), None);
+        assert_eq!(ok.try_get("title"), Some("題"));
     }
 
     #[test]

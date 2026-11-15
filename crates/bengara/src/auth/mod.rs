@@ -82,6 +82,11 @@ impl<'a> Auth<'a> {
     }
 
     /// ログインしているか。
+    ///
+    /// **セッションだけを見ます。DB は引きません。** 利用者の行を消しても、
+    /// その人のセッションが残っているあいだは真のままです（`Authenticate` も
+    /// 同じ判定です）。利用者を消したときは [`logout_user`](Self::logout_user) で
+    /// セッションも切ってください。
     pub fn check(&self) -> bool {
         self.id().is_some()
     }
@@ -139,6 +144,9 @@ impl<'a> Auth<'a> {
     ///   索引は持ちません。
     /// - 自分で作った `SessionStore` が `destroy_for_user_except` を実装していなければ、
     ///   警告を出して `0` を返します。
+    /// - **呼んだ本人は残ります。** このあと `regenerate()` で ID を作り直しても
+    ///   残るように、このセッションの「ログインした時刻」を切った時刻より後に
+    ///   進めます。
     ///
     /// **非同期の処理の中では
     /// [`logout_other_devices_async`](Self::logout_other_devices_async) を使ってください。**
@@ -147,9 +155,10 @@ impl<'a> Auth<'a> {
         let Some(user_id) = self.id() else {
             return Ok(0);
         };
-        session
-            .store()?
-            .destroy_for_user_except(&user_id, &session.id())
+        let store = session.store()?;
+        let (removed, logged_in_at) = revoke_others(&*store, &user_id, &session.id())?;
+        session.put(AUTH_AT_KEY, logged_in_at.to_string());
+        Ok(removed)
     }
 
     /// [`logout_other_devices`](Self::logout_other_devices) を裏のスレッドで行う。
@@ -169,7 +178,10 @@ impl<'a> Auth<'a> {
         };
         let store = session.store()?;
         let keep_id = session.id();
-        crate::support::blocking(move || store.destroy_for_user_except(&user_id, &keep_id)).await?
+        let (removed, logged_in_at) =
+            crate::support::blocking(move || revoke_others(&*store, &user_id, &keep_id)).await??;
+        session.put(AUTH_AT_KEY, logged_in_at.to_string());
+        Ok(removed)
     }
 
     /// 同じ利用者のセッションを**全部**切る。消した数を返す。
@@ -187,7 +199,7 @@ impl<'a> Auth<'a> {
             return Ok(0);
         };
         let removed = session.store()?.destroy_for_user(&user_id)?;
-        // いまのセッションは、置き場所から消したうえで Cookie も作り直す。
+        // いまのセッションは、置き場所から消したうえで Cookie も消す（新しい ID は配らない）。
         self.logout()?;
         Ok(removed)
     }
@@ -206,7 +218,7 @@ impl<'a> Auth<'a> {
         };
         let store = session.store()?;
         let removed = crate::support::blocking(move || store.destroy_for_user(&user_id)).await??;
-        // いまのセッションは、置き場所から消したうえで Cookie も作り直す。
+        // いまのセッションは、置き場所から消したうえで Cookie も消す（新しい ID は配らない）。
         self.logout()?;
         Ok(removed)
     }
@@ -253,12 +265,12 @@ impl<'a> Auth<'a> {
         let Some(id) = self.id() else {
             return Ok(None);
         };
-        // セッションには文字列で入っている。整数の主キーなら整数に直して束縛する
-        // （PostgreSQL は `bigint = text` を断る）。
-        U::query()
-            .where_(U::PRIMARY_KEY, U::key_value(id))
-            .first()
-            .await
+        // セッションには文字列で入っている。整数の主キーなら `find` が整数に直して
+        // 束縛する（PostgreSQL は `bigint = text` を断る）。
+        //
+        // **整数に読めない値は、問い合わせずに `None` です。** `where_(主キー, ..)
+        // .first()` と書いていたころは、`where 1 = 0` を 1 往復ぶん流していました。
+        U::find(id).await
     }
 
     /// ログイン中の利用者を読む。いなければ 401 のエラー。
@@ -320,6 +332,42 @@ impl<'a> Auth<'a> {
     }
 }
 
+/// 同じ利用者のセッションのうち `keep_id` 以外を切り、
+/// 「消した数」と「残したセッションに付け直すログインの時刻（UNIX ミリ秒）」を返す。
+///
+/// # なぜ時刻を付け直すのか
+///
+/// 置き場所は「切った時刻・除外は `keep_id`」の印を残します。`StartSession` は
+/// 保存の直前に、印がログインの時刻より新しければ切られたものとして捨てます。
+/// 除外は **ID で** 覚えているので、呼んだ本人がこのあと `regenerate()` で ID を
+/// 作り直すと、新しい ID は除外に当たりません。ログインの時刻が古いままだと、
+/// **次のリクエストの保存で本人が切られます**（パスワードを変える → 他の端末を
+/// 切る → ID を作り直す、という勧めている流れで起きていました）。
+///
+/// そこで、残すセッションのログインの時刻を**印より後**に進めます。
+/// 「印より後にログインし直したセッションは巻き込まない」という、もとからある
+/// 規則にそのまま乗る形です。ID が何度変わっても残ります。
+///
+/// # 印と同じミリ秒にならないこと
+///
+/// 比較は「印 > ログインの時刻」です。同じミリ秒なら残りますが、時計が戻った
+/// ときや、別のプロセスが同時に切った印のほうが新しいときにも負けないよう、
+/// **印の時刻 + 1 と、いまの時刻の大きいほう**にします。
+///
+/// 印の時刻は、どのセッションとも重ならない空の ID で置き場所に聞きます
+/// （除外した ID で聞くと `None` が返るため）。印を持たない置き場所
+/// （`mark_revoked` を実装していないもの）では、いまの時刻になります。
+fn revoke_others(
+    store: &dyn crate::session::SessionStore,
+    user_id: &str,
+    keep_id: &str,
+) -> Result<(usize, i64)> {
+    let removed = store.destroy_for_user_except(user_id, keep_id)?;
+    let mark = store.revoked_at(user_id, "").unwrap_or(0);
+    let logged_in_at = crate::support::time::now_millis().max(mark.saturating_add(1));
+    Ok((removed, logged_in_at))
+}
+
 /// 許されていなければ 403 で止める。
 ///
 /// ```ignore
@@ -370,9 +418,11 @@ pub fn decrypt(cipher: &str) -> Result<String> {
 
 #[cfg(not(feature = "encryption"))]
 fn missing_encryption() -> Error {
+    // 「`features = ["encryption"]` にしてください」と書いていたころは、そのまま
+    // 写すと `sqlite` などのほかの機能フラグが落ちた。足す形で案内する。
     Error::msg(
-        "暗号化を使うには Cargo.toml を \
-         `bengara = { version = \"0.1\", features = [\"encryption\"] }` にしてください",
+        "暗号化を使うには、Cargo.toml の bengara の features に \
+         `\"encryption\"` を足してください（いまある機能フラグは残します）",
     )
 }
 
@@ -402,6 +452,65 @@ mod tests {
         assert!(auth.logout().is_err());
         assert!(auth.logout_other_devices().is_err());
         assert!(auth.logout_all_devices().is_err());
+    }
+
+    /// `user()` を試すための利用者。整数の主キー（既定）です。
+    struct Member {
+        id: i64,
+        password: String,
+    }
+
+    impl Model for Member {
+        const TABLE: &'static str = "members";
+        const PRIMARY_KEY: &'static str = "id";
+        const COLUMNS: &'static [&'static str] = &["id", "password"];
+
+        fn from_row(row: &crate::database::Row) -> Result<Self> {
+            Ok(Self {
+                id: row.get("id")?,
+                password: row.get("password")?,
+            })
+        }
+
+        fn attributes(&self) -> Vec<(&'static str, crate::database::Value)> {
+            vec![(
+                "password",
+                crate::database::Value::Text(self.password.clone()),
+            )]
+        }
+
+        fn key(&self) -> crate::database::Value {
+            crate::database::Value::Int(self.id)
+        }
+
+        fn set_key(&mut self, _value: crate::database::Value) {}
+    }
+
+    impl Authenticatable for Member {
+        fn password_hash(&self) -> &str {
+            &self.password
+        }
+    }
+
+    #[tokio::test]
+    async fn 整数に読めないidのuserは問い合わせずにnoneを返す() {
+        // 既定の接続には流れない（流れれば、つなぐところで別のエラーになる）。
+        let session = Session::empty();
+        let auth = Auth::new(Some(&session));
+        for id in ["abc", "12abc", "99999999999999999999999"] {
+            session.put(AUTH_ID_KEY, id);
+            let user = auth.user::<Member>().await.expect("エラーにしない");
+            assert!(user.is_none(), "{id}");
+            // `user_or_fail` は、これまでどおり 401。
+            let error = auth.user_or_fail::<Member>().await.err().expect("401");
+            assert_eq!(error.status(), 401, "{id}");
+        }
+
+        // ログインしていなければ、これまでどおり `None`。
+        let guest = Session::empty();
+        let user = Auth::new(Some(&guest)).user::<Member>().await.unwrap();
+        assert!(user.is_none());
+        assert!(Auth::new(None).user::<Member>().await.unwrap().is_none());
     }
 
     #[test]
@@ -450,6 +559,97 @@ mod tests {
         assert_eq!(auth.logout_all_devices().unwrap(), 1);
         assert!(store.read(&mine).unwrap().is_none());
         assert!(!auth.check(), "呼んだ本人もログアウトする");
+    }
+
+    /// セッションに入っているログインの時刻。
+    fn logged_in_at(session: &Session) -> i64 {
+        session
+            .get(AUTH_AT_KEY)
+            .and_then(|v| v.parse().ok())
+            .expect("ログインの時刻が入っている")
+    }
+
+    #[test]
+    fn 他の端末を切るとログインの時刻が印より後になる() {
+        // 印の除外は ID で覚えている。呼んだ本人が ID を作り直すと除外に
+        // 当たらなくなるので、ログインの時刻のほうを印より後に進めておく。
+        use crate::session::{MemoryStore, SessionStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(MemoryStore::new(60));
+        let session = Session::empty().with_store(store.clone());
+        let auth = Auth::new(Some(&session));
+        auth.login_using_id(7).unwrap();
+        let before = logged_in_at(&session);
+
+        assert_eq!(auth.logout_other_devices().unwrap(), 0);
+        let mark = store
+            .revoked_at("7", "ほかの端末")
+            .expect("切った印が付いている");
+        let after = logged_in_at(&session);
+        assert!(after > mark, "印より後: {after} > {mark}");
+        assert!(after >= before, "時刻は戻さない");
+
+        // ID を作り直すと除外には当たらないが、時刻の比較で残る
+        // （`StartSession` の判定は「印 > ログインの時刻」）。
+        session.regenerate();
+        let at = store
+            .revoked_at("7", &session.id())
+            .expect("新しい ID は除外に当たらない");
+        assert!(at <= logged_in_at(&session), "切られた扱いにならない");
+        assert!(auth.check(), "ログインしたまま");
+    }
+
+    #[test]
+    fn 付け直す時刻は印と同じミリ秒にならない() {
+        use crate::session::SessionStore;
+        use std::collections::BTreeMap;
+
+        /// 印の時刻だけを決められる置き場所。
+        struct Marked(Option<i64>);
+        impl SessionStore for Marked {
+            fn read(&self, _id: &str) -> Result<Option<BTreeMap<String, String>>> {
+                Ok(None)
+            }
+            fn write(&self, _id: &str, _data: &BTreeMap<String, String>) -> Result<()> {
+                Ok(())
+            }
+            fn destroy(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+            fn destroy_for_user_except(&self, _user_id: &str, _keep_id: &str) -> Result<usize> {
+                Ok(3)
+            }
+            fn revoked_at(&self, _user_id: &str, session_id: &str) -> Option<i64> {
+                // 除外した ID には `None`（`FileStore` / `MemoryStore` と同じ約束）。
+                if session_id == "mine" {
+                    return None;
+                }
+                self.0
+            }
+        }
+
+        let now = crate::support::time::now_millis();
+
+        // 印がいまより未来（時計が戻った・別のプロセスの時計が進んでいる）でも、
+        // 必ず印より後になる。
+        let future = now + 60_000;
+        let (removed, at) = revoke_others(&Marked(Some(future)), "7", "mine").unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(at, future + 1, "印 + 1 ミリ秒");
+
+        // 印がいまと同じミリ秒でも、同じ値にはならない。
+        let (_, at) = revoke_others(&Marked(Some(now)), "7", "mine").unwrap();
+        assert!(at > now, "{at} > {now}");
+
+        // 印を持たない置き場所では、いまの時刻。
+        let (_, at) = revoke_others(&Marked(None), "7", "mine").unwrap();
+        assert!(at >= now);
+        assert!(at < now + 60_000);
+
+        // 端までいってもあふれない。
+        let (_, at) = revoke_others(&Marked(Some(i64::MAX)), "7", "mine").unwrap();
+        assert_eq!(at, i64::MAX);
     }
 
     #[test]
@@ -509,6 +709,9 @@ mod tests {
         assert_eq!(auth.logout_other_devices_async().await.unwrap(), 1);
         assert!(store.read(&mine).unwrap().is_some(), "自分は残る");
         assert!(store.read("otheruser").unwrap().is_some(), "他の利用者");
+        // 同期版と同じく、ログインの時刻を印より後に進める。
+        let mark = store.revoked_at("7", "ほかの端末").expect("切った印");
+        assert!(logged_in_at(&session) > mark, "印より後");
 
         // 全部切ると自分も切れる。
         assert_eq!(auth.logout_all_devices_async().await.unwrap(), 1);
@@ -535,9 +738,15 @@ mod tests {
     #[cfg(not(feature = "encryption"))]
     #[test]
     fn 機能フラグが無ければ直し方を知らせる() {
-        let error = encrypt("x").unwrap_err();
-        assert!(error.to_string().contains("features = [\"encryption\"]"));
-        let error = decrypt("x").unwrap_err();
-        assert!(error.to_string().contains("features = [\"encryption\"]"));
+        // 「`features = ["encryption"]` にしてください」ではなく、足す形で案内する
+        // （そのまま写すと、ほかの機能フラグが落ちるため）。
+        for error in [encrypt("x").unwrap_err(), decrypt("x").unwrap_err()] {
+            let text = error.to_string();
+            assert!(
+                text.contains("features に `\"encryption\"` を足して"),
+                "{text}"
+            );
+            assert!(!text.contains("features = ["), "{text}");
+        }
     }
 }

@@ -15,13 +15,19 @@
 //! 中身がブラウザに出ないので、Cookie の大きさ（4 KB）にも縛られません。
 //!
 //! プロセスを2つ以上動かすときは、全プロセスが同じ `storage/` を見るようにしてください
-//! （`APP_STORAGE_PATH`）。
+//! （`APP_STORAGE_PATH`）。同じセッションのリクエストを順番にする錠は
+//! **プロセスの中だけ**です（[`StartSession`] の説明を参照）。
+//!
+//! # 鍵の名前
+//!
+//! `__` で始まる鍵は、フレームワークが中で使います（CSRF のトークン、検査に落ちた
+//! 入力、flash の持ち越しの目印）。`put` / `flash` に渡すと警告が出て、
+//! `all()` には入りません。
 
 mod middleware;
 mod store;
 
 pub use middleware::{SessionConfig, StartSession, VerifyCsrfToken};
-pub(crate) use store::{rename_with_retry, MEMORY_GC_EVERY};
 pub use store::{FileStore, MemoryStore, SessionStore};
 
 use std::collections::BTreeMap;
@@ -133,8 +139,10 @@ impl Session {
 
     /// 値を読む。1 回だけの値（flash）も読めます。
     ///
-    /// **新しく入れたほうが勝ちます。** 今回の `flash` → 持ち越しの `flash` →
-    /// `put` の値、の順で探します。[`all`](Self::all) と同じ順です。
+    /// **入れた順番に関係なく、`flash` の値が勝ちます。** 今回の `flash` →
+    /// 持ち越しの `flash` → `put` の値、の順で探します。
+    /// `flash("status", "2")` のあとに `put("status", "1")` しても、読めるのは `"2"` です。
+    /// [`all`](Self::all) は、持ち越しの `flash` と `put` が同じ鍵のときだけ逆（`put`）になります。
     /// 逆にすると、`put("status", "1")` のあとの `flash("status", "2")` が
     /// `get` から永久に見えなくなります。
     pub fn get(&self, key: &str) -> Option<String> {
@@ -153,18 +161,37 @@ impl Session {
     }
 
     /// 値を入れる。次のリクエストでも読めます。
+    ///
+    /// **`__` で始まる鍵は使わないでください。** フレームワークが中で使う名前です
+    /// （CSRF のトークン、検査に落ちた入力、持ち越しの目印）。たとえば
+    /// `put("__flash:x", ..)` は次の回に flash として読まれ、その次で消えます。
+    /// 断りはしませんが、**警告を出します。**
     pub fn put(&self, key: &str, value: impl Into<String>) {
+        warn_reserved_key("put", key);
+        self.put_internal(key, value.into());
+    }
+
+    /// 鍵の名前を確かめずに入れる。フレームワークの中から内部の鍵を入れる口です。
+    pub(crate) fn put_internal(&self, key: &str, value: String) {
         let mut inner = self.lock();
-        inner.data.insert(key.to_string(), value.into());
+        inner.data.insert(key.to_string(), value);
         inner.dirty = true;
     }
 
     /// **次のリクエストまでだけ**残る値を入れる。
     ///
     /// 「保存しました」のような、1回見せたら消えてよいものに使います。
+    ///
+    /// [`put`](Self::put) と同じく、`__` で始まる鍵には警告を出します。
     pub fn flash(&self, key: &str, value: impl Into<String>) {
+        warn_reserved_key("flash", key);
+        self.flash_internal(key, value.into());
+    }
+
+    /// 鍵の名前を確かめずに flash する（中だけで使います）。
+    fn flash_internal(&self, key: &str, value: String) {
         let mut inner = self.lock();
-        inner.flash.insert(key.to_string(), value.into());
+        inner.flash.insert(key.to_string(), value);
         inner.dirty = true;
     }
 
@@ -229,12 +256,24 @@ impl Session {
     }
 
     /// 中身の組を全部返す（持ち越し中の値も含む）。
+    ///
+    /// **`__` で始まる鍵は入りません。** フレームワークが中で使う値
+    /// （CSRF のトークン `__csrf_token`、検査に落ちた入力 `__old_input`）です。
+    /// 画面やログにそのまま出すと、トークンや入力し直し用の値が漏れます。
+    /// 要るときは `req.csrf_token()` と [`old`](Self::old) で取り出してください。
     pub fn all(&self) -> BTreeMap<String, String> {
         let inner = self.lock();
-        let mut out = inner.old_flash.clone();
-        out.extend(inner.data.clone());
-        out.extend(inner.flash.clone());
-        out
+        // 後ろに並べたほうが勝つ（持ち越し → `put` → 今回の flash）。
+        // 今回の flash が一番強いのは `get` と同じ。持ち越しと `put` が同じ鍵のときは
+        // `get`（持ち越しが勝つ）と逆になる。
+        inner
+            .old_flash
+            .iter()
+            .chain(&inner.data)
+            .chain(&inner.flash)
+            .filter(|(key, _)| !key.starts_with(RESERVED_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     /// 前のリクエストの入力を覚えておく（入力し直しを避けるため）。
@@ -253,7 +292,7 @@ impl Session {
         }
         let json = serde_json::to_string(&pairs.iter().cloned().collect::<BTreeMap<_, _>>())
             .unwrap_or_else(|_| "{}".to_string());
-        self.flash(OLD_INPUT_KEY, json);
+        self.flash_internal(OLD_INPUT_KEY, json);
     }
 
     /// ログイン前に見ようとしていたパスを取り出す。**読むと消えます。**
@@ -296,8 +335,10 @@ impl Session {
         inner.dirty || !inner.old_flash.is_empty()
     }
 
-    /// 書き換えたか（テストと内部の確認用）。
-    #[cfg(test)]
+    /// 書き換えたか。
+    ///
+    /// ルートに当たらなかったリクエストは、これが真のときだけ保存します
+    /// （持ち越しの値を抱えているだけでは保存しません。`StartSession` を参照）。
     pub(crate) fn is_dirty(&self) -> bool {
         self.lock().dirty
     }
@@ -317,6 +358,23 @@ impl Session {
         let inner = self.lock();
         let mut data = inner.data.clone();
         for (k, v) in &inner.flash {
+            data.insert(format!("{FLASH_PREFIX}{k}"), v.clone());
+        }
+        data
+    }
+
+    /// 保存する中身を、**持ち越しの値を消費せずに**写し取る。
+    ///
+    /// ルートに当たらなかったリクエスト（静的ファイル・404・405）が書き換えたときに
+    /// 使います。[`snapshot_for_save`](Self::snapshot_for_save) で保存すると、
+    /// 画面に出していない「保存しました」が、CSS を 1 本返しただけで消えます。
+    ///
+    /// 前回ぶんも「次回ぶん」の形のまま残します。同じ鍵に今回 flash したときは
+    /// 今回のほうが勝ちます。
+    pub(crate) fn snapshot_keeping_flash(&self) -> Data {
+        let inner = self.lock();
+        let mut data = inner.data.clone();
+        for (k, v) in inner.old_flash.iter().chain(&inner.flash) {
             data.insert(format!("{FLASH_PREFIX}{k}"), v.clone());
         }
         data
@@ -348,6 +406,25 @@ pub(crate) fn sweep_expired(dir: &std::path::Path) -> crate::error::Result<usize
 /// CSRF のトークンを取り出す（無ければ作る）。
 pub(crate) fn csrf_token(session: &Session) -> String {
     middleware::ensure_token(session)
+}
+
+/// フレームワークが中で使う鍵の頭。
+///
+/// [`FLASH_PREFIX`]・[`OLD_INPUT_KEY`]・CSRF のトークンの鍵は、どれもこれで始まります。
+/// 利用者の鍵と同じ地図に入るので、`put` / `flash` に来たら警告し、
+/// `all()` からは外します。
+const RESERVED_PREFIX: &str = "__";
+
+/// `__` で始まる鍵を利用者が入れようとしたら知らせる。
+///
+/// **断りません。** これまで通っていた呼び出しを落とさないためです。
+fn warn_reserved_key(method: &str, key: &str) {
+    if key.starts_with(RESERVED_PREFIX) {
+        tracing::warn!(
+            "Session::{method}(\"{key}\", ..): `__` で始まる鍵はフレームワークが中で使います。\
+             思わぬ消え方をするので、別の名前にしてください"
+        );
+    }
 }
 
 /// 持ち越しの値に付ける目印。
@@ -561,6 +638,80 @@ mod tests {
     }
 
     #[test]
+    fn 全部の値に内部の鍵は入らない() {
+        // CSRF のトークンと検査に落ちた入力は、`all()` をそのまま画面やログに
+        // 出したときに漏れる。持ち越しの目印つきの鍵も出さない。
+        let mut old_flash = Data::new();
+        old_flash.insert("status".into(), "ok".into());
+        old_flash.insert(OLD_INPUT_KEY.into(), "{}".into());
+        let s = Session::new("id".into(), Data::new(), old_flash);
+        s.put("a", "1");
+        let _ = csrf_token(&s);
+        s.flash_input(&[("title".to_string(), "下書き".to_string())]);
+        // 利用者が入れてしまった `__` 始まりも、内部の鍵と同じ扱い。
+        s.put("__mine", "x");
+        s.flash("__flash:y", "z");
+
+        let all = s.all();
+        let keys: Vec<&str> = all.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["a", "status"], "内部の鍵は出さない");
+
+        // 外すのは `all()` だけ。個別には今までどおり読める。
+        assert!(s.get(super::middleware::CSRF_KEY).is_some());
+        assert_eq!(s.old("title").as_deref(), Some("下書き"));
+        assert_eq!(s.get("__mine").as_deref(), Some("x"), "警告は出すが入る");
+    }
+
+    #[test]
+    fn 内部の鍵かどうかを頭で見分ける() {
+        // 警告を出す条件。内部の 3 つの鍵がどれも当たること。
+        for key in [FLASH_PREFIX, OLD_INPUT_KEY, super::middleware::CSRF_KEY] {
+            assert!(key.starts_with(RESERVED_PREFIX), "{key}");
+        }
+        // 認証の鍵は `__` で始まらない（`put` で入れても警告しない）。
+        assert!(!crate::auth::INTENDED_KEY.starts_with(RESERVED_PREFIX));
+        // 呼んでも落ちない（警告を出すだけ）。
+        warn_reserved_key("put", "__x");
+        warn_reserved_key("put", "cart");
+    }
+
+    #[test]
+    fn 持ち越しを消費せずに写し取れる() {
+        // ルートに当たらなかったリクエストが書き換えたときの保存の形。
+        let mut old_flash = Data::new();
+        old_flash.insert("status".into(), "保存しました".into());
+        old_flash.insert("both".into(), "前回".into());
+        let s = Session::new("id".into(), Data::new(), old_flash);
+        s.put("keep", "always");
+        s.flash("fresh", "今回");
+        s.flash("both", "今回");
+
+        let kept = s.snapshot_keeping_flash();
+        assert_eq!(
+            kept.get("__flash:status").map(String::as_str),
+            Some("保存しました"),
+            "前回ぶんも次回ぶんとして残す"
+        );
+        assert_eq!(kept.get("__flash:fresh").map(String::as_str), Some("今回"));
+        assert_eq!(
+            kept.get("__flash:both").map(String::as_str),
+            Some("今回"),
+            "同じ鍵は今回が勝つ"
+        );
+        assert_eq!(kept.get("keep").map(String::as_str), Some("always"));
+
+        // ふつうの保存では前回ぶんを捨てる（こちらは変えていない）。
+        assert!(!s.snapshot_for_save().contains_key("__flash:status"));
+
+        // 読み込み直すと、持ち越しとしてもう一度読める。
+        let (_, flash) = Session::split_flash(kept);
+        assert_eq!(
+            flash.get("status").map(String::as_str),
+            Some("保存しました")
+        );
+    }
+
+    #[test]
     fn 同じ鍵にflashしたら新しいほうを読む() {
         // `get` と `all` の順をそろえる。逆だと、あとから入れた flash が
         // `get` から永久に見えなくなる。
@@ -578,6 +729,16 @@ mod tests {
         s.flash("status", "新しい");
         assert_eq!(s.get("status").as_deref(), Some("新しい"));
         assert_eq!(s.all().get("status").map(String::as_str), Some("新しい"));
+    }
+
+    #[test]
+    fn flashのあとにputしてもflashを読む() {
+        // 「新しく入れたほうが勝つ」ではない。順番に関係なく flash が勝つ。
+        let s = session();
+        s.flash("status", "2");
+        s.put("status", "1");
+        assert_eq!(s.get("status").as_deref(), Some("2"));
+        assert_eq!(s.all().get("status").map(String::as_str), Some("2"));
     }
 
     #[test]

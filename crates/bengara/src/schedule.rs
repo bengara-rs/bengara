@@ -236,10 +236,7 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
     }
     let storage = crate::paths::storage_path("");
     if !storage.is_dir() {
-        return Err(Error::msg(format!(
-            "{} がありません。デプロイのときに storage/ を作ってください",
-            storage.display()
-        )));
+        return Err(Error::msg(crate::paths::missing_storage_message(&storage)));
     }
     for path in [dir, locks.as_path()] {
         if !path.is_dir() {
@@ -273,7 +270,7 @@ fn read_last_run_file(path: &Path) -> Option<i64> {
 /// してから書くので原子的ではありません。途中で落ちると 0 バイトか途中までの
 /// ファイルが残り、`read_last_run` が `None` を返して毎分走り出しました。
 /// 改行を潰して直した形が、書き込みの非原子性で開き直っていました。
-/// 作りは `cache/store.rs` の `FileCache::put` にそろえます。
+/// 置き換えは `support::fs::write_atomic` に任せます（`FileCache::put` と同じ）。
 #[cfg(test)]
 fn write_last_run(dir: &Path, task: &Task, now: i64) -> Result<()> {
     write_last_run_file(dir, &task.state_file(), &task.name, now)
@@ -287,12 +284,14 @@ fn write_last_run_file(dir: &Path, state_file: &str, task_name: &str, now: i64) 
     // 一時ファイルの名前は、覚えるファイル（SHA-256 の16進）とぶつからない
     // ように印を入れる。プロセス番号と連番で、同時に走っても重ならない。
     let temp = dir.join(format!("{state_file}+tmp.{}.{seq}", std::process::id()));
-    std::fs::write(&temp, format!("{name}\n{now}\n"))?;
-    if let Err(e) = std::fs::rename(&temp, &path) {
-        // 置き換えに失敗したら、書きかけを残さない。
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::Io(e));
-    }
+    // Windows の「使用中」のやり直しと、失敗時の片付けは `write_atomic` が持ちます。
+    let body = format!("{name}\n{now}\n");
+    crate::support::fs::write_atomic(
+        &temp,
+        &path,
+        body.as_bytes(),
+        crate::support::fs::Access::Default,
+    )?;
     Ok(())
 }
 
@@ -370,48 +369,131 @@ fn remembered_at(every: Every, now: i64) -> i64 {
 ///
 /// 錠の取得は待ち（`sleep`）を含むので、`spawn_blocking` の中で行います。
 /// 非同期の土台で待つと、同じスレッドのほかの処理を止めます。
-async fn claim(dir: &Path, task: &Task) -> Result<bool> {
+///
+/// **`Err` は「動かせなかった」失敗だけです。** 錠が取れなかった場合は
+/// [`Claim::Busy`] で返します。別の `schedule:run` が同じタスクを判定している
+/// だけの正常な場合なので、失敗（前回の時刻を書けない・錠ファイルを作れない）と
+/// 混ぜません。混ぜていたころは、権限や容量の問題でも「錠を取れませんでした」と
+/// 出て、原因を探す向きを間違えました。
+async fn claim(dir: &Path, task: &Task) -> Result<Claim> {
     let dir = dir.to_path_buf();
     let state_file = task.state_file();
     let name = task.name.clone();
     let every = task.every;
     crate::support::blocking(move || {
-        let _lock = crate::support::lock::FileLock::acquire_tries(
-            &lock_path_for(&dir, &state_file),
-            CLAIM_LOCK_TRIES,
-        )?;
+        let lock_path = lock_path_for(&dir, &state_file);
+        let _lock =
+            match crate::support::lock::FileLock::acquire_tries(&lock_path, CLAIM_LOCK_TRIES) {
+                Ok(lock) => lock,
+                // 錠ファイルそのものを作れない（権限・容量・置き場所が無い）。
+                // 待っても直らないので、失敗として知らせる。
+                Err(Error::Io(e)) => {
+                    return Err(Error::msg(format!(
+                        "錠ファイル {} を作れませんでした: {e}",
+                        lock_path.display()
+                    )));
+                }
+                // 回数を使い切った。別のプロセスが握っているので任せる。
+                Err(_) => return Ok(Claim::Busy),
+            };
         let now = crate::support::time::now_seconds();
         if !is_due(read_last_run_file(&dir.join(&state_file)), every, now) {
-            return Ok(false);
+            return Ok(Claim::NotYet);
         }
         // 先に時刻を書く。処理が失敗しても、次の1分でまた走らないようにするため。
         // 書く値は分の頭に丸める（ずれを積まないため。[`remembered_at`]）。
-        write_last_run_file(&dir, &state_file, &name, remembered_at(every, now))?;
-        Ok(true)
+        write_last_run_file(&dir, &state_file, &name, remembered_at(every, now)).map_err(|e| {
+            Error::msg(format!(
+                "前回の時刻を {} に書けませんでした: {e}",
+                dir.join(&state_file).display()
+            ))
+        })?;
+        Ok(Claim::Due)
     })
     .await?
 }
 
-/// 動かすべきものを動かす。返るのは動かした名前です。
-pub(crate) async fn run_due(schedule: &Schedule) -> Result<Vec<String>> {
-    let dir = state_dir();
-    ensure_state_dir(&dir)?;
-    run_due_in(&dir, schedule).await
+/// [`claim`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// 動かす。前回の時刻は書き終えている。
+    Due,
+    /// まだ動かすときではない。
+    NotYet,
+    /// 錠が取れなかった。別のプロセスが判定しているので任せる（失敗ではない）。
+    Busy,
 }
 
-/// 置き場所を指定して動かす（テストから使います）。
+/// `schedule:run` 1 回ぶんの結果。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Outcome {
+    /// 動かして成功した名前。
+    pub(crate) done: Vec<String>,
+    /// 失敗した名前（`Err`・パニック・動かす前の書き込みの失敗）。
+    pub(crate) failed: Vec<String>,
+    /// 錠が取れずに飛ばした名前。**失敗には数えません。**
+    pub(crate) busy: Vec<String>,
+}
+
+impl Outcome {
+    /// 失敗が 1 件でもあれば、コマンドの結果にするエラーを返す。
+    ///
+    /// **残りのタスクを動かし終えてから**呼びます。終了コードを 0 以外にして、
+    /// cron や監視の側で失敗を拾えるようにするためです。以前は `Err` でも
+    /// パニックでも 0 で終わり、画面を見ないかぎり気づけませんでした。
+    ///
+    /// 錠が取れずに飛ばした分は入れません。別の `schedule:run` が動かしている
+    /// 正常な場合で、これを失敗にすると 2 台構成で毎分エラーになります。
+    pub(crate) fn failure(&self) -> Option<Error> {
+        if self.failed.is_empty() {
+            return None;
+        }
+        Some(Error::msg(format!(
+            "定期処理が {} 件失敗しました（{}）",
+            self.failed.len(),
+            self.failed.join("、")
+        )))
+    }
+}
+
+/// 動かすべきものを動かす。
+pub(crate) async fn run_due(schedule: &Schedule) -> Result<Outcome> {
+    let dir = state_dir();
+    ensure_state_dir(&dir)?;
+    Ok(run_in(&dir, schedule).await)
+}
+
+/// 置き場所を指定して動かし、動かした名前だけを返す（テストから使います）。
+#[cfg(test)]
 async fn run_due_in(dir: &Path, schedule: &Schedule) -> Result<Vec<String>> {
-    let mut done = Vec::new();
+    Ok(run_in(dir, schedule).await.done)
+}
+
+/// 置き場所を指定して動かす。
+///
+/// 1 つ失敗しても、1 つ飛ばしても、残りは動かします。結果は [`Outcome`] に
+/// 分けて入れ、終了コードは呼ぶ側が [`Outcome::failure`] で決めます。
+async fn run_in(dir: &Path, schedule: &Schedule) -> Outcome {
+    let mut outcome = Outcome::default();
 
     for task in &schedule.tasks {
         match claim(dir, task).await {
-            Ok(true) => {}
-            // まだ動かすときではない。
-            Ok(false) => continue,
-            // 錠が取れなかった。別のプロセスが見ているので任せる。
-            // 1 つ飛ばしても、ほかの処理は動かす。
+            Ok(Claim::Due) => {}
+            Ok(Claim::NotYet) => continue,
+            // 別のプロセスが見ているので任せる。
+            Ok(Claim::Busy) => {
+                eprintln!(
+                    "  {} は飛ばします（錠を取れませんでした。別の schedule:run が判定中です）",
+                    task.name
+                );
+                outcome.busy.push(task.name.clone());
+                continue;
+            }
+            // 動かす前の準備で失敗した。書けない間は毎回ここに来るので、
+            // 錠の話と混ぜずに理由をそのまま出す。
             Err(e) => {
-                eprintln!("  {} は飛ばします（錠を取れませんでした）: {e}", task.name);
+                eprintln!("  {} 失敗（動かせませんでした）: {e}", task.name);
+                outcome.failed.push(task.name.clone());
                 continue;
             }
         }
@@ -424,13 +506,16 @@ async fn run_due_in(dir: &Path, schedule: &Schedule) -> Result<Vec<String>> {
                     task.name,
                     started.elapsed().as_millis()
                 );
-                done.push(task.name.clone());
+                outcome.done.push(task.name.clone());
             }
             // 1つ失敗しても、ほかの処理は動かす。
-            Err(e) => eprintln!("  {} 失敗: {e}", task.name),
+            Err(e) => {
+                eprintln!("  {} 失敗: {e}", task.name);
+                outcome.failed.push(task.name.clone());
+            }
         }
     }
-    Ok(done)
+    outcome
 }
 
 /// タスクを 1 つ動かす。パニックも失敗として扱います。
@@ -644,8 +729,9 @@ mod tests {
         // 時刻を取り直すので、5 秒後の前回は「まだ早い」ではなく未来と見る。
         // ここで確かめたいのは、動かさないこと**ではなく**、前回の時刻が
         // 判定の瞬間の `now` と比べられること。
-        assert!(
+        assert_eq!(
             claim(&dir, task).await.unwrap(),
+            Claim::Due,
             "未来の前回は動かす（時計ずれの扱い）"
         );
         // 書くのは判定の瞬間の時刻を分の頭に丸めた値。未来の時刻は残らない。
@@ -836,6 +922,116 @@ mod tests {
         assert_eq!(run_due_in(&dir, &schedule).await.unwrap().len(), 1);
         // 錠は手放したら残らない。
         assert!(!lock_path(&dir, &schedule.tasks()[0]).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 錠を取れずに飛ばした分は失敗に数えない() {
+        let dir = temp_dir("busy");
+        let mut schedule = Schedule::new();
+        schedule
+            .job("重なった処理", Every::Hour, || async { Ok(()) })
+            .job("次の処理", Every::Hour, || async { Ok(()) });
+
+        // 別の `schedule:run` が同じタスクを判定している最中。
+        let held = crate::support::lock::FileLock::acquire(&lock_path(&dir, &schedule.tasks()[0]))
+            .unwrap();
+        assert_eq!(
+            claim(&dir, &schedule.tasks()[0]).await.unwrap(),
+            Claim::Busy
+        );
+
+        let outcome = run_in(&dir, &schedule).await;
+        assert_eq!(outcome.busy, vec!["重なった処理".to_string()]);
+        assert_eq!(outcome.done, vec!["次の処理".to_string()], "残りは動く");
+        assert!(outcome.failed.is_empty());
+        // 正常な場合なので、終了コードは 0 のまま。失敗にすると、2 台で
+        // 同じ `storage/` を見る構成で毎分エラーになる。
+        assert!(outcome.failure().is_none());
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 前回の時刻を書けないのは錠の話と分けて失敗にする() {
+        let dir = temp_dir("unwritable");
+        let mut schedule = Schedule::new();
+        schedule
+            .job("書けない処理", Every::Hour, || async { Ok(()) })
+            .job("次の処理", Every::Hour, || async { Ok(()) });
+
+        // 覚えるファイルの場所を、中身のあるディレクトリでふさぐ（権限や容量で
+        // 書けない形の代わり。どの OS でも置き換えに失敗する）。
+        let blocked = dir.join(schedule.tasks()[0].state_file());
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("ふた"), "").unwrap();
+
+        // 以前はこれも「錠を取れませんでした」と出ていた。
+        let error = claim(&dir, &schedule.tasks()[0])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("前回の時刻を"), "{error}");
+        assert!(error.contains("書けませんでした"), "{error}");
+        assert!(!error.contains("錠"), "{error}");
+
+        let outcome = run_in(&dir, &schedule).await;
+        assert_eq!(outcome.failed, vec!["書けない処理".to_string()]);
+        assert!(outcome.busy.is_empty());
+        assert_eq!(outcome.done, vec!["次の処理".to_string()], "残りは動く");
+        // 書けない間は毎回飛ぶので、終了コードで知らせる。
+        let failure = outcome.failure().expect("失敗として返る").to_string();
+        assert!(failure.contains("1 件"), "{failure}");
+        assert!(failure.contains("書けない処理"), "{failure}");
+
+        // 錠も書きかけも残さない。
+        assert!(!lock_path(&dir, &schedule.tasks()[0]).exists());
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("+tmp"))
+            .collect();
+        assert!(left.is_empty(), "残っている: {left:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 失敗があれば残りを動かしたうえでエラーを返す() {
+        let dir = temp_dir("exit-code");
+        let mut schedule = Schedule::new();
+        schedule
+            .job("失敗する処理", Every::Hour, || async {
+                Err(crate::error::Error::msg("わざと失敗"))
+            })
+            .job("落ちる処理", Every::Hour, || async {
+                panic!("わざと落ちる")
+            })
+            .job("次の処理", Every::Hour, || async { Ok(()) });
+
+        let outcome = run_in(&dir, &schedule).await;
+        // 失敗の後ろも動いている。
+        assert_eq!(outcome.done, vec!["次の処理".to_string()]);
+        assert_eq!(
+            outcome.failed,
+            vec!["失敗する処理".to_string(), "落ちる処理".to_string()]
+        );
+        // 以前は `Err` でもパニックでも終了コード 0 で、cron から失敗を拾えなかった。
+        let failure = outcome.failure().expect("失敗として返る").to_string();
+        assert!(failure.contains("2 件"), "{failure}");
+        assert!(failure.contains("失敗する処理"), "{failure}");
+        assert!(failure.contains("落ちる処理"), "{failure}");
+
+        // 全部成功した回と、動かすものが無い回は成功のまま。
+        let mut fine = Schedule::new();
+        fine.job("うまくいく処理", Every::Hour, || async { Ok(()) });
+        assert!(run_in(&dir, &fine).await.failure().is_none());
+        let again = run_in(&dir, &fine).await;
+        assert_eq!(again, Outcome::default(), "2 回目は動かすものが無い");
+        assert!(again.failure().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

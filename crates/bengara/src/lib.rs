@@ -140,7 +140,8 @@ impl Default for Hooks {
 /// fn main() { bengara::run() }
 /// ```
 ///
-/// この状態では `init` だけを受け付けます。
+/// この状態で実行するのは `init` と、版の表示（`version` など）だけです。
+/// それ以外は、何も実行せずに使い方を表示します。
 pub fn run() {
     cli::run_before_init();
 }

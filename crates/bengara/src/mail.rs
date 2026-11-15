@@ -13,14 +13,15 @@
 //! | 送り先 | 何をするか | 要るもの |
 //! |---|---|---|
 //! | `log`（既定） | `storage/logs/mail.log` に書き出す | 無し |
-//! | `array` | プロセスのメモリに溜める（テスト用） | 無し |
+//! | `array`（別名 `memory`） | プロセスのメモリに溜める（テスト用） | 無し |
 //! | `smtp` | SMTP サーバへ送る | Cargo の機能フラグ `mail` |
 //!
 //! `smtp` は既定では入りません。フラグが無いままでもコンパイルはできて、
 //! 送ろうとしたときに直し方を書いたエラーになります。
+//! `features` に `"mail"` を**足します**（DB のフラグは残します）。
 //!
 //! ```toml
-//! bengara = { version = "0.1", features = ["mail"] }
+//! bengara = { version = "0.1", features = ["sqlite", "mail"] }
 //! ```
 
 use std::sync::{Mutex, OnceLock};
@@ -36,7 +37,7 @@ mod smtp;
 /// `host` から下は `smtp` のときだけ使います。
 #[derive(Debug, Clone)]
 pub struct MailConfig {
-    /// 送り先の名前（`log` / `array` / `smtp`）。
+    /// 送り先の名前（`log` / `array` / `smtp`）。`memory` は `array` の別名です。
     pub driver: String,
     /// 差出人（`.from(..)` を書かなかったときに使う）。
     pub from: String,
@@ -53,7 +54,12 @@ pub struct MailConfig {
     pub username: String,
     /// SMTP のパスワード。
     pub password: String,
-    /// `EHLO` で名乗る名前。空のときは lettre の既定（`localhost`）です。
+    /// `EHLO` で名乗る名前。空のときは lettre の既定で、`[127.0.0.1]` と名乗ります。
+    ///
+    /// `localhost` ではありません。lettre は `hostname` 機能を入れないかぎり
+    /// IPv4 のアドレス表記（`ClientId::Ipv4(127.0.0.1)`）を使います。
+    /// 名乗りを確かめるサーバには断られることがあるので、そのときは
+    /// 自分のホスト名（`app.example.com` など）を書いてください。
     pub ehlo_name: String,
     /// 返事を待つ上限（秒）。
     pub timeout: u64,
@@ -126,12 +132,16 @@ impl Message {
         let mut out = String::new();
         out.push_str(&format!("---- {} ----\n", crate::database::now()));
         out.push_str(&format!("From: {}\n", self.from));
-        out.push_str(&format!("To: {}\n", self.to.join(", ")));
-        if !self.cc.is_empty() {
-            out.push_str(&format!("Cc: {}\n", self.cc.join(", ")));
+        // 空白だけの宛先は書かない。`smtp` が飛ばすのと同じにして、
+        // 送り先を切り替えても宛先の見え方が変わらないようにする。
+        out.push_str(&format!("To: {}\n", join_addresses(&self.to)));
+        let cc = join_addresses(&self.cc);
+        if !cc.is_empty() {
+            out.push_str(&format!("Cc: {cc}\n"));
         }
-        if !self.bcc.is_empty() {
-            out.push_str(&format!("Bcc: {}\n", self.bcc.join(", ")));
+        let bcc = join_addresses(&self.bcc);
+        if !bcc.is_empty() {
+            out.push_str(&format!("Bcc: {bcc}\n"));
         }
         if let Some(reply_to) = &self.reply_to {
             out.push_str(&format!("Reply-To: {reply_to}\n"));
@@ -148,6 +158,16 @@ impl Message {
         }
         out
     }
+}
+
+/// 宛先を `, ` でつなぐ。**空白だけのものは飛ばします。**
+fn join_addresses(addresses: &[String]) -> String {
+    addresses
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// メールの送り先。自分で作れば差し替えられます。
@@ -252,6 +272,15 @@ fn make_mailer(driver: &str) -> Box<dyn Mailer> {
     }
 }
 
+/// 機能フラグ `mail` が無いときの案内。
+///
+/// **「足してください」と言います。** 以前は「`features = ["mail"]` に
+/// してください」で、そのとおりに書くと `sqlite` などが消えて DB が
+/// 使えなくなりました。
+#[cfg(not(feature = "mail"))]
+const MAIL_FEATURE_HINT: &str = "SMTP で送るには、Cargo.toml の bengara の features に \
+    `\"mail\"` を足してください（例: `features = [\"sqlite\", \"mail\"]`）";
+
 /// SMTP の送り先を作る。
 ///
 /// 機能フラグ `mail` が無いときと、設定が足りないときは、どちらも
@@ -270,9 +299,7 @@ fn make_smtp_mailer() -> Box<dyn Mailer> {
     #[cfg(not(feature = "mail"))]
     {
         Box::new(UnavailableMailer {
-            reason: "SMTP で送るには Cargo.toml を \
-                     `bengara = { version = \"0.1\", features = [\"mail\"] }` にしてください"
-                .to_string(),
+            reason: MAIL_FEATURE_HINT.to_string(),
         })
     }
 }
@@ -487,6 +514,27 @@ mod tests {
         assert!(log.contains("本文"));
     }
 
+    #[test]
+    fn ログの形は空白だけの宛先を書かない() {
+        // `smtp` は空白だけの宛先を飛ばす。`log` も同じに見せる。
+        let message = Message {
+            to: vec!["  ".into(), "a@example.com".into()],
+            cc: vec![String::new()],
+            bcc: vec![" ".into(), "b@example.com".into()],
+            from: "me@example.com".into(),
+            subject: "件名".into(),
+            text: Some("本文".into()),
+            ..Message::default()
+        };
+        // 空白だけの写しがあっても、検査は通る（全部の送り先で同じ）。
+        assert!(check(&message).is_ok());
+
+        let log = message.to_log();
+        assert!(log.contains("To: a@example.com\n"), "{log}");
+        assert!(!log.contains("Cc:"), "空の写しは行ごと出さない: {log}");
+        assert!(log.contains("Bcc: b@example.com\n"), "{log}");
+    }
+
     /// テストで使う送り先。`install_mailer` を使わずに差し替えられます。
     ///
     /// `ArrayMailer` を使わないのは、溜め先（`SENT`）がプロセス全体で1つで、
@@ -692,6 +740,10 @@ mod tests {
             let error = mailer.send(&message).unwrap_err().to_string();
             assert!(error.contains("features"), "{error}");
             assert!(error.contains("mail"), "{error}");
+            // 「`features = ["mail"]` にしてください」だと、そのとおりに書いて
+            // `sqlite` を落とす。足すように言う。
+            assert!(error.contains("足してください"), "{error}");
+            assert!(!error.contains("features = [\"mail\"]"), "{error}");
         }
 
         // フラグがあるときは、つなぎ口ができる。

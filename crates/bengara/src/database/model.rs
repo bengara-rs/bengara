@@ -13,6 +13,7 @@
 
 use std::marker::PhantomData;
 
+use super::grammar::Driver;
 use super::query::{Paginator, QueryBuilder};
 use super::transaction::Transaction;
 use super::value::{FromValue, IntoValue, Row, Value};
@@ -37,8 +38,14 @@ pub trait Model: Sized + Send + Sync + 'static {
     /// `bigint = text` を断るので、文字列のまま渡すと `operator does not exist` に
     /// なります（SQLite と MySQL は暗黙に変換するので気づけません）。
     ///
-    /// 文字列の主キーを自分で実装するときは `false` にしてください。
+    /// **真のとき、整数に読めない値では探しません。** `find("abc")` や
+    /// `/posts/abc` への `req.model::<Post>("post")` は「無い」を返します。
+    /// そのまま比べると、PostgreSQL だけ `bigint = text` の SQL エラー（500）に
+    /// なるためです。
+    ///
+    /// 文字列の主キーを自分で実装するときは **必ず** `false` にしてください。
     /// `"123"` のような値をそのまま文字列として探せるようになります。
+    /// 真のままだと、`"a1"` のような主キーは1件も見つかりません。
     const INTEGER_KEY: bool = true;
 
     /// 主キーの列に渡す値を、主キーの型に合わせて直す。
@@ -68,7 +75,9 @@ pub trait Model: Sized + Send + Sync + 'static {
 
     /// `created_at` / `updated_at` を今の時刻にする。
     ///
-    /// その名前の `String` のフィールドが無いときは、何もしません。
+    /// その**列名**のフィールドが無いときは、何もしません。
+    /// 入れる値は `now()` の文字列です。`#[derive(Model)]` は `.into()` で入れるので、
+    /// `String` から `Into` で変えられる型のフィールドなら動きます。
     fn touch_timestamps(&mut self, creating: bool) {
         let _ = creating;
     }
@@ -107,11 +116,14 @@ pub trait Model: Sized + Send + Sync + 'static {
     /// 主キーで1件取る。
     ///
     /// 整数に読める文字列（パス引数など）は整数として探します（[`Model::key_value`]）。
+    ///
+    /// **`NULL` と、整数の主キーに整数として読めない値は、問い合わせずに `None` です**
+    /// （[`Model::INTEGER_KEY`]）。
     fn find<V: IntoValue + Send>(
         id: V,
     ) -> impl std::future::Future<Output = Result<Option<Self>>> + Send {
-        let id = Self::key_value(id);
-        async move { Self::query().where_(Self::PRIMARY_KEY, id).first().await }
+        let id = id.into_value();
+        async move { find_by_key(&Self::query(), id).await }
     }
 
     /// 主キーで1件取る。無ければ 404 のエラー。
@@ -241,8 +253,9 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
                 // 「入れられなかった」と言うと実態と食い違います。
                 return Err(Error::msg(format!(
                     "{}.{} に採番された値が返りませんでした（行は入っています）。\
-                     主キーが自動採番か確かめてください。自分で主キーを決める表では、\
-                     値を入れてから `save()` を呼んでください",
+                     主キーが自動採番か確かめてください。主キーを自分で決める表の行は、\
+                     `DB::table(..).insert(..)` で入れてください。`save()` で新しく\
+                     入れられるのは、自動採番の主キーの行だけです",
                     T::TABLE,
                     T::PRIMARY_KEY
                 )));
@@ -258,7 +271,12 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
             )));
         }
     } else {
-        let key = T::key_value(model.key());
+        // 探しても無いと分かっている主キー（整数の主キーに文字列など）は、
+        // 問い合わせずに「行が無い」にする。PostgreSQL では SQL エラーになる形。
+        let Some(key) = lookup_key::<T>(model.key(), query.driver()) else {
+            query.check()?;
+            return Err(missing_row::<T>(&T::key_value(model.key())));
+        };
         // `created_at` は作ったときの値を保つ。全列を書き戻す作りなので、
         // 読み直さずに作った構造体（`created_at` が空）を保存すると、
         // 以前は `created_at = ''` で上書きされていた。
@@ -280,15 +298,87 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
         if affected == 0 {
             // 当てはまる行が無かった。消えた行・推測した主キー・並行削除のどれか。
             // 以前は警告だけで `Ok` を返していたので、書き込みが静かに失われていました。
-            return Err(Error::msg(format!(
-                "{}.{} = {key} の行が無いので保存できませんでした。\
-                 消えた行を保存しようとしていないか、主キーの値を確かめてください",
-                T::TABLE,
-                T::PRIMARY_KEY
-            )));
+            return Err(missing_row::<T>(&key));
         }
     }
     Ok(())
+}
+
+/// 更新のつもりで `save()` して、当てはまる行が無かったときのエラー。
+///
+/// **主キーを自分で決める行を `save()` で入れようとした場合もここに来ます。**
+/// 主キーに値が入っていると「保存済み」とみなして `update` を流すためです。
+/// 以前は「値を入れてから `save()`」と案内していましたが、その通りにすると
+/// このエラーになるので、入れ方（`DB::table(..).insert(..)`）を添えます。
+fn missing_row<T: Model>(key: &Value) -> Error {
+    Error::msg(format!(
+        "{}.{} = {key} の行が無いので保存できませんでした。\
+         消えた行を保存しようとしていないか、主キーの値を確かめてください。\
+         主キーを自分で決める行を新しく入れるときは、`DB::table(..).insert(..)` を\
+         使ってください（`save()` が新しく入れるのは、主キーが空の行だけです）",
+        T::TABLE,
+        T::PRIMARY_KEY
+    ))
+}
+
+/// 主キーで探すときに渡す値を決める。**探しても無いと分かっているときは `None`。**
+///
+/// | 値                                       | 返すもの                  |
+/// |------------------------------------------|---------------------------|
+/// | `NULL`                                   | `None`                    |
+/// | 整数の主キーに、整数として読めない文字列 | `None`                    |
+/// | それ以外                                 | [`Model::key_value`] の値 |
+///
+/// `NULL` を外すのは、`where_` が `NULL` を `is null` に読み替えるためです。
+/// そのまま渡すと「主キーが NULL の行」を探してしまいます。
+fn lookup_key<T: Model>(value: impl IntoValue, driver: Driver) -> Option<Value> {
+    let value = T::key_value(value);
+    if value.is_null() || (T::INTEGER_KEY && never_matches_integer_key(&value, driver)) {
+        return None;
+    }
+    Some(value)
+}
+
+/// 整数の主キーと比べても、当たる行が無いと分かっている値か。
+///
+/// 整数として読めない文字列（`"abc"`）がこれです。そのまま束縛すると、
+/// PostgreSQL は `bigint = text` を断って SQL エラー（500）になります。
+/// MySQL は文字列を `0` に読み替えるので、`id = 0` の行に当たってしまいます。
+/// どちらも「無い」が正しい答えです。
+///
+/// `i64` を超える数字だけの文字列（`u64` の大きな値）は、MySQL でだけ通します。
+/// MySQL の `id()` は `bigint unsigned` なので、その値の行がありえます。
+/// SQLite と PostgreSQL の整数は `i64` までなので、当たる行がありません。
+fn never_matches_integer_key(value: &Value, driver: Driver) -> bool {
+    let Value::Text(text) = value else {
+        return false;
+    };
+    let text = text.trim();
+    if text.parse::<i64>().is_ok() {
+        return false;
+    }
+    !(driver == Driver::MySql && text.parse::<u64>().is_ok())
+}
+
+/// `Model::find` / `ModelQuery::find` / `fresh` の中身。
+///
+/// 探しても無いと分かっている値のときは、問い合わせずに `None` を返します。
+/// 組み立てと接続の間違いは、そのときも知らせます。
+async fn find_by_key<T: Model>(query: &ModelQuery<T>, id: Value) -> Result<Option<T>> {
+    let Some(key) = lookup_key::<T>(id, query.inner.driver()) else {
+        query.inner.check()?;
+        return Ok(None);
+    };
+    let row = query
+        .inner
+        .clone()
+        .where_(T::PRIMARY_KEY, key)
+        .first()
+        .await?;
+    match row {
+        Some(row) => T::from_row(&row).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// `delete()` と `delete_using()` の中身。
@@ -296,18 +386,18 @@ async fn delete_from<T: Model>(model: &T, source: Source) -> Result<u64> {
     if model.is_new() {
         return Ok(0);
     }
-    QueryBuilder::new(source, T::TABLE)
-        .where_(T::PRIMARY_KEY, T::key_value(model.key()))
-        .delete()
-        .await
+    let query = QueryBuilder::new(source, T::TABLE);
+    // 探しても無いと分かっている主キーは、問い合わせずに 0 件にする。
+    let Some(key) = lookup_key::<T>(model.key(), query.driver()) else {
+        query.check()?;
+        return Ok(0);
+    };
+    query.where_(T::PRIMARY_KEY, key).delete().await
 }
 
 /// `fresh()` と `fresh_using()` の中身。
 async fn fresh_from<T: Model>(model: &T, source: Source) -> Result<Option<T>> {
-    ModelQuery::<T>::new(source)
-        .where_(T::PRIMARY_KEY, T::key_value(model.key()))
-        .first()
-        .await
+    find_by_key(&ModelQuery::<T>::new(source), model.key()).await
 }
 
 /// `#[derive(Model)]` が生成するコードから呼ばれます。利用者が直接呼ぶものではありません。
@@ -398,8 +488,23 @@ impl<T: Model> ModelQuery<T> {
 
     // ---- 条件 ----
 
-    /// 列が値と等しい。
+    /// 列が値と等しい。値が `NULL`（`None`）のときは `is null` になります。
+    ///
+    /// **整数の主キーの列に、整数として読めない文字列を渡すと、必ず 0 件になります**
+    /// （`1 = 0` を置きます）。`req.model::<Post>("post")` や
+    /// `req.auth().user::<User>()` は、外から来た文字列をここへ渡します。
+    /// そのまま比べると、PostgreSQL だけ `bigint = text` の SQL エラー（500）に
+    /// なるためです（[`Model::INTEGER_KEY`]）。
     pub fn where_(self, column: &str, value: impl IntoValue) -> Self {
+        let value = value.into_value();
+        if T::INTEGER_KEY
+            && is_primary_key::<T>(column)
+            && never_matches_integer_key(&value, self.inner.driver())
+        {
+            // 空の一覧との `where_in` は `1 = 0` になる。列名の検査もそのまま通る。
+            let nothing: [i64; 0] = [];
+            return self.map(|q| q.where_in(column, &nothing));
+        }
         self.map(|q| q.where_(column, value))
     }
 
@@ -590,17 +695,11 @@ impl<T: Model> ModelQuery<T> {
     /// ```ignore
     /// let post = Post::query().where_("status", "published").find(id).await?;
     /// ```
+    ///
+    /// **`NULL` と、整数の主キーに整数として読めない値は、問い合わせずに `None` です**
+    /// （[`Model::INTEGER_KEY`]）。
     pub async fn find(&self, id: impl IntoValue) -> Result<Option<T>> {
-        let row = self
-            .inner
-            .clone()
-            .where_(T::PRIMARY_KEY, T::key_value(id))
-            .first()
-            .await?;
-        match row {
-            Some(row) => T::from_row(&row).map(Some),
-            None => Ok(None),
-        }
+        find_by_key(self, id.into_value()).await
     }
 
     /// 最初の1件。無ければ 404 のエラー。
@@ -645,12 +744,12 @@ impl<T: Model> ModelQuery<T> {
         self.inner.max(column).await
     }
 
-    /// ある列だけを一覧で取る。
+    /// ある列だけを一覧で取る。NULL がありうる列は `Option<V>` で読んでください。
     pub async fn pluck<V: FromValue>(&self, column: &str) -> Result<Vec<V>> {
         self.inner.pluck(column).await
     }
 
-    /// 最初の行の、ある列の値。
+    /// 最初の行の、ある列の値。NULL がありうる列は `Option<V>` で読んでください。
     pub async fn value<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
         self.inner.value(column).await
     }
@@ -674,13 +773,26 @@ impl<T: Model> ModelQuery<T> {
     }
 }
 
+/// 列の名前が、このモデルの主キーを指しているか。`posts.id` のような表名付きも見ます。
+fn is_primary_key<T: Model>(column: &str) -> bool {
+    let column = column.trim();
+    if column == T::PRIMARY_KEY {
+        return true;
+    }
+    column
+        .strip_prefix(T::TABLE)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| rest == T::PRIMARY_KEY)
+}
+
 impl<T: Model> std::fmt::Debug for ModelQuery<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (sql, bindings) = self.to_sql();
+        // 中身は `QueryBuilder` に任せる。SQL と値の数に加えて、組み立ての間違い
+        // （`deferred_error`）も出る。以前はここで SQL だけを出していたので、
+        // 列名の間違いなどが `{:?}` で見えませんでした。
         f.debug_struct("ModelQuery")
             .field("table", &T::TABLE)
-            .field("sql", &sql)
-            .field("bindings", &bindings.len())
+            .field("query", &self.inner)
             .finish()
     }
 }
@@ -982,6 +1094,217 @@ mod tests {
     }
 
     #[test]
+    fn 整数の主キーに整数として読めない値は探さない() {
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            // 整数に読めるものは、整数にして探す。
+            assert_eq!(lookup_key::<Post>("12", driver), Some(Value::Int(12)));
+            assert_eq!(lookup_key::<Post>(12, driver), Some(Value::Int(12)));
+            // 読めない文字列は探さない。PostgreSQL では bigint = text の 500 になる。
+            assert_eq!(lookup_key::<Post>("abc", driver), None, "{driver}");
+            assert_eq!(lookup_key::<Post>("12abc", driver), None, "{driver}");
+            assert_eq!(lookup_key::<Post>("", driver), None, "{driver}");
+            assert_eq!(lookup_key::<Post>("1.5", driver), None, "{driver}");
+            // NULL の主キーの行は無い。`is null` で探さない。
+            assert_eq!(lookup_key::<Post>(None::<i64>, driver), None);
+            assert_eq!(lookup_key::<Coded>(None::<String>, driver), None);
+            // 文字列の主キー（INTEGER_KEY = false）は、そのまま探す。
+            assert_eq!(
+                lookup_key::<Coded>("abc", driver),
+                Some(Value::Text("abc".into()))
+            );
+        }
+
+        // i64 を超える数字は、MySQL でだけ通す（`bigint unsigned` にありうる）。
+        assert_eq!(
+            lookup_key::<Post>(u64::MAX, Driver::MySql),
+            Some(Value::Text(u64::MAX.to_string()))
+        );
+        assert_eq!(lookup_key::<Post>(u64::MAX, Driver::Sqlite), None);
+        assert_eq!(lookup_key::<Post>(u64::MAX, Driver::Postgres), None);
+        // 20 桁を超える数字は、どのドライバでも探さない。
+        let huge = "999999999999999999999999";
+        assert_eq!(lookup_key::<Post>(huge, Driver::MySql), None);
+    }
+
+    #[tokio::test]
+    async fn 整数に読めない主キーのfindは問い合わせずに無いを返す() {
+        let (found, tx) = spy().await;
+
+        assert!(Post::on(&tx).find("abc").await.expect("読める").is_none());
+        assert!(Post::on(&tx)
+            .where_("title", "x")
+            .find(None::<i64>)
+            .await
+            .expect("読める")
+            .is_none());
+        // クエリビルダの `find` も、NULL では問い合わせない。
+        assert!(tx
+            .table("posts")
+            .find(None::<i64>)
+            .await
+            .expect("読める")
+            .is_none());
+        assert!(joined(&found.tx).is_empty(), "{}", joined(&found.tx));
+        assert!(joined(&found.pool).is_empty());
+
+        // 整数に読める文字列は、これまでどおり問い合わせる。
+        assert!(Post::on(&tx).find("12").await.expect("読める").is_none());
+        let sent = joined(&found.tx);
+        assert_eq!(sent, "select * from \"posts\" where \"id\" = ? limit 1");
+
+        // 問い合わせないときも、組み立ての間違いは知らせる。
+        let message = Post::on(&tx)
+            .order_by("id; drop table posts")
+            .find("abc")
+            .await
+            .err()
+            .expect("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 既定の接続のfindとfind_or_failも問い合わせずに返す() {
+        // 既定の接続には流れない（流れれば、つなぐところで別のエラーになる）。
+        assert!(Post::find("abc").await.expect("読める").is_none());
+        assert!(Post::find(None::<i64>).await.expect("読める").is_none());
+        let error = Post::find_or_fail("abc").await.err().expect("404 になる");
+        assert!(matches!(error, Error::Http { status: 404, .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn 主キーの条件に読めない文字列を渡すと必ず0件になる() {
+        // `req.model` と `req.auth().user` は、この形で主キーを比べる。
+        let (found, tx) = spy().await;
+        let row = Post::on(&tx)
+            .where_(Post::PRIMARY_KEY, Post::key_value("abc"))
+            .first()
+            .await
+            .expect("SQL エラーにならない");
+        assert!(row.is_none());
+        let sent = joined(&found.tx);
+        assert_eq!(sent, "select * from \"posts\" where 1 = 0 limit 1");
+
+        // 表名付きでも同じ。値は束縛しない。
+        let (sql, bindings) = Post::query().where_("posts.id", "abc").to_sql();
+        assert_eq!(sql, "select * from \"posts\" where 1 = 0");
+        assert!(bindings.is_empty());
+
+        // 整数に読める値と、主キー以外の列は、これまでどおり。
+        let (sql, bindings) = Post::query().where_("id", "12").to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"id\" = ?");
+        assert_eq!(bindings, vec![Value::Text("12".into())]);
+        let (sql, _) = Post::query().where_("title", "abc").to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"title\" = ?");
+        let (sql, _) = Post::query().where_("comments.id", "abc").to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"comments\".\"id\" = ?");
+
+        // 文字列の主キーは、そのまま比べる。
+        let (sql, bindings) = Coded::query().where_("code", "a1").to_sql();
+        assert_eq!(sql, "select * from \"coded\" where \"code\" = ?");
+        assert_eq!(bindings, vec![Value::Text("a1".into())]);
+
+        // 列名の検査は、読み替えたときも効く。
+        assert!(is_primary_key::<Post>(" id "));
+        assert!(!is_primary_key::<Post>("posts.title"));
+        assert!(!is_primary_key::<Post>("postsid"));
+    }
+
+    #[test]
+    fn モデルの条件でもnullは_is_null_になる() {
+        let none: Option<String> = None;
+        let (sql, bindings) = Post::query()
+            .where_("deleted_at", none.clone())
+            .or_where("title", none.clone())
+            .where_op("body", "!=", none)
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"deleted_at\" is null \
+             or \"title\" is null and \"body\" is not null"
+        );
+        assert!(bindings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn usingで替えたら元の接続の間違いは残らない() {
+        // 設定に無い接続で組み立てても、有効なトランザクションへ替えれば動く。
+        let (found, tx) = spy().await;
+        let query = ModelQuery::<Post>::new(Source::Named("無い接続".to_string()))
+            .where_("title", "x")
+            .using(&tx);
+        query.get().await.expect("トランザクションで動く");
+        assert_eq!(
+            joined(&found.tx),
+            "select * from \"posts\" where \"title\" = ?"
+        );
+    }
+
+    #[tokio::test]
+    async fn 件数が0のページ分けは本体を問い合わせない() {
+        // Spy は行を返さないので、件数は 0 になる。
+        let (found, tx) = spy().await;
+        let page = Post::on(&tx)
+            .where_("title", "x")
+            .latest()
+            .paginate(15, 2)
+            .await
+            .expect("取れる");
+        assert_eq!(page.total, 0);
+        assert!(page.is_empty());
+        assert_eq!(page.current_page, 2);
+        assert_eq!(
+            joined(&found.tx),
+            "select count(*) as bengara_aggregate from \"posts\" where \"title\" = ?",
+            "流れるのは件数の 1 本だけ"
+        );
+    }
+
+    #[tokio::test]
+    async fn 主キーを自分で決める行のsaveは入れ方を案内する() {
+        // 主キーに値があるので update になり、0 件で断られる。
+        let tx = fixed(Affected {
+            rows: 0,
+            last_insert_id: None,
+        })
+        .await;
+        let mut coded = Coded {
+            code: "a1".into(),
+            title: "x".into(),
+        };
+        let message = coded
+            .save_using(&tx)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("coded.code = a1"), "{message}");
+        assert!(message.contains("DB::table(..).insert(..)"), "{message}");
+
+        // 採番が返らない表（MySQL の `last_insert_id()` が 0）でも、同じ入れ方を案内する。
+        let tx = fixed(Affected {
+            rows: 1,
+            last_insert_id: Some(0),
+        })
+        .await;
+        let mut post = Post {
+            id: 0,
+            title: "x".into(),
+        };
+        let message = post
+            .save_using(&tx)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(
+            message.contains("採番された値が返りませんでした"),
+            "{message}"
+        );
+        assert!(message.contains("DB::table(..).insert(..)"), "{message}");
+        // 以前の案内。その通りにすると「行が無い」で落ちるので、出さない。
+        assert!(!message.contains("値を入れてから"), "{message}");
+    }
+
+    #[test]
     fn find_は主キーの名前で絞る() {
         // ModelQuery::find は `id` 固定ではなく PRIMARY_KEY を使う。
         let query = Coded::query().where_("title", "x");
@@ -1101,6 +1424,16 @@ mod tests {
     fn デバッグ表示にsqlが出る() {
         let text = format!("{:?}", Post::query().where_("id", 1));
         assert!(text.contains("posts"));
+        assert!(text.contains("select * from"), "{text}");
+    }
+
+    #[test]
+    fn デバッグ表示に組み立ての間違いも出る() {
+        // 以前は SQL だけを出していたので、列名の間違いが見えなかった。
+        let text = format!("{:?}", Post::query().order_by("id; drop table posts"));
+        assert!(text.contains("ModelQuery"), "{text}");
+        assert!(text.contains("deferred_error"), "{text}");
+        assert!(text.contains("使えません"), "{text}");
     }
 
     #[tokio::test]

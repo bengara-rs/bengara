@@ -173,6 +173,15 @@ fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
     (out, warnings)
 }
 
+/// `.env` の `=` の右側を、読み込みと同じ規則で値にする。
+///
+/// `key:generate` が「`APP_KEY` は設定済みか」を見るのに使います。別々に
+/// 読むと、`APP_KEY=""` や `APP_KEY= # 後で` を「設定済み」と見てしまいます
+/// （読み込みではどちらも空です）。警告は読み込みのときに出るので、ここでは捨てます。
+pub(crate) fn dotenv_value(raw: &str) -> String {
+    parse_value(raw.trim(), 0, &mut Vec::new())
+}
+
 /// `=` の右側を値にする。`number` は警告に出す行番号。
 fn parse_value(raw: &str, number: usize, warnings: &mut Vec<String>) -> String {
     let mut chars = raw.chars().peekable();
@@ -387,6 +396,29 @@ mod tests {
             pairs(stripped),
             vec![("APP_NAME".to_string(), "myapp".to_string())]
         );
+    }
+
+    #[test]
+    fn 右側だけを読み込みと同じ規則で値にする() {
+        // `key:generate` が使う。読み込みと 1 つの規則を共有していること。
+        for raw in [
+            "abc",
+            "  abc  ",
+            "\"\"",
+            "''",
+            " # 後で",
+            "#全部コメント",
+            "\"a#b\"",
+            "abc # コメント",
+            "\"閉じていない",
+            "",
+        ] {
+            let loaded = pairs(&format!("A={raw}\n"));
+            assert_eq!(dotenv_value(raw), loaded[0].1, "{raw}");
+        }
+        assert_eq!(dotenv_value("\"\""), "");
+        assert_eq!(dotenv_value(" # 後で"), "");
+        assert_eq!(dotenv_value("abc # コメント"), "abc");
     }
 
     #[test]

@@ -11,7 +11,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::{PgArguments, PgConnectOptions, PgPool, PgPoolOptions, PgQueryResult, PgRow};
+use sqlx::encode::IsNull;
+use sqlx::postgres::types::Oid;
+use sqlx::postgres::{
+    PgArgumentBuffer, PgArguments, PgConnectOptions, PgPool, PgPoolOptions, PgQueryResult, PgRow,
+    PgTypeInfo,
+};
 use sqlx::{Column, Postgres, Row as SqlxRow, TypeInfo, ValueRef};
 
 use super::backend::{Backend, DbFuture, RawTx};
@@ -32,9 +37,11 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
         .connect_with(options)
         .await
         .map_err(|e| {
+            // `url` でつないでいるときに host / port を出すと、使っていない既定値
+            // （`127.0.0.1:5432`）を見せる。
             Error::msg(format!(
-                "PostgreSQL につなげません（{}:{} / {}）: {e}",
-                settings.host, settings.port, settings.database
+                "PostgreSQL につなげません（{}）: {e}",
+                super::connection_target(settings)
             ))
         })?;
     Ok(Arc::new(PgBackend { pool }))
@@ -46,8 +53,9 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
 /// password / database から組み立てます。
 fn build_options(settings: &ConnectionConfig) -> Result<PgConnectOptions> {
     if !settings.url.is_empty() {
+        // 接続文字列そのものは出さない（`unreadable_url` の説明を参照）。
         return PgConnectOptions::from_str(&settings.url)
-            .map_err(|e| Error::msg(format!("接続文字列が読めません（{}）: {e}", settings.url)));
+            .map_err(|e| super::unreadable_url(settings, e));
     }
     let mut options = PgConnectOptions::new()
         .host(&settings.host)
@@ -72,7 +80,7 @@ impl Backend for PgBackend {
 
     fn fetch_all<'a>(&'a self, sql: &'a str, bindings: &'a [Value]) -> DbFuture<'a, Vec<Row>> {
         Box::pin(async move {
-            let rows = bind(sqlx::query(sql), bindings)
+            let rows = query(sql, bindings)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| failed(sql, e))?;
@@ -82,7 +90,7 @@ impl Backend for PgBackend {
 
     fn execute<'a>(&'a self, sql: &'a str, bindings: &'a [Value]) -> DbFuture<'a, Affected> {
         Box::pin(async move {
-            let result = bind(sqlx::query(sql), bindings)
+            let result = query(sql, bindings)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| failed(sql, e))?;
@@ -126,7 +134,7 @@ struct PgTx {
 impl RawTx for PgTx {
     fn fetch_all<'a>(&'a mut self, sql: &'a str, bindings: &'a [Value]) -> DbFuture<'a, Vec<Row>> {
         Box::pin(async move {
-            let rows = bind(sqlx::query(sql), bindings)
+            let rows = query(sql, bindings)
                 .fetch_all(&mut *self.tx)
                 .await
                 .map_err(|e| failed(sql, e))?;
@@ -136,7 +144,7 @@ impl RawTx for PgTx {
 
     fn execute<'a>(&'a mut self, sql: &'a str, bindings: &'a [Value]) -> DbFuture<'a, Affected> {
         Box::pin(async move {
-            let result = bind(sqlx::query(sql), bindings)
+            let result = query(sql, bindings)
                 .execute(&mut *self.tx)
                 .await
                 .map_err(|e| failed(sql, e))?;
@@ -193,13 +201,15 @@ fn affected(result: &PgQueryResult) -> Affected {
 /// 桁を落とさずに書きたいときは、`DB::statement`（または `Transaction::statement`）で
 /// `$1::numeric` を自分で書いてください。**ビルダーの `*_raw` には書けません**
 /// （PostgreSQL では `$` を断ります。番号が衝突するためです）。
+///
+/// **NULL は型を決めずに渡します**（[`UntypedNull`]）。
 fn bind<'q>(
     mut query: sqlx::query::Query<'q, Postgres, PgArguments>,
     bindings: &'q [Value],
 ) -> sqlx::query::Query<'q, Postgres, PgArguments> {
     for value in bindings {
         query = match value {
-            Value::Null => query.bind(Option::<i64>::None),
+            Value::Null => query.bind(UntypedNull),
             Value::Bool(v) => query.bind(*v),
             Value::Int(v) => query.bind(*v),
             Value::Float(v) => query.bind(*v),
@@ -208,6 +218,69 @@ fn bind<'q>(
         };
     }
     query
+}
+
+/// 型を決めない NULL。`Value::Null` を渡すときに使います。
+///
+/// 値の型として OID 0 を名乗ります。PostgreSQL の通信の決まりでは、`Parse` に
+/// 書く型の OID が 0 のとき「型は指定なし」で、**サーバが文から推し測ります**
+/// （`insert` なら列の型、`a = $1` なら `a` の型）。sqlx は `PgTypeInfo::with_oid` の
+/// OID をそのまま `Parse` に書きます（sqlx-postgres 0.8.6 の `resolve_type_id`）。
+///
+/// 以前は `Option::<i64>::None` で渡していました。型が `bigint` と決まるので、
+/// 次のように断られていました。
+///
+/// | 書き方                                         | 以前の結果                                            |
+/// |------------------------------------------------|-------------------------------------------------------|
+/// | `boolean` / `bytea` の列に `None` を書く       | `column "x" is of type boolean but expression is of type bigint` |
+/// | 文字列の列を `None` と比べる                   | `operator does not exist: character varying = bigint` |
+///
+/// SQLite と MySQL は NULL に型を見ないので、PostgreSQL でしか起きません。
+///
+/// **推し測れない場所では失敗します。** `select ?` や `? is null` のように、相手の型が
+/// 文から決まらない所に `None` を渡すと `could not determine data type of parameter $1`
+/// になります。`cast(? as text) is null` のように型を書いてください。
+struct UntypedNull;
+
+impl sqlx::Type<Postgres> for UntypedNull {
+    fn type_info() -> PgTypeInfo {
+        // 0 は「指定なし」（InvalidOid）。
+        PgTypeInfo::with_oid(Oid(0))
+    }
+}
+
+impl sqlx::Encode<'_, Postgres> for UntypedNull {
+    fn encode_by_ref(
+        &self,
+        _buf: &mut PgArgumentBuffer,
+    ) -> std::result::Result<IsNull, sqlx::error::BoxDynError> {
+        // 中身は書かない。sqlx が長さ -1（NULL）として送ります。
+        Ok(IsNull::Yes)
+    }
+}
+
+/// 値を渡した問い合わせを作る。**用意した文を接続に覚えさせません**（`persistent(false)`）。
+///
+/// sqlx は用意した文を**SQL の文字列だけ**を鍵にして接続ごとに覚えます
+/// （sqlx-postgres 0.8.6 の `get_or_prepare`）。2 回目からは、最初に用意したときの
+/// 値の型のまま、新しい値のバイト列だけを送ります。型の照合はしません。
+///
+/// bengara は同じ SQL に、呼ぶたびに違う腕の `Value` を渡します。覚えさせると、
+/// 同じ接続で次のことが起きます。
+///
+/// | 1 回目               | 2 回目              | 起きること                                              |
+/// |----------------------|---------------------|---------------------------------------------------------|
+/// | `Value::Int(1)`      | `Value::Float(1.5)` | 小数の 8 バイトを整数として読む。**エラーにならず違う値** |
+/// | `Value::Null`        | `Value::Int(1)`     | 推し測った型（`int4` など）に 8 バイトを送ってエラー    |
+/// | `Value::Null`（以前の `bigint`） | `Value::Text(..)` | 文字列のバイト列を整数として読む          |
+///
+/// `where_("price", 1)` の後の `where_("price", 1.5)` や、`Option` の列を持つ
+/// モデルの `save()` で当たります。覚えさせなければ、毎回その時の型で用意し直します。
+/// 代わりに、問い合わせのたびに文の解析が走ります。
+///
+/// MySQL は実行のたびに値の型を送り直すので、この問題がありません。
+fn query<'q>(sql: &'q str, bindings: &'q [Value]) -> sqlx::query::Query<'q, Postgres, PgArguments> {
+    bind(sqlx::query(sql).persistent(false), bindings)
 }
 
 /// sqlx の行をまとめて `Row` に直す。列の名前は最初の行から1回だけ作ります。
@@ -419,6 +492,218 @@ mod tests {
         assert_eq!(row.value("blob"), Some(&Value::Bytes(vec![1, 2, 3])));
 
         assert!(db.table_names().await.unwrap().contains(&table.to_string()));
+    }
+
+    #[test]
+    fn null_は型を決めずに渡す() {
+        use sqlx::{Encode, Type};
+
+        // OID 0 は「型は指定なし」。サーバが文から推し測る。
+        // 以前は `Option::<i64>::None` で、型が `bigint`（OID 20）に決まっていた。
+        assert_eq!(UntypedNull::type_info().oid(), Some(Oid(0)));
+        // 中身は書かずに NULL と伝える。
+        let mut buffer = PgArgumentBuffer::default();
+        let is_null = UntypedNull.encode_by_ref(&mut buffer).expect("書ける");
+        assert!(matches!(is_null, IsNull::Yes));
+        assert!(buffer.is_empty(), "NULL のときは 1 バイトも書かない");
+    }
+
+    #[test]
+    fn 読めない接続文字列をエラー文に出さない() {
+        // パスワードに `#` をそのまま書くと、ポートが読めなくなる典型の形。
+        // 以前は `接続文字列が読めません（{url}）` とパスワードごと出していた。
+        let url = "postgres://app:p4ss#word@db.example.com:5432/shop";
+        let settings = ConnectionConfig::postgres("pgsql", "").url(url);
+        let message = build_options(&settings).expect_err("読めない").to_string();
+        assert!(message.contains("`pgsql`"), "{message}");
+        assert!(message.contains("読めません"), "{message}");
+        assert!(!message.contains("p4ss"), "{message}");
+        assert!(!message.contains("word"), "{message}");
+        assert!(!message.contains("db.example.com"), "{message}");
+    }
+
+    /// null を許す `boolean` / `bytea` / `varchar` の列に `None` を書けること。
+    ///
+    /// 以前は NULL を `bigint` 型として渡していたので、`boolean` と `bytea` の列では
+    /// `column "x" is of type boolean but expression is of type bigint` で断られ、
+    /// 文字列の列との比較は `operator does not exist` になっていました。
+    #[tokio::test]
+    async fn どの型の列にも_null_を書けて比べられる() {
+        let Some(db) = db().await else { return };
+        let table = "bengara_null_bind";
+        fresh(&db, table, |t| {
+            t.id();
+            t.boolean("flag").nullable();
+            t.binary("blob").nullable();
+            t.string("name").nullable();
+            t.integer("views").nullable();
+            t.double("ratio").nullable();
+            t.decimal("total", 8, 2).nullable();
+        })
+        .await;
+
+        // insert
+        let insert = format!(
+            "insert into \"{table}\" \
+             (\"flag\", \"blob\", \"name\", \"views\", \"ratio\", \"total\") \
+             values ($1, $2, $3, $4, $5, $6)"
+        );
+        let nulls = [
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        db.execute(&insert, &nulls)
+            .await
+            .expect("全部 NULL でも入る");
+        // 同じ SQL に、今度は値を渡す（同じ接続でも型を取り違えない）。
+        db.execute(
+            &insert,
+            &[
+                Value::Bool(true),
+                Value::Bytes(vec![1, 2]),
+                Value::Text("a".into()),
+                Value::Int(7),
+                Value::Float(1.5),
+                Value::Float(12.5),
+            ],
+        )
+        .await
+        .expect("値でも入る");
+
+        // update
+        let update = format!(
+            "update \"{table}\" set \"flag\" = $1, \"blob\" = $2, \"name\" = $3 \
+             where \"views\" = $4"
+        );
+        let updated = db
+            .execute(
+                &update,
+                &[Value::Null, Value::Null, Value::Null, Value::Int(7)],
+            )
+            .await
+            .expect("NULL に書き換えられる");
+        assert_eq!(updated.rows, 1);
+
+        // where に NULL（`= NULL` なので 1 件も当たらないが、**エラーにはならない**）。
+        for column in ["flag", "blob", "name", "views", "ratio", "total"] {
+            let rows = db
+                .fetch_all(
+                    &format!("select \"id\" from \"{table}\" where \"{column}\" = $1"),
+                    &[Value::Null],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{column} を NULL と比べられる: {e}"));
+            assert!(rows.is_empty(), "{column}");
+        }
+
+        let rows = db
+            .fetch_all(&format!("select * from \"{table}\" order by \"id\""), &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.value("flag"), Some(&Value::Null));
+            assert_eq!(row.value("blob"), Some(&Value::Null));
+            assert_eq!(row.value("name"), Some(&Value::Null));
+        }
+        assert_eq!(rows[1].value("views"), Some(&Value::Int(7)));
+    }
+
+    /// 同じ SQL に違う腕の値を続けて渡しても、型を取り違えないこと。
+    ///
+    /// sqlx は用意した文を SQL の文字列だけを鍵に覚えます。覚えさせていた頃は、
+    /// 最初の型のまま 2 回目のバイト列を読んでいました（[`query`] の説明）。
+    /// 接続を 1 本にして、必ず同じ接続に当てます。
+    #[tokio::test]
+    async fn 同じ_sql_に違う型の値を続けて渡せる() {
+        let Some(url) = url() else { return };
+        let settings = ConnectionConfig::postgres("test", "")
+            .url(url)
+            .max_connections(1);
+        let db = connect(&settings).await.expect("PostgreSQL につながる");
+        let table = "bengara_bind_types";
+        fresh(&db, table, |t| {
+            t.id();
+            t.double("price").nullable();
+            t.string("name").nullable();
+            t.integer("views").nullable();
+        })
+        .await;
+
+        let insert =
+            format!("insert into \"{table}\" (\"price\", \"name\", \"views\") values ($1, $2, $3)");
+        // 整数 → 小数 → NULL → 値 の順に、同じ文へ渡す。
+        for values in [
+            [Value::Int(1), Value::Null, Value::Null],
+            [
+                Value::Float(1.5),
+                Value::Text("abcdefgh".into()),
+                Value::Int(3),
+            ],
+            [Value::Null, Value::Text("x".into()), Value::Null],
+            [Value::Float(2.5), Value::Null, Value::Int(4)],
+        ] {
+            db.execute(&insert, &values)
+                .await
+                .unwrap_or_else(|e| panic!("{values:?} が入る: {e}"));
+        }
+
+        let rows = db
+            .fetch_all(&format!("select * from \"{table}\" order by \"id\""), &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].value("price"), Some(&Value::Float(1.0)));
+        assert_eq!(
+            rows[1].value("price"),
+            Some(&Value::Float(1.5)),
+            "小数を整数として読み違えない"
+        );
+        assert_eq!(rows[1].value("name"), Some(&Value::Text("abcdefgh".into())));
+        assert_eq!(rows[1].value("views"), Some(&Value::Int(3)));
+        assert_eq!(rows[2].value("price"), Some(&Value::Null));
+        assert_eq!(rows[3].value("views"), Some(&Value::Int(4)));
+
+        // where でも同じ。整数で比べた後に小数で比べる。
+        let select = format!("select \"id\" from \"{table}\" where \"price\" = $1");
+        let rows = db.fetch_all(&select, &[Value::Int(1)]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let rows = db.fetch_all(&select, &[Value::Float(1.5)]).await.unwrap();
+        assert_eq!(rows.len(), 1, "1.5 を整数として読み違えない");
+    }
+
+    /// 列の `unique()` で作った索引を、名前で落とせること。
+    ///
+    /// 以前は列の指定に `unique` と書いていたので、PostgreSQL は一意「制約」
+    /// （名前は `{表}_email_key`）を作っていました。`drop index if exists
+    /// "{表}_email_unique"` は黙って何もしませんでした。いまは一意「索引」なので
+    /// `drop index` で落とせます。
+    #[tokio::test]
+    async fn 列の_unique_で作った索引を名前で落とせる() {
+        let Some(db) = db().await else { return };
+        let table = "bengara_unique_named";
+        fresh(&db, table, |t| {
+            t.id();
+            t.string("email").unique();
+        })
+        .await;
+
+        let sql = format!("insert into \"{table}\" (\"email\") values ($1)");
+        let value = [Value::Text("a@example.com".into())];
+        db.execute(&sql, &value).await.expect("1件目は入る");
+        assert!(db.execute(&sql, &value).await.is_err(), "重なりは断る");
+
+        let mut schema = Schema::new(Driver::Postgres);
+        schema.drop_unique(table, &["email"]);
+        for statement in schema.into_statements() {
+            db.execute(&statement, &[]).await.expect("名前で落とせる");
+        }
+        db.execute(&sql, &value)
+            .await
+            .expect("索引を落としたので重なっても入る");
     }
 
     #[tokio::test]

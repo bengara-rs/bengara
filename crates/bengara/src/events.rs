@@ -154,7 +154,65 @@ fn events() -> Arc<Events> {
         .unwrap_or_else(|| EMPTY.get_or_init(|| Arc::new(Events::new())).clone())
 }
 
+/// 聞く側の失敗。出来事の名前を添えて、**元のエラーを原因として持ちます。**
+///
+/// `Error::other` に包んで返します。`source()` で元のエラーまでたどれます。
+#[derive(Debug)]
+struct ListenerError {
+    event: String,
+    source: Error,
+}
+
+impl std::fmt::Display for ListenerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "イベント `{}` の処理に失敗しました: {}",
+            self.event, self.source
+        )
+    }
+}
+
+impl std::error::Error for ListenerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// 聞く側が返したエラーを、`dispatch` が返す形にする。
+///
+/// 以前は全部 `Error::msg` に包み直していたので、**元のエラーの種類が消えました。**
+/// 聞く側が `abort(404)` や検査のエラー（422）を返しても、呼んだ側には 500 に
+/// 見えていました。
+///
+/// | 元のエラー | 返すもの |
+/// |---|---|
+/// | ステータスを持つもの（`Error::Http`・`Error::Validation`） | **そのまま**返す |
+/// | それ以外（500 になるもの） | 出来事の名前を添えて包む。原因は `source()` に残す |
+///
+/// ステータスを持つエラーをそのまま返すのは Laravel と同じです。Laravel の
+/// 同期のリスナーが投げた例外は、包まれずに `event()` の呼び元まで届きます。
+/// 包むと `status()` が 500 になるので、文を足さずに通します
+/// （どの出来事だったかは `debug` のログに残します）。
+fn listener_failed(event: &str, error: Error) -> Error {
+    match error {
+        Error::Http { .. } | Error::Validation(_) => {
+            tracing::debug!(
+                "イベント `{event}` の聞く側がステータス {} のエラーを返しました: {error}",
+                error.status()
+            );
+            error
+        }
+        other => Error::other(ListenerError {
+            event: event.to_string(),
+            source: other,
+        }),
+    }
+}
+
 /// 登録順に全部呼び、**1つ失敗したらそこで止める**（[`Event::dispatch_raw`] の本体）。
+///
+/// 返すエラーの形は [`listener_failed`] を見てください。
 ///
 /// 入れ物を引数で受け取ります。プロセス共通の表（`install` が入れるもの）を
 /// 通さないので、テストが並んで走っても互いの登録を踏みません。
@@ -163,7 +221,7 @@ pub(crate) async fn dispatch_in(events: &Events, event: &str, payload: &str) -> 
         listener
             .call(payload.to_string())
             .await
-            .map_err(|e| Error::msg(format!("イベント `{event}` の処理に失敗しました: {e}")))?;
+            .map_err(|e| listener_failed(event, e))?;
     }
     Ok(())
 }
@@ -187,6 +245,10 @@ impl Event {
     /// 聞く側が 1 件も無ければ、何もせず成功します。表はプロセス共通で、
     /// 呼ぶたびに `RwLock` の読み取りと `Arc` の複製を通ります
     /// （モジュールの説明を見てください）。
+    ///
+    /// **聞く側のエラーの種類を保ちます。** ステータスを持つエラー
+    /// （`abort(404)` や検査の 422）はそのまま返します。それ以外は出来事の
+    /// 名前を添えて包み、元のエラーを `source()` に残します（500 になります）。
     pub async fn dispatch<T: serde::Serialize>(event: &str, payload: &T) -> Result<()> {
         let text = serde_json::to_string(payload)?;
         Self::dispatch_raw(event, &text).await
@@ -311,6 +373,60 @@ mod tests {
             vec!["1:payload".to_string()],
             "失敗した時点で止まる"
         );
+    }
+
+    #[tokio::test]
+    async fn 聞く側のエラーは原因としてたどれる() {
+        use std::error::Error as _;
+
+        async fn io_fail(_payload: String) -> Result<()> {
+            Err(Error::Io(std::io::Error::other("ディスクが一杯")))
+        }
+        let events = Events::new().listen("a", io_fail);
+
+        let error = dispatch_in(&events, "a", "{}").await.unwrap_err();
+        // 以前は `Error::msg` に包み直していたので、原因が残らなかった。
+        assert!(matches!(error, Error::Other(_)), "{error:?}");
+        assert_eq!(error.status(), 500);
+        let text = error.to_string();
+        assert!(text.contains("イベント `a` の処理に失敗しました"), "{text}");
+        assert!(text.contains("ディスクが一杯"), "{text}");
+
+        // 原因をたどると、元の `Error::Io` と、その中の入出力エラーまで届く。
+        let wrapped = error.source().expect("包んだ失敗がある");
+        let original = wrapped.source().expect("元のエラーがある");
+        assert!(
+            matches!(original.downcast_ref::<Error>(), Some(Error::Io(_))),
+            "{original:?}"
+        );
+        assert!(original.source().is_some(), "入出力エラーまでたどれる");
+    }
+
+    #[tokio::test]
+    async fn 聞く側のステータスは保つ() {
+        async fn not_found(_payload: String) -> Result<()> {
+            Err(Error::http(404, "記事がありません"))
+        }
+        async fn invalid(_payload: String) -> Result<()> {
+            let mut errors = crate::validation::ValidationErrors::default();
+            errors.add("title", "title は必ず入力してください。");
+            Err(Error::Validation(Box::new(errors)))
+        }
+        let events = Events::new()
+            .listen("404", not_found)
+            .listen("422", invalid);
+
+        // 以前はどちらも 500 になっていた（Laravel は投げた例外がそのまま届く）。
+        let error = dispatch_in(&events, "404", "{}").await.unwrap_err();
+        assert_eq!(error.status(), 404);
+        assert_eq!(error.public_message(), "記事がありません");
+
+        let error = dispatch_in(&events, "422", "{}").await.unwrap_err();
+        assert_eq!(error.status(), 422);
+        match error {
+            Error::Validation(errors) => assert_eq!(errors.get("title").len(), 1),
+            other => panic!("検査のエラーのまま返るはずです: {other:?}"),
+        }
     }
 
     #[tokio::test]

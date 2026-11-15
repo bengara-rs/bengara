@@ -23,6 +23,14 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// 持ちません。前段のプロキシで掛けてください（`docs/deployment.md`）。
 const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 上限で打ち切った後、裏のスレッドが終わるのを待つ時間。
+///
+/// 打ち切った時点で走っている `spawn_blocking`（静的ファイル・セッション・
+/// キャッシュ・ストレージ・SMTP）と、`await` を挟まないハンドラは、途中で
+/// 止められません。待たずに捨てると書きかけのファイルが残りやすいので、
+/// 数秒だけ待ちます。過ぎたら待つのをやめてプロセスを終えます。
+const CUT_OFF_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// サーバーを起動して、止まるまで待つ。
 pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -30,7 +38,7 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
         .build()
         .map_err(Error::Io)?;
 
-    runtime.block_on(async move {
+    let cut_off = runtime.block_on(async move {
         let addr = format!("{host}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -48,13 +56,25 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
             // これが無いと `X-Forwarded-For` を信じるしかなくなり、回数制限を偽装で回せる。
             .into_make_service_with_connect_info::<SocketAddr>();
 
-        // 合図を受け取った時刻を、待ち受けを閉じる側と打ち切る側の両方に伝える。
+        // 合図を受け取ったことを、待ち受けを閉じる側と打ち切る側の両方に伝える。
         let (signalled, mut wait_signal) = tokio::sync::watch::channel(false);
+
+        // 合図の見張りは、待ち受けとは別のタスクに置く。
+        //
+        // 待ち受けを閉じる future の中で 1 回だけ待っていたころは、受け取った時点で
+        // 見張りが終わり、**2 回目の合図が捨てられました。** 上限（既定 30 秒、
+        // `APP_SHUTDOWN_TIMEOUT=0` なら無期限）まで待つしかなく、`queue:work`
+        // （2 回目で強制終了）と動きが食い違っていました。
+        tokio::spawn(watch_shutdown(move || {
+            // 送れなくても（受け手がもういなくても）止める処理は続ける。
+            let _ = signalled.send(true);
+        }));
+
+        let mut closing = wait_signal.clone();
         let serving = axum::serve(listener, router)
             .with_graceful_shutdown(async move {
-                shutdown_signal().await;
-                // 送れなくても（受け手がもういなくても）止める処理は続ける。
-                let _ = signalled.send(true);
+                // 送り手が消えたとき（見張りのタスクが落ちたとき）も閉じる。
+                let _ = closing.wait_for(|signalled| *signalled).await;
             })
             .into_future();
 
@@ -66,43 +86,74 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
         // `wait_for` は、送り手が消えたときもエラーで返ります。送り手が消えるのは
         // 合図の処理が終わったときだけなので、どちらでも「合図は来た」と扱って構いません。
         let served = tokio::select! {
-            result = &mut serving => result,
+            result = &mut serving => Some(result),
             _ = wait_signal.wait_for(|signalled| *signalled) => {
                 drain(&mut serving, timeout).await
             }
         };
-        served.map_err(Error::Io)?;
+        match served {
+            Some(result) => {
+                result.map_err(Error::Io)?;
+                Ok::<bool, Error>(false)
+            }
+            // 上限で打ち切った。
+            None => Ok(true),
+        }
+    })?;
 
-        println!("bengara: 終了しました");
-        Ok(())
-    })
+    finish(runtime, cut_off, CUT_OFF_GRACE);
+    println!("bengara: 終了しました");
+    Ok(())
+}
+
+/// ランタイムを片付ける。
+///
+/// **打ち切ったときだけ、待つ時間に上限を付けます。** `Runtime` をそのまま
+/// 捨てると、tokio は走っている `spawn_blocking` が終わるまで**無期限に**
+/// 待ちます（`BlockingPool::drop` が `shutdown(None)` を呼ぶため）。
+/// 上限で打ち切ったのに、固まった NFS や返事の来ない SMTP を待ってプロセスが
+/// 終わらない、という形になっていました。
+///
+/// 打ち切っていないとき（全部のリクエストが終わったとき）は、これまでどおり
+/// 終わるまで待ちます。残っているのは書き込みの後始末なので、切りません。
+fn finish(runtime: tokio::runtime::Runtime, cut_off: bool, grace: std::time::Duration) {
+    if cut_off {
+        runtime.shutdown_timeout(grace);
+    } else {
+        drop(runtime);
+    }
 }
 
 /// 合図を受け取った後、処理中のリクエストが終わるのを待つ。
 ///
-/// 上限時間を過ぎたら、警告を出して打ち切ります。
+/// 上限時間を過ぎたら、警告を出して打ち切ります。**打ち切ったときは `None`** を
+/// 返します（呼ぶ側がランタイムの片付け方を変えるため。[`finish`]）。
 /// axum に打ち切りの仕組みは無いので、ここで待つのをやめることで打ち切ります。
+///
+/// 待っている間に 2 回目の合図が来たら、[`watch_shutdown`] が強制終了します。
 async fn drain<F>(
     serving: &mut std::pin::Pin<&mut F>,
     timeout: Option<std::time::Duration>,
-) -> F::Output
+) -> Option<F::Output>
 where
     F: Future<Output = std::io::Result<()>>,
 {
     let Some(limit) = timeout else {
-        tracing::info!("処理中のリクエストが終わるまで待ちます（上限なし）");
-        return serving.as_mut().await;
+        tracing::info!(
+            "処理中のリクエストが終わるまで待ちます（上限なし。もう一度合図を送ると強制終了します）"
+        );
+        return Some(serving.as_mut().await);
     };
 
     tracing::info!(
-        "処理中のリクエストが終わるまで待ちます（上限 {} 秒）",
+        "処理中のリクエストが終わるまで待ちます（上限 {} 秒。もう一度合図を送ると強制終了します）",
         limit.as_secs()
     );
     match tokio::time::timeout(limit, serving.as_mut()).await {
-        Ok(result) => result,
+        Ok(result) => Some(result),
         Err(_) => {
             tracing::warn!("{} 秒たったので、残りの接続を打ち切ります", limit.as_secs());
-            Ok(())
+            None
         }
     }
 }
@@ -314,7 +365,42 @@ fn into_axum(response: Response) -> axum::response::Response {
     }
 }
 
-/// 停止の合図を待つ。
+/// 強制終了のときの終了コード（Ctrl+C の慣わし）。
+const FORCED_EXIT_CODE: i32 = 130;
+
+/// 停止の合図を見張る。**1 回目で `graceful` を呼び、2 回目で強制終了します。**
+///
+/// `serve` と `queue:work` の両方が使います。別々に書いていたころは、
+/// `queue:work` が Ctrl+C（SIGINT）しか見ておらず、`systemctl stop` や
+/// `docker stop` の SIGTERM で処理中のジョブごと即死していました。
+/// `serve` のほうは 2 回目の合図を捨てていました。
+///
+/// 2 回目は待たずに落とします（終了コードは 130）。処理が固まったときに
+/// `kill -9` を持ち出さなくて済むようにするためです。
+pub(crate) async fn watch_shutdown(graceful: impl FnOnce()) {
+    two_stage(shutdown_signal, graceful, || {
+        eprintln!("\n強制終了します。");
+        std::process::exit(FORCED_EXIT_CODE);
+    })
+    .await;
+}
+
+/// 合図を 2 回待ち、1 回目で `graceful`、2 回目で `force` を呼ぶ。
+///
+/// 合図の待ち方と終わらせ方を外から渡すのは、テストで確かめるためです
+/// （本物は OS の合図を待ち、プロセスを終わらせます）。
+async fn two_stage<S, F>(mut signal: S, graceful: impl FnOnce(), force: impl FnOnce())
+where
+    S: FnMut() -> F,
+    F: Future<Output = ()>,
+{
+    signal().await;
+    graceful();
+    signal().await;
+    force();
+}
+
+/// 停止の合図を 1 回待つ。
 ///
 /// 受け付けるものは OS で違いますが、 **受け取った後の動きは同じ**です
 /// （待ち受けを閉じる → 処理中を終える → 上限時間で打ち切る）。
@@ -325,6 +411,9 @@ fn into_axum(response: Response) -> axum::response::Response {
 /// | Windows | Ctrl+C、Ctrl+Break、コンソールを閉じる操作、ログオフ、シャットダウン |
 ///
 /// Windows のサービス停止要求は受け取れません（サービスとして登録する仕組みが要ります）。
+///
+/// 呼ぶたびに合図の受け口を作り直します。2 回目を待つときは、もう一度呼んでください
+/// （[`watch_shutdown`] がそうしています）。
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -592,7 +681,8 @@ mod tests {
         let started = std::time::Instant::now();
         let result = drain(&mut never, Some(Duration::from_millis(50))).await;
 
-        assert!(result.is_ok(), "打ち切りは成功として扱う");
+        // 打ち切ったことは `None` で伝える（ランタイムの片付け方を変えるため）。
+        assert!(result.is_none(), "打ち切りは None で返る");
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -609,6 +699,7 @@ mod tests {
         let started = std::time::Instant::now();
         drain(&mut done, Some(Duration::from_secs(30)))
             .await
+            .expect("打ち切っていない")
             .expect("成功する");
         assert!(started.elapsed() < Duration::from_secs(1));
     }
@@ -618,6 +709,130 @@ mod tests {
     async fn 上限なしでも終われば返る() {
         let done = async { Ok::<(), std::io::Error>(()) };
         tokio::pin!(done);
-        drain(&mut done, None).await.expect("成功する");
+        drain(&mut done, None)
+            .await
+            .expect("打ち切っていない")
+            .expect("成功する");
+    }
+
+    /// 合図の 1 回目と 2 回目で、呼ぶものが分かれる。
+    #[tokio::test]
+    async fn 合図の1回目は穏やかに止め2回目で強制終了する() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let graceful = Arc::new(AtomicU32::new(0));
+        let forced = Arc::new(AtomicU32::new(0));
+
+        let watching = {
+            let signal = signal.clone();
+            let graceful = graceful.clone();
+            let forced = forced.clone();
+            tokio::spawn(two_stage(
+                move || {
+                    let signal = signal.clone();
+                    async move { signal.notified().await }
+                },
+                move || {
+                    graceful.fetch_add(1, Ordering::SeqCst);
+                },
+                move || {
+                    forced.fetch_add(1, Ordering::SeqCst);
+                },
+            ))
+        };
+
+        // 合図が来るまでは、どちらも呼ばない。
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(graceful.load(Ordering::SeqCst), 0);
+        assert_eq!(forced.load(Ordering::SeqCst), 0);
+
+        // 1 回目。穏やかに止めるほうだけ。以前の `serve` はここで見張りをやめ、
+        // 2 回目の合図を捨てていた。
+        signal.notify_one();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(graceful.load(Ordering::SeqCst), 1);
+        assert_eq!(forced.load(Ordering::SeqCst), 0, "1 回では強制終了しない");
+
+        // 2 回目で強制終了。
+        signal.notify_one();
+        watching.await.expect("見張りが終わる");
+        assert_eq!(
+            graceful.load(Ordering::SeqCst),
+            1,
+            "穏やかなほうは 1 回だけ"
+        );
+        assert_eq!(forced.load(Ordering::SeqCst), 1);
+    }
+
+    /// 打ち切ったときは、走っている裏のスレッドを待ち続けない。
+    #[test]
+    fn 打ち切った後は裏のスレッドを待ち続けない() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("ランタイムを作れる");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        runtime.block_on(async move {
+            // 固まった NFS や返事の来ない SMTP の代わり。
+            tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                std::thread::sleep(Duration::from_secs(60));
+            });
+        });
+        // 走り始めてから片付ける（待ち行列にあるだけの処理は、もともと捨てられる）。
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("裏の処理が走り始める");
+
+        // そのまま捨てると、tokio は 60 秒の処理が終わるまで待っていた。
+        let started = std::time::Instant::now();
+        finish(runtime, true, Duration::from_millis(100));
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "上限までは待つ"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "上限を過ぎたら待たない: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 打ち切っていないときは、これまでどおり裏の処理が終わるまで待つ。
+    #[test]
+    fn 打ち切っていなければ裏の処理を待つ() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("ランタイムを作れる");
+        let done = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let flag = done.clone();
+        runtime.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                flag.store(true, Ordering::SeqCst);
+            });
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("裏の処理が走り始める");
+
+        // 上限（1 ミリ秒）は使われない。書き込みの後始末を途中で切らないため。
+        finish(runtime, false, Duration::from_millis(1));
+        assert!(done.load(Ordering::SeqCst), "終わるまで待つ");
+    }
+
+    #[test]
+    fn 打ち切った後に待つのは数秒だけ() {
+        // 長くすると、systemd の `TimeoutStopSec`（文書の例は上限 + 10 秒）を超える。
+        assert!(CUT_OFF_GRACE <= Duration::from_secs(5));
+        assert!(CUT_OFF_GRACE >= Duration::from_secs(1));
     }
 }

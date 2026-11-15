@@ -15,6 +15,18 @@
 //! `public/` 側の枝に入り、`public/storage/x.css` を返していました
 //! （上の「どちらか一方」が守れていませんでした）。
 //!
+//! `public/storage/` の中身は、**どんな書き方でも返しません**。守る場所は 2 つあります。
+//!
+//! | 場所 | 見るもの | 止めるもの |
+//! |---|---|---|
+//! | 入口（`is_storage_path`） | 最初の区間が `storage` か。**大文字小文字は区別しない** | `/STORAGE/x.css`。Windows では `/storage\x.css` も |
+//! | `public/` の配信（`serve_public`） | 開く直前の**実体**が `public/storage/` の中か | 入口をすり抜けた書き方（Windows の `/storage./x.css` など） |
+//!
+//! 大文字小文字を区別しないファイルシステム（Windows、macOS の既定）では、
+//! `public/STORAGE/x.css` と `public/storage/x.css` は同じファイルです。入口が
+//! 小文字の `/storage/` だけを見ていたころは、`/STORAGE/x.css` が `public/` 側の枝に入り、
+//! `public/storage/x.css` を返していました。
+//!
 //! 埋め込みはリリースビルドのときだけ入ります（`bengara-build` が `PROFILE` を見ます）。
 //! デバッグビルドでは常にディスクを読むので、ファイルを直せばすぐ反映されます。
 //!
@@ -25,8 +37,9 @@
 //! 画面1枚に20本のアセットがあると、リロードごとの全文送信がそのまま消えます。
 //!
 //! ETag は**弱い ETag**（`W/"..."`）です。ディスクのファイルは「長さと更新時刻」、
-//! 埋め込みは「長さと中身のハッシュ」から作ります。中身を読まずに決まるので、
-//! 304 を返すときはファイルを開きません。
+//! 埋め込みは「長さと中身のハッシュ」から作ります（起動時に 1 回だけ）。
+//! ディスクのファイルは、開いて長さと更新時刻を採るだけで決まります。
+//! 304 を返すときは本文を読みません。
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -79,8 +92,40 @@ pub(crate) fn normalize_path(request_path: &str) -> String {
 ///
 /// `/storage` だけのときも storage 側に入れます。ここで `public/` 側へ落とすと、
 /// `public/storage` を探してしまい、2つの入口が混ざります（storage 側で 404）。
+///
+/// 見るのは**最初の区間**です。次の 2 つも storage 側に入れます。
+///
+/// | 書き方 | なぜ storage 側か |
+/// |---|---|
+/// | `/STORAGE/x.css` `/Storage` | 大文字小文字を区別しないファイルシステムでは `public/storage/` と同じ場所を指す |
+/// | `/storage\x.css`（Windows だけ） | Windows は `\` もパスの区切りとして読む |
+///
+/// storage 側に入っても、`serve_storage` は小文字の `/storage/` で始まるものしか
+/// 配りません。上の 2 つは **404** になります（`public/` 側へは落ちません）。
+///
+/// 大文字小文字は **どの OS でも**区別しません。OS で動きを変えると、開発機
+/// （Windows / macOS）と本番（Linux）で見えるファイルが変わるためです。
+/// その引き換えに、Linux でも `public/Storage/` のような名前のディレクトリは配れません。
 pub(crate) fn is_storage_path(path: &str) -> bool {
-    path.starts_with(STORAGE_PREFIX) || path == STORAGE_PREFIX.trim_end_matches('/')
+    is_storage_name(first_segment(path))
+}
+
+/// 正規化したパスの最初の区間（`/storage/x.css` なら `storage`）。
+///
+/// Windows では `\` も区切りです。`Path::components` が `\` で分けるので、
+/// ここで分けないと `/storage\x.css` が `storage\x.css` という 1 区間に見えます。
+/// Unix では `\` はファイル名に使える普通の文字なので、区切りにしません。
+fn first_segment(path: &str) -> &str {
+    let rest = path.trim_start_matches('/');
+    let end = rest
+        .find(|c: char| c == '/' || (cfg!(windows) && c == '\\'))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// `/storage/` の入口の名前か。大文字小文字は区別しません（理由は `is_storage_path`）。
+fn is_storage_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(STORAGE_PREFIX.trim_matches('/'))
 }
 
 /// 静的ファイルに付ける `Cache-Control`。
@@ -152,6 +197,10 @@ pub(crate) fn serve_embedded(
     }
     let relative = safe_relative(request_path)?;
     let key = to_key(&relative)?;
+    // `public/storage/` の中身は埋め込みからも返さない（入口をすり抜けたときの備え）。
+    if is_storage_name(first_segment(&key)) {
+        return None;
+    }
 
     // そのままの鍵で探し、無ければディレクトリとして index.html を探す。
     if let Some(file) = files.get(key.as_str()) {
@@ -233,12 +282,60 @@ fn to_key(relative: &Path) -> Option<String> {
 /// `want_body` が偽のときは**ファイルを読みません**。`HEAD` で 100 MB の
 /// アセットを丸ごとメモリに読んでから捨てるのを避けるためです。長さは
 /// `Content-Length` で知らせます。
+///
+/// 本文は**全部をメモリに読んでから**返します（流しながらは返しません）。
+/// 大きなファイルを同時に取りに来られると、その数だけメモリを使います。
 pub(crate) fn serve(
     public_dir: &Path,
     canonical_root: Option<&Path>,
     request_path: &str,
     if_none_match: Option<&str>,
     want_body: bool,
+) -> Option<Response> {
+    serve_from(
+        public_dir,
+        canonical_root,
+        request_path,
+        if_none_match,
+        want_body,
+        false,
+    )
+}
+
+/// `public/` から探して返す。**`public/storage/` の中身は返しません。**
+///
+/// `/storage/...` は `storage/app/public/` だけを配る入口です。入口の判定
+/// （`is_storage_path`）は文字列で見るので、ファイルシステムが同じ場所として読む
+/// 別の書き方を数え切れません。Windows は区間の末尾の `.` と空白を落とし
+/// （`/storage./x.css`）、短い名前（`/STORAG~1/x.css`）でも同じ場所を開きます。
+///
+/// そこで、こちらは**開く直前の実体**で確かめます。実体は OS が解決した本当の
+/// 名前なので、どんな書き方で来ても `public/storage/` の中なら分かります。
+pub(crate) fn serve_public(
+    public_dir: &Path,
+    canonical_root: Option<&Path>,
+    request_path: &str,
+    if_none_match: Option<&str>,
+    want_body: bool,
+) -> Option<Response> {
+    serve_from(
+        public_dir,
+        canonical_root,
+        request_path,
+        if_none_match,
+        want_body,
+        true,
+    )
+}
+
+/// `serve` と `serve_public` の中身。`hide_storage` が真なら `storage/` の下を返さない。
+fn serve_from(
+    public_dir: &Path,
+    canonical_root: Option<&Path>,
+    request_path: &str,
+    if_none_match: Option<&str>,
+    want_body: bool,
+    hide_storage: bool,
 ) -> Option<Response> {
     let relative = safe_relative(request_path)?;
     let mut path = public_dir.join(&relative);
@@ -249,14 +346,13 @@ pub(crate) fn serve(
     //    開く前に確かめるためです。無いファイルはここで失敗するので 404 になります
     //    （以前の `File::open` が失敗していたのと同じ順です）。
     let canonical = path.canonicalize().ok()?;
-    let inside = match canonical_root {
-        Some(root) => canonical.starts_with(root),
-        None => public_dir
-            .canonicalize()
-            .map(|root| canonical.starts_with(&root))
-            .unwrap_or(false),
+    let root = match canonical_root {
+        Some(root) => std::borrow::Cow::Borrowed(root),
+        None => std::borrow::Cow::Owned(public_dir.canonicalize().ok()?),
     };
-    if !inside {
+    // 置き場所の外なら `None`（＝404）。中なら、置き場所からの相対の形が採れる。
+    let below_root = canonical.strip_prefix(&*root).ok()?;
+    if hide_storage && starts_in_storage(below_root) {
         return None;
     }
     // 2. 確かめた**その実体**を開く。canonical なパスにはシンボリックリンクが無いので、
@@ -290,6 +386,17 @@ pub(crate) fn serve(
     let mut body = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     std::io::Read::read_to_end(&mut file, &mut body).ok()?;
     Some(response.with_body(body))
+}
+
+/// 置き場所からの相対パス（実体）が `storage/` の下か。
+///
+/// 大文字小文字は区別しません。区別しないファイルシステムでは、実体の名前が
+/// `Storage` でも `/storage/` の入口と同じ場所だからです（`is_storage_path` と同じ規則）。
+fn starts_in_storage(below_root: &Path) -> bool {
+    matches!(
+        below_root.components().next(),
+        Some(Component::Normal(first)) if first.to_str().is_some_and(is_storage_name)
+    )
 }
 
 /// 本文を返さない 304。
@@ -643,6 +750,140 @@ mod tests {
         // 関係ないパスは `public/` 側。
         assert!(!is_storage_path(&normalize_path("/css/app.css")));
         assert!(!is_storage_path(&normalize_path("/storageroom/x.css")));
+    }
+
+    #[test]
+    fn storageの入口は大文字小文字を区別しない() {
+        // 大文字小文字を区別しないファイルシステム（Windows、macOS の既定）では、
+        // `public/STORAGE/x.css` は `public/storage/x.css` と同じファイル。
+        // 小文字だけを見ていたころは `public/` 側の枝に入り、それを返していた。
+        for raw in [
+            "/STORAGE/x.css",
+            "/Storage/x.css",
+            "/sToRaGe",
+            "/STORAGE/",
+            "//STORAGE//x.css",
+            "/%53TORAGE/x.css",
+        ] {
+            assert!(is_storage_path(&normalize_path(raw)), "{raw} は storage 側");
+        }
+        // 最初の区間だけを見る。似た名前と、2 つ目以降の区間は `public/` 側。
+        for raw in [
+            "/STORAGEROOM/x.css",
+            "/storage.txt",
+            "/css/STORAGE/x.css",
+            "/",
+        ] {
+            assert!(!is_storage_path(&normalize_path(raw)), "{raw} は public 側");
+        }
+        // storage 側に入っても配らない（小文字の `/storage/` で始まるものだけを配る）。
+        let dir = temp_dir("storage-case");
+        std::fs::write(dir.join("x.css"), "body{}").unwrap();
+        for raw in ["/STORAGE/x.css", "/Storage/x.css"] {
+            let path = normalize_path(raw);
+            assert!(
+                serve_storage(&dir, None, &path, None, true).is_none(),
+                "{raw} は 404"
+            );
+        }
+        assert!(serve_storage(&dir, None, "/storage/x.css", None, true).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storageの入口はwindowsでは逆スラッシュも区切りとして見る() {
+        // Windows は `\` もパスの区切りとして読むので、`/storage\x.css` は
+        // `public/storage/x.css` を指す。Unix では `storage\x.css` という 1 つの名前。
+        for raw in ["/storage\\x.css", "/storage%5Cx.css", "/STORAGE%5cx.css"] {
+            assert_eq!(
+                is_storage_path(&normalize_path(raw)),
+                cfg!(windows),
+                "{raw}"
+            );
+        }
+        assert_eq!(first_segment("/storage/x.css"), "storage");
+        assert_eq!(first_segment("/storage"), "storage");
+        assert_eq!(first_segment("/"), "");
+        assert_eq!(first_segment("/a/b"), "a");
+    }
+
+    #[test]
+    fn publicの配信はstorageディレクトリの中身を返さない() {
+        // 入口の判定は文字列で見るので、ファイルシステムが同じ場所として読む別の
+        // 書き方（Windows の `/storage./x.css` など）を数え切れない。
+        // `public/` の配信は、開く直前の**実体**で `public/storage/` の中かを見る。
+        let dir = temp_dir("public-storage");
+        std::fs::create_dir_all(dir.join("storage").join("sub")).unwrap();
+        std::fs::write(dir.join("storage").join("x.css"), "secret{}").unwrap();
+        std::fs::write(dir.join("storage").join("index.html"), "<p>x</p>").unwrap();
+        std::fs::write(dir.join("storage").join("sub").join("y.css"), "y{}").unwrap();
+        std::fs::write(dir.join("storageroom.css"), "ok{}").unwrap();
+        std::fs::create_dir_all(dir.join("css").join("storage")).unwrap();
+        std::fs::write(dir.join("css").join("storage").join("z.css"), "z{}").unwrap();
+        let root = dir.canonicalize().unwrap();
+
+        // どの書き方でも返さない。区別しないファイルシステムでは同じファイルに届き、
+        // 区別するファイルシステムではそもそも無い。どちらも `None`。
+        for path in [
+            "/storage/x.css",
+            "/STORAGE/x.css",
+            "/Storage/x.css",
+            "/storage./x.css",
+            "/storage\\x.css",
+            "/storage/sub/y.css",
+            "/storage",
+            "/css/../storage/x.css",
+        ] {
+            assert!(
+                serve_public(&dir, Some(&root), path, None, true).is_none(),
+                "{path} は返さない"
+            );
+            assert!(
+                serve_public(&dir, None, path, None, true).is_none(),
+                "{path} は返さない（実体をその場で解決する道）"
+            );
+        }
+        // 似た名前と、2 つ目以降の区間が `storage` のものは今までどおり配る。
+        for path in ["/storageroom.css", "/css/storage/z.css"] {
+            assert!(
+                serve_public(&dir, Some(&root), path, None, true).is_some(),
+                "{path} は配る"
+            );
+        }
+        // `storage/app/public/` の配信（`serve`）は、この制限を持たない。
+        // `/storage/storage/x.css`（置き場所の中の `storage/` ディレクトリ）は配れる。
+        assert!(serve(&dir, Some(&root), "/storage/x.css", None, true).is_some());
+        assert!(serve_storage(&dir, Some(&root), "/storage/storage/x.css", None, true).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 埋め込みもstorageディレクトリの中身を返さない() {
+        const LIST: &[(&str, &[u8])] = &[
+            ("storage/x.css", b"secret{}"),
+            ("storage/index.html", b"<p>x</p>"),
+            ("Storage/y.css", b"y{}"),
+            ("storageroom.css", b"ok{}"),
+        ];
+        static ONCE: OnceLock<Embedded> = OnceLock::new();
+        let files = ONCE.get_or_init(|| {
+            LIST.iter()
+                .map(|(key, body)| {
+                    (
+                        *key,
+                        EmbeddedFile {
+                            body,
+                            etag: embedded_etag(body),
+                        },
+                    )
+                })
+                .collect()
+        });
+        for path in ["/storage/x.css", "/storage", "/Storage/y.css"] {
+            assert!(serve_embedded(files, path, None).is_none(), "{path}");
+        }
+        assert!(serve_embedded(files, "/storageroom.css", None).is_some());
     }
 
     #[test]

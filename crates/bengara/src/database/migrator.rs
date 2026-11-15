@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::backend::Backend;
+use super::backend::{Backend, RawTx};
 use super::grammar::Driver;
 use super::schema::Schema;
 use super::transaction::Transaction;
@@ -232,6 +232,30 @@ impl Migrator {
         Ok(affected)
     }
 
+    /// 残った札を外す。`migrate:unlock` が使います。返るのは外した札の持ち主です。
+    ///
+    /// **表を作りません。** 札の表（`migration_locks`）が無ければ、札は誰も持って
+    /// いないので、そのまま `None` を返します。`migrate:status` と同じ考え方で、
+    /// 一度も `migrate` していないデータベースに表を残しません。
+    pub(crate) async fn clear_lock(&self) -> Result<Option<(String, String)>> {
+        let exists = self
+            .backend
+            .table_names()
+            .await?
+            .iter()
+            .any(|name| name == LOCK_TABLE);
+        if !exists {
+            return Ok(None);
+        }
+        // 表はあるので、この先で作る文を流さない。
+        let _ = self.lock_table_ready.set(());
+        let held = self.lock_holder().await?;
+        if held.is_some() {
+            self.unlock().await?;
+        }
+        Ok(held)
+    }
+
     /// 札を持っている相手（名前と取った時刻）。
     pub(crate) async fn lock_holder(&self) -> Result<Option<(String, String)>> {
         self.ensure_lock_table().await?;
@@ -290,6 +314,11 @@ impl Migrator {
     }
 
     /// 1本を実行して記録する。失敗したら巻き戻す。
+    ///
+    /// **MySQL / MariaDB では巻き戻りません。** 表を作る・変える文（DDL）が
+    /// トランザクションを勝手に確定するので、失敗した文より前の DDL は残ります。
+    /// 記録（`migrations` 表の行）は入らないので、直して流し直すと同じ文をもう一度流します。
+    /// SQLite と PostgreSQL は DDL もトランザクションに入るので、1本まるごと戻ります。
     async fn apply(&self, migration: &Migration, batch: i64) -> Result<()> {
         let mut schema = Schema::new(self.driver());
         (migration.up)(&mut schema);
@@ -385,10 +414,27 @@ impl Migrator {
         Transaction::start(Arc::clone(&self.backend)).await
     }
 
+    /// 記録を残す表があるか。
+    async fn has_table(&self) -> Result<bool> {
+        Ok(self
+            .backend
+            .table_names()
+            .await?
+            .iter()
+            .any(|name| name == TABLE))
+    }
+
     /// 実行済みかどうかの一覧。
+    ///
+    /// **表を作りません。** 読むだけのコマンドなので、一度も `migrate` していない
+    /// データベースに `migrations` 表を残しません。読み取り専用の利用者でも動きます。
+    /// 表が無ければ、全部を「未実行」として返します。
     pub(crate) async fn status(&self, migrations: &[Migration]) -> Result<Vec<Status>> {
-        self.ensure_table().await?;
-        let ran = self.ran().await?;
+        let ran = if self.has_table().await? {
+            self.ran().await?
+        } else {
+            Vec::new()
+        };
         let mut out: Vec<Status> = migrations
             .iter()
             .map(|migration| Status {
@@ -426,31 +472,18 @@ impl Migrator {
 
         // 1つのトランザクションの中で流す。
         // 外部キーの確かめを止める指定は**接続ごと**なので、プールから取り直すと
-        // 別の接続に当たりえます。途中で失敗したときに、止めたままの接続が
-        // プールに戻るのも防ぎます。
+        // 別の接続に当たりえます。
         //
         // MySQL は DDL でトランザクションが勝手に確定します。それでも
         // トランザクションを使うのは、接続を1本に固定するためです。
-        let tx = self.begin().await?;
-        if let Some(sql) = before {
-            tx.statement_raw(sql).await?;
-        }
-        let mut result = Ok(());
-        for sql in &statements {
-            if let Err(error) = tx.statement_raw(sql).await {
-                result = Err(error);
-                break;
-            }
-        }
-        // 失敗しても確かめを戻す。止めたままの接続をプールに返さないため。
-        if let Some(sql) = after {
-            let restored = tx.statement_raw(sql).await;
-            if result.is_ok() {
-                result = restored.map(|_| ());
-            }
-        }
-        result?;
-        tx.commit().await?;
+        //
+        // 包み（`Transaction`）ではなく下回りを直に使います。包みは 1 本失敗すると
+        // 以後の文を全部断るので、「失敗しても確かめを戻す」文まで断られていました。
+        // `foreign_key_checks = 0` のままの接続がプールに戻っていました。
+        let mut raw = self.backend.begin().await?;
+        // 失敗したときは `raw` を落とす。下回りが巻き戻します。
+        drop_with_checks_off(raw.as_mut(), before, &statements, after).await?;
+        raw.commit().await?;
         Ok(tables)
     }
 
@@ -459,6 +492,49 @@ impl Migrator {
         self.drop_all_tables().await?;
         self.run(migrations).await
     }
+}
+
+/// 外部キーの確かめを止めて、表を消す文を順に流す。
+///
+/// **消す文が失敗しても、確かめを戻す文（`after`）は必ず流します。**
+/// MySQL の `foreign_key_checks` は接続ごとの設定です。戻さないと、確かめを
+/// 止めたままの接続がプールに戻り、次に借りた処理が外部キーを素通りします。
+/// MySQL は文が 1 本失敗しても接続とトランザクションは使えるので、同じ接続で戻せます。
+///
+/// MySQL を 1 文の `drop table a, b, c` にして確かめを止めずに済ませる手は
+/// 取りません。1 文の中でも外部キーの確かめは掛かり、親と子をまとめて消せるかが
+/// サーバの種類と版（MySQL 5.7 / 8.0 / MariaDB）でそろわないためです。
+///
+/// SQLite と PostgreSQL は `after` がありません（SQLite の `defer_foreign_keys` は
+/// 確定か巻き戻しで自動で戻り、PostgreSQL は `cascade` で消します）。
+pub(crate) async fn drop_with_checks_off(
+    raw: &mut dyn RawTx,
+    before: Option<&str>,
+    statements: &[String],
+    after: Option<&str>,
+) -> Result<()> {
+    if let Some(sql) = before {
+        raw.execute(sql, &[]).await?;
+    }
+    let mut result = Ok(());
+    for sql in statements {
+        if let Err(error) = raw.execute(sql, &[]).await {
+            result = Err(error);
+            break;
+        }
+    }
+    if let Some(sql) = after {
+        let restored = raw.execute(sql, &[]).await.map(|_| ());
+        if result.is_ok() {
+            // 消すのは成功して、戻すのだけ失敗したら、そのエラーを返す。
+            result = restored;
+        } else if let Err(error) = restored {
+            // 両方失敗した。返すのは元のエラー。戻せなかったことは記録に残す
+            // （接続が切れたときなど。切れた接続はプールに戻りません）。
+            tracing::warn!("外部キーの確かめを戻せませんでした（{sql}）: {error}");
+        }
+    }
+    result
 }
 
 /// シーダーを流す。`class` が `None` なら `DatabaseSeeder`、
@@ -581,6 +657,166 @@ mod tests {
                 "drop table if exists \"comments\"".to_string(),
             ]
         );
+    }
+
+    /// 流れてきた文を覚える、テスト用の中身。`fail_on` を含む文だけ失敗します。
+    struct RecordingTx {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        fail_on: &'static str,
+    }
+
+    impl RawTx for RecordingTx {
+        fn fetch_all<'a>(
+            &'a mut self,
+            _sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> super::super::backend::DbFuture<'a, Vec<super::super::Row>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(
+            &'a mut self,
+            sql: &'a str,
+            _bindings: &'a [Value],
+        ) -> super::super::backend::DbFuture<'a, super::super::Affected> {
+            Box::pin(async move {
+                self.log.lock().unwrap().push(sql.to_string());
+                if !self.fail_on.is_empty() && sql.contains(self.fail_on) {
+                    return Err(Error::msg(format!("失敗: {sql}")));
+                }
+                Ok(super::super::Affected::default())
+            })
+        }
+
+        fn commit(self: Box<Self>) -> super::super::backend::DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(self: Box<Self>) -> super::super::backend::DbFuture<'static, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn 表を消すのに失敗しても外部キーの確かめは戻す() {
+        // 以前は包み（`Transaction`）越しに流していた。1 本失敗すると以後の文を
+        // 全部断るので、戻す文も断られ、`foreign_key_checks = 0` の接続がプールに戻っていた。
+        let (before, after) = super::super::grammar::defer_foreign_keys(Driver::MySql);
+        let statements = vec![
+            "drop table if exists `a`".to_string(),
+            "drop table if exists `b`".to_string(),
+            "drop table if exists `c`".to_string(),
+        ];
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tx = RecordingTx {
+            log: Arc::clone(&log),
+            fail_on: "`b`",
+        };
+        let error = drop_with_checks_off(&mut tx, before, &statements, after)
+            .await
+            .expect_err("消す文のエラーが返る");
+        assert!(error.to_string().contains("`b`"), "{error}");
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "set session foreign_key_checks = 0",
+                "drop table if exists `a`",
+                "drop table if exists `b`",
+                // `c` には進まない。戻す文は流す。
+                "set session foreign_key_checks = 1",
+            ]
+        );
+
+        // 成功したときは、全部流してから戻す。
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tx = RecordingTx {
+            log: Arc::clone(&log),
+            fail_on: "",
+        };
+        drop_with_checks_off(&mut tx, before, &statements, after)
+            .await
+            .expect("通る");
+        assert_eq!(log.lock().unwrap().len(), 5);
+        assert_eq!(
+            log.lock().unwrap().last().map(String::as_str),
+            Some("set session foreign_key_checks = 1")
+        );
+
+        // 戻す文だけが失敗したときは、そのエラーを返す。
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tx = RecordingTx {
+            log,
+            fail_on: "foreign_key_checks = 1",
+        };
+        assert!(drop_with_checks_off(&mut tx, before, &statements, after)
+            .await
+            .is_err());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 状況を見るだけでは記録の表を作らない() {
+        // 以前は `migrate:status` が `migrations` 表を作っていた。
+        // 読むだけのコマンドが表を残し、読み取り専用の利用者では失敗していた。
+        let backend = super::super::sqlite::connect(&super::super::ConnectionConfig::sqlite(
+            "test", ":memory:",
+        ))
+        .await
+        .expect("メモリ上の SQLite につながる");
+        let migrator = Migrator {
+            backend: Arc::clone(&backend),
+            source: Source::Default,
+            lock_table_ready: std::sync::OnceLock::new(),
+        };
+
+        let rows = migrator.status(LIST).await.expect("表が無くても読める");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, LIST[0].name);
+        assert_eq!(rows[0].batch, None, "表が無ければ未実行");
+        assert!(rows[0].present);
+        assert!(
+            backend.table_names().await.unwrap().is_empty(),
+            "status が表を作ってはいけない"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 札を外すだけでは札の表を作らない() {
+        // 以前は `migrate:unlock` が `migration_locks` 表を作っていた。
+        let _db = crate::testing::refresh_database().await;
+        let migrator = Migrator::connect(None).await.expect("つながる");
+        // ほかのテストが残した札の表を消して、無い状態から始める。
+        migrator
+            .source
+            .execute(&format!("drop table if exists {LOCK_TABLE}"), &[])
+            .await
+            .expect("消せる");
+        let has_lock_table = || async {
+            migrator
+                .backend
+                .table_names()
+                .await
+                .unwrap()
+                .iter()
+                .any(|name| name == LOCK_TABLE)
+        };
+
+        assert_eq!(migrator.clear_lock().await.expect("表が無くても通る"), None);
+        assert!(!has_lock_table().await, "unlock が表を作ってはいけない");
+
+        // 札があるときは外して、持ち主を返す。
+        migrator.lock().await.expect("札が取れる");
+        let (owner, _) = migrator
+            .clear_lock()
+            .await
+            .expect("外せる")
+            .expect("持ち主が返る");
+        assert_eq!(owner, lock_owner());
+        assert_eq!(migrator.lock_holder().await.unwrap(), None);
+        // 表はあるが札が無いときも `None`。
+        assert_eq!(migrator.clear_lock().await.unwrap(), None);
+        assert!(has_lock_table().await, "あった表は消さない");
     }
 
     #[test]

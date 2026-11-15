@@ -11,7 +11,11 @@
 //! | `.gitignore` | 雛形の行のうち、足りない行を足す |
 //! | `.cargo/config.toml` | `artisan` の別名が無ければ足す |
 //! | `build.rs` | `bengara_build::discover()` が無ければ警告を出す（書き換えない） |
+//!
+//! 中身を確かめるファイルは、**何かを書く前に全部読みます**（[`Existing`]）。
+//! 読めないファイル（UTF-8 でないものなど）があれば、何も書き換えずに止まります。
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use super::cargo_toml::CargoToml;
@@ -81,6 +85,10 @@ pub(crate) fn run(root: &Path) -> Result<()> {
         .package_name()
         .ok_or_else(|| Error::msg("Cargo.toml の [package] に name がありません"))?;
 
+    // 中身を確かめるファイルを、書き始める前に全部読む。
+    // 読めないものがあれば、ここで止まる（まだ何も書き換えていない）。
+    let existing = Existing::read(root)?;
+
     println!("bengara init: {} を用意します\n", root.display());
 
     let mut report = Report::default();
@@ -88,10 +96,7 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     for dir in DIRECTORIES {
         create_dir(root, dir, &mut report)?;
     }
-    // storage/ の下は `storage:init` と同じ一覧で作る。
-    for dir in storage_directories() {
-        create_dir(root, &dir, &mut report)?;
-    }
+    create_storage_dirs(root, &mut report)?;
     for dir in KEEP {
         // 中身があるディレクトリには置かない。git は空のディレクトリだけを無視するため。
         if is_empty_dir(&root.join(dir)) {
@@ -101,9 +106,9 @@ pub(crate) fn run(root: &Path) -> Result<()> {
 
     // 利用者が手で書くことになっている入口と、数行の設定ファイル。
     // この3つは「すでにある」ことが多いので、そのまま残さず中身を確かめる。
-    merge_cargo_config(root, &mut report)?;
-    check_build_rs(root, &mut report)?;
-    merge_gitignore(root, &mut report)?;
+    merge_cargo_config(root, existing.cargo_config, &mut report)?;
+    check_build_rs(root, existing.build_rs.as_deref(), &mut report)?;
+    merge_gitignore(root, existing.gitignore.as_deref(), &mut report)?;
     write_if_missing(root, "artisan.rs", stub("artisan_rs"), &mut report)?;
     write_if_missing(
         root,
@@ -162,7 +167,7 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     )?;
 
     // 入口（main.rs）を用意し、cargo new が作った src/ を片付ける。
-    update_main(root, &mut report)?;
+    update_main(root, existing.main_rs.as_deref(), &mut report)?;
     clean_src(root, &mut report)?;
 
     // Cargo.toml に足りない行を足す。
@@ -233,14 +238,87 @@ fn print_list(label: &str, items: &[String]) {
     println!();
 }
 
-fn create_dir(root: &Path, relative: &str, report: &mut Report) -> Result<()> {
+/// すでにあるファイルの中身。`init` が書き始める前に読みます。
+///
+/// `init` は「あれば中身を確かめ、無ければ雛形を書く」ファイルをいくつか持ちます。
+/// 以前は読み込みの失敗をすべて「無い」と同じに扱っていたので、**読めないだけ**の
+/// ファイルを雛形で上書きしていました。たとえば Windows PowerShell 5.1 の `>` で
+/// 作った UTF-16 の `.gitignore` です。手で書いた中身が確認なしで消え、一覧には
+/// 「作成」と出ていました。
+///
+/// 「無い」と見なすのは `ErrorKind::NotFound` のときだけです。それ以外はファイル名を
+/// 添えたエラーにします。先にまとめて読むのは、途中まで書いてから止まらないためです。
+struct Existing {
+    cargo_config: Option<CargoToml>,
+    build_rs: Option<String>,
+    gitignore: Option<String>,
+    main_rs: Option<String>,
+}
+
+impl Existing {
+    fn read(root: &Path) -> Result<Self> {
+        let cargo_config = root.join(".cargo/config.toml");
+        Ok(Self {
+            // 先に `read_optional` で確かめる。エラーの文をほかのファイルとそろえるため。
+            cargo_config: match read_optional(&cargo_config)? {
+                Some(_) => Some(CargoToml::load(&cargo_config)?),
+                None => None,
+            },
+            build_rs: read_optional(&root.join("build.rs"))?,
+            gitignore: read_optional(&root.join(".gitignore"))?,
+            main_rs: read_optional(&root.join("main.rs"))?,
+        })
+    }
+}
+
+/// ファイルを読む。**無いときだけ** `None` を返す。
+///
+/// 読めないとき（UTF-8 でない・権限が無い・ディレクトリだった）はエラーです。
+/// 「無い」と同じに扱うと、呼ぶ側が雛形で上書きしてしまいます。
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::msg(format!(
+            "{} を読めません: {error}\n\
+             init は何も書き換えていません。読めるように直してから（文字コードは UTF-8）、\
+             もう一度実行してください",
+            path.display()
+        ))),
+    }
+}
+
+/// ディレクトリを作る。戻り値は「いま作ったか」です。
+fn create_dir(root: &Path, relative: &str, report: &mut Report) -> Result<bool> {
     let path = root.join(relative);
     if path.is_dir() {
-        return Ok(());
+        return Ok(false);
     }
     std::fs::create_dir_all(&path)
         .map_err(|e| Error::msg(format!("{} を作れません: {e}", path.display())))?;
     report.created.push(format!("{relative}/"));
+    Ok(true)
+}
+
+/// `storage/` とその下を作る。`storage:init` と同じ一覧・同じ権限にします。
+///
+/// 作ったものは所有者だけに絞ります（Unix では 0700。`ops::restrict`）。
+/// 以前は `create_dir_all` だけだったので umask まかせになり、`storage:init` は
+/// 「すでにある」ものを触らないので、`init` したプロジェクトではセッションや
+/// ログの置き場所が他のアカウントから読めるまま残っていました。
+///
+/// `storage/` 自身も先に作って絞ります。下のディレクトリを作るついでに
+/// できた `storage/` は、絞られないまま残るためです。
+///
+/// すでにあるものは触りません（`storage:init` と同じ）。
+fn create_storage_dirs(root: &Path, report: &mut Report) -> Result<()> {
+    for dir in std::iter::once("storage".to_string()).chain(storage_directories()) {
+        if create_dir(root, &dir, report)? {
+            let path = root.join(&dir);
+            crate::ops::restrict(&path)
+                .map_err(|e| Error::msg(format!("{} の権限を絞れません: {e}", path.display())))?;
+        }
+    }
     Ok(())
 }
 
@@ -324,18 +402,21 @@ fn write_file(path: &PathBuf, contents: &str) -> Result<()> {
 /// **そのまま残してはいけません。** `cargo new` は `/target` の1行だけの `.gitignore` を
 /// 必ず作ります。「ある」と見て残すと `/.env` が入らず、`key:generate` で作った
 /// `APP_KEY` 入りの `.env` が git に入ります。
-fn merge_gitignore(root: &Path, report: &mut Report) -> Result<()> {
+///
+/// `current` は、すでにあるファイルの中身です（無ければ `None`）。読むのは
+/// [`Existing::read`] で、読めないファイルはここまで来ません。
+fn merge_gitignore(root: &Path, current: Option<&str>, report: &mut Report) -> Result<()> {
     let path = root.join(".gitignore");
     let wanted = stub("gitignore");
 
-    let Ok(current) = std::fs::read_to_string(&path) else {
+    let Some(current) = current else {
         write_file(&path, wanted)?;
         report.created.push(".gitignore".to_string());
         println!(".env を git の管理から外しました。\n");
         return Ok(());
     };
 
-    let missing = missing_lines(&current, wanted);
+    let missing = missing_lines(current, wanted);
     if missing.is_empty() {
         report.kept.push(".gitignore".to_string());
         return Ok(());
@@ -366,6 +447,9 @@ fn merge_gitignore(root: &Path, report: &mut Report) -> Result<()> {
 ///
 /// コメント行と空行は足しません。無くても害が無く、足すと読みにくくなるためです。
 fn missing_lines(current: &str, wanted: &str) -> Vec<String> {
+    // 先頭の BOM は行の一部ではない。外さないと 1 行目（`/target` など）が
+    // 「無い」と見えて、同じ行をもう 1 つ足してしまう。
+    let current = current.trim_start_matches('\u{feff}');
     let mut missing: Vec<String> = Vec::new();
     for line in wanted.lines() {
         let line = line.trim();
@@ -386,17 +470,18 @@ fn missing_lines(current: &str, wanted: &str) -> Vec<String> {
 /// リンカの指定などで自前の `.cargo/config.toml` を持っている人は多いです。
 /// そのまま残すと `cargo artisan` が「そんなサブコマンドは無い」で終わり、
 /// `init` が最後に案内する「次の一歩」がそのまま動きません。
-fn merge_cargo_config(root: &Path, report: &mut Report) -> Result<()> {
+///
+/// `config` は、すでにあるファイルです（無ければ `None`）。
+fn merge_cargo_config(root: &Path, config: Option<CargoToml>, report: &mut Report) -> Result<()> {
     let relative = ".cargo/config.toml";
     let path = root.join(relative);
-    if !path.exists() {
+    // `CargoToml` は Cargo.toml 用の名前だが、中身は「行の並び」として扱う汎用の作り。
+    let Some(mut config) = config else {
         write_file(&path, stub("cargo_config"))?;
         report.created.push(relative.to_string());
         return Ok(());
-    }
+    };
 
-    // `CargoToml` は Cargo.toml 用の名前だが、中身は「行の並び」として扱う汎用の作り。
-    let mut config = CargoToml::load(&path)?;
     if config.has_key("alias", "artisan") {
         report.kept.push(relative.to_string());
         return Ok(());
@@ -424,9 +509,11 @@ fn artisan_alias_line() -> &'static str {
 ///
 /// 呼んでいないと `bengara::app!()` が `bengara_app.rs` を読めず、原因の分からない
 /// エラーになります。自前の `build.rs` を壊さないよう、書き換えずに案内だけ出します。
-fn check_build_rs(root: &Path, report: &mut Report) -> Result<()> {
+///
+/// `current` は、すでにあるファイルの中身です（無ければ `None`）。
+fn check_build_rs(root: &Path, current: Option<&str>, report: &mut Report) -> Result<()> {
     let path = root.join("build.rs");
-    let Ok(current) = std::fs::read_to_string(&path) else {
+    let Some(current) = current else {
         write_file(&path, stub("build_rs"))?;
         report.created.push("build.rs".to_string());
         return Ok(());
@@ -448,25 +535,32 @@ fn check_build_rs(root: &Path, report: &mut Report) -> Result<()> {
 ///
 /// `cargo new` が作った雛形と、`fn main() { bengara::run() }` の1行だけを置き換えます。
 /// それ以外が書かれていたら、触らずに案内だけ出します。
-fn update_main(root: &Path, report: &mut Report) -> Result<()> {
+///
+/// `current` は、すでにある `main.rs` の中身です（無ければ `None`）。
+fn update_main(root: &Path, current: Option<&str>, report: &mut Report) -> Result<()> {
     let path = root.join("main.rs");
     let wanted = stub("main_rs");
 
-    let current = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => {
-            // 直下に無ければ、cargo new が作った src/main.rs を引き継ぐ。
-            let legacy = std::fs::read_to_string(root.join("src/main.rs")).unwrap_or_default();
-            if !legacy.is_empty() && !is_replaceable_main(&legacy) {
-                println!(
-                    "src/main.rs に手で書いたコードがあります。中身を {} に移してから src/ を消してください。\n",
-                    root.join("main.rs").display()
-                );
-            }
-            write_file(&path, wanted)?;
-            report.created.push("main.rs".to_string());
-            return Ok(());
+    let Some(current) = current else {
+        // 直下に無ければ、cargo new が作った src/main.rs を引き継ぐ。
+        //
+        // こちらは読めなくても止めない。`src/main.rs` は上書きも削除もしないので
+        // （`clean_src` は読めないものを残す）、失うものが無い。読めないものは
+        // 「手で書いたコード」として案内する。
+        let legacy = std::fs::read_to_string(root.join("src/main.rs"));
+        let hand_written = match &legacy {
+            Ok(text) => !text.is_empty() && !is_replaceable_main(text),
+            Err(error) => error.kind() != ErrorKind::NotFound,
+        };
+        if hand_written {
+            println!(
+                "src/main.rs に手で書いたコードがあります。中身を {} に移してから src/ を消してください。\n",
+                root.join("main.rs").display()
+            );
         }
+        write_file(&path, wanted)?;
+        report.created.push("main.rs".to_string());
+        return Ok(());
     };
 
     if current.contains("bengara::app!") {
@@ -474,7 +568,7 @@ fn update_main(root: &Path, report: &mut Report) -> Result<()> {
         return Ok(());
     }
 
-    if is_replaceable_main(&current) {
+    if is_replaceable_main(current) {
         write_file(&path, wanted)?;
         report.updated.push("main.rs".to_string());
         return Ok(());
@@ -518,16 +612,27 @@ fn clean_src(root: &Path, report: &mut Report) -> Result<()> {
 }
 
 /// 置き換えてよい入口のファイルか。
+///
+/// 空白の書き方（空白・タブ・改行）と行コメントは無視して比べます。
+/// `bengara::run()` は `;` があっても無くても同じ意味なので、どちらも認めます。
+/// 以前は `;` つきを「手で書いたコード」と見て、置き換えずに案内だけ出していました。
 fn is_replaceable_main(text: &str) -> bool {
+    // 先頭の BOM は中身ではない。
     let body: String = text
+        .trim_start_matches('\u{feff}')
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("");
-    let body = body.replace(' ', "");
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
     // cargo new の雛形 か、bengara::run() の1行。
-    body == "fnmain(){println!(\"Hello,world!\");}" || body == "fnmain(){bengara::run()}"
+    matches!(
+        body.as_str(),
+        "fnmain(){println!(\"Hello,world!\");}"
+            | "fnmain(){bengara::run()}"
+            | "fnmain(){bengara::run();}"
+    )
 }
 
 /// `Cargo.toml` に足りない行を足す。すでにある行には触りません。
@@ -614,6 +719,194 @@ fn update_manifest(manifest: &mut CargoToml, name: &str) {
 mod tests {
     use super::*;
 
+    /// テスト用の空のプロジェクト。テストごとに別の名前にする。
+    fn temp_project(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("bengara-init-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        root
+    }
+
+    /// UTF-16LE（BOM つき）の中身。Windows PowerShell 5.1 の `>` が作る形。
+    fn utf16(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn 読めないファイルは上書きせずに止まる() {
+        // 以前は「読めない」を「無い」と同じに扱い、雛形で上書きしていた。
+        for file in [".gitignore", "build.rs", "main.rs", ".cargo/config.toml"] {
+            let tag = file.replace(['.', '/'], "_");
+            let root = temp_project(&format!("unreadable{tag}"));
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = utf16("/my-secret-dir\r\n");
+            std::fs::write(&path, &original).unwrap();
+            let manifest = std::fs::read(root.join("Cargo.toml")).unwrap();
+
+            let error = run(&root).expect_err("読めないファイルがあるのに進みました");
+            let message = error.to_string();
+            // どのファイルかが分かる。
+            assert!(message.contains(&path.display().to_string()), "{message}");
+
+            // 中身はそのまま。
+            assert_eq!(std::fs::read(&path).unwrap(), original, "{file}");
+            // ほかのものも、何も書き換えていない。
+            assert_eq!(std::fs::read(root.join("Cargo.toml")).unwrap(), manifest);
+            for untouched in ["app", "storage", "artisan.rs", ".env", "routes"] {
+                assert!(
+                    !root.join(untouched).exists(),
+                    "{file}: {untouched} を作っています"
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn 無いファイルは雛形で作る() {
+        // 「無い」（NotFound）のときは、今までどおり作る。
+        let root = temp_project("fresh");
+        run(&root).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            stub("gitignore")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("build.rs")).unwrap(),
+            stub("build_rs")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.rs")).unwrap(),
+            stub("main_rs")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".cargo/config.toml")).unwrap(),
+            stub("cargo_config")
+        );
+        // storage/ の下は `storage:init` と同じ一覧で揃う。
+        for dir in storage_directories() {
+            assert!(root.join(&dir).is_dir(), "{dir}");
+        }
+
+        // 2回目は何も変えない。
+        let before = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        run(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
+            before
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 無いと読めないを区別する() {
+        let root = temp_project("optional");
+        assert_eq!(read_optional(&root.join("nothing.txt")).unwrap(), None);
+
+        std::fs::write(root.join("ok.txt"), "中身\n").unwrap();
+        assert_eq!(
+            read_optional(&root.join("ok.txt")).unwrap().as_deref(),
+            Some("中身\n")
+        );
+
+        // UTF-8 でないファイルは「無い」ではない。
+        std::fs::write(root.join("utf16.txt"), utf16("/target\r\n")).unwrap();
+        let error = read_optional(&root.join("utf16.txt"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("utf16.txt"), "{error}");
+        assert!(error.contains("何も書き換えていません"), "{error}");
+
+        // ディレクトリも「無い」ではない。
+        std::fs::create_dir(root.join("dir")).unwrap();
+        assert!(read_optional(&root.join("dir")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 読めないsrc_mainは消さずに案内する() {
+        // `src/main.rs` は上書きも削除もしないので、読めなくても止めない。
+        let root = temp_project("legacy");
+        std::fs::create_dir(root.join("src")).unwrap();
+        let original = utf16("fn main() {}\r\n");
+        std::fs::write(root.join("src/main.rs"), &original).unwrap();
+
+        run(&root).unwrap();
+
+        assert_eq!(std::fs::read(root.join("src/main.rs")).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.rs")).unwrap(),
+            stub("main_rs")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn storageは自身も含めて作る() {
+        let root = temp_project("storage");
+        let mut report = Report::default();
+        create_storage_dirs(&root, &mut report).unwrap();
+
+        assert!(root.join("storage").is_dir());
+        for dir in storage_directories() {
+            assert!(root.join(&dir).is_dir(), "{dir}");
+        }
+        // `storage/` 自身も一覧に出る（下のついでに黙って作らない）。
+        assert_eq!(report.created.first().map(String::as_str), Some("storage/"));
+
+        // 2回目は何も作らない。
+        let mut report = Report::default();
+        create_storage_dirs(&root, &mut report).unwrap();
+        assert!(report.created.is_empty(), "{:?}", report.created);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `storage:init` と同じく、所有者だけに絞る。
+    #[cfg(unix)]
+    #[test]
+    fn initが作るstorageは0700になる() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_project("storage-mode");
+        let mut report = Report::default();
+        create_storage_dirs(&root, &mut report).unwrap();
+
+        for dir in std::iter::once("storage".to_string()).chain(storage_directories()) {
+            let mode = std::fs::metadata(root.join(&dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{dir}: {mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bomつきのgitignoreでも同じ行を足さない() {
+        // 先頭の BOM を行の一部と見ると、1 行目の `/target` が「無い」ことになる。
+        let missing = missing_lines("\u{feff}/target\n", stub("gitignore"));
+        assert!(!missing.iter().any(|l| l == "/target"), "{missing:?}");
+        assert!(missing.iter().any(|l| l == "/.env"), "{missing:?}");
+    }
+
     /// `.env` には `APP_KEY` が入るので、所有者だけが読める権限にする。
     #[cfg(unix)]
     #[test]
@@ -647,6 +940,18 @@ mod tests {
         assert!(is_replaceable_main(
             "// コメント\nfn main() { bengara::run() }\n"
         ));
+        // `;` つきと、空白の書き方の違い（タブ・改行・詰めた形）も同じと見る。
+        assert!(is_replaceable_main("fn main() { bengara::run(); }\n"));
+        assert!(is_replaceable_main("fn main() {\n\tbengara::run();\n}\n"));
+        assert!(is_replaceable_main("fn main(){bengara::run()}"));
+        assert!(is_replaceable_main(
+            "\u{feff}fn main() {\r\n    bengara::run()\r\n}\r\n"
+        ));
+        // 1文でも足してあれば、手で書いたコードと見る。
+        assert!(!is_replaceable_main(
+            "fn main() { setup(); bengara::run(); }\n"
+        ));
+        assert!(!is_replaceable_main(""));
         assert!(!is_replaceable_main(
             "fn main() {\n    my_app::start();\n}\n"
         ));

@@ -15,7 +15,7 @@ mod worker;
 
 pub(crate) use worker::{
     failed_count, failed_list, retry_failed, run as work, Options as WorkerOptions,
-    DEFAULT_RETRY_AFTER,
+    DEFAULT_RETRY_AFTER, DEFAULT_TIMEOUT,
 };
 
 use std::future::Future;
@@ -88,6 +88,19 @@ impl Queue {
         Self::push_raw_on(queue, job, &text, 0).await
     }
 
+    /// キューの名前を決めて入れる。`delay_secs` 秒たってから処理されます。
+    ///
+    /// [`Queue::later`] の、キューを選べる形です（Laravel の `laterOn`）。
+    pub async fn later_on<T: serde::Serialize>(
+        queue: &str,
+        job: &str,
+        payload: &T,
+        delay_secs: u64,
+    ) -> Result<i64> {
+        let text = serde_json::to_string(payload)?;
+        Self::push_raw_on(queue, job, &text, delay_secs).await
+    }
+
     async fn push_raw_on(queue: &str, job: &str, payload: &str, delay_secs: u64) -> Result<i64> {
         if job.trim().is_empty() {
             return Err(Error::msg("ジョブの名前がありません"));
@@ -107,7 +120,10 @@ impl Queue {
             .await
     }
 
-    /// 表に残っているジョブの数。
+    /// **既定のキュー（`default`）**の表に残っているジョブの数。
+    ///
+    /// ほかのキューは数えません（[`Queue::size_on`] を使ってください）。
+    /// [`Queue::clear`] は全キューを消すので、範囲が違います。
     ///
     /// **すぐ処理できる数ではありません。** 下の `size_on` と同じで、処理中
     /// （予約済み）・遅延待ち・再挑戦待ちも数に入ります。すぐ処理できる数は
@@ -127,7 +143,7 @@ impl Queue {
         DB::table(TABLE).where_("queue", queue).count().await
     }
 
-    /// いますぐ処理できるジョブの数。
+    /// **既定のキュー（`default`）**で、いますぐ処理できるジョブの数。
     ///
     /// 処理中・遅延待ち・再挑戦待ちを除いた数です。
     pub async fn ready_size() -> Result<i64> {
@@ -150,9 +166,25 @@ impl Queue {
         failed_count().await
     }
 
-    /// 待っているジョブを全部捨てる。
+    /// 待っているジョブを全部捨てる。返るのは消した件数です。
+    ///
+    /// **全部のキューが対象です。** [`Queue::size`] は既定のキューだけを
+    /// 数えるので、範囲が違います。1 つのキューだけ消すときは
+    /// [`Queue::clear_on`] を使ってください。
+    ///
+    /// **処理中の行も消します。** いま動いているジョブは止まりません。
+    /// 終わったときに自分の行が無いので、ワーカーは警告を出すだけです
+    /// （失敗しても再挑戦されず、`failed_jobs` にも残りません）。
+    /// 諦めたジョブ（`failed_jobs`）は消しません。
     pub async fn clear() -> Result<u64> {
         DB::table(TABLE).delete().await
+    }
+
+    /// そのキューで待っているジョブを捨てる。返るのは消した件数です。
+    ///
+    /// [`Queue::clear`] と同じく、処理中・遅延待ち・再挑戦待ちの行も消します。
+    pub async fn clear_on(queue: &str) -> Result<u64> {
+        DB::table(TABLE).where_("queue", queue).delete().await
     }
 
     /// この 2 つの表を作るマイグレーションの中身。
@@ -270,6 +302,78 @@ mod tests {
             .iter()
             .any(|s| s.contains("jobs_queue_available_at_index")));
         assert!(sql.iter().any(|s| s.contains("\"failed_jobs\"")));
+    }
+
+    /// テスト用にキューの表を作る。
+    #[cfg(feature = "sqlite")]
+    async fn 表を作る() {
+        let mut schema = Schema::new(Driver::Sqlite);
+        Queue::define(&mut schema);
+        for sql in schema.to_sql() {
+            DB::statement(sql, &[]).await.unwrap();
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn キューを選んで遅らせて入れられる() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+
+        // 以前は、遅らせて入れられるのは既定のキューだけだった。
+        let id = Queue::later_on("mail", "SendWelcome", &serde_json::json!({ "id": 1 }), 600)
+            .await
+            .unwrap();
+        let row = DB::table(TABLE).find(id).await.unwrap().unwrap();
+        assert_eq!(row.get::<String>("queue").unwrap(), "mail");
+        assert_eq!(row.get::<String>("payload").unwrap(), r#"{"id":1}"#);
+        assert!(
+            row.get::<String>("available_at").unwrap() > crate::database::now(),
+            "先の時刻で入る"
+        );
+
+        // 数には入るが、まだ処理できない。既定のキューには入らない。
+        assert_eq!(Queue::size_on("mail").await.unwrap(), 1);
+        assert_eq!(Queue::ready_size_on("mail").await.unwrap(), 0);
+        assert_eq!(Queue::size().await.unwrap(), 0);
+
+        // 0 秒なら `push_on` と同じで、すぐ処理できる。
+        Queue::later_on("mail", "SendWelcome", &1, 0).await.unwrap();
+        assert_eq!(Queue::ready_size_on("mail").await.unwrap(), 1);
+
+        // 名前の無いジョブは、ほかの入口と同じく断る。
+        assert!(Queue::later_on("mail", " ", &1, 0).await.is_err());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn キューを絞って捨てられる() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+
+        Queue::push("A", &1).await.unwrap();
+        Queue::push_on("mail", "B", &1).await.unwrap();
+        Queue::later_on("mail", "C", &1, 600).await.unwrap();
+        // 処理中の行（予約済み）も 1 本。
+        let reserved = Queue::push_on("mail", "D", &1).await.unwrap();
+        DB::table(TABLE)
+            .where_("id", reserved)
+            .update(&[("reserved_at", Value::Text(crate::database::now()))])
+            .await
+            .unwrap();
+
+        // そのキューだけを消す。遅延待ちと処理中の行も消える。
+        assert_eq!(Queue::clear_on("mail").await.unwrap(), 3);
+        assert_eq!(Queue::size_on("mail").await.unwrap(), 0);
+        assert_eq!(Queue::size().await.unwrap(), 1, "ほかのキューは残る");
+        // 無いキューは 0 件。
+        assert_eq!(Queue::clear_on("none").await.unwrap(), 0);
+
+        // `clear()` は全部のキューを消す（`size()` は既定のキューだけ）。
+        Queue::push_on("mail", "B", &1).await.unwrap();
+        assert_eq!(Queue::size().await.unwrap(), 1);
+        assert_eq!(Queue::clear().await.unwrap(), 2);
+        assert_eq!(Queue::size_on("mail").await.unwrap(), 0);
     }
 
     #[test]

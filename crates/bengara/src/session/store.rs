@@ -6,10 +6,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::support::crypto;
+use crate::support::fs::{write_atomic, Access};
+use crate::support::time::now_seconds_u64;
+use crate::support::MEMORY_GC_EVERY;
 
 type Data = BTreeMap<String, String>;
 
@@ -50,6 +52,30 @@ pub trait SessionStore: Send + Sync + 'static {
             self.write(id, &data)?;
         }
         Ok(())
+    }
+
+    /// 中身を読み、**ついでに期限も延ばす**（[`read`](Self::read) と
+    /// [`touch`](Self::touch) を 1 回で済ませる）。
+    ///
+    /// `StartSession` が、ルートに当たったリクエストの最初に呼びます。
+    /// 別々に呼ぶと、期限を知るためだけに同じ中身を 2 回読むことになります
+    /// （`FileStore` はファイルを 2 回読んで解析していました）。
+    ///
+    /// **既定は `read` のあとに `touch` を呼ぶだけです。** 動きは別々に呼ぶのと
+    /// 同じなので、自分で作った置き場所はそのままで壊れません。1 回の読みで
+    /// 期限まで分かる置き場所では、自分で実装してください
+    /// （`FileStore` と `MemoryStore` はそうしています）。
+    ///
+    /// 期限を延ばせなかったときは**警告だけ出して、読めた中身を返します。**
+    /// 延ばせないだけでリクエストを落とすほどのことではありません。
+    fn read_and_touch(&self, id: &str) -> Result<Option<Data>> {
+        let found = self.read(id)?;
+        if found.is_some() {
+            if let Err(e) = self.touch(id) {
+                tracing::warn!("セッションの期限を延ばせませんでした: {e}");
+            }
+        }
+        Ok(found)
     }
 
     /// ある利用者のセッションを**全部**消す。消した数を返す。
@@ -101,17 +127,50 @@ pub trait SessionStore: Send + Sync + 'static {
     /// 巻き込まないためです（ログインの時刻もミリ秒で持ちます）。
     ///
     /// `mark_revoked` で `except` にした ID には `None` を返します。
+    ///
+    /// **古い印は返さないでください**（組み込みの置き場所は 1 時間）。
+    /// 印が要るのは、切った瞬間に処理中だったリクエストだけです。いつまでも
+    /// 返すと、ずっと後のリクエストまで「切られた」と判定されます。
     fn revoked_at(&self, user_id: &str, session_id: &str) -> Option<i64> {
         let _ = (user_id, session_id);
         None
     }
 }
 
-/// 「切った」印を置いておく秒数。
+/// 「切った」印が効く秒数。
 ///
-/// 印が効くのは、切った瞬間に処理中だったリクエストだけです。
-/// リクエストが 1 時間を超えて走ることはないので、それより古い印は捨てます。
+/// 印が要るのは、切った瞬間に処理中だったリクエストだけです。
+/// リクエストが 1 時間を超えて走ることはないので、それより古い印は
+/// **読むときに無視します**（[`mark_is_fresh`]）。ファイルそのものは掃除が消します。
+///
+/// 読むときに見ないと、掃除が走るまで（`MemoryStore` では次に誰かを切るまで）
+/// 印が効き続けます。
 const REVOKED_MARK_SECS: u64 = 3600;
+
+/// 「切った」印がまだ効くか。`at` は印の時刻（UNIX ミリ秒）です。
+///
+/// 時計が戻って印のほうが未来になったときは、効くほうに倒します。
+fn mark_is_fresh(at: i64) -> bool {
+    let limit = i64::try_from(REVOKED_MARK_SECS * 1000).unwrap_or(i64::MAX);
+    crate::support::time::now_millis().saturating_sub(at) <= limit
+}
+
+/// 中身に入っているログインの時刻より後に、その利用者が切られているか。
+///
+/// 期限を延ばす書き込みの直前に見ます。`StartSession` が保存の直前に見るのと
+/// 同じ判定です（ログインしていない中身は対象外。時刻が無ければ 0 として扱う）。
+fn revoked_since_login(store: &dyn SessionStore, id: &str, data: &Data) -> bool {
+    let Some(user) = data.get(crate::auth::AUTH_ID_KEY) else {
+        return false;
+    };
+    let logged_in_at = data
+        .get(crate::auth::AUTH_AT_KEY)
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    store
+        .revoked_at(user, id)
+        .is_some_and(|at| at > logged_in_at)
+}
 
 /// 一時ファイル（`<ID>.<乱数>.tmp`）がこの秒数より古ければ、書き込みに失敗した
 /// 残骸と見なして消す。`FileCache` と同じ数字です。
@@ -145,62 +204,6 @@ static SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 /// 「切った」印を置くディレクトリ。`is_session_id` が通さない `+` で始めます。
 const REVOKED_DIR: &str = "+revoked";
-
-/// `rename` が「使用中」で失敗したときに、やり直す回数と間隔。
-///
-/// Windows では、別のプロセスやウイルス対策ソフトが同じファイルを開いている瞬間に
-/// `rename` が失敗します。1 回で諦めるとそのリクエストが 500 になるので、
-/// 少しだけ待ってやり直します。
-const RENAME_RETRIES: u32 = 5;
-const RENAME_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// 一時ファイルを本体へ置き換える。「使用中」系の失敗は少し待ってやり直す。
-pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut attempt = 0;
-    loop {
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < RENAME_RETRIES && is_busy_error(&e) => {
-                attempt += 1;
-                std::thread::sleep(RENAME_RETRY_WAIT);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// やり直す価値のある失敗か（別のプロセスが使っているだけ、の失敗）。
-///
-/// **やり直すのは次の2つだけです。**
-///
-/// | 見るもの | 理由 |
-/// |---|---|
-/// | `PermissionDenied` | Windows は「別のプロセスが使用中」をこれで返すことがある |
-/// | OS の 32・33 番 | Windows の共有違反・錠違反。標準ライブラリが種類を付けない |
-///
-/// 「`NotFound` 以外は全部やり直す」にしていたころは、権限不足やディスク満杯の
-/// ような**待っても結果が変わらない失敗**でも 5 回 × 10ms 待ってから失敗して
-/// いました。
-///
-/// 32・33 番を番号で見るのは、標準ライブラリの `ErrorKind::Uncategorized` が
-/// まだ名前で書けないためです。
-fn is_busy_error(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::PermissionDenied || is_sharing_violation(e)
-}
-
-/// Windows の共有違反（32 番）・錠違反（33 番）か。
-///
-/// `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION` です。別のプロセスが
-/// 同じファイルを開いている瞬間に出ます。少し待てば消えます。
-#[cfg(windows)]
-fn is_sharing_violation(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(32 | 33))
-}
-
-#[cfg(not(windows))]
-fn is_sharing_violation(_e: &std::io::Error) -> bool {
-    false
-}
 
 /// 既定のままの実装を呼ばれたことを知らせる。
 ///
@@ -278,10 +281,7 @@ impl FileStore {
         // storage/ そのものが無いなら、作らずに知らせる（決定記録 #023）。
         let storage = crate::paths::storage_path("");
         if !storage.is_dir() {
-            return Err(Error::msg(format!(
-                "{} がありません。デプロイのときに storage/ を作ってください",
-                storage.display()
-            )));
+            return Err(Error::msg(crate::paths::missing_storage_message(&storage)));
         }
         std::fs::create_dir_all(&self.dir)?;
         self.restricted.call_once(|| restrict_dir(&self.dir));
@@ -393,8 +393,13 @@ impl FileStore {
     }
 }
 
-impl SessionStore for FileStore {
-    fn read(&self, id: &str) -> Result<Option<Data>> {
+impl FileStore {
+    /// ファイルを読んで解析する。無い・壊れている・期限切れは `None`
+    /// （壊れたものと期限切れは、その場で消します）。
+    ///
+    /// `read` と `read_and_touch` の共通部分です。**期限も一緒に返す**ので、
+    /// 期限を知るために読み直す必要がありません。
+    fn load(&self, id: &str) -> Result<Option<Stored>> {
         let path = self.path_of(id)?;
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
@@ -410,9 +415,46 @@ impl SessionStore for FileStore {
                 return Ok(None);
             }
         };
-        if stored.expires_at <= now() {
+        if stored.expires_at <= now_seconds_u64() {
             let _ = std::fs::remove_file(&path);
             return Ok(None);
+        }
+        Ok(Some(stored))
+    }
+
+    /// 読めた中身の期限を、残りが半分を切っていれば延ばす。
+    ///
+    /// **期限切れでないことは呼ぶ側が確かめておきます。**
+    ///
+    /// 書く直前に「切った」印を見ます。ここは「読む → 書く」のあいだに
+    /// `logout_user` などがファイルを消すと、消したはずのセッションを
+    /// 書き戻してしまう場所です。印は消すより**前に**付くので、印があれば
+    /// 書かずに帰ります（ファイルは切る側が消します）。窓は「印を見てから
+    /// 置き換えるまで」に縮みます。無くなりはしません。
+    fn extend(&self, id: &str, stored: &Stored) -> Result<()> {
+        if !needs_touch(stored.expires_at, self.lifetime_secs) {
+            return Ok(());
+        }
+        if revoked_since_login(self, id, &stored.data) {
+            return Ok(());
+        }
+        self.write(id, &stored.data)
+    }
+}
+
+impl SessionStore for FileStore {
+    fn read(&self, id: &str) -> Result<Option<Data>> {
+        Ok(self.load(id)?.map(|stored| stored.data))
+    }
+
+    /// ファイルを **1 回だけ**読んで、中身を返し、期限も延ばす。
+    fn read_and_touch(&self, id: &str) -> Result<Option<Data>> {
+        let Some(stored) = self.load(id)? else {
+            return Ok(None);
+        };
+        // 延ばせなくても、読めた中身は返す（致命的ではない）。
+        if let Err(e) = self.extend(id, &stored) {
+            tracing::warn!("セッションの期限を延ばせませんでした: {e}");
         }
         Ok(Some(stored.data))
     }
@@ -422,7 +464,7 @@ impl SessionStore for FileStore {
         self.ensure_dir()?;
         let stored = Stored {
             // `SESSION_LIFETIME` に巨大な値を入れてもあふれない。
-            expires_at: now().saturating_add(self.lifetime_secs),
+            expires_at: now_seconds_u64().saturating_add(self.lifetime_secs),
             data: data.clone(),
         };
         let body = serde_json::to_string(&stored)?;
@@ -437,18 +479,13 @@ impl SessionStore for FileStore {
         //
         // `is_session_id` がドットを通さないので、この名前は本体とぶつからず、
         // `destroy_matching` と `sweep` も触りません。
+        //
+        // 権限・Windows のやり直し・失敗時の片付けは `write_atomic` が持ちます。
+        // 片付けられなかった一時ファイルは `sweep` が 5 分後に消します。
         let temp = self
             .dir
             .join(format!("{id}.{}.tmp", crypto::random_token()));
-        write_private(&temp, body.as_bytes())?;
-        if let Err(e) = rename_with_retry(&temp, &path) {
-            // 置き換えられなかった一時ファイルを残さない。
-            // 残しても `sweep` が 5 分後に片付けますが、ここで消せるなら消します。
-            if let Err(cleanup) = std::fs::remove_file(&temp) {
-                tracing::warn!("一時ファイルを片付けられませんでした: {cleanup}");
-            }
-            return Err(Error::Io(e));
-        }
+        write_atomic(&temp, &path, body.as_bytes(), Access::Private)?;
         self.maybe_sweep();
         Ok(())
     }
@@ -474,13 +511,10 @@ impl SessionStore for FileStore {
         // 期限切れは延命しない。`needs_touch` だけを見ていたころは、
         // 残り 0 秒が「半分を切った」に当たり、満額の寿命を与え直していた。
         // `MemoryStore::touch` には最初からこの確認がある。
-        if stored.expires_at <= now() {
+        if stored.expires_at <= now_seconds_u64() {
             return Ok(());
         }
-        if !needs_touch(stored.expires_at, self.lifetime_secs) {
-            return Ok(());
-        }
-        self.write(id, &stored.data)
+        self.extend(id, &stored)
     }
 
     fn destroy_for_user(&self, user_id: &str) -> Result<usize> {
@@ -497,7 +531,7 @@ impl SessionStore for FileStore {
     /// 書けなくても `destroy_*` は続けます（印は保険なので）。
     ///
     /// **`write` と同じく、別名に書いてから `rename` で置き換えます。**
-    /// `write_private` は `truncate` で開くので、直に書くと中身が 0 バイトの
+    /// 直に書くと、`truncate` で開いてから書き終えるまで中身が 0 バイトの
     /// 瞬間ができます。その瞬間に `revoked_at` が読むと「切られていない」と
     /// 答え、切ったはずのセッションが保存されてしまいます。
     fn mark_revoked(&self, user_id: &str, except: Option<&str>) {
@@ -519,14 +553,9 @@ impl SessionStore for FileStore {
         );
         let name = Self::revoked_name(user_id);
         let temp = dir.join(format!("{name}.{}.tmp", crypto::random_token()));
-        if let Err(e) = write_private(&temp, body.as_bytes()) {
+        // 失敗したときの一時ファイルは `write_atomic` が片付けます。
+        if let Err(e) = write_atomic(&temp, &dir.join(&name), body.as_bytes(), Access::Private) {
             tracing::warn!("セッションを切った印を書けませんでした: {e}");
-            return;
-        }
-        if let Err(e) = rename_with_retry(&temp, &dir.join(&name)) {
-            tracing::warn!("切った印を置き換えられませんでした: {e}");
-            // 置き換えられなかった一時ファイルを残さない。
-            let _ = std::fs::remove_file(&temp);
         }
     }
 
@@ -538,7 +567,8 @@ impl SessionStore for FileStore {
         if !except.is_empty() && except == session_id {
             return None;
         }
-        Some(at)
+        // 古い印は無視する。ファイルは掃除が消すまで残るので、ここで見ます。
+        mark_is_fresh(at).then_some(at)
     }
 }
 
@@ -547,38 +577,8 @@ impl SessionStore for FileStore {
 /// 毎リクエスト書くと、GET の画面を開くたびにファイルを置き換えることになります。
 /// 半分を境にすれば、書く回数は多くても期限の半分に1回で済みます。
 fn needs_touch(expires_at: u64, lifetime_secs: u64) -> bool {
-    let remaining = expires_at.saturating_sub(now());
+    let remaining = expires_at.saturating_sub(now_seconds_u64());
     remaining <= lifetime_secs / 2
-}
-
-/// 所有者だけが読み書きできるファイルとして書く。
-///
-/// セッションのファイルには認証 ID と、検査に落ちた入力（`flash_input`）が入ります。
-/// `std::fs::write` は Unix で 0644 になり、同じホストの他の利用者から読めてしまいます。
-///
-/// Windows では何もしません（`ops.rs` の `restrict` と同じ考え方で、既定の継承に任せます）。
-#[cfg(unix)]
-fn write_private(path: &Path, body: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `mode` は**作るときだけ**効きます。前のバージョンが 0644 で作ったファイルが
-    // 残っている場合もあるので、開いたあとに念のため付け直します。
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(body)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, body: &[u8]) -> Result<()> {
-    std::fs::write(path, body)?;
-    Ok(())
 }
 
 /// 置き場所のディレクトリを、所有者だけが入れるようにする（Unix のみ）。
@@ -598,7 +598,7 @@ fn restrict_dir(_dir: &Path) {}
 /// プロセスのメモリに置く。**テスト専用です。**
 ///
 /// プロセスをまたげないので、本番では使えません
-/// （[340_方針_本番運用] のとおり、本番は複数のプロセスで動かします）。
+/// （本番はプロセスを 2 つ以上動かすことがあります。`docs/deployment.md`）。
 pub struct MemoryStore {
     entries: Mutex<BTreeMap<String, (u64, Data)>>,
     lifetime_secs: u64,
@@ -610,11 +610,6 @@ pub struct MemoryStore {
     /// 書き込みの回数。期限切れをまとめて落とす間隔を決めるのに使う。
     writes: std::sync::atomic::AtomicU64,
 }
-
-/// `MemoryStore` / `MemoryCache` が、書き込みの何回に 1 回、期限切れをまとめて落とすか。
-///
-/// 読んだ鍵しか消さない作りだと、二度と読まれない鍵が増え続けます。
-pub(crate) const MEMORY_GC_EVERY: u64 = 100;
 
 impl MemoryStore {
     /// 放っておいて消えるまでの秒数を決めて作る。
@@ -629,7 +624,7 @@ impl MemoryStore {
 
     /// 期限切れの組をまとめて落とす（テストと `write` から呼ぶ）。
     fn collect_expired(entries: &mut BTreeMap<String, (u64, Data)>) {
-        let cutoff = now();
+        let cutoff = now_seconds_u64();
         entries.retain(|_, (expires_at, _)| *expires_at > cutoff);
     }
 }
@@ -644,7 +639,7 @@ impl SessionStore for MemoryStore {
     fn read(&self, id: &str) -> Result<Option<Data>> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         match entries.get(id) {
-            Some((expires_at, _)) if *expires_at <= now() => {
+            Some((expires_at, _)) if *expires_at <= now_seconds_u64() => {
                 entries.remove(id);
                 Ok(None)
             }
@@ -663,7 +658,10 @@ impl SessionStore for MemoryStore {
         }
         entries.insert(
             id.to_string(),
-            (now().saturating_add(self.lifetime_secs), data.clone()),
+            (
+                now_seconds_u64().saturating_add(self.lifetime_secs),
+                data.clone(),
+            ),
         );
         Ok(())
     }
@@ -674,15 +672,31 @@ impl SessionStore for MemoryStore {
         Ok(())
     }
 
+    /// 錠を 1 回だけ取って、中身を返し、期限も延ばす。
+    fn read_and_touch(&self, id: &str) -> Result<Option<Data>> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((expires_at, data)) = entries.get_mut(id) else {
+            return Ok(None);
+        };
+        if *expires_at <= now_seconds_u64() {
+            entries.remove(id);
+            return Ok(None);
+        }
+        if needs_touch(*expires_at, self.lifetime_secs) {
+            *expires_at = now_seconds_u64().saturating_add(self.lifetime_secs);
+        }
+        Ok(Some(data.clone()))
+    }
+
     fn touch(&self, id: &str) -> Result<()> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let Some((expires_at, _)) = entries.get_mut(id) else {
             return Ok(());
         };
-        if *expires_at <= now() || !needs_touch(*expires_at, self.lifetime_secs) {
+        if *expires_at <= now_seconds_u64() || !needs_touch(*expires_at, self.lifetime_secs) {
             return Ok(());
         }
-        *expires_at = now().saturating_add(self.lifetime_secs);
+        *expires_at = now_seconds_u64().saturating_add(self.lifetime_secs);
         Ok(())
     }
 
@@ -710,7 +724,9 @@ impl SessionStore for MemoryStore {
         if except.as_deref() == Some(session_id) {
             return None;
         }
-        Some(*at)
+        // 古い印は無視する（`FileStore` と同じ扱い）。`mark_revoked` が落とすのは
+        // 次に誰かを切ったときなので、それまで残っている印をここで見ます。
+        mark_is_fresh(*at).then_some(*at)
     }
 }
 
@@ -738,14 +754,6 @@ impl MemoryStore {
 struct Stored {
     expires_at: u64,
     data: Data,
-}
-
-/// 1970 年からの秒数。
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// 期限切れのセッションを消す（`session:gc` から呼びます）。**全部見ます。**
@@ -801,7 +809,7 @@ fn sweep_limited(dir: &Path, max: Option<usize>) -> Result<usize> {
         let expired = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<Stored>(&raw).ok())
-            .map(|stored| stored.expires_at <= now())
+            .map(|stored| stored.expires_at <= now_seconds_u64())
             // 読めないファイルも捨てる。
             .unwrap_or(true);
         if expired && std::fs::remove_file(&path).is_ok() {
@@ -842,6 +850,7 @@ fn sweep_revoked_marks(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     fn data(pairs: &[(&str, &str)]) -> Data {
         pairs
@@ -1177,13 +1186,13 @@ mod tests {
 
         // 残り 10 秒の形に差し替える。
         let stored = Stored {
-            expires_at: now() + 10,
+            expires_at: now_seconds_u64() + 10,
             data: data(&[("a", "1")]),
         };
         std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
         store.touch("abc").unwrap();
         let after = expires_of(&dir, "abc");
-        assert!(after > now() + 50, "期限が延びている");
+        assert!(after > now_seconds_u64() + 50, "期限が延びている");
         // 中身は変えない。
         assert_eq!(store.read("abc").unwrap(), Some(data(&[("a", "1")])));
 
@@ -1201,14 +1210,14 @@ mod tests {
         let dir = temp_dir("touch-expired");
         let store = FileStore::new(&dir, 60);
         let stored = Stored {
-            expires_at: now().saturating_sub(10),
+            expires_at: now_seconds_u64().saturating_sub(10),
             data: data(&[("a", "1")]),
         };
         std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
 
         store.touch("abc").unwrap();
         assert!(
-            expires_of(&dir, "abc") <= now(),
+            expires_of(&dir, "abc") <= now_seconds_u64(),
             "期限は延びない: {}",
             expires_of(&dir, "abc")
         );
@@ -1217,7 +1226,8 @@ mod tests {
         // メモリの置き場所も同じ（こちらには最初から確認があった）。
         let store = MemoryStore::new(60);
         store.write("abc", &data(&[("a", "1")])).unwrap();
-        store.entries.lock().unwrap().get_mut("abc").unwrap().0 = now().saturating_sub(10);
+        store.entries.lock().unwrap().get_mut("abc").unwrap().0 =
+            now_seconds_u64().saturating_sub(10);
         store.touch("abc").unwrap();
         assert!(store.read("abc").unwrap().is_none());
 
@@ -1238,10 +1248,10 @@ mod tests {
         );
 
         // 残り 10 秒にする。
-        store.entries.lock().unwrap().get_mut("abc").unwrap().0 = now() + 10;
+        store.entries.lock().unwrap().get_mut("abc").unwrap().0 = now_seconds_u64() + 10;
         store.touch("abc").unwrap();
         assert!(
-            store.entries.lock().unwrap().get("abc").unwrap().0 > now() + 50,
+            store.entries.lock().unwrap().get("abc").unwrap().0 > now_seconds_u64() + 50,
             "期限が延びている"
         );
         assert_eq!(store.read("abc").unwrap(), Some(data(&[("a", "1")])));
@@ -1314,7 +1324,7 @@ mod tests {
 
             assert_eq!(store.destroy_for_user_except("7", "aaa").unwrap(), 1);
             let at = store.revoked_at("7", "bbb").expect("切った印がある");
-            assert!(at >= now() as i64 - 1);
+            assert!(at >= now_seconds_u64() as i64 - 1);
             assert!(
                 store.revoked_at("7", "aaa").is_none(),
                 "残したセッションには印が効かない"
@@ -1372,7 +1382,7 @@ mod tests {
 
     #[test]
     fn 切った印は空に見えない() {
-        // `write_private` を直に使っていたころは `truncate` で開くので、
+        // 直に書いていたころは `truncate` で開くので、
         // 中身が 0 バイトの瞬間があった。その瞬間に `revoked_at` が読むと
         // 「切られていない」と答え、切ったはずのセッションが保存される。
         let dir = temp_dir("revoke-atomic");
@@ -1420,7 +1430,7 @@ mod tests {
         // `store.write` は抽選つきなので、ここではファイルを直に置く。
         let dir = temp_dir("sweep-max");
         let stored = Stored {
-            expires_at: now().saturating_sub(10),
+            expires_at: now_seconds_u64().saturating_sub(10),
             data: data(&[("a", "1")]),
         };
         let body = serde_json::to_string(&stored).unwrap();
@@ -1444,27 +1454,214 @@ mod tests {
     }
 
     #[test]
-    fn やり直すのは使用中の失敗だけ() {
-        use std::io::{Error as IoError, ErrorKind};
-
-        // 待てば変わるかもしれない失敗。
-        assert!(is_busy_error(&IoError::from(ErrorKind::PermissionDenied)));
-        // 待っても変わらない失敗。やり直すと 5 回 × 10ms ぶん遅れるだけ。
-        for kind in [
-            ErrorKind::NotFound,
-            ErrorKind::InvalidInput,
-            ErrorKind::Unsupported,
-            ErrorKind::AlreadyExists,
-            ErrorKind::WriteZero,
-        ] {
-            assert!(!is_busy_error(&IoError::from(kind)), "{kind:?}");
-        }
-        // Windows の共有違反は番号で見分ける。
-        #[cfg(windows)]
+    fn 古い印は効かない() {
+        // 読むときに古さを見ていなかったころは、掃除が走るまで
+        // （メモリでは次に誰かを切るまで）印が効き続けた。
+        let now_ms = crate::support::time::now_millis();
+        let old = now_ms - i64::try_from(REVOKED_MARK_SECS * 1000).unwrap() - 1_000;
+        assert!(!mark_is_fresh(old), "1 時間より古い");
+        assert!(mark_is_fresh(now_ms), "いま付けた印は効く");
         assert!(
-            is_busy_error(&IoError::from_raw_os_error(32)),
-            "共有違反はやり直す"
+            mark_is_fresh(now_ms + 5_000),
+            "時計が戻っても効くほうに倒す"
         );
+
+        // ファイル。印のファイルを古い時刻で直に置く。
+        let dir = temp_dir("revoke-stale");
+        let store = FileStore::new(&dir, 60);
+        std::fs::create_dir_all(dir.join(REVOKED_DIR)).unwrap();
+        std::fs::write(store.revoked_path_of("7"), format!("{old}\n")).unwrap();
+        assert!(store.revoked_at("7", "aaa").is_none(), "古い印は無視する");
+        store.mark_revoked("7", None);
+        assert!(store.revoked_at("7", "aaa").is_some(), "新しい印は効く");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // メモリ。
+        let store = MemoryStore::new(60);
+        store
+            .revoked
+            .lock()
+            .unwrap()
+            .insert("7".to_string(), (old, None));
+        assert!(store.revoked_at("7", "aaa").is_none(), "古い印は無視する");
+        store.mark_revoked("7", None);
+        assert!(store.revoked_at("7", "aaa").is_some(), "新しい印は効く");
+    }
+
+    #[test]
+    fn ファイルは一度読むだけで期限も延ばす() {
+        let dir = temp_dir("read-touch-file");
+        let store = FileStore::new(&dir, 60);
+        store.write("abc", &data(&[("a", "1")])).unwrap();
+
+        // 書いた直後は残り 60 秒。読めるが、まだ延ばさない。
+        let before = expires_of(&dir, "abc");
+        assert_eq!(
+            store.read_and_touch("abc").unwrap(),
+            Some(data(&[("a", "1")]))
+        );
+        assert_eq!(expires_of(&dir, "abc"), before, "まだ延ばさない");
+
+        // 残り 10 秒の形に差し替えると、読むついでに延びる。中身は変えない。
+        let stored = Stored {
+            expires_at: now_seconds_u64() + 10,
+            data: data(&[("a", "1")]),
+        };
+        std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
+        assert_eq!(
+            store.read_and_touch("abc").unwrap(),
+            Some(data(&[("a", "1")]))
+        );
+        assert!(
+            expires_of(&dir, "abc") > now_seconds_u64() + 50,
+            "期限が延びている"
+        );
+
+        // 期限切れは延命せず、`read` と同じく消して `None`。
+        let stored = Stored {
+            expires_at: now_seconds_u64().saturating_sub(10),
+            data: data(&[("a", "1")]),
+        };
+        std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
+        assert!(store.read_and_touch("abc").unwrap().is_none());
+        assert!(!dir.join("abc").exists(), "期限切れのファイルは消す");
+
+        // 無い ID は `None`。新しいファイルも作らない。
+        assert!(store.read_and_touch("missing").unwrap().is_none());
+        assert!(!dir.join("missing").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn メモリも一度読むだけで期限を延ばす() {
+        let store = MemoryStore::new(60);
+        store.write("abc", &data(&[("a", "1")])).unwrap();
+
+        let before = store.entries.lock().unwrap().get("abc").unwrap().0;
+        assert_eq!(
+            store.read_and_touch("abc").unwrap(),
+            Some(data(&[("a", "1")]))
+        );
+        assert_eq!(
+            store.entries.lock().unwrap().get("abc").unwrap().0,
+            before,
+            "まだ延ばさない"
+        );
+
+        store.entries.lock().unwrap().get_mut("abc").unwrap().0 = now_seconds_u64() + 10;
+        assert!(store.read_and_touch("abc").unwrap().is_some());
+        assert!(
+            store.entries.lock().unwrap().get("abc").unwrap().0 > now_seconds_u64() + 50,
+            "期限が延びている"
+        );
+
+        // 期限切れは延命せず、消して `None`。
+        store.entries.lock().unwrap().get_mut("abc").unwrap().0 =
+            now_seconds_u64().saturating_sub(10);
+        assert!(store.read_and_touch("abc").unwrap().is_none());
+        assert!(store.entries.lock().unwrap().get("abc").is_none());
+        assert!(store.read_and_touch("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn 既定の読むついでは読んでから延ばす() {
+        // 自分で作った置き場所は、足したメソッドを書かなくても今までどおり動く
+        // （`read` のあとに `touch`。`touch` の既定は読んで書き直す）。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counting {
+            reads: AtomicUsize,
+            writes: AtomicUsize,
+            fail_write: bool,
+        }
+        impl SessionStore for Counting {
+            fn read(&self, id: &str) -> Result<Option<Data>> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok((id == "abc").then(|| data(&[("a", "1")])))
+            }
+            fn write(&self, _id: &str, _data: &Data) -> Result<()> {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                if self.fail_write {
+                    return Err(Error::msg("書けない"));
+                }
+                Ok(())
+            }
+            fn destroy(&self, _id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Counting::default();
+        assert_eq!(
+            store.read_and_touch("abc").unwrap(),
+            Some(data(&[("a", "1")]))
+        );
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1, "延ばしている");
+
+        // 無い ID では延ばさない。
+        assert!(store.read_and_touch("missing").unwrap().is_none());
+        assert_eq!(store.writes.load(Ordering::Relaxed), 1);
+
+        // 延ばせなくても、読めた中身は返す（警告だけ）。
+        let store = Counting {
+            fail_write: true,
+            ..Counting::default()
+        };
+        assert_eq!(
+            store.read_and_touch("abc").unwrap(),
+            Some(data(&[("a", "1")]))
+        );
+    }
+
+    #[test]
+    fn 切られた後は期限を延ばさない() {
+        // 「読む → 書く」のあいだに切られると、消したはずのセッションを
+        // 書き戻す。書く直前に印を見て、切られていれば書かない。
+        let dir = temp_dir("touch-revoked");
+        let store = FileStore::new(&dir, 60);
+        let logged_in = data(&[
+            (crate::auth::AUTH_ID_KEY, "7"),
+            (crate::auth::AUTH_AT_KEY, "1000"),
+        ]);
+        let stored = Stored {
+            expires_at: now_seconds_u64() + 10,
+            data: logged_in.clone(),
+        };
+        let body = serde_json::to_string(&stored).unwrap();
+        std::fs::write(dir.join("abc"), &body).unwrap();
+        let before = expires_of(&dir, "abc");
+
+        // 印だけ付ける（ファイルを消す直前の状態）。
+        store.mark_revoked("7", None);
+        assert_eq!(store.read_and_touch("abc").unwrap(), Some(logged_in));
+        assert_eq!(expires_of(&dir, "abc"), before, "書き戻さない");
+        store.touch("abc").unwrap();
+        assert_eq!(expires_of(&dir, "abc"), before, "`touch` も書き戻さない");
+
+        // 印の除外に当たる ID（切った本人）は延ばす。
+        store.mark_revoked("7", Some("abc"));
+        store.touch("abc").unwrap();
+        assert!(
+            expires_of(&dir, "abc") > now_seconds_u64() + 50,
+            "本人は延ばす"
+        );
+
+        // ログインしていない中身は印と関係ない。
+        std::fs::write(
+            dir.join("anon"),
+            serde_json::to_string(&Stored {
+                expires_at: now_seconds_u64() + 10,
+                data: data(&[("cart", "1")]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        store.touch("anon").unwrap();
+        assert!(expires_of(&dir, "anon") > now_seconds_u64() + 50);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

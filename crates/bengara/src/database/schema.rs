@@ -328,6 +328,9 @@ impl Blueprint {
     ///   `create table` が成功して、名前が空の親を指す表が残ります。
     /// - `Schema::table`（alter）の中の `id()`。`add column` に自動採番の主キーは
     ///   書けないので、どのドライバでも必ず失敗します。
+    /// - `Schema::table`（alter）の中の列の `.primary()`。`add column .. primary key` は
+    ///   SQLite では必ず、MySQL と PostgreSQL では主キーが既にあると失敗します。
+    ///   表の `primary(&[..])` が SQL を出さないのに、こちらだけ出していました。
     fn collect_errors(&mut self) -> Vec<String> {
         let table = self.table.clone();
         let alter = self.mode == Mode::Alter;
@@ -347,15 +350,23 @@ impl Blueprint {
 
         if alter {
             self.columns.retain(|column| {
-                if column.kind != ColumnType::Id {
-                    return true;
+                if column.kind == ColumnType::Id {
+                    errors.push(format!(
+                        "{table}.{} に id() を使っています。alter table add column では\
+                         自動採番の主キーを足せません。表を作り直してください",
+                        column.name
+                    ));
+                    return false;
                 }
-                errors.push(format!(
-                    "{table}.{} に id() を使っています。alter table add column では\
-                     自動採番の主キーを足せません。表を作り直してください",
-                    column.name
-                ));
-                false
+                if column.primary {
+                    errors.push(format!(
+                        "{table}.{} に primary() を使っています。alter table add column では\
+                         主キーを足せません。表を作り直してください",
+                        column.name
+                    ));
+                    return false;
+                }
+                true
             });
         }
 
@@ -480,16 +491,22 @@ impl Blueprint {
         let mut out = Vec::new();
         for column in &self.columns {
             if column.index {
-                out.push((vec![column.name.clone()], false));
+                push_target(&mut out, vec![column.name.clone()], false);
             }
-            // 列に付けた unique は、作るときは列の指定に入れている。
-            // 表を変えるときだけ、後から索引として足す。
-            if column.unique && self.mode == Mode::Alter {
-                out.push((vec![column.name.clone()], true));
+            // 列に付けた unique も、名前付きの索引（`{表}_{列}_unique`）として足す。
+            // 以前は作るときだけ列の指定（`unique`）に入れていたので、名前を
+            // データベースが決めていました。`drop_index_named(表, "表_列_unique")` が
+            // SQLite と PostgreSQL では黙って空振りし、MySQL ではエラーになっていました。
+            //
+            // 自動採番の主キーに付けた unique は無視します（`column_sql` が警告を出します）。
+            if column.unique && column.kind != ColumnType::Id {
+                push_target(&mut out, vec![column.name.clone()], true);
             }
         }
         for index in &self.indexes {
-            out.push((index.columns.clone(), index.unique));
+            // `t.string("email").unique()` と `t.unique(&["email"])` を両方書くと、
+            // 同じ名前の索引を 2 回作ろうとして落ちます。同じものは 1 つにします。
+            push_target(&mut out, index.columns.clone(), index.unique);
         }
         out
     }
@@ -626,10 +643,9 @@ impl Blueprint {
             sql.push_str(" default ");
             sql.push_str(&default_sql(driver, &column.name, default));
         }
-        // 作るときの unique は、列の指定として書く。
-        if column.unique && self.mode != Mode::Alter {
-            sql.push_str(" unique");
-        }
+        // `unique` はここには書きません。名前付きの索引として別に出します
+        // （`index_targets`）。列の指定に入れると名前をデータベースが決めるので、
+        // 後から名前で落とせなくなります。
         sql
     }
 
@@ -707,6 +723,9 @@ impl ColumnDefinition<'_> {
     }
 
     /// 重なりを禁じる。
+    ///
+    /// `{表}_{列}_unique` という名前の一意索引になります（Laravel と同じ名前）。
+    /// 落とすときは [`Schema::drop_unique`] を使います。
     pub fn unique(mut self) -> Self {
         self.column().unique = true;
         self
@@ -718,7 +737,9 @@ impl ColumnDefinition<'_> {
         self
     }
 
-    /// 主キーにする。
+    /// 主キーにする。表を作るとき（`Schema::create`）だけ使えます。
+    ///
+    /// `Schema::table`（alter）の中では**実行の前のエラー**になります。
     pub fn primary(mut self) -> Self {
         self.column().primary = true;
         self
@@ -730,6 +751,14 @@ impl ColumnDefinition<'_> {
     /// SQL には出ないので、説明はマイグレーションのコメントとして残ります。
     pub fn comment(self, _text: &str) -> Self {
         self
+    }
+}
+
+/// 索引として足すものを 1 つ加える。同じ列の並び・同じ種類のものは重ねません。
+fn push_target(out: &mut Vec<(Vec<String>, bool)>, columns: Vec<String>, unique: bool) {
+    let target = (columns, unique);
+    if !out.contains(&target) {
+        out.push(target);
     }
 }
 
@@ -826,7 +855,7 @@ impl Schema {
     /// 外部キーは SQLite では足せません（`alter table` に `add constraint` がない）。
     /// 主キーはどのデータベースでも足せません。どちらも組み立てのときに警告を出します。
     ///
-    /// `id()` はここでは使えません。どのデータベースでも必ず失敗するので、
+    /// `id()` と列の `.primary()` はここでは使えません。実行すれば失敗するので、
     /// 警告ではなく**実行の前のエラー**にします。
     pub fn table(&mut self, table: &str, build: impl FnOnce(&mut Blueprint)) {
         self.run(table, Mode::Alter, build);
@@ -889,15 +918,35 @@ impl Schema {
     /// | PostgreSQL | `drop index if exists "名前"`                     |
     /// | MySQL      | ``alter table `表` drop index `名前` ``          |
     ///
-    /// 次の 2 つのときは名前が合いません。[`Schema::drop_index_named`] を使ってください。
+    /// `unique()` で作った索引は、名前の末尾が `_index` ではなく `_unique` です。
+    /// [`Schema::drop_unique`] を使ってください。
     ///
-    /// - `unique()` で作った索引。名前の末尾が `_index` ではなく `_unique` になります。
+    /// 次のときは名前が合いません。[`Schema::drop_index_named`] を使ってください。
+    ///
     /// - 同じ `create` の中に、同じ名前になる別の列の並びがあったとき
     ///   （`index(&["b_c"])` と `index(&["b", "c"])` など）。名前の後ろにハッシュが
     ///   付くので、落とすときだけでは同じ名前を作れません。
     pub fn drop_index(&mut self, table: &str, columns: &[&str]) {
         let columns: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
         let name = constraint_name_for(table, &columns, index_suffix(false), |_| false);
+        self.drop_index_named(table, &name);
+    }
+
+    /// 一意索引を落とす（Laravel の `dropUnique`）。
+    ///
+    /// 名前は列の並びから組み立てます。`unique()` と同じ規則（`{表}_{列}_unique`）なので、
+    /// `t.string("email").unique()` や `t.unique(&["email"])` で作ったものを
+    /// `drop_unique("users", &["email"])` で落とせます。
+    ///
+    /// 出す SQL は [`Schema::drop_index`] と同じ形です。名前にハッシュが付く場合の
+    /// 注意も同じです。
+    ///
+    /// **列の `unique()` を名前付きの索引にする前に作った表には効きません。**
+    /// その頃の名前はデータベースが決めています（PostgreSQL は `{表}_{列}_key`、
+    /// MySQL は列の名前）。[`Schema::drop_index_named`] か [`Schema::raw`] で落としてください。
+    pub fn drop_unique(&mut self, table: &str, columns: &[&str]) {
+        let columns: Vec<String> = columns.iter().map(|c| (*c).to_string()).collect();
+        let name = constraint_name_for(table, &columns, index_suffix(true), |_| false);
         self.drop_index_named(table, &name);
     }
 
@@ -1179,16 +1228,197 @@ mod tests {
             t.index(&["name", "email"]);
         });
         let sql = schema.to_sql();
-        assert_eq!(sql.len(), 3);
-        assert!(sql[0].contains("\"email\" varchar(255) not null unique"));
+        assert_eq!(sql.len(), 4, "{sql:?}");
+        // 列の unique は列の指定に書かない。名前付きの索引として別の文にする。
+        assert!(
+            sql[0].contains("\"email\" varchar(255) not null,"),
+            "{}",
+            sql[0]
+        );
+        assert!(!sql[0].contains("unique"), "{}", sql[0]);
         assert_eq!(
             sql[1],
-            "create index \"users_name_index\" on \"users\" (\"name\")"
+            "create unique index \"users_email_unique\" on \"users\" (\"email\")"
         );
         assert_eq!(
             sql[2],
+            "create index \"users_name_index\" on \"users\" (\"name\")"
+        );
+        assert_eq!(
+            sql[3],
             "create index \"users_name_email_index\" on \"users\" (\"name\", \"email\")"
         );
+    }
+
+    #[test]
+    fn 列の_unique_はどのドライバでも名前付きの索引になる() {
+        // 以前は `create table` の列の指定に `unique` と書いていた。
+        // 名前をデータベースが決めるので、`drop_index_named("users", "users_email_unique")`
+        // が SQLite と PostgreSQL では黙って空振りし、MySQL ではエラーになっていた。
+        let expected = [
+            (
+                Driver::Sqlite,
+                r#"create unique index "users_email_unique" on "users" ("email")"#,
+            ),
+            (
+                Driver::Postgres,
+                r#"create unique index "users_email_unique" on "users" ("email")"#,
+            ),
+        ];
+        for (driver, want) in expected {
+            let mut schema = Schema::new(driver);
+            schema.create("users", |t| {
+                t.id();
+                t.string("email").unique();
+            });
+            let sql = schema.to_sql();
+            assert_eq!(sql.len(), 2, "{driver}: {sql:?}");
+            assert!(!sql[0].contains("unique"), "{driver}: {}", sql[0]);
+            assert_eq!(sql[1], want, "{driver}");
+        }
+
+        // MySQL は表の定義の中に、名前を付けて書く。
+        let mut schema = Schema::new(Driver::MySql);
+        schema.create("users", |t| {
+            t.id();
+            t.string("email").unique();
+        });
+        let sql = schema.to_sql();
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(
+            sql[0].contains(
+                "`email` varchar(255) not null, unique key `users_email_unique` (`email`)"
+            ),
+            "{}",
+            sql[0]
+        );
+    }
+
+    #[test]
+    fn 列の_unique_で作った索引を_drop_unique_で落とせる() {
+        // 作るときの名前と落とすときの名前が同じであること。3 つのドライバで見る。
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            let mut dropped = Schema::new(driver);
+            dropped.drop_unique("users", &["email"]);
+            let mut named = Schema::new(driver);
+            named.drop_index_named("users", "users_email_unique");
+            assert_eq!(dropped.to_sql(), named.to_sql(), "{driver}");
+
+            let mut created = Schema::new(driver);
+            created.create("users", |t| {
+                t.string("email").unique();
+            });
+            let all = created.to_sql().join("\n");
+            assert!(all.contains("users_email_unique"), "{driver}: {all}");
+        }
+
+        let mut schema = Schema::new(Driver::MySql);
+        schema.drop_unique("users", &["email"]);
+        assert_eq!(
+            schema.to_sql(),
+            ["alter table `users` drop index `users_email_unique`".to_string()]
+        );
+        // PostgreSQL は一意「制約」ではなく一意「索引」なので、`drop index` で落とせる。
+        let mut schema = Schema::new(Driver::Postgres);
+        schema.drop_unique("users", &["email"]);
+        assert_eq!(
+            schema.to_sql(),
+            [r#"drop index if exists "users_email_unique""#.to_string()]
+        );
+        // 複数の列。
+        let mut schema = sqlite();
+        schema.drop_unique("comments", &["post_id", "author"]);
+        assert_eq!(
+            schema.to_sql(),
+            [r#"drop index if exists "comments_post_id_author_unique""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn 長い列の_unique_も作るときと落とすときで同じ名前になる() {
+        // 63 バイトを超えるとハッシュ付きの名前になる。alter のときと同じ規則。
+        let long = "c".repeat(60);
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            let mut created = Schema::new(driver);
+            created.create("users", |t| {
+                t.string(&long).unique();
+            });
+            let mut altered = Schema::new(driver);
+            altered.table("users", |t| {
+                t.string(&long).nullable().unique();
+            });
+            let mut dropped = Schema::new(driver);
+            dropped.drop_unique("users", &[long.as_str()]);
+
+            let quote = if driver == Driver::MySql { '`' } else { '"' };
+            // 落とす文の最後の引用の中身が索引の名前。
+            let gone = dropped.to_sql()[0]
+                .rsplit(quote)
+                .nth(1)
+                .unwrap()
+                .to_string();
+            assert!(gone.len() <= MAX_NAME_LEN, "{driver}: {gone}");
+            assert!(
+                created.to_sql().join("\n").contains(&gone),
+                "{driver}: {gone} が create に無い"
+            );
+            assert!(
+                altered.to_sql().join("\n").contains(&gone),
+                "{driver}: {gone} が alter に無い"
+            );
+        }
+    }
+
+    #[test]
+    fn 列と表の両方に同じ_unique_を書いても索引は_1_つ() {
+        // 同じ名前の `create unique index` が 2 本出ると、2 本目が必ず落ちる。
+        let mut schema = sqlite();
+        schema.create("users", |t| {
+            t.string("email").unique();
+            t.unique(&["email"]);
+        });
+        let sql = schema.to_sql();
+        assert_eq!(sql.len(), 2, "{sql:?}");
+    }
+
+    #[test]
+    fn 自動採番の主キーに付けた_unique_は索引にしない() {
+        // 警告を出して無視する（主キーなので、もともと重ならない）。
+        let mut schema = sqlite();
+        schema.create("posts", |t| {
+            t.id().unique();
+        });
+        assert_eq!(schema.to_sql().len(), 1, "{:?}", schema.to_sql());
+    }
+
+    #[test]
+    fn 表を変えるときの列の_primary_は実行の前のエラーになる() {
+        // 以前は `add column .. primary key` をそのまま出していた。
+        // SQLite は必ず、MySQL と PostgreSQL は主キーが既にあると実行のときに失敗する。
+        // 表の `primary(&[..])` は SQL を出さないので、扱いがそろっていなかった。
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            let mut schema = Schema::new(driver);
+            schema.table("posts", |t| {
+                t.uuid("key").primary();
+                t.string("slug").nullable();
+            });
+            let sql = schema.to_sql();
+            assert_eq!(sql.len(), 1, "{driver}: {sql:?}");
+            assert!(sql[0].contains("slug"), "{driver}: {sql:?}");
+            assert!(!sql[0].contains("primary key"), "{driver}: {sql:?}");
+            let errors = schema.take_errors();
+            assert_eq!(errors.len(), 1, "{driver}: {errors:?}");
+            assert!(errors[0].contains("posts.key"), "{}", errors[0]);
+            assert!(errors[0].contains("primary()"), "{}", errors[0]);
+        }
+
+        // 表を作るときの `.primary()` は今までどおり。
+        let mut schema = sqlite();
+        schema.create("posts", |t| {
+            t.uuid("key").primary();
+        });
+        assert!(schema.take_errors().is_empty());
+        assert!(schema.to_sql()[0].contains("primary key"));
     }
 
     #[test]

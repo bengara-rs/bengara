@@ -98,12 +98,27 @@ pub(crate) fn number_placeholders(driver: Driver, sql: &str, already: usize) -> 
 
 /// 大文字小文字と空白をそろえた演算子が `is` / `is not` か。
 ///
-/// `NULL` と比べるときに `is $1` と書かないために使います
-/// （PostgreSQL は `is` の右にプレースホルダを置けません）。
+/// `NULL` 以外の値を `is` / `is not` と組にした書き方を断るために使います
+/// （PostgreSQL と MySQL は `is` の右にプレースホルダを置けません）。
 pub(crate) fn is_null_operator(operator: &str) -> Option<bool> {
     match normalize_operator(operator).as_str() {
         "is" => Some(false),
         "is not" => Some(true),
+        _ => None,
+    }
+}
+
+/// `NULL` と比べたときに `is null` / `is not null` に読み替える演算子か。
+///
+/// 返すのは「否定か」です。`=` と `is` は `Some(false)`、`!=` `<>` `is not` は
+/// `Some(true)`、それ以外は `None`。
+///
+/// `"c" = NULL` は SQL では真にも偽にもならず、必ず 0 件になります。
+/// Laravel の `where('c', null)` と同じく、`is null` に読み替えます。
+pub(crate) fn null_comparison(operator: &str) -> Option<bool> {
+    match normalize_operator(operator).as_str() {
+        "=" | "is" => Some(false),
+        "!=" | "<>" | "is not" => Some(true),
         _ => None,
     }
 }
@@ -153,16 +168,27 @@ fn is_expression(name: &str) -> bool {
 /// `*` も式も通しません。式を書きたいときは `order_by_raw` / `having_raw` /
 /// `where_raw` を使ってください。
 ///
+/// **`.` で区切った各部は空にできません。** `.`・`a..b`・`users.` は断ります。
+/// 通すと `"".""` や `"users".""` のような壊れた SQL になります。
+///
 /// **呼ぶのはクエリビルダ（`query.rs`）だけです。** `schema.rs` は呼んでいません。
 /// 移行の表名・列名は [`quote`] を通るだけで、検査されません。
 pub(crate) fn is_plain_identifier(name: &str) -> bool {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    trimmed
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    name.trim().split('.').all(is_identifier_part)
+}
+
+/// 表名を付けていない、ただの列名か。英数字と `_` だけを許します。
+///
+/// 書き込み（`insert` / `update` / `increment`）の列名に使います。
+/// `set "posts"."title" = ?` は SQLite と PostgreSQL で SQL エラーになるためです
+/// （通るのは MySQL だけ）。
+pub(crate) fn is_bare_identifier(name: &str) -> bool {
+    is_identifier_part(name.trim())
+}
+
+/// `.` で区切った1つぶん。空は通しません。
+fn is_identifier_part(part: &str) -> bool {
+    !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// 列と列を比べるのに使える演算子の一覧。これ以外は受け付けません。
@@ -266,6 +292,39 @@ fn quote_part(driver: Driver, part: &str) -> String {
     match driver {
         Driver::MySql => format!("`{}`", part.replace('`', "``")),
         _ => format!("\"{}\"", part.replace('"', "\"\"")),
+    }
+}
+
+/// 表を空にする文（MySQL と PostgreSQL）。
+///
+/// **PostgreSQL だけ `restart identity` を付けます。** PostgreSQL の `truncate` は
+/// 既定で採番を続けます（`continue identity`）。MySQL の `truncate` は
+/// `auto_increment` を必ず戻すので、何も足しません。
+///
+/// SQLite に `truncate` は無いので、ここは通りません（`QueryBuilder::truncate` が
+/// `delete` と採番の戻しに分けます）。
+pub(crate) fn truncate(driver: Driver, table: &str) -> String {
+    let quoted = quote(driver, table);
+    match driver {
+        Driver::Postgres => format!("truncate table {quoted} restart identity"),
+        _ => format!("truncate table {quoted}"),
+    }
+}
+
+/// 1つの文に束縛できる値の数の上限。
+///
+/// | ドライバ   | 上限   | 決まる所                                           |
+/// |------------|--------|----------------------------------------------------|
+/// | SQLite     | 32,766 | `SQLITE_MAX_VARIABLE_NUMBER` の既定（3.32.0 以降） |
+/// | MySQL      | 65,535 | プリペアドステートメントの値の数が 16 ビット       |
+/// | PostgreSQL | 65,535 | Bind メッセージの値の数が 16 ビット                |
+///
+/// 超えるとドライバのエラーになり、文から原因が読み取りにくいので、
+/// クエリビルダが投げる前に確かめます。
+pub(crate) fn max_bindings(driver: Driver) -> usize {
+    match driver {
+        Driver::Sqlite => 32_766,
+        Driver::MySql | Driver::Postgres => 65_535,
     }
 }
 
@@ -376,6 +435,46 @@ mod tests {
     }
 
     #[test]
+    fn 点で区切った部分が空の名前は断る() {
+        // 通すと `"".""` のような壊れた SQL になる。
+        for broken in [".", "..", "a..b", "users.", ".id", " . ", "a.b."] {
+            assert!(!is_plain_identifier(broken), "{broken}");
+        }
+        // 区切りが正しければ、何段でも通る。前後の空白は今までどおり見ない。
+        assert!(is_plain_identifier("main.users.id"));
+        assert!(is_plain_identifier(" users.id "));
+    }
+
+    #[test]
+    fn 書き込みの列名は表名を付けられない() {
+        assert!(is_bare_identifier("title"));
+        assert!(is_bare_identifier("views_2"));
+        assert!(is_bare_identifier("題名"));
+        assert!(!is_bare_identifier("posts.title"));
+        assert!(!is_bare_identifier(""));
+        assert!(!is_bare_identifier("."));
+        assert!(!is_bare_identifier("title = 0, body"));
+    }
+
+    #[test]
+    fn 表を空にする文はpostgresだけ採番を戻す指定を付ける() {
+        // PostgreSQL の truncate は、既定では採番を続ける。
+        assert_eq!(
+            truncate(Driver::Postgres, "posts"),
+            "truncate table \"posts\" restart identity"
+        );
+        // MySQL の truncate は必ず戻すので、何も足さない。
+        assert_eq!(truncate(Driver::MySql, "posts"), "truncate table `posts`");
+    }
+
+    #[test]
+    fn 束縛できる値の数の上限はドライバで違う() {
+        assert_eq!(max_bindings(Driver::Sqlite), 32_766);
+        assert_eq!(max_bindings(Driver::MySql), 65_535);
+        assert_eq!(max_bindings(Driver::Postgres), 65_535);
+    }
+
+    #[test]
     fn 日本語の列名も通る() {
         // 英数字を Unicode で見るので、`where_` と `order_by` で結果がそろう。
         assert!(is_plain_identifier("題名"));
@@ -447,6 +546,18 @@ mod tests {
         assert_eq!(is_null_operator("is"), Some(false));
         assert_eq!(is_null_operator(" IS  NOT "), Some(true));
         assert_eq!(is_null_operator("="), None);
+    }
+
+    #[test]
+    fn nullと比べたときに読み替える演算子が分かる() {
+        assert_eq!(null_comparison("="), Some(false));
+        assert_eq!(null_comparison(" IS "), Some(false));
+        assert_eq!(null_comparison("!="), Some(true));
+        assert_eq!(null_comparison("<>"), Some(true));
+        assert_eq!(null_comparison("is  not"), Some(true));
+        // 大小や like は読み替えない。
+        assert_eq!(null_comparison(">"), None);
+        assert_eq!(null_comparison("like"), None);
     }
 
     #[test]

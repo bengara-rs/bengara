@@ -427,6 +427,9 @@ async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backend>> {
 /// 機能フラグが無いドライバを使おうとしたときのエラー。
 ///
 /// 付けるフラグの名前をそのまま出します。MySQL は `mariadb` でも同じものが入ります。
+///
+/// 「features に足す」と言います。以前は `features = ["mysql"]` と 1 行まるごと
+/// 見せていたので、そのまま写すと `sqlite` や `mail` など他のフラグが落ちました。
 fn unavailable(driver: Driver) -> Error {
     let (flag, note) = match driver {
         Driver::Sqlite => ("sqlite", ""),
@@ -438,8 +441,46 @@ fn unavailable(driver: Driver) -> Error {
         Driver::Postgres => ("postgres", ""),
     };
     Error::msg(format!(
-        "{driver} につなぐには Cargo.toml を \
-         `bengara = {{ version = \"0.1\", features = [\"{flag}\"] }}` にしてください{note}"
+        "{driver} につなぐには Cargo.toml の bengara の features に \
+         \"{flag}\" を足してください{note}"
+    ))
+}
+
+/// つなぎ先をエラー文に出すときの書き方。
+///
+/// `url` でつないでいるときは「`url`（`DB_URL`）の指定」とだけ出します。
+///
+/// - host / port / database は使っていないので、出すと**実際と違うつなぎ先**を
+///   見せることになります（以前は既定値の `127.0.0.1:3306` が出ていました）。
+/// - `url` そのものは出しません。パスワードが入っているためです。
+#[cfg(feature = "database")]
+pub(crate) fn connection_target(settings: &ConnectionConfig) -> String {
+    if !settings.url.is_empty() {
+        return format!("接続 `{}`: url（DB_URL）の指定", settings.name);
+    }
+    match settings.driver {
+        Driver::Sqlite => format!("接続 `{}`: {}", settings.name, settings.database),
+        _ => format!(
+            "接続 `{}`: {}:{} / {}",
+            settings.name, settings.host, settings.port, settings.database
+        ),
+    }
+}
+
+/// 接続文字列が読めなかったときのエラー。
+///
+/// **接続文字列そのものは出しません。** 資格情報が標準エラーとログに残るためです。
+/// 書式が壊れるのは、パスワードに `@` や `#` をそのまま書いたときが典型なので、
+/// 出すとパスワードがそのまま見えます。出すのは接続の名前と原因だけです。
+///
+/// sqlx の原因の文（`cause`）に URL の全体は入りません（0.8.6 の `options/parse.rs` で
+/// 確かめました）。入るのは「invalid port number」のような理由か、クエリの値 1 つまでです。
+#[cfg(feature = "database")]
+pub(crate) fn unreadable_url(settings: &ConnectionConfig, cause: impl std::fmt::Display) -> Error {
+    Error::msg(format!(
+        "接続 `{}` の接続文字列（url / DB_URL）が読めません: {cause}\n\
+         パスワードに `@` `#` `/` `?` などの記号があるときは、パーセントエンコードしてください",
+        settings.name
     ))
 }
 
@@ -823,6 +864,58 @@ mod tests {
         assert_eq!(replace_url_database("postgres://h", "t"), "postgres://h/t");
         // 接続文字列でないものは触らない。
         assert_eq!(replace_url_database("not a url", "t"), "not a url");
+    }
+
+    #[test]
+    fn 機能フラグが無いときは_features_に足すと言う() {
+        // 以前は `features = ["mysql"]` と 1 行まるごと見せていた。
+        // そのまま写すと `sqlite` など他のフラグが落ちる。
+        for (driver, flag) in [
+            (Driver::Sqlite, "\"sqlite\""),
+            (Driver::MySql, "\"mysql\""),
+            (Driver::Postgres, "\"postgres\""),
+        ] {
+            let message = unavailable(driver).to_string();
+            assert!(message.contains(flag), "{message}");
+            assert!(message.contains("足してください"), "{message}");
+            assert!(!message.contains("features = ["), "{message}");
+        }
+        assert!(unavailable(Driver::MySql).to_string().contains("mariadb"));
+    }
+
+    #[cfg(feature = "database")]
+    #[test]
+    fn つなぎ先の文に接続文字列を出さない() {
+        let secret = "mysql://app:p@ss#word@db.example.com:3307/shop";
+
+        // url でつないでいるときは、既定値の host:port を出さない。url も出さない。
+        let with_url = ConnectionConfig::mysql("mysql", "bengara").url(secret);
+        let target = connection_target(&with_url);
+        assert!(target.contains("`mysql`"), "{target}");
+        assert!(target.contains("DB_URL"), "{target}");
+        assert!(!target.contains("127.0.0.1"), "{target}");
+        assert!(!target.contains("3306"), "{target}");
+        assert!(!target.contains("p@ss"), "{target}");
+        assert!(!target.contains("db.example.com"), "{target}");
+
+        // url が空なら、実際に使う host / port / database を出す。
+        let plain = ConnectionConfig::postgres("pgsql", "shop").host("db.internal");
+        assert_eq!(
+            connection_target(&plain),
+            "接続 `pgsql`: db.internal:5432 / shop"
+        );
+        let file = ConnectionConfig::sqlite("sqlite", "database/database.sqlite");
+        assert_eq!(
+            connection_target(&file),
+            "接続 `sqlite`: database/database.sqlite"
+        );
+
+        // 読めないときの文にも、接続文字列は出さない。
+        let message = unreadable_url(&with_url, "invalid port number").to_string();
+        assert!(message.contains("`mysql`"), "{message}");
+        assert!(message.contains("invalid port number"), "{message}");
+        assert!(!message.contains("p@ss"), "{message}");
+        assert!(!message.contains("db.example.com"), "{message}");
     }
 
     #[test]

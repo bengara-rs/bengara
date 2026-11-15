@@ -1,6 +1,12 @@
 # 認可（誰に何を許すか）
 
 「この記事を直してよいのは持ち主だけ」のような判定のしかたです。
+このページで分かることは 3 つです。
+
+- 判定（ポリシー）の書き方と置き場所
+- コントローラでの使い方と、止まる順番
+- テストのしかた
+
 ログインしているかどうかは [authentication.md](authentication.md) にあります。
 
 ## 考え方
@@ -48,8 +54,9 @@ impl PostPolicy {
 }
 ```
 
-`app/Policies/` は自動で取り込まれます。登録は要りません。
-呼ぶときは `crate::app::policies::PostPolicy` です。
+- `app/Policies/` は自動で取り込まれます。登録は要りません。
+- 呼ぶときは `crate::app::policies::PostPolicy` です。
+- **判定は同期の関数にします。** DB を引きたくなったら、呼ぶ側で先に引いてから渡します。
 
 ## 使う
 
@@ -60,40 +67,38 @@ use bengara::prelude::*;
 use crate::app::models::{Post, User};
 use crate::app::policies::PostPolicy;
 
-pub async fn update(req: Request) -> Result<Response> {
+pub async fn destroy(req: Request) -> Result<Response> {
     let user = req.auth().user_or_fail::<User>().await?;   // 401
-    let mut post = req.model::<Post>("post").await?;       // 404
-    authorize(PostPolicy::update(&user, &post))?;          // 403
+    let post = req.model::<Post>("post").await?;           // 404
+    authorize(PostPolicy::delete(&user, &post))?;          // 403
 
-    let input = req.validate(&[("title", "required|max:50")])?;
-    post.title = input.get("title").to_string();
-    post.save().await?;
-
-    json(&bengara::serde_json::json!({ "id": post.id }))
+    let removed = post.delete().await?;
+    json(&json!({ "deleted": removed }))
 }
 ```
 
-3 行で「ログイン必須」「対象を読む」「持ち主か確かめる」が並びます。
+3 行で「ログイン必須」「対象を読む」「許されているか確かめる」が並びます。
 **止まる順番も、この並びのとおり**です（401 → 404 → 403）。
-
-### 呼ばないと効きません
-
-**ポリシーはただの関数です。呼び忘れても、何も起きません。**
-コンパイルも通り、警告も出ません。**書いただけでは誰も止まりません。**
-
-- 書いたポリシーの一覧と、呼んでいる場所を突き合わせてください。
-  とくに `view` のような「見てよいか」は呼び忘れやすく、
-  忘れると**下書きが誰にでも見えます。**
-- 見せてはいけないものを隠すときは、403 ではなく **404** を返す形も考えてください。
-  403 だと「そこに何かある」ことが伝わります。
 
 | 関数                               | すること                                           |
 |------------------------------------|----------------------------------------------------|
-| `authorize(bool)`                  | 偽なら 403。本文は「この操作は許可されていません」 |
+| `authorize(bool)`                  | 偽なら 403。文は「この操作は許可されていません」   |
 | `authorize_with(bool, メッセージ)` | 403 のメッセージを指定する                         |
 
-403 を HTML で返すか JSON で返すかは、リクエストの `Accept` で決まります
+403 を HTML で返すか JSON で返すかは、リクエストを見て決まります
 （[requests-and-responses.md](requests-and-responses.md)）。
+
+### 呼ばないと効かない
+
+**ポリシーはただの関数です。呼び忘れても、何も起きません。**
+コンパイルも通り、警告も出ません。書いただけでは誰も止まりません。
+
+- 書いたポリシーの一覧と、呼んでいる場所を突き合わせます。
+- `view` のような「見てよいか」は、特に呼び忘れやすいです。
+  忘れると**下書きが誰にでも見えます。**
+- ルートを足したら、対になるテスト（他人で 403）も足します。
+- 見せてはいけないものを隠すときは、403 ではなく **404** を返す形も考えます。
+  403 だと「そこに何かある」ことが伝わります。
 
 ## 止めずに分岐する
 
@@ -102,7 +107,7 @@ pub async fn update(req: Request) -> Result<Response> {
 ```rust
 let can_edit = PostPolicy::update(&user, &post);
 
-json(&bengara::serde_json::json!({
+json(&json!({
     "title": post.title,
     "can_edit": can_edit,     // 画面でボタンを出すかどうか
 }))
@@ -117,7 +122,6 @@ json(&bengara::serde_json::json!({
 async fn 他人の記事は直せない() {
     let _db = refresh_database().await;
 
-    // パスワードの変換は時間がかかるので、非同期版を使う
     let mut alice = User::register("アリス", "alice@example.com", "password123").await.unwrap();
     alice.save().await.unwrap();
     let mut bob = User::register("ボブ", "bob@example.com", "password123").await.unwrap();
@@ -131,7 +135,9 @@ async fn 他人の記事は直せない() {
 }
 ```
 
-画面ごしに確かめるなら、ログインしてから叩きます（[testing.md](testing.md)）。
+`User::register` と `Post::draft` は、アプリ側のモデルに書いた関数です。
+
+画面ごしに確かめるなら、ログインしてから送ります（[testing.md](testing.md)）。
 
 ```rust
 // ボブでログインする（Cookie が client に残ります）
@@ -152,7 +158,7 @@ client
 ```
 
 **`VerifyCsrfToken` を掛けているルートでは、トークンを忘れると 419 になります。**
-403 を確かめたいのに 419 が返るときは、ここを疑ってください（[session.md](session.md)）。
+403 を確かめたいのに 419 が返るときは、ここを疑います（[session.md](session.md)）。
 
 ## Laravel との違い
 
@@ -163,15 +169,6 @@ client
 | `$this->authorize('update', $post)`                     | `authorize(PostPolicy::update(&user, &post))?` |
 | ポリシーの自動対応づけ                                  | ありません。呼ぶ側で関数を指定します           |
 | `@can('update', $post)`                                 | 真偽値なので `if` で分けます                   |
-
-## 気をつけること
-
-| こと                     | 内容                                                           |
-|--------------------------|----------------------------------------------------------------|
-| 判定は同期の関数にする   | DB を引きたくなったら、呼ぶ側で先に引いてから渡してください    |
-| 先にログインを確かめる   | `user_or_fail()` を先に呼べば 401 が先に返ります               |
-| 判定を忘れないようにする | ルートを足したら、対になるテスト（他人で 403）も足してください |
-| 読む側の判定も呼ぶ       | `view` を呼び忘れると、下書きが誰にでも見えます                 |
 
 ## 関連
 

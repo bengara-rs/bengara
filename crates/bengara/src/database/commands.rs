@@ -49,6 +49,8 @@ pub(crate) fn run(
     seeders: &'static [Seeder],
 ) -> Result<()> {
     let options = Options::parse(args)?;
+    // つなぐ前に見る。効かない指定のまま表を消したり流したりしないため。
+    options.check(command)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -82,12 +84,65 @@ const DESTRUCTIVE: &[&str] = &[
     "db:wipe",
 ];
 
+/// コマンドごとに使える指定。ここに無い指定はエラーにします。
+///
+/// 以前はどのコマンドも全部の指定を受けていました。`migrate:refresh --step=2` は
+/// 黙って全部を巻き戻し、`migrate:status --seed` は何も流さずに成功していました。
+/// 「知らない指定はエラー」と同じ考え方で、**効かない指定もエラー**にします。
+///
+/// `migrate` と `db:seed` の `--force` は受けるだけです。Laravel では本番で流すのに
+/// 要る指定で、デプロイの手順に `migrate --force` と書く習慣があります。bengara は
+/// 足すだけのコマンドを本番でも止めないので、付けても付けなくても同じ動きです。
+const ALLOWED: &[(&str, &[&str])] = &[
+    ("migrate", &["--database", "--seed", "--class", "--force"]),
+    ("migrate:status", &["--database"]),
+    ("migrate:rollback", &["--database", "--step", "--force"]),
+    ("migrate:reset", &["--database", "--force"]),
+    (
+        "migrate:refresh",
+        &["--database", "--seed", "--class", "--force"],
+    ),
+    (
+        "migrate:fresh",
+        &["--database", "--seed", "--class", "--force"],
+    ),
+    ("db:seed", &["--database", "--class", "--force"]),
+    ("db:wipe", &["--database", "--force"]),
+    ("migrate:unlock", &["--database"]),
+];
+
+/// シーダーを、既定ではない接続に向けて流そうとしていたら止める。
+///
+/// シーダーの中の `DB::table(..)` は**既定の接続**に書きます。`--database=` は
+/// マイグレーションの流し先しか変えません。以前は
+/// `migrate:fresh --database=pgsql --seed` が pgsql を作り直したうえで、
+/// シーダーを黙って既定のデータベースに流していました。
+///
+/// つなぐ前・表を消す前に呼びます。
+fn guard_seed_connection(command: &str, options: &Options, default: &str) -> Result<()> {
+    let seeds = command == "db:seed" || options.seed;
+    let Some(name) = options.database.as_deref() else {
+        return Ok(());
+    };
+    if !seeds || name == default {
+        return Ok(());
+    }
+    Err(Error::msg(format!(
+        "シーダーは既定の接続（`{default}`）に書きます。`--database={name}` には流せません。\n\
+         シーダーの中の `DB::table(..)` が既定の接続を使うためです。\
+         このまま流すと、`{name}` ではなく `{default}` に書いてしまいます。\n\
+         `{name}` に流すときは、`DB_CONNECTION={name}` にして `--database=` を外してください。\
+         何も実行していません。"
+    )))
+}
+
 async fn execute(
     command: &str,
     options: &Options,
     migrations: &[Migration],
     seeders: &[Seeder],
 ) -> Result<()> {
+    guard_seed_connection(command, options, &super::database_config().default)?;
     let migrator = Migrator::connect(options.database.as_deref()).await?;
 
     // 複数のプロセスから同時に流さない（決定記録 #067）。
@@ -169,9 +224,9 @@ async fn run_one(
         "db:wipe" => {
             report("消した", migrator.drop_all_tables().await?);
         }
-        "migrate:unlock" => match migrator.lock_holder().await? {
+        // 札の表が無ければ作らない（読むだけで終わる）。
+        "migrate:unlock" => match migrator.clear_lock().await? {
             Some((owner, at)) => {
-                migrator.unlock().await?;
                 println!("札を外しました（{owner} が {at} に取ったもの）。");
             }
             None => println!("札は誰も持っていません。"),
@@ -242,6 +297,10 @@ struct Options {
     force: bool,
     /// 流すシーダーの名前（`--class=`）。
     class: Option<String>,
+    /// 実際に書かれた指定の名前（`--step` など）。コマンドごとの確かめに使います。
+    ///
+    /// 値だけでは「書かれたか」が分かりません（`--step=1` は既定値と同じ）。
+    given: Vec<&'static str>,
 }
 
 impl Options {
@@ -253,16 +312,21 @@ impl Options {
         for arg in args {
             if let Some(value) = arg.strip_prefix("--database=") {
                 options.database = Some(value.to_string());
+                options.given.push("--database");
             } else if let Some(value) = arg.strip_prefix("--class=") {
                 options.class = Some(value.to_string());
+                options.given.push("--class");
             } else if let Some(value) = arg.strip_prefix("--step=") {
                 options.step = value.parse().map_err(|_| {
                     Error::msg(format!("--step の値 `{value}` が数値ではありません"))
                 })?;
+                options.given.push("--step");
             } else if arg == "--seed" {
                 options.seed = true;
+                options.given.push("--seed");
             } else if arg == "--force" {
                 options.force = true;
+                options.given.push("--force");
             } else {
                 return Err(Error::msg(format!(
                     "`{arg}` は受け付けません（使えるのは --database= / --class= / --step= / --seed / --force）"
@@ -270,6 +334,30 @@ impl Options {
             }
         }
         Ok(options)
+    }
+
+    /// このコマンドで使えない指定が書かれていないか確かめる。
+    ///
+    /// 一覧（[`ALLOWED`]）に無いコマンドは見ません。あとで
+    /// 「DB のコマンドではありません」のエラーになります。
+    fn check(&self, command: &str) -> Result<()> {
+        let Some((_, allowed)) = ALLOWED.iter().find(|(name, _)| *name == command) else {
+            return Ok(());
+        };
+        if let Some(flag) = self.given.iter().find(|flag| !allowed.contains(*flag)) {
+            return Err(Error::msg(format!(
+                "`{command}` に {flag} は使えません（使えるのは {}）。何も実行していません",
+                allowed.join(" / ")
+            )));
+        }
+        // `db:seed` 以外は、`--seed` が無いとシーダーを流しません。
+        if self.class.is_some() && !self.seed && command != "db:seed" {
+            return Err(Error::msg(format!(
+                "`{command}` の --class は --seed と一緒に使います\
+                 （--seed が無いとシーダーを流さないので効きません）。何も実行していません"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -302,12 +390,104 @@ mod tests {
         assert_eq!(options.step, 3);
         assert_eq!(options.database.as_deref(), Some("other"));
         assert!(options.force);
+        // 書かれた指定の名前を、書かれた順に覚える。
+        assert_eq!(options.given, ["--seed", "--step", "--database", "--force"]);
     }
 
     #[test]
     fn 知らない指定は断る() {
         assert!(Options::parse(&args(&["--nope"])).is_err());
         assert!(Options::parse(&args(&["--step=x"])).is_err());
+    }
+
+    #[test]
+    fn コマンドごとに使えない指定は断る() {
+        let check =
+            |command: &str, list: &[&str]| Options::parse(&args(list)).unwrap().check(command);
+
+        // 以前は黙って受けていた組み合わせ。
+        let error = check("migrate:refresh", &["--step=2"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("migrate:refresh"), "{error}");
+        assert!(error.contains("--step"), "{error}");
+        assert!(check("migrate:status", &["--seed"]).is_err());
+        assert!(check("migrate:status", &["--force"]).is_err());
+        assert!(
+            check("migrate", &["--step=1"]).is_err(),
+            "既定値と同じでも断る"
+        );
+        assert!(check("migrate:reset", &["--seed"]).is_err());
+        assert!(check("db:wipe", &["--class=X"]).is_err());
+        assert!(check("db:seed", &["--seed"]).is_err());
+        assert!(check("migrate:unlock", &["--force"]).is_err());
+
+        // `--class` は、シーダーを流すときだけ。
+        let error = check("migrate", &["--class=UserSeeder"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--seed"), "{error}");
+        assert!(check("migrate:fresh", &["--class=UserSeeder"]).is_err());
+        check("migrate", &["--seed", "--class=UserSeeder"]).expect("--seed と一緒なら通る");
+        check("db:seed", &["--class=UserSeeder"]).expect("db:seed は --seed が要らない");
+
+        // 使える組み合わせ。
+        check("migrate", &[]).unwrap();
+        check("migrate", &["--database=pgsql", "--seed", "--force"]).unwrap();
+        check("migrate:status", &["--database=pgsql"]).unwrap();
+        check("migrate:rollback", &["--step=2", "--force"]).unwrap();
+        check("migrate:refresh", &["--seed", "--force"]).unwrap();
+        check("migrate:fresh", &["--seed", "--class=X", "--force"]).unwrap();
+        check("db:wipe", &["--force", "--database=pgsql"]).unwrap();
+        check("migrate:unlock", &["--database=pgsql"]).unwrap();
+    }
+
+    #[test]
+    fn 使える指定の表は全部のコマンドを持つ() {
+        // コマンドを足したときに表を足し忘れると、そのコマンドだけ何でも受ける。
+        for (command, _) in COMMANDS {
+            assert!(
+                ALLOWED.iter().any(|(name, _)| name == command),
+                "{command} が ALLOWED に無い"
+            );
+        }
+        assert_eq!(ALLOWED.len(), COMMANDS.len());
+        // 中身が消えるコマンドは、本番で通すための --force を受ける。
+        for command in DESTRUCTIVE {
+            let (_, allowed) = ALLOWED.iter().find(|(name, _)| name == command).unwrap();
+            assert!(allowed.contains(&"--force"), "{command}");
+        }
+    }
+
+    #[test]
+    fn 既定ではない接続にシーダーは流さない() {
+        let parse = |list: &[&str]| Options::parse(&args(list)).unwrap();
+
+        // 以前は pgsql を作り直して、シーダーを黙って既定の接続に流していた。
+        let error = guard_seed_connection(
+            "migrate:fresh",
+            &parse(&["--database=pgsql", "--seed"]),
+            "sqlite",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pgsql"), "{error}");
+        assert!(error.contains("sqlite"), "{error}");
+        assert!(error.contains("DB_CONNECTION=pgsql"), "{error}");
+        assert!(guard_seed_connection("db:seed", &parse(&["--database=pgsql"]), "sqlite").is_err());
+        assert!(guard_seed_connection(
+            "migrate",
+            &parse(&["--database=pgsql", "--seed"]),
+            "sqlite"
+        )
+        .is_err());
+
+        // 既定の接続を名指ししたとき、--database が無いとき、シーダーを流さないときは通る。
+        guard_seed_connection("db:seed", &parse(&["--database=sqlite"]), "sqlite").unwrap();
+        guard_seed_connection("db:seed", &parse(&[]), "sqlite").unwrap();
+        guard_seed_connection("migrate", &parse(&["--seed"]), "sqlite").unwrap();
+        guard_seed_connection("migrate", &parse(&["--database=pgsql"]), "sqlite").unwrap();
+        guard_seed_connection("migrate:fresh", &parse(&["--database=pgsql"]), "sqlite").unwrap();
     }
 
     #[test]

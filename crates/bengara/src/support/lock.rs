@@ -4,7 +4,8 @@
 //! どの OS でも同じように動く排他にするためです（同じプロセスのスレッド同士にも効きます）。
 //!
 //! キャッシュの `increment`（`cache/store.rs`）と、`schedule:run`
-//! （`schedule.rs`）の両方から使います。
+//! （`schedule.rs`）の両方から使います。回数の制限（`http/throttle.rs`）は
+//! プロセスの中で数えるので、ここを通りません。
 
 use std::path::{Path, PathBuf};
 
@@ -18,8 +19,8 @@ const LOCK_STALE_SECS: u64 = 10;
 /// **合計の待ち時間は [`LOCK_STALE_SECS`] より長くします。** 短いと、錠を
 /// 置いたプロセスが落ちた直後に来た側が、古い錠と見なされる前に諦めます。
 /// 1200 × 10ms = 12 秒で、10 秒より 2 秒長いので必ず外す側まで待てます。
-/// 回数制限（throttle）は `Cache::increment` を使うので、ここで諦めると
-/// 落ちた 1 プロセスのせいで同じ鍵への要求が失敗し続けます。
+/// ここで先に諦めると、落ちた 1 プロセスのせいで、同じ鍵への
+/// `Cache::increment` が古い錠を外せないまま失敗し続けます。
 const LOCK_TRIES: u32 = 1200;
 const LOCK_SLEEP_MS: u64 = 10;
 

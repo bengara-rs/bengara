@@ -23,6 +23,12 @@ pub struct Request {
     /// `Arc<str>` なのは、1リクエストごとに `String` を作らないためです
     /// （ルートの一覧は起動時に固定され、名前はそこから借りるだけです）。
     route_name: Option<Arc<str>>,
+    /// 当たったルートの登録パス（`/posts/{id}` の形）。当たらなければ `None`。
+    ///
+    /// 回数の制限（`Throttle`）が、名前の無いルートの鍵にします。
+    /// 届いたパス（`path`）は相手が形を変えられます（末尾の `/`、パス引数の値）。
+    /// 登録パスは起動時に固定したものなので、相手には変えられません。
+    route_path: Option<Arc<str>>,
     /// ルートに当たったか。
     ///
     /// 共通のミドルウェアは 404 や 405 にも掛かるので、
@@ -57,6 +63,7 @@ impl Request {
             params: Vec::new(),
             body: Vec::new(),
             route_name: None,
+            route_path: None,
             matched: false,
             session: None,
             remote_addr: None,
@@ -94,6 +101,18 @@ impl Request {
 
     pub(crate) fn set_route_name(&mut self, name: Option<Arc<str>>) {
         self.route_name = name;
+    }
+
+    /// 当たったルートの登録パスを載せる。`Application` が照合の直後に呼びます。
+    pub(crate) fn set_route_path(&mut self, path: Option<Arc<str>>) {
+        self.route_path = path;
+    }
+
+    /// 当たったルートの登録パス（`/posts/{id}` の形）。当たらなければ `None`。
+    ///
+    /// 公開していません。使うのは `Throttle` の鍵だけです。
+    pub(crate) fn route_path(&self) -> Option<&str> {
+        self.route_path.as_deref()
     }
 
     /// ルートに当たったことを覚える。`Application` が照合の直後に呼びます。
@@ -155,13 +174,13 @@ impl Request {
                 "パス引数 `{{{param}}}` がありません。ルートの書き方を確かめてください"
             ))
         })?;
-        // パス引数は文字列で届く。整数の主キーなら整数に直して束縛する
+        // パス引数は文字列で届く。整数の主キーなら `find` が整数に直して束縛する
         // （PostgreSQL は `bigint = text` を断る。`Model::key_value` を参照）。
-        T::query()
-            .where_(T::PRIMARY_KEY, T::key_value(value))
-            .first()
-            .await?
-            .ok_or_else(|| Error::http(404, format!("{} が見つかりません", T::TABLE)))
+        //
+        // **整数に読めない値（`/posts/abc`）は、問い合わせずに 404 です。**
+        // `where_(主キー, ..).first()` と書いていたころは、当たらないと分かっている
+        // `where 1 = 0` を 1 往復ぶん流していました。
+        T::find_or_fail(value).await
     }
 
     /// CSRF のトークン。フォームの `_token` に入れて返してもらいます。
@@ -214,10 +233,21 @@ impl Request {
     }
 
     /// パス引数を型に変換して取り出す。
+    ///
+    /// | 起きたこと | 結果 |
+    /// |---|---|
+    /// | 値が型に合わない（`/posts/abc` を `u32` で読む） | **404**。相手が送った URL の問題 |
+    /// | ルートにその名前の引数が無い | **500**。ルートかハンドラの書き間違い |
+    ///
+    /// 名前が無いときも 404 にしていたころは、書き間違えたハンドラが
+    /// 「ページがありません」を返すだけで、ログにも残らず気づけませんでした。
+    /// `model()` と同じ扱いにそろえてあります。
     pub fn param_as<T: std::str::FromStr>(&self, name: &str) -> Result<T> {
-        let raw = self
-            .param(name)
-            .ok_or_else(|| Error::http(404, format!("パス引数 {name} がありません")))?;
+        let raw = self.param(name).ok_or_else(|| {
+            Error::msg(format!(
+                "パス引数 `{{{name}}}` がありません。ルートの書き方を確かめてください"
+            ))
+        })?;
         raw.parse::<T>().map_err(|_| {
             Error::http(
                 404,
@@ -681,6 +711,66 @@ mod tests {
         req.set_params(vec![("post".into(), "12".into())]);
         assert_eq!(req.param_as::<i64>("post").unwrap(), 12);
         assert!(req.param_as::<i64>("missing").is_err());
+    }
+
+    /// `model()` を試すためのモデル。整数の主キー（既定）です。
+    struct Post {
+        id: i64,
+    }
+
+    impl crate::database::Model for Post {
+        const TABLE: &'static str = "posts";
+        const PRIMARY_KEY: &'static str = "id";
+        const COLUMNS: &'static [&'static str] = &["id"];
+
+        fn from_row(row: &crate::database::Row) -> Result<Self> {
+            Ok(Self { id: row.get("id")? })
+        }
+
+        fn attributes(&self) -> Vec<(&'static str, crate::database::Value)> {
+            Vec::new()
+        }
+
+        fn key(&self) -> crate::database::Value {
+            crate::database::Value::Int(self.id)
+        }
+
+        fn set_key(&mut self, _value: crate::database::Value) {}
+    }
+
+    #[tokio::test]
+    async fn 整数に読めないパス引数のmodelは問い合わせずに404になる() {
+        // 既定の接続には流れない（流れれば、つなぐところで別のエラーになる）。
+        for value in ["abc", "12abc", "1.5", "99999999999999999999999"] {
+            let mut req = Request::new("get", "/posts/x");
+            req.set_params(vec![("post".into(), value.into())]);
+            let error = req.model::<Post>("post").await.err().expect("404 になる");
+            assert_eq!(error.status(), 404, "{value}: {error}");
+            // 文は `find_or_fail` と同じ（以前の `model()` とも同じ）。
+            assert!(
+                error.to_string().contains("posts が見つかりません"),
+                "{value}: {error}"
+            );
+        }
+
+        // ルートに無い名前は、これまでどおり開発者の書き間違い（500）。
+        let req = Request::new("get", "/posts/1");
+        let error = req.model::<Post>("post").await.err().expect("断られる");
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("{post}"), "{error}");
+    }
+
+    #[test]
+    fn パス引数の名前が無ければ500で値が合わなければ404() {
+        let mut req = Request::new("get", "/posts/abc");
+        req.set_params(vec![("post".into(), "abc".into())]);
+        // 値が型に合わないのは、相手が送った URL の問題。404 のまま。
+        assert_eq!(req.param_as::<i64>("post").unwrap_err().status(), 404);
+        // ルートに無い名前は開発者の書き間違い。以前は 404 で、気づきにくかった。
+        // `model()` と同じ 500 にそろえる。
+        let error = req.param_as::<i64>("id").unwrap_err();
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("`{id}`"), "{error}");
     }
 
     #[test]

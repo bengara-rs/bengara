@@ -6,9 +6,14 @@
 //! - 停止の合図（Ctrl+C）を受けたら、**いま処理中のジョブを終えてから**止まります。
 //! - ワーカーが強制終了しても、`retry_after` 秒たてば別のワーカーが取り直します
 //!   （Laravel の `retry_after` と同じ考え方）。
+//! - 1 本のジョブは `timeout` 秒で打ち切ります（[`run_one`]）。
+//! - DB の一時的なエラーでは、すぐには終わりません。短い待ちを挟んで
+//!   数回やり直します（[`RESERVE_RETRIES`]、[`RECORD_RETRIES`]）。
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::{Job, DEFAULT_QUEUE, FAILED_TABLE, TABLE};
 use crate::database::{QueryBuilder, Row, Value, DB};
@@ -31,6 +36,11 @@ pub(crate) struct Options {
     /// **1 本のジョブにかかる最長の時間より長くしてください。** 短いと、
     /// まだ動いているジョブを別のワーカーが二重に処理します。
     pub retry_after: i64,
+    /// 1 本のジョブを待つ上限（秒）。**0 は無制限です。**
+    ///
+    /// 超えたらジョブのタスクを打ち切って、失敗として扱います。
+    /// **`retry_after` より短くしてください**（[`timeout_warning`]）。
+    pub timeout: u64,
 }
 
 impl Default for Options {
@@ -41,12 +51,45 @@ impl Default for Options {
             sleep: 1,
             once: false,
             retry_after: DEFAULT_RETRY_AFTER,
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 }
 
 /// 予約を取り直すまでの既定の秒数。Laravel の `retry_after` に当たります。
 pub(crate) const DEFAULT_RETRY_AFTER: i64 = 90;
+
+/// 1 本のジョブを待つ上限の既定（秒）。Laravel の `--timeout` と同じ 60 秒です。
+pub(crate) const DEFAULT_TIMEOUT: u64 = 60;
+
+/// 秒数を「待つ上限」にする。0 は無制限（`None`）。
+fn job_timeout(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// `--timeout` が `--retry-after` 以上のときの警告文。問題が無ければ `None`。
+///
+/// 打ち切る前に `retry_after` が来ると、**まだ動いているジョブ**を別のワーカーが
+/// 取り直して二重に動かします。Laravel が「`--timeout` は `retry_after` より
+/// 数秒短く」と言うのと同じ理由です。断らずに警告にとどめます。ワーカーが
+/// 1 つだけなら実害が無く、起動を止めるほどではないためです。
+///
+/// 無制限（0）は警告しません。利用者が選んだ値で、比べる相手がありません。
+fn timeout_warning(options: &Options) -> Option<String> {
+    if options.timeout == 0 {
+        return None;
+    }
+    let timeout = i64::try_from(options.timeout).unwrap_or(i64::MAX);
+    if timeout < options.retry_after {
+        return None;
+    }
+    Some(format!(
+        "警告: --timeout（{} 秒）が --retry-after（{} 秒）以上です。\
+         ジョブを打ち切る前に別のワーカーが同じジョブを取り直し、二重に動きます。\
+         --timeout を --retry-after より数秒短くしてください",
+        options.timeout, options.retry_after
+    ))
+}
 
 /// 失敗の回数から次に試すまでの待ち時間（秒）を決める。
 ///
@@ -385,8 +428,31 @@ fn unknown_job_message(name: &str) -> String {
     format!("`{name}` というジョブはありません（app/Jobs/ を確かめてください）")
 }
 
-/// ジョブを 1 件動かす。パニックも失敗として扱います。
-async fn run_one(jobs: &[Job], reserved: &Reserved) -> std::result::Result<(), String> {
+/// 打ち切ったときの説明文。
+fn timed_out_message(limit: Duration) -> String {
+    format!(
+        "{} 秒で終わらなかったので打ち切りました（--timeout）",
+        limit.as_secs()
+    )
+}
+
+/// ジョブを 1 件動かす。パニックと時間切れも失敗として扱います。
+///
+/// `timeout` を超えたら、ジョブのタスクを打ち切って（`abort`）失敗にします。
+/// 以前は上限が無く、固まったジョブ 1 本でワーカーが止まり続けました。
+/// `retry_after` 後に別のワーカーが同じジョブを取り直すので、二重にも動きました。
+///
+/// **止められるのは「待ち」で固まったジョブだけです。** `abort` は次の
+/// `.await` で効きます。`.await` を挟まずに CPU を回し続ける処理や、
+/// 同期の入出力で止まっている処理は打ち切れません。その間はワーカーの
+/// スレッドを 1 本ふさぎますが、ワーカー自体は次のジョブへ進みます。
+/// 打ち切ったタスクの終わりは**待ちません**（待つと、止められないジョブで
+/// ワーカーごと固まります）。
+async fn run_one(
+    jobs: &[Job],
+    reserved: &Reserved,
+    timeout: Option<Duration>,
+) -> std::result::Result<(), String> {
     let Some(job) = jobs.iter().find(|j| j.name == reserved.job) else {
         return Err(unknown_job_message(&reserved.job));
     };
@@ -394,8 +460,18 @@ async fn run_one(jobs: &[Job], reserved: &Reserved) -> std::result::Result<(), S
     let handle = job.handle;
     let payload = reserved.payload.clone();
     // パニックでワーカーを落とさない（ハンドラと同じ考え方。決定記録 #008）。
-    let task = tokio::spawn(async move { handle(payload).await });
-    match task.await {
+    let mut task = tokio::spawn(async move { handle(payload).await });
+    let joined = match timeout {
+        None => task.await,
+        Some(limit) => match tokio::time::timeout(limit, &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                task.abort();
+                return Err(timed_out_message(limit));
+            }
+        },
+    };
+    match joined {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(e) if e.is_panic() => Err("ジョブがパニックしました".to_string()),
@@ -426,31 +502,131 @@ fn back_off_after_losses(lost: &mut u32) -> bool {
 
 /// `--sleep` 秒待つ。ここで止まらないよう、細かく区切って合図を見る。
 async fn idle_sleep(sleep: u64, stop: &AtomicBool) {
-    for _ in 0..sleep.max(1) * 10 {
-        if stop.load(Ordering::Relaxed) {
-            break;
+    pause(Duration::from_secs(sleep.max(1)), stop).await;
+}
+
+/// 決めた時間だけ待つ。**停止の合図が来たら、そこで切り上げます。**
+async fn pause(wait: Duration, stop: &AtomicBool) {
+    let step = Duration::from_millis(100);
+    let mut left = wait;
+    while !left.is_zero() && !stop.load(Ordering::Relaxed) {
+        let slice = left.min(step);
+        tokio::time::sleep(slice).await;
+        left -= slice;
+    }
+}
+
+/// 取り出し（`reserve`）が続けて失敗したとき、やり直す回数。
+///
+/// 以前は DB のエラー 1 回でワーカーが終わりました。DB の再起動や、つなぎ直しの
+/// 一瞬の失敗でも止まるので、外で上げ直す仕組みが要りました（Windows では
+/// 用意しにくい）。待ちは 1・2・4・8・10 秒で、合わせて 25 秒です。
+/// それでも直らなければ、今までどおりエラーで終わります。
+const RESERVE_RETRIES: u32 = 5;
+
+/// 結果の記録（`finish` / `fail` / `give_up`）が失敗したとき、やり直す回数。
+///
+/// **取り出しより少なくします。** 待っている間も予約の時計（`retry_after`）は
+/// 進むので、長く粘ると別のワーカーが取り直します。待ちは 1・2・4 秒です。
+const RECORD_RETRIES: u32 = 3;
+
+/// やり直しの待ちの単位。テストでは短くします。
+const RETRY_UNIT: Duration = Duration::from_secs(1);
+
+/// `failures` 回目の失敗の後に待つ時間。単位の 1・2・4・8 倍、上限は 10 倍。
+fn retry_wait(failures: u32, unit: Duration) -> Duration {
+    let factor = 1u32 << failures.saturating_sub(1).min(4);
+    unit * factor.min(10)
+}
+
+/// 結果の記録を、失敗したら待ってやり直す。
+///
+/// `finish` / `fail` / `give_up` はどれも**自分の予約のままの行だけ**を触るので、
+/// 2 回流しても害がありません（1 回目が実は通っていたら、2 回目は 0 件です）。
+///
+/// 停止の合図が来ていたら待ちません。残りの回数をすぐ試して、駄目なら返します。
+async fn with_retries<T, F, Fut>(
+    what: &str,
+    stop: &AtomicBool,
+    unit: Duration,
+    mut operation: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut failures = 0u32;
+    loop {
+        let error = match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        failures += 1;
+        if failures > RECORD_RETRIES {
+            return Err(error);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        eprintln!(
+            "  {what}を記録できませんでした（やり直します {failures}/{RECORD_RETRIES}）: {error}"
+        );
+        pause(retry_wait(failures, unit), stop).await;
     }
 }
 
 /// `queue:work` の本体。止まるまでジョブを処理し続けます。
 pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) -> Result<()> {
+    run_with(jobs, options, stop, RETRY_UNIT).await
+}
+
+/// [`run`] の中身。やり直しの待ちの単位を引数で受け取ります（テストで短くするため）。
+async fn run_with(
+    jobs: &[Job],
+    options: &Options,
+    stop: Arc<AtomicBool>,
+    retry_unit: Duration,
+) -> Result<()> {
     println!(
         "キュー `{}` のジョブを処理します（Ctrl+C で終了）",
         options.queue
     );
+    if let Some(warning) = timeout_warning(options) {
+        eprintln!("{warning}");
+    }
+    let timeout = job_timeout(options.timeout);
 
     let mut processed = 0u64;
     // 続けて競り合いに負けた回数。取れたら 0 に戻します。
     let mut lost = 0u32;
+    // 続けて取り出しに失敗した回数。成功したら 0 に戻します。
+    let mut reserve_failures = 0u32;
     loop {
         if stop.load(Ordering::Relaxed) {
             println!("\n停止の合図を受けました。{processed} 件処理しました。");
             return Ok(());
         }
 
-        let reserved = match reserve(&options.queue, options.retry_after, options.tries).await? {
+        let reservation = match reserve(&options.queue, options.retry_after, options.tries).await {
+            Ok(reservation) => {
+                reserve_failures = 0;
+                reservation
+            }
+            // 一時的な DB のエラーで終わらない。待ってやり直す。
+            // 待ちの間に停止の合図が来たら、ループの先頭で普通に止まる。
+            Err(error) => {
+                reserve_failures += 1;
+                if reserve_failures > RESERVE_RETRIES {
+                    return Err(error);
+                }
+                let wait = retry_wait(reserve_failures, retry_unit);
+                eprintln!(
+                    "  ジョブを取り出せませんでした（{} 秒後にやり直します {reserve_failures}/{RESERVE_RETRIES}）: {error}",
+                    wait.as_secs()
+                );
+                pause(wait, &stop).await;
+                continue;
+            }
+        };
+
+        let reserved = match reservation {
             Reservation::Taken(reserved) => {
                 lost = 0;
                 reserved
@@ -479,7 +655,7 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
         // ファイルを置き忘れたまま `queue:retry` で戻せるよう、記録は残す。
         if !jobs.iter().any(|j| j.name == reserved.job) {
             let message = unknown_job_message(&reserved.job);
-            give_up(&reserved, &message).await?;
+            with_retries("失敗", &stop, retry_unit, || give_up(&reserved, &message)).await?;
             eprintln!(
                 "  {} #{} 失敗（諦めました）: {message}",
                 reserved.job, reserved.id
@@ -491,9 +667,19 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
         }
 
         let started = std::time::Instant::now();
-        match run_one(jobs, &reserved).await {
+        match run_one(jobs, &reserved, timeout).await {
             Ok(()) => {
-                finish(&reserved).await?;
+                let finished = with_retries("成功", &stop, retry_unit, || finish(&reserved)).await;
+                if let Err(error) = finished {
+                    // ジョブは終わっているのに、行が残った。黙って終わると
+                    // 「なぜ 2 回動いたか」が分からないので、ここで言っておく。
+                    eprintln!(
+                        "  {} #{} は成功しましたが、キューから消せませんでした。\
+                         --retry-after（{} 秒）の後にもう 1 回動きます",
+                        reserved.job, reserved.id, options.retry_after
+                    );
+                    return Err(error);
+                }
                 processed += 1;
                 println!(
                     "  {} #{} 成功（{} ms）",
@@ -503,7 +689,10 @@ pub(crate) async fn run(jobs: &[Job], options: &Options, stop: Arc<AtomicBool>) 
                 );
             }
             Err(message) => {
-                let gave_up = fail(&reserved, options.tries, &message).await?;
+                let gave_up = with_retries("失敗", &stop, retry_unit, || {
+                    fail(&reserved, options.tries, &message)
+                })
+                .await?;
                 if gave_up {
                     eprintln!(
                         "  {} #{} 失敗（{} 回目で諦めました）: {message}",
@@ -619,6 +808,258 @@ mod tests {
         assert_eq!(options.sleep, 1);
         assert!(!options.once);
         assert_eq!(options.retry_after, 90);
+        // Laravel の `--timeout` と同じ 60 秒。`retry_after` より短い。
+        assert_eq!(options.timeout, 60);
+        assert!(timeout_warning(&options).is_none());
+    }
+
+    #[test]
+    fn timeoutがretry_after以上なら警告する() {
+        let options = |timeout, retry_after| Options {
+            timeout,
+            retry_after,
+            ..Options::default()
+        };
+        // 短ければ何も言わない。
+        assert!(timeout_warning(&options(60, 90)).is_none());
+        assert!(timeout_warning(&options(89, 90)).is_none());
+        // 同じか長いと、打ち切る前に別のワーカーが取り直す。
+        for (timeout, retry_after) in [(90, 90), (120, 90), (u64::MAX, 90)] {
+            let warning = timeout_warning(&options(timeout, retry_after)).expect("警告する");
+            assert!(warning.contains("--timeout"), "{warning}");
+            assert!(warning.contains("--retry-after"), "{warning}");
+            assert!(warning.contains("二重"), "{warning}");
+        }
+        // 0 は無制限。比べる相手が無いので言わない。
+        assert!(timeout_warning(&options(0, 90)).is_none());
+    }
+
+    #[test]
+    fn timeoutの0は無制限() {
+        assert_eq!(job_timeout(0), None);
+        assert_eq!(job_timeout(60), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn やり直しの待ちは伸びて止まる() {
+        let unit = Duration::from_secs(1);
+        let waits: Vec<u64> = (1..=6).map(|n| retry_wait(n, unit).as_secs()).collect();
+        assert_eq!(waits, vec![1, 2, 4, 8, 10, 10]);
+        // 0 回目やとても大きい回数でもあふれない。
+        assert_eq!(retry_wait(0, unit).as_secs(), 1);
+        assert_eq!(retry_wait(u32::MAX, unit).as_secs(), 10);
+        // 取り出しのやり直しは、合わせて 25 秒まで。
+        let total: u64 = (1..=RESERVE_RETRIES)
+            .map(|n| retry_wait(n, unit).as_secs())
+            .sum();
+        assert_eq!(total, 25);
+    }
+
+    /// テスト用の予約 1 件。
+    fn reserved_of(job: &str) -> Reserved {
+        Reserved {
+            id: 1,
+            job: job.into(),
+            payload: "{}".into(),
+            attempts: 0,
+            queue: DEFAULT_QUEUE.into(),
+            reserved_at: "2024-01-01 00:00:00".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn 固まったジョブは時間切れで打ち切る() {
+        use std::sync::atomic::AtomicUsize;
+
+        // 待ちの後まで進んだ回数。打ち切れていれば 0 のまま。
+        static FINISHED: AtomicUsize = AtomicUsize::new(0);
+        let jobs = [
+            Job {
+                name: "Stuck",
+                handle: |_| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        FINISHED.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                },
+            },
+            Job {
+                name: "Quick",
+                handle: |_| Box::pin(async { Ok(()) }),
+            },
+        ];
+
+        // 以前は上限が無く、ジョブが返るまでワーカーが止まり続けた。
+        let started = std::time::Instant::now();
+        let error = run_one(
+            &jobs,
+            &reserved_of("Stuck"),
+            Some(Duration::from_millis(30)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("打ち切りました"), "{error}");
+        assert!(error.contains("--timeout"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "ジョブの終わりを待たない"
+        );
+
+        // タスクは打ち切られているので、待ちの後ろは動かない。
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(
+            FINISHED.load(Ordering::SeqCst),
+            0,
+            "打ち切ったら続きは動かない"
+        );
+
+        // 上限の中で終わるジョブと、無制限は今までどおり。
+        run_one(&jobs, &reserved_of("Quick"), Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        run_one(&jobs, &reserved_of("Quick"), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 記録の失敗は数回やり直す() {
+        use std::sync::atomic::AtomicU32;
+
+        let stop = AtomicBool::new(false);
+        let unit = Duration::from_millis(1);
+
+        // 2 回失敗して 3 回目に通る。以前は 1 回目でワーカーが終わった。
+        let calls = AtomicU32::new(0);
+        let value = with_retries("成功", &stop, unit, || async {
+            if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(crate::error::Error::msg("一時的な失敗"))
+            } else {
+                Ok(7)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // 失敗し続けるなら、決めた回数で諦めて元のエラーを返す。
+        let calls = AtomicU32::new(0);
+        let error = with_retries("成功", &stop, unit, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(crate::error::Error::msg("直らない失敗"))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("直らない失敗"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1 + RECORD_RETRIES);
+    }
+
+    #[tokio::test]
+    async fn 停止の合図が来ていたら待たない() {
+        // 待ちの単位を長くしても、合図が立っていればすぐ返る。
+        let stop = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        pause(Duration::from_secs(30), &stop).await;
+        let result = with_retries("成功", &stop, Duration::from_secs(30), || async {
+            Err::<(), _>(crate::error::Error::msg("失敗"))
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5), "待たずに返る");
+
+        // 合図が無ければ、決めた時間だけ待つ。
+        let stop = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        pause(Duration::from_millis(120), &stop).await;
+        assert!(started.elapsed() >= Duration::from_millis(120));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 取り出しの失敗は数回やり直してから終わる() {
+        let _db = crate::testing::refresh_database().await;
+        // キューの表を作らない。取り出しは必ず DB のエラーになる。
+        let stop = Arc::new(AtomicBool::new(false));
+        let options = Options {
+            once: true,
+            ..Options::default()
+        };
+        let result = run_with(&[], &options, stop, Duration::from_millis(1)).await;
+        assert!(result.is_err(), "直らなければ、今までどおりエラーで終わる");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 取り出しの失敗が直れば続ける() {
+        let _db = crate::testing::refresh_database().await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let options = Options {
+            once: true,
+            ..Options::default()
+        };
+
+        // 最初は表が無くて失敗する。やり直しの間に表ができる。
+        // 以前は 1 回目のエラーでワーカーが終わっていた。
+        // 待ちの単位は 100 ミリ秒（合わせて 2.5 秒まで粘る）。
+        let worker = run_with(&[], &options, stop, Duration::from_millis(100));
+        let fix = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            表を作る().await;
+        };
+        let (result, ()) = tokio::join!(worker, fix);
+        result.expect("直ったので、エラーにならずに終わる");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 時間切れは普通の失敗と同じ流れに乗る() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        let id = 待っているジョブを入れる("Stuck").await;
+
+        let jobs = [Job {
+            name: "Stuck",
+            handle: |_| {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(())
+                })
+            },
+        }];
+        let stop = Arc::new(AtomicBool::new(false));
+        let options = Options {
+            once: true,
+            timeout: 1,
+            ..Options::default()
+        };
+        let started = std::time::Instant::now();
+        run(&jobs, &options, stop).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(30), "固まらない");
+
+        // 失敗 1 回として数え、予約を外して、次の時刻を先へ送る。
+        let row = DB::table(TABLE).find(id).await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>("attempts").unwrap(), 1);
+        assert!(row.value("reserved_at").unwrap().is_null(), "予約を外す");
+        assert!(
+            row.get::<String>("available_at").unwrap() > crate::database::now(),
+            "待ち時間を置く"
+        );
+        assert_eq!(DB::table(FAILED_TABLE).count().await.unwrap(), 0);
+
+        // 最後の 1 回が時間切れなら、理由を付けて諦める。
+        DB::table(TABLE)
+            .where_("id", id)
+            .update(&[
+                ("attempts", Value::Int(2)),
+                ("available_at", Value::Text(crate::database::now())),
+            ])
+            .await
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        run(&jobs, &options, stop).await.unwrap();
+        let failed = failed_list().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].3.contains("打ち切りました"), "{}", failed[0].3);
     }
 
     /// `reserve` の 1 文目を組み立てて SQL と値を見る。

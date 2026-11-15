@@ -287,10 +287,18 @@ pub(crate) fn normalize(path: &str) -> String {
 /// パス引数（`{post}` / `{*path}`）はそのまま残します。`%` は残すので、
 /// 符号化済みのパスを渡しても二重にはなりません。
 ///
-/// 区間を残すかどうかは「`{` を**含むか**」で見ます。頭が `{` かどうかで見ていたころは、
-/// `/file-{name}` のようにパス引数の前に固定文字がある区間が丸ごと符号化され、
-/// `/file-%7Bname%7D` として登録されていました。警告もエラーも出ず、必ず 404 でした。
-/// `{id}.json` のように後ろに固定文字がある形も、同じ規則でそのまま残ります。
+/// パス引数を含む区間は、**`{...}` の外だけ**を符号化します（`encode_outside_braces`）。
+///
+/// | 以前の見分け方 | 起きていたこと |
+/// |---|---|
+/// | 区間の頭が `{` か | `/file-{name}` が丸ごと符号化され `/file-%7Bname%7D` で登録。必ず 404 |
+/// | 区間が `{` を含むか（丸ごと素通し） | `/記事-{id}` の `記事-` が生の UTF-8 のまま登録。ブラウザからは必ず 404 |
+///
+/// どちらも警告もエラーも出ませんでした。
+///
+/// `{id}.json` のように引数の**後ろ**に固定文字がある形も、ここではそのまま残します。
+/// ただし **matchit 0.8.4 はこの形を登録できません**（`Routes::build` が起動時に
+/// パニックします。文面は `insert_error_message`）。
 fn encode_static_segments(path: &str) -> String {
     // `{` と `}` は `path_literal` に入っていないので、ここで早抜けの対象に足します。
     // 足さないと、パス引数つきのパスが必ず下の組み立てを通ります。
@@ -302,15 +310,43 @@ fn encode_static_segments(path: &str) -> String {
     }
     path.split('/')
         .map(|segment| {
-            // パス引数を含む区間は丸ごと素通し。符号化すると照合できなくなります。
             if segment.contains('{') {
-                segment.to_string()
+                encode_outside_braces(segment)
             } else {
                 super::percent::encode(segment, super::percent::path_literal)
             }
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// パス引数を含む区間の、`{...}` の**外だけ**を符号化する。
+///
+/// 中（引数の名前）は matchit が読むので触りません。符号化すると照合できなくなります。
+/// `{` と `}` そのものも残します。`{{` `}}`（matchit の逃がし方）を崩さないためです。
+/// 閉じていない `{` の後ろは中として扱い、そのまま渡します（matchit が登録を断ります）。
+fn encode_outside_braces(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut inside = false;
+    let mut utf8 = [0u8; 4];
+    for c in segment.chars() {
+        match c {
+            '{' => {
+                inside = true;
+                out.push(c);
+            }
+            '}' => {
+                inside = false;
+                out.push(c);
+            }
+            _ if inside => out.push(c),
+            _ => out.push_str(&super::percent::encode(
+                c.encode_utf8(&mut utf8),
+                super::percent::path_literal,
+            )),
+        }
+    }
+    out
 }
 
 /// 登録するパスの形にそろえる（`normalize` ＋ 固定の部分の符号化）。
@@ -348,6 +384,11 @@ pub(crate) fn match_path(path: &str) -> &str {
 pub(crate) struct Routes {
     by_method: HashMap<&'static str, matchit::Router<usize>>,
     defs: Vec<RouteDef>,
+    /// 登録パス（`/posts/{id}` の形）。`defs` と同じ並びです。
+    ///
+    /// `Arc<str>` で別に持つのは、当たるたびに `Request` へ渡すときに確保しないためです
+    /// （`RouteDef::path` は `String` なので、そのまま渡すと 1 リクエストに 1 回複製します）。
+    paths: Vec<Arc<str>>,
     names: HashMap<String, String>,
 }
 
@@ -356,6 +397,11 @@ pub(crate) enum Matched<'a> {
     /// 当たった。
     Found {
         def: &'a RouteDef,
+        /// 当たったルートの登録パス（`/posts/{id}` の形）。
+        ///
+        /// 回数の制限（`Throttle`）が鍵にします。届いたパスは `/login/` や
+        /// `/posts/2` のように相手が形を変えられますが、これは変えられません。
+        path: Arc<str>,
         params: Vec<(String, String)>,
     },
     /// パスは合うが、メソッドが違う。
@@ -369,7 +415,11 @@ impl Routes {
     ///
     /// # パニック
     ///
-    /// 同じメソッドとパスのルートが2本あるときは、起動時にパニックします。
+    /// 次のときは、起動時にパニックします。
+    ///
+    /// - 同じメソッドとパスのルートが2本ある
+    /// - パスの書き方を matchit が受け付けない（`insert_error_message` の表）
+    /// - ルート名が重なっている
     pub(crate) fn build(defs: Vec<RouteDef>) -> Self {
         let mut by_method: HashMap<&'static str, matchit::Router<usize>> = HashMap::new();
         let mut names: HashMap<String, String> = HashMap::new();
@@ -377,10 +427,7 @@ impl Routes {
         for (index, def) in defs.iter().enumerate() {
             let router = by_method.entry(def.method).or_default();
             if let Err(e) = router.insert(def.path.clone(), index) {
-                panic!(
-                    "ルートの登録に失敗しました: {} {} ({e})。同じパスが2回登録されていないか確かめてください",
-                    def.method, def.path
-                );
+                panic!("{}", insert_error_message(def.method, &def.path, &e));
             }
             if let Some(name) = &def.name {
                 if let Some(existing) = names.insert(name.to_string(), def.path.clone()) {
@@ -391,9 +438,14 @@ impl Routes {
                 }
             }
         }
+        let paths = defs
+            .iter()
+            .map(|def| Arc::from(def.path.as_str()))
+            .collect();
         Self {
             by_method,
             defs,
+            paths,
             names,
         }
     }
@@ -450,6 +502,7 @@ impl Routes {
             .collect();
         Some(Matched::Found {
             def: &self.defs[*matched.value],
+            path: self.paths[*matched.value].clone(),
             params,
         })
     }
@@ -462,6 +515,46 @@ impl Routes {
     /// 名前とパスの対応。
     pub(crate) fn names(&self) -> &HashMap<String, String> {
         &self.names
+    }
+}
+
+/// ルートを登録できなかったときの文面。原因ごとに分けます。
+///
+/// 以前はどの原因でも「同じパスが2回登録されていないか確かめてください」でした。
+/// `/posts/{id}.json` のように**書き方**が原因のときも同じ文だったので、
+/// 重なったルートを探しても見つからず、原因に辿り着けませんでした。
+///
+/// | matchit の理由 | 起きる書き方 |
+/// |---|---|
+/// | `Conflict` | 同じパス。パス引数の名前だけが違うパス（`/posts/{id}` と `/posts/{post}`） |
+/// | `InvalidParamSegment` | 引数の後ろに固定文字（`/posts/{id}.json`）。1 区間に引数が 2 つ（`/{a}-{b}`） |
+/// | `InvalidParam` | 名前が空（`{}` `{*}`）。`{` `}` が対になっていない |
+/// | `InvalidCatchAll` | `{*path}` がパスの末尾に無い |
+///
+/// matchit 0.8.4 のソース（`tree.rs` の `find_wildcard`）で確かめた対応です。
+/// axum 0.8 が matchit を `=0.8.4` で固定しているので、版は上げられません。
+fn insert_error_message(method: &str, path: &str, error: &matchit::InsertError) -> String {
+    use matchit::InsertError;
+    let head = format!("ルートの登録に失敗しました: {method} {path}");
+    match error {
+        InsertError::Conflict { with } => format!(
+            "{head}。同じパス（またはパス引数の名前だけが違うパス）が既に登録されています: \
+             {method} {with}"
+        ),
+        InsertError::InvalidParamSegment => format!(
+            "{head}。パス引数の後ろに固定文字は書けません（`/posts/{{id}}.json` は不可）。\
+             1 つの区間に書けるパス引数は 1 つだけです（`/{{a}}-{{b}}` は不可）。\
+             引数の前の固定文字は書けます（`/file-{{name}}`）"
+        ),
+        InsertError::InvalidParam => format!(
+            "{head}。パス引数の書き方が正しくありません。\
+             名前が空（`{{}}` `{{*}}`）か、`{{` と `}}` が対になっていません"
+        ),
+        InsertError::InvalidCatchAll => {
+            format!("{head}。`{{*名前}}` はパスの末尾にだけ書けます（`/files/{{*path}}`）")
+        }
+        // matchit が理由を増やしたとき。元の文をそのまま添えます。
+        other => format!("{head} ({other})"),
     }
 }
 
@@ -645,7 +738,9 @@ mod tests {
         // 警告もエラーも出ないまま必ず 404 だった。
         assert_eq!(encode_static_segments("/file-{name}"), "/file-{name}");
         assert_eq!(encode_static_segments("/v{n}/x"), "/v{n}/x");
-        // 後ろに固定文字がある形も、今までどおりそのまま。
+        // 後ろに固定文字がある形も、符号化では形を変えない。
+        // **登録はできない**（matchit 0.8.4 が断る）。そちらは
+        // `パス引数の後ろの固定文字は登録できない` で確かめる。
         assert_eq!(
             encode_static_segments("/posts/{id}.json"),
             "/posts/{id}.json"
@@ -666,6 +761,150 @@ mod tests {
             fill("/file-{name}", &[("name", "abc")]).unwrap(),
             "/file-abc"
         );
+    }
+
+    #[test]
+    fn パス引数と同じ区間の非asciiは外側だけ符号化する() {
+        // 区間が `{` を含むと丸ごと素通しにしていたころは、`記事-` が生の UTF-8 のまま
+        // 登録され、ブラウザが送る `%E8%A8%98...` とは必ず食い違って 404 だった。
+        assert_eq!(
+            encode_static_segments("/記事-{id}"),
+            "/%E8%A8%98%E4%BA%8B-{id}"
+        );
+        // 引数の名前（`{...}` の中）は触らない。
+        assert_eq!(
+            encode_static_segments("/記事-{番号}/a b-{*rest}"),
+            "/%E8%A8%98%E4%BA%8B-{番号}/a%20b-{*rest}"
+        );
+        // 何回通しても形が変わらない。
+        assert_eq!(
+            register_path(&register_path("/記事-{id}")),
+            "/%E8%A8%98%E4%BA%8B-{id}"
+        );
+        // ASCII だけの区間と、matchit の逃がし方（`{{` `}}`）はそのまま。
+        assert_eq!(encode_outside_braces("file-{name}"), "file-{name}");
+        assert_eq!(encode_outside_braces("a{{b}}"), "a{{b}}");
+
+        // 登録して、ブラウザが送る形で実際に当たるところまで確かめる。
+        let defs = collect(|| {
+            Route::get("/記事-{id}", ok).name("articles.show");
+        });
+        let routes = Routes::build(defs);
+        for sent in ["/%E8%A8%98%E4%BA%8B-12", "/%e8%a8%98%e4%ba%8b-12"] {
+            match routes.find("GET", sent) {
+                Matched::Found { params, path, .. } => {
+                    assert_eq!(params, vec![("id".to_string(), "12".to_string())]);
+                    assert_eq!(&*path, "/%E8%A8%98%E4%BA%8B-{id}");
+                }
+                _ => panic!("{sent} が当たらなかった"),
+            }
+        }
+
+        // URL を引く側（`route_with` の中身）と食い違わない。
+        // 埋めた結果は符号化済みで、そのまま同じルートに当たる。
+        let pattern = routes.names().get("articles.show").expect("名前がある");
+        let url = fill(pattern, &[("id", "a/b")]).unwrap();
+        assert_eq!(url, "/%E8%A8%98%E4%BA%8B-a%2Fb");
+        match routes.find("GET", &url) {
+            Matched::Found { params, .. } => {
+                assert_eq!(params, vec![("id".to_string(), "a/b".to_string())]);
+            }
+            _ => panic!("埋めた URL が当たらなかった"),
+        }
+        // 署名付き URL が通す文字（`percent::path_literal`）だけでできている。
+        assert!(url.bytes().all(crate::http::percent::path_literal));
+    }
+
+    #[test]
+    fn パス引数の後ろの固定文字は登録できない() {
+        // matchit 0.8.4 は `}` の次が `/` 以外だと断る。以前の注釈とテストは
+        // 「そのまま残る＝使える」と読めたが、実際は起動時にパニックする。
+        let mut router = matchit::Router::new();
+        let error = router.insert("/posts/{id}.json", 0).unwrap_err();
+        assert_eq!(error, matchit::InsertError::InvalidParamSegment);
+        let message = insert_error_message("GET", "/posts/{id}.json", &error);
+        assert!(
+            message.contains("パス引数の後ろに固定文字は書けません"),
+            "{message}"
+        );
+        assert!(message.contains("GET /posts/{id}.json"), "{message}");
+        // 以前はここも「同じパスが2回」だった。
+        assert!(!message.contains("同じパス"), "{message}");
+    }
+
+    #[test]
+    #[should_panic(expected = "パス引数の後ろに固定文字は書けません")]
+    fn パス引数の後ろに固定文字があると起動時に理由を言って止まる() {
+        let defs = collect(|| {
+            Route::get("/posts/{id}.json", ok);
+        });
+        Routes::build(defs);
+    }
+
+    #[test]
+    fn 登録できない理由ごとに文面を分ける() {
+        let reason = |first: Option<&str>, path: &str| {
+            let mut router = matchit::Router::new();
+            if let Some(first) = first {
+                router.insert(first, 0).expect("1 本目は入る");
+            }
+            let error = router.insert(path, 1).unwrap_err();
+            insert_error_message("GET", path, &error)
+        };
+        // 同じパス。相手のパスも出す。
+        let message = reason(Some("/posts"), "/posts");
+        assert!(message.contains("同じパス"), "{message}");
+        assert!(message.contains("GET /posts"), "{message}");
+        // パス引数の名前だけが違うのも重なり。
+        let message = reason(Some("/posts/{id}"), "/posts/{post}");
+        assert!(message.contains("同じパス"), "{message}");
+        assert!(message.contains("/posts/{id}"), "{message}");
+        // 1 区間に引数が 2 つ。
+        let message = reason(None, "/{a}-{b}");
+        assert!(message.contains("1 つだけ"), "{message}");
+        // 名前が空・対になっていない。
+        for path in ["/posts/{}", "/posts/{id", "/posts/id}", "/files/{*}"] {
+            let message = reason(None, path);
+            assert!(message.contains("書き方が正しくありません"), "{message}");
+        }
+        // 末尾全取りが途中にある。
+        let message = reason(None, "/files/{*path}/edit");
+        assert!(message.contains("末尾にだけ"), "{message}");
+    }
+
+    #[test]
+    #[should_panic(expected = "同じパス")]
+    fn 同じパスを2回登録すると起動時に止まる() {
+        let defs = collect(|| {
+            Route::get("/posts", ok);
+            Route::get("/posts/", ok);
+        });
+        Routes::build(defs);
+    }
+
+    #[test]
+    fn 当たったルートの登録パスを返す() {
+        // 回数の制限の鍵に使う。届いたパスの形（末尾の `/`・パス引数の値・
+        // 16 進の大文字小文字）が違っても、同じルートなら同じ文字列になる。
+        let defs = collect(|| {
+            Route::post("/login", ok);
+            Route::get("/posts/{id}", ok);
+            Route::get("/あ", ok);
+        });
+        let routes = Routes::build(defs);
+        let path_of = |method: &str, sent: &str| match routes.find(method, sent) {
+            Matched::Found { path, .. } => path.to_string(),
+            _ => panic!("{sent} が当たらなかった"),
+        };
+        for sent in ["/login", "/login/", "/login//"] {
+            assert_eq!(path_of("POST", sent), "/login", "{sent}");
+        }
+        for sent in ["/posts/1", "/posts/20000", "/posts/1/"] {
+            assert_eq!(path_of("GET", sent), "/posts/{id}", "{sent}");
+        }
+        for sent in ["/%E3%81%82", "/%e3%81%82", "/%E3%81%82/"] {
+            assert_eq!(path_of("GET", sent), "/%E3%81%82", "{sent}");
+        }
     }
 
     #[test]

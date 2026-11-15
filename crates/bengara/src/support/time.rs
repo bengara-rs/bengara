@@ -13,9 +13,17 @@ pub(crate) fn now_string() -> String {
 
 /// いまの UNIX 時刻（秒）。
 pub(crate) fn now_seconds() -> i64 {
+    now_seconds_u64() as i64
+}
+
+/// いまの UNIX 時刻（秒）を符号なしで返す。
+///
+/// 期限（`expires_at`）を `u64` で持つ所が使います（セッションと署名付き URL）。
+/// 時計が 1970 年より前を指していれば 0 です。
+pub(crate) fn now_seconds_u64() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
@@ -278,6 +286,15 @@ mod tests {
         // 秒をまたぐことがあるので 2 秒まで許す。
         let parsed = parse_timestamp(&text).expect("自分が作った形は読める");
         assert!((parsed - seconds).abs() <= 2, "{text} と {seconds}");
+    }
+
+    #[test]
+    fn 符号なしの秒は符号つきの秒と同じ時刻を指す() {
+        let signed = now_seconds();
+        let unsigned = now_seconds_u64();
+        // 秒をまたぐことがあるので 2 秒まで許す。
+        assert!(unsigned.abs_diff(signed as u64) <= 2);
+        assert!(unsigned > 1_700_000_000, "1970 年ではない");
     }
 
     #[test]

@@ -1,7 +1,10 @@
 //! パスワードの再設定（トークンの作成・照合・片付け）。
 //!
-//! 表の名前と列は Laravel と同じ `password_resets` です。
-//! **メールは本当には送れません。** ここで作るのはトークンとリンクまでです。
+//! 表の名前は `password_resets` です。Laravel 9 までの名前で、列（`email`・
+//! `token`・`created_at`）も同じです。Laravel 10 からは `password_reset_tokens` に
+//! 変わっています。
+//! **メールは送りません。** ここで作るのはトークンとリンクまでです。
+//! リンクを届けるのは呼ぶ側の役目です（`Mail` で送れます）。
 
 use crate::database::{Value, DB};
 use crate::error::Result;
@@ -34,26 +37,45 @@ impl PasswordReset {
     /// 表に入れるのはハッシュです。表が漏れても、そのままでは使えません。
     /// 同じメールアドレスのトークンが残っていたら上書きします（1 アドレス 1 本）。
     ///
-    /// **消すのと入れるのを 1 つのトランザクションで囲みます。** 別の文にすると、
-    /// 同じアドレスで同時に 2 本来たときに主キー違反で 500 になります。
-    /// 登録済みのアドレスだけが 500 になりえるので、
-    /// 「登録の有無を漏らさない」という配慮が崩れます。
+    /// **消すのと入れるのを 1 つのトランザクションで囲みます。** 途中で落ちても、
+    /// 古いトークンだけが消えた状態を残しません。
+    ///
+    /// # 同じアドレスに同時に 2 本来たとき
+    ///
+    /// 囲むだけでは防げません。SQLite は書き込みが 1 本ずつなので起きませんが、
+    /// PostgreSQL と MySQL では、**まだ行が無いアドレス**への 2 本が並ぶと、
+    /// どちらの `delete` も相手の未確定の行を見ないので、後から入れたほうが
+    /// 主キー違反になります（二度押しで起きます）。
+    ///
+    /// そこで、**主キー違反のときだけ 1 回やり直します。** やり直しの時点では
+    /// 相手の行が確定しているので、`delete` が消してから入れ直せます。
+    /// 2 回目も失敗したらエラーを返します。
+    ///
+    /// MySQL が行き詰まり（デッドロック）として返したときは、主キー違反では
+    /// ないので、やり直しません。
     pub async fn create(email: &str) -> Result<String> {
         let token = crypto::random_token();
         let hashed = crypto::to_hex(&crypto::sha256(token.as_bytes()));
+        retry_on_unique_violation(|| Self::replace(email, &hashed)).await?;
+        Ok(token)
+    }
 
+    /// そのアドレスのトークンを入れ替える（1 トランザクション）。
+    ///
+    /// 失敗したときは `tx` が落ちるので、下回りが巻き戻します。
+    async fn replace(email: &str, hashed: &str) -> Result<()> {
         // 入れ替えなので、先に消してから入れる。
         let tx = DB::begin().await?;
         tx.table(TABLE).where_("email", email).delete().await?;
         tx.table(TABLE)
             .insert(&[
                 ("email", Value::Text(email.to_string())),
-                ("token", Value::Text(hashed)),
+                ("token", Value::Text(hashed.to_string())),
                 ("created_at", Value::Text(crate::database::now())),
             ])
             .await?;
         tx.commit().await?;
-        Ok(token)
+        Ok(())
     }
 
     /// 照合して、合っていれば**その場で消す**。1 回しか使えません。
@@ -168,6 +190,25 @@ impl PasswordReset {
                 true
             }
         }
+    }
+}
+
+/// 主キー違反（一意制約の違反）で失敗したときだけ、**1 回**やり直す。
+///
+/// ほかの失敗はそのまま返します。何度もやり直さないのは、同時に来るのが
+/// 二度押しの 2 本までという前提だからです。それ以上ぶつかるなら、
+/// 黙って粘るよりエラーで知らせます。
+async fn retry_on_unique_violation<F, Fut>(mut op: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    match op().await {
+        Err(error) if crate::database::is_unique_violation(&error) => {
+            tracing::debug!("再設定トークンの入れ替えが主キー違反になったので、やり直します");
+            op().await
+        }
+        other => other,
     }
 }
 
@@ -289,8 +330,8 @@ mod tests {
             let _db = setup().await;
             let email = "twice@example.com";
 
-            // `delete` → `insert` をトランザクションで囲んでいるので、
-            // 主キー違反にならず、最後の 1 本だけが残る。
+            // 先に `delete` してから `insert` するので、主キー違反にならず、
+            // 最後の 1 本だけが残る。
             let first = PasswordReset::create(email).await.unwrap();
             let second = PasswordReset::create(email).await.unwrap();
             assert_ne!(first, second, "トークンは毎回変わる");
@@ -301,6 +342,85 @@ mod tests {
             // 残っているのは 1 本だけ。
             let rows = DB::table(TABLE).where_("email", email).get().await.unwrap();
             assert_eq!(rows.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn 主キー違反のときだけ一度やり直す() {
+            // PostgreSQL / MySQL では、同じアドレスへの 2 本が並ぶと、後から入れた
+            // ほうが主キー違反になる。SQLite では並べられないので、ここでは
+            // 「主キー違反を返す操作」を作って、やり直しの動きだけを確かめる。
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let _db = setup().await;
+            let email = "race@example.com";
+            // 相手が先に入れて確定した行。
+            PasswordReset::create(email).await.unwrap();
+
+            // 消さずに入れると主キー違反になる（やり直しの条件に当たること）。
+            let duplicate = || async {
+                DB::table(TABLE)
+                    .insert(&[
+                        ("email", Value::Text(email.to_string())),
+                        ("token", Value::Text("x".to_string())),
+                        ("created_at", Value::Text(crate::database::now())),
+                    ])
+                    .await
+                    .map(|_| ())
+            };
+            let error = duplicate().await.unwrap_err();
+            assert!(crate::database::is_unique_violation(&error), "{error}");
+
+            // 1 回目が主キー違反なら、もう 1 回だけ呼ぶ。
+            let calls = AtomicUsize::new(0);
+            retry_on_unique_violation(|| {
+                let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                async move {
+                    if first {
+                        duplicate().await
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .expect("2 回目で通る");
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+            // 2 回目も主キー違反なら、そのまま返す（3 回目は呼ばない）。
+            let calls = AtomicUsize::new(0);
+            let error = retry_on_unique_violation(|| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                duplicate()
+            })
+            .await
+            .unwrap_err();
+            assert!(crate::database::is_unique_violation(&error));
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+            // 主キー違反でない失敗は、やり直さない。
+            let calls = AtomicUsize::new(0);
+            let error = retry_on_unique_violation(|| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { Err(crate::Error::msg("別の失敗")) }
+            })
+            .await
+            .unwrap_err();
+            assert!(!crate::database::is_unique_violation(&error));
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+            // 成功したら 1 回だけ。
+            let calls = AtomicUsize::new(0);
+            retry_on_unique_violation(|| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+            // 本物の入口は、行が残っていても入れ替えられる。
+            let token = PasswordReset::create(email).await.unwrap();
+            assert!(PasswordReset::verify(email, &token).await.unwrap());
         }
 
         #[tokio::test]

@@ -9,6 +9,13 @@
 //!
 //! 置き場所は**ファイル**（既定）と**メモリ**の2つです。`CACHE_DRIVER` で選びます。
 //! 依存クレートは増やしていません。
+//!
+//! | `CACHE_DRIVER` | 置き場所 |
+//! |---|---|
+//! | `file`（既定） | `storage/framework/cache/` |
+//! | `memory`（別名 `array`） | プロセスのメモリ |
+//!
+//! 知らない名前は警告を出して `file` にします。
 
 pub(crate) mod store;
 
@@ -29,7 +36,7 @@ use crate::support::crypto;
 /// ```
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
-    /// 置き場所の名前（`file` / `memory`）。
+    /// 置き場所の名前（`file` / `memory`）。`array` は `memory` の別名です。
     pub driver: String,
 }
 

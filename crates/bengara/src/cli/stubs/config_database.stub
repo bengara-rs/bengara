@@ -63,5 +63,8 @@ pub fn config() -> DatabaseConfig {
         selected.url = url;
     }
 
-    DatabaseConfig { default, connections }
+    DatabaseConfig {
+        default,
+        connections,
+    }
 }

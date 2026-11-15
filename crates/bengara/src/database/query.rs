@@ -116,10 +116,21 @@ struct TableJoin {
 pub struct QueryBuilder {
     source: Source,
     driver: Driver,
+    /// いまの投げ先のドライバが決まらなかった理由（接続名の間違いなど）。
+    ///
+    /// **投げ先に付いた間違いなので、`deferred_error` とは別に持ちます。**
+    /// 投げ先を替えたら（`with_source`）入れ直します。同じ欄に積むと、
+    /// 有効なトランザクションへ替えた後も、元の接続の間違いで落ちていました。
+    driver_error: Option<String>,
     /// 組み立てのときに見つけた間違い。終端メソッドでこのエラーを返す。
     ///
     /// 組み立ての途中でパニックさせないため、最初の1つだけ覚えておきます。
     deferred_error: Option<String>,
+    /// `*_raw` に `$` を書いた最初の場所（`where_raw` など）。
+    ///
+    /// 断るのは PostgreSQL のときだけですが、**ドライバは後から替わります**
+    /// （`using(&tx)`）。書いた時点では決めず、終端で、いまのドライバと照らします。
+    raw_dollar: Option<String>,
     table: String,
     columns: Vec<String>,
     distinct: bool,
@@ -153,7 +164,8 @@ impl std::fmt::Debug for QueryBuilder {
             .field("sql", &sql)
             .field("bindings", &bindings.len())
             // 組み立ての間違いは `to_sql()` に出ないので、ここで見せる。
-            .field("deferred_error", &self.deferred_error)
+            // 接続の間違いと `$` の直書きも、終端で返すものと同じ文で出す。
+            .field("deferred_error", &self.pending_error())
             .finish()
     }
 }
@@ -165,8 +177,9 @@ impl QueryBuilder {
         let mut query = Self {
             source,
             driver,
-            // 接続名の間違いは、列名や演算子の間違いより先に知らせる。
-            deferred_error: driver_error,
+            driver_error,
+            deferred_error: None,
+            raw_dollar: None,
             table: table.into(),
             columns: Vec::new(),
             distinct: false,
@@ -186,14 +199,42 @@ impl QueryBuilder {
     /// 投げ先を差し替える。モデルのクエリから使います。
     ///
     /// 組み立てのときに見つけた間違い（`deferred_error`）は残します。
+    ///
+    /// **接続の間違い（`driver_error`）は入れ直します。** 元の投げ先のものなので、
+    /// 替えた先には当てはまりません。既定の接続が設定に無くても、
+    /// `Post::query().using(&tx)` は有効なトランザクションで動きます。
     pub(crate) fn with_source(mut self, source: Source) -> Self {
         let (driver, driver_error) = resolve_driver(&source);
         self.driver = driver;
-        if let Some(message) = driver_error {
-            self.defer(message);
-        }
+        self.driver_error = driver_error;
         self.source = source;
         self
+    }
+
+    /// 終端メソッドで返す間違い。無ければ `None`。
+    ///
+    /// 順は、接続の間違い → 組み立ての間違い → `$` の直書き。
+    /// 接続名の間違いは、列名や演算子の間違いより先に知らせます。
+    fn pending_error(&self) -> Option<String> {
+        if let Some(message) = &self.driver_error {
+            return Some(message.clone());
+        }
+        if let Some(message) = &self.deferred_error {
+            return Some(message.clone());
+        }
+        self.dollar_error()
+    }
+
+    /// PostgreSQL へ投げるのに、`*_raw` に `$` を書いていたときの文。
+    fn dollar_error(&self) -> Option<String> {
+        if self.driver != Driver::Postgres {
+            return None;
+        }
+        let place = self.raw_dollar.as_ref()?;
+        Some(format!(
+            "{place} に書いた `$` は使えません。ビルダーの `*_raw` では `?` を使ってください。\
+             `$1` は DB::select / DB::statement 専用です"
+        ))
     }
 
     /// 後で知らせる間違いを積む。最初の1つだけ残します。
@@ -282,14 +323,15 @@ impl QueryBuilder {
     ///
     /// `DB::select` / `DB::statement` は値をその SQL だけに渡すので、
     /// そちらでは `$1` の直書きを通します。
+    ///
+    /// **ここでは書いた場所を覚えるだけです。** 断るかどうかは終端の `check()` が、
+    /// そのときのドライバで決めます（`dollar_error`）。ここで決めると、
+    /// SQLite の接続で組み立ててから `using(&tx)` で PostgreSQL の
+    /// トランザクションへ替えたときに、検査を抜けていました。
     fn check_raw_dollar(&mut self, place: &str, sql: &str) {
-        if self.driver != Driver::Postgres || !sql.contains('$') {
-            return;
+        if self.raw_dollar.is_none() && sql.contains('$') {
+            self.raw_dollar = Some(place.to_string());
         }
-        self.defer(format!(
-            "{place} に書いた `$` は使えません。ビルダーの `*_raw` では `?` を使ってください。\
-             `$1` は DB::select / DB::statement 専用です"
-        ));
     }
 
     /// つながる先のデータベースの種類。
@@ -507,6 +549,10 @@ impl QueryBuilder {
         if let Some(message) = nested.deferred_error {
             self.defer(message);
         }
+        // `$` の直書きも引き継ぐ。断るかどうかは、外側の終端が決める。
+        if self.raw_dollar.is_none() {
+            self.raw_dollar = nested.raw_dollar;
+        }
         if !nested.wheres.is_empty() {
             self.wheres.push(Where::Nested {
                 boolean,
@@ -524,14 +570,59 @@ impl QueryBuilder {
         operator: &str,
         value: Value,
     ) -> Self {
+        let condition = self.basic_condition(place, boolean, column, operator, value);
+        self.wheres.push(condition);
+        self
+    }
+
+    /// 列と値1つを比べる条件を作る。`where` 系と `having_op` が通ります。
+    ///
+    /// **`NULL` と比べるときは `is null` / `is not null` に読み替えます。**
+    ///
+    /// | 演算子             | 値が `NULL` のとき |
+    /// |--------------------|--------------------|
+    /// | `=` / `is`         | `is null`          |
+    /// | `!=` `<>` `is not` | `is not null`      |
+    /// | それ以外           | そのまま値を渡す   |
+    ///
+    /// `"c" = NULL` は真にも偽にもならないので、エラーも無く必ず 0 件になります。
+    /// `where_("deleted_at", None::<String>)` と書いた人が欲しいのは
+    /// `is null` です（Laravel の `where('deleted_at', null)` と同じ）。
+    ///
+    /// **`is` / `is not` に `NULL` 以外を渡したときは断ります。**
+    /// `"c" is ?` が通るのは SQLite だけで、PostgreSQL と MySQL では
+    /// 構文エラーになります。SQLite で通って本番で落ちる形を残しません。
+    fn basic_condition(
+        &mut self,
+        place: &str,
+        boolean: Glue,
+        column: &str,
+        operator: &str,
+        value: Value,
+    ) -> Where {
         self.check_column(place, column);
-        self.wheres.push(Where::Basic {
+        if value.is_null() {
+            if let Some(not) = grammar::null_comparison(operator) {
+                return Where::Null {
+                    boolean,
+                    column: column.to_string(),
+                    not,
+                };
+            }
+        } else if grammar::is_null_operator(operator).is_some() {
+            self.defer(format!(
+                "{place} の演算子 `{operator}` には NULL だけを渡せます。\
+                 `is ?` の形は PostgreSQL と MySQL で構文エラーになるためです。\
+                 NULL かどうかは where_null / where_not_null、\
+                 値と比べるときは `=` / `!=` を使ってください"
+            ));
+        }
+        Where::Basic {
             boolean,
             column: column.to_string(),
             operator: operator.to_string(),
             value,
-        });
-        self
+        }
     }
 
     fn push_in<T: IntoValue + Clone>(
@@ -626,14 +717,11 @@ impl QueryBuilder {
     ///
     /// 列名は英数字と `_` `.` だけ、演算子は許可一覧で照合します。
     pub fn having_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.check_column("having_op", column);
         self.check_value_operator("having_op", operator);
-        self.havings.push(Where::Basic {
-            boolean: Glue::And,
-            column: column.to_string(),
-            operator: operator.to_string(),
-            value: value.into_value(),
-        });
+        // `NULL` の読み替えと `is` の検査は `where_op` と同じ（`basic_condition`）。
+        let condition =
+            self.basic_condition("having_op", Glue::And, column, operator, value.into_value());
+        self.havings.push(condition);
         self
     }
 
@@ -894,14 +982,9 @@ impl QueryBuilder {
                 value,
                 ..
             } => {
+                // `NULL` と `=` / `is` などの組は、組み立てのとき（`basic_condition`）に
+                // `Where::Null` へ読み替えてある。ここには来ない。
                 c.sql.push_str(&grammar::quote(driver, column));
-                // `is` / `is not` に NULL を渡したときは、プレースホルダを置かずに
-                // `is null` と書く。PostgreSQL は `"c" is $1` を受け付けない。
-                if let (Some(not), Value::Null) = (grammar::is_null_operator(operator), value) {
-                    c.sql
-                        .push_str(if not { " is not null" } else { " is null" });
-                    return;
-                }
                 c.sql.push(' ');
                 c.sql.push_str(operator);
                 c.sql.push(' ');
@@ -974,10 +1057,18 @@ impl QueryBuilder {
     ///
     /// 設定が読めないこと（接続の名前が無いなど）も、組み立ての間違いも、
     /// ここで初めてエラーにします。`DB::table()` を `Result` にしないためです。
-    fn check(&self) -> Result<()> {
+    ///
+    /// モデルの側（`model.rs`）も呼びます。問い合わせずに「無い」を返すときに、
+    /// 組み立てと接続の間違いだけは知らせるためです。
+    pub(crate) fn check(&self) -> Result<()> {
+        // 接続の間違いは、いまの投げ先に聞き直す（`driver_error` は表示用の控え）。
         self.source.driver()?;
         if let Some(message) = &self.deferred_error {
             return Err(Error::msg(message.clone()));
+        }
+        // `$` の直書きは、ここで初めて、いまのドライバと照らす。
+        if let Some(message) = self.dollar_error() {
+            return Err(Error::msg(message));
         }
         if !self.havings.is_empty() && self.groups.is_empty() {
             // `having` は束ねた結果を絞るものなので、束ねていないと意味が決まらない。
@@ -1023,8 +1114,28 @@ impl QueryBuilder {
     ///
     /// 足す行に条件や結合は効きません。黙って無視すると、絞ったつもりの
     /// `insert` が通ってしまいます。
+    ///
+    /// **文は `check_write` と分けます。** あちらの「先に主キーを取り出して
+    /// where_in で絞る」は、行を足す場面には当てはまらない案内です。
     fn check_insert(&self, what: &str) -> Result<()> {
-        self.check_write(what)?;
+        if !self.joins.is_empty() {
+            return Err(Error::msg(format!(
+                "join を付けた問い合わせでは {what} できません。\
+                 足す行に結合は効きません。足す値だけを渡してください"
+            )));
+        }
+        if !self.groups.is_empty() || !self.havings.is_empty() || self.distinct {
+            return Err(Error::msg(format!(
+                "group_by / having / distinct を付けた問い合わせでは {what} できません。\
+                 足す行には効きません。足す値だけを渡してください"
+            )));
+        }
+        if self.limit.is_some() || self.offset.is_some() {
+            return Err(Error::msg(format!(
+                "limit / offset を付けた問い合わせでは {what} できません。\
+                 足す行の数は、渡した行の数で決まります。limit / offset を外してください"
+            )));
+        }
         if !self.wheres.is_empty() {
             return Err(Error::msg(format!(
                 "{what} では条件が効きません。足す値だけを渡してください"
@@ -1035,11 +1146,27 @@ impl QueryBuilder {
 
     // ---- 実行 ----
 
+    /// 行を返す文を投げる。**終端メソッドは必ずここか `run` を通します。**
+    ///
+    /// 束縛する値の総数を、投げる直前に確かめるためです。`where_in` 単体の
+    /// 件数は組み立てのときに見ていますが、何回か重ねた合計はここでしか
+    /// 分かりません。
+    async fn fetch(&self, sql: &str, bindings: &[Value]) -> Result<Vec<Row>> {
+        ensure_binding_count(self.driver, bindings.len())?;
+        self.source.fetch_all(sql, bindings).await
+    }
+
+    /// 行を返さない文を投げる。確かめる内容は `fetch` と同じです。
+    async fn run(&self, sql: &str, bindings: &[Value]) -> Result<Affected> {
+        ensure_binding_count(self.driver, bindings.len())?;
+        self.source.execute(sql, bindings).await
+    }
+
     /// 行を取る。
     pub async fn get(&self) -> Result<Vec<Row>> {
         self.check()?;
         let (sql, bindings) = self.to_sql();
-        self.source.fetch_all(&sql, &bindings).await
+        self.fetch(&sql, &bindings).await
     }
 
     /// 最初の1行を取る。
@@ -1049,7 +1176,7 @@ impl QueryBuilder {
             limit: Some(1),
             ..self.shape()
         });
-        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        let rows = self.fetch(&sql, &bindings).await?;
         Ok(rows.into_iter().next())
     }
 
@@ -1064,11 +1191,18 @@ impl QueryBuilder {
     ///
     /// 条件を1つ足すので、ここだけはビルダーを複製します。
     /// 以前は `first()` も複製していたので、2回複製していました。
+    ///
+    /// **`NULL`（`None`）を渡したときは、問い合わせずに `None` を返します。**
+    /// `where_` は `NULL` を `is null` に読み替えるので、そのまま渡すと
+    /// 「`id` が NULL の行」を探してしまいます。
     pub async fn find(&self, id: impl IntoValue) -> Result<Option<Row>> {
-        self.clone()
-            .where_("id", super::normalize_key(id.into_value()))
-            .first()
-            .await
+        let id = super::normalize_key(id.into_value());
+        if id.is_null() {
+            // 組み立ての間違いは、問い合わせないときも知らせる。
+            self.check()?;
+            return Ok(None);
+        }
+        self.clone().where_("id", id).first().await
     }
 
     /// 最初の行の、ある列の値を取る。
@@ -1078,6 +1212,10 @@ impl QueryBuilder {
     ///
     /// 列名は英数字と `_` `.` だけが使えます。式が欲しいときは `select(...)` ＋
     /// `get()` を使ってください。
+    ///
+    /// **NULL がありうる列は `Option<T>` で読んでください**
+    /// （`value::<Option<i64>>("views")`）。`T` のままだと、NULL の行で
+    /// 読み出しのエラーになります。`row.get::<T>()` と同じ決まりです。
     pub async fn value<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
         ensure_value_column("value", column)?;
         self.check()?;
@@ -1087,7 +1225,7 @@ impl QueryBuilder {
             limit: Some(1),
             ..self.shape()
         });
-        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        let rows = self.fetch(&sql, &bindings).await?;
         let row = rows.into_iter().next();
         match row.as_ref().and_then(|row| row.at(0)) {
             Some(value) => T::from_value(value)
@@ -1104,6 +1242,10 @@ impl QueryBuilder {
     ///
     /// 列名は英数字と `_` `.` だけが使えます。式が欲しいときは `select(...)` ＋
     /// `get()` を使ってください。
+    ///
+    /// **NULL がありうる列は `Option<T>` で読んでください**
+    /// （`pluck::<Option<String>>("body")`）。`T` のままだと、NULL の行が
+    /// 1つでもあると読み出しのエラーになります。
     pub async fn pluck<T: FromValue>(&self, column: &str) -> Result<Vec<T>> {
         ensure_value_column("pluck", column)?;
         self.check()?;
@@ -1112,7 +1254,7 @@ impl QueryBuilder {
             columns: &columns,
             ..self.shape()
         });
-        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        let rows = self.fetch(&sql, &bindings).await?;
         rows.iter()
             .map(|row| match row.at(0) {
                 Some(value) => T::from_value(value)
@@ -1132,7 +1274,7 @@ impl QueryBuilder {
     pub async fn count(&self) -> Result<i64> {
         self.check()?;
         let (sql, bindings) = self.count_sql()?;
-        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        let rows = self.fetch(&sql, &bindings).await?;
         match rows.first().and_then(|row| row.at(0)) {
             None | Some(Value::Null) => Ok(0),
             Some(value) => i64::from_value(value),
@@ -1216,7 +1358,7 @@ impl QueryBuilder {
     pub async fn exists(&self) -> Result<bool> {
         self.check()?;
         let (sql, bindings) = self.exists_sql();
-        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        let rows = self.fetch(&sql, &bindings).await?;
         Ok(!rows.is_empty())
     }
 
@@ -1258,7 +1400,7 @@ impl QueryBuilder {
     async fn aggregate<T: FromValue>(&self, function: &str, column: &str) -> Result<Option<T>> {
         self.check()?;
         let (sql, bindings) = self.aggregate_sql(function, column)?;
-        let rows = self.source.fetch_all(&sql, &bindings).await?;
+        let rows = self.fetch(&sql, &bindings).await?;
         // 1列だけ取るので、名前ではなく位置から読む。
         match rows.first().and_then(|row| row.at(0)) {
             Some(Value::Null) | None => Ok(None),
@@ -1315,8 +1457,9 @@ impl QueryBuilder {
 
     /// 1行足す。
     pub async fn insert(&self, values: &[(&str, Value)]) -> Result<Affected> {
-        let rows = vec![values.to_vec()];
-        self.insert_many(&rows).await
+        // 行は借りたまま渡す。以前は `values.to_vec()` で1回、束縛の一覧へ
+        // 積むときにもう1回、値を複製していました。
+        self.insert_rows(&[values]).await
     }
 
     /// 何行かまとめて足す。
@@ -1326,17 +1469,29 @@ impl QueryBuilder {
     ///
     /// **`where_` / `join` / `limit` などは使えません。** 組み立てた SQL に入らない
     /// ので、付いているときはエラーにします。
+    ///
+    /// **1回に渡せる値の数（行 × 列）には上限があります。** SQLite は 32,766、
+    /// MySQL と PostgreSQL は 65,535 です。超えるときはエラーにするので、
+    /// 行を分割して何回かに分けて呼んでください。
     pub async fn insert_many(&self, rows: &[Vec<(&str, Value)>]) -> Result<Affected> {
+        self.insert_rows(rows).await
+    }
+
+    /// `insert` と `insert_many` の中身。行は借りたまま受けます。
+    async fn insert_rows<'a, R>(&self, rows: &[R]) -> Result<Affected>
+    where
+        R: AsRef<[(&'a str, Value)]>,
+    {
         self.check()?;
         self.check_insert("insert")?;
         let Some(first) = rows.first() else {
             return Ok(Affected::default());
         };
-        if first.is_empty() {
+        if first.as_ref().is_empty() {
             return Err(Error::msg("insert に渡す列がありません"));
         }
-        let (sql, bindings) = self.insert_sql(rows, first, "")?;
-        self.source.execute(&sql, &bindings).await
+        let (sql, bindings) = self.insert_sql(rows, "")?;
+        self.run(&sql, &bindings).await
     }
 
     /// 1行足して、自動採番された ID を返す。
@@ -1360,16 +1515,17 @@ impl QueryBuilder {
     /// 名前に関係なく、その列に採番された値を返します。
     ///
     /// **外れるのは、自動採番でない列を `primary_key` に渡したときです。**
-    /// その場合、SQLite と MySQL は指定とは別の値（rowid や 0）を返します。
+    /// その場合、SQLite は指定とは別の値（rowid）を返し、MySQL はエラーにします。
     /// 名前だけでは見分けられないので（`id` 以外でも普通に正しい）、
     /// 警告は出しません。毎回の `insert` で鳴って雑音になるためです。
     ///
-    /// **採番されない列を主キーに指定すると、MySQL では `0` が返ります。**
-    /// `last_insert_id()` は、その接続で `auto_increment` が働いていないときに
-    /// `0` を返すためです。`auto_increment` を持たない表（主キーが文字列の表や、
-    /// 値を自分で入れる表）がこれに当たります。
-    /// エラーにはならないので、返った `0` を主キーとして使わないでください。
-    /// SQLite では rowid が返るので、`0` ではなく別の値になります。
+    /// **採番されない表に使うと、MySQL ではエラー（「insert が ID を返しませんでした」）
+    /// になります。行は入っています。** `last_insert_id()` は `auto_increment` が
+    /// 働かなかったときに `0` を返し、bengara はその `0` を「番号なし」と見なすためです
+    /// （`0` を主キーとして返しません）。`auto_increment` を持たない表（主キーが
+    /// 文字列の表や、値を自分で入れる表）がこれに当たります。そういう表には
+    /// [`insert`](Self::insert) を使ってください。
+    /// SQLite では rowid が返るので、エラーにはならず、主キーとは別の値になります。
     pub async fn insert_get_id_as(
         &self,
         values: &[(&str, Value)],
@@ -1380,13 +1536,13 @@ impl QueryBuilder {
         if values.is_empty() {
             return Err(Error::msg("insert に渡す列がありません"));
         }
+        // 主キーは `returning` に置くだけなので、`t.id` のような表名付きも通す。
         ensure_column("insert_get_id_as の主キー", primary_key)?;
-        let rows = vec![values.to_vec()];
         let returning = grammar::returning_id(self.driver, primary_key);
-        let (sql, bindings) = self.insert_sql(&rows, values, &returning)?;
+        let (sql, bindings) = self.insert_sql(&[values], &returning)?;
 
         if self.driver == Driver::Postgres {
-            let rows = self.source.fetch_all(&sql, &bindings).await?;
+            let rows = self.fetch(&sql, &bindings).await?;
             // 1列だけ返るので位置で読む。`t.id` のように表名を付けて渡されると、
             // 返る列名は `id` になって名前では引けない。
             return match rows.first().and_then(|row| row.at(0)) {
@@ -1395,22 +1551,28 @@ impl QueryBuilder {
             };
         }
 
-        let affected = self.source.execute(&sql, &bindings).await?;
+        let affected = self.run(&sql, &bindings).await?;
         affected
             .last_insert_id
             .ok_or_else(|| Error::msg("insert が ID を返しませんでした"))
     }
 
-    fn insert_sql(
-        &self,
-        rows: &[Vec<(&str, Value)>],
-        shape: &[(&str, Value)],
-        suffix: &str,
-    ) -> Result<(String, Vec<Value>)> {
+    /// `insert` の SQL を組み立てる。列の名前と並びは最初の行から取ります。
+    ///
+    /// 行は `Vec` でもスライスでも受けます（`AsRef`）。1行の `insert` が
+    /// 行を複製せずに渡せるようにするためです。
+    fn insert_sql<'a, R>(&self, rows: &[R], suffix: &str) -> Result<(String, Vec<Value>)>
+    where
+        R: AsRef<[(&'a str, Value)]>,
+    {
+        let shape: &[(&str, Value)] = match rows.first() {
+            Some(first) => first.as_ref(),
+            None => &[],
+        };
         let mut c = Compiler::new(self.driver);
         let mut columns: Vec<String> = Vec::with_capacity(shape.len());
         for (name, _) in shape {
-            ensure_column("insert", name)?;
+            ensure_write_column("insert", name)?;
             columns.push(grammar::quote(self.driver, name));
         }
         c.sql.push_str("insert into ");
@@ -1420,6 +1582,7 @@ impl QueryBuilder {
         c.sql.push_str(") values ");
 
         for (index, row) in rows.iter().enumerate() {
+            let row = row.as_ref();
             if row.len() != shape.len() {
                 return Err(Error::msg(
                     "insert_many に渡した行で、列の数がそろっていません",
@@ -1466,13 +1629,13 @@ impl QueryBuilder {
             if index > 0 {
                 c.sql.push_str(", ");
             }
-            ensure_column("update", name)?;
+            ensure_write_column("update", name)?;
             c.sql.push_str(&grammar::quote(self.driver, name));
             c.sql.push_str(" = ");
             c.push_value(value.clone());
         }
         self.compile_wheres(&mut c);
-        let affected = self.source.execute(&c.sql, &c.bindings).await?;
+        let affected = self.run(&c.sql, &c.bindings).await?;
         Ok(affected.rows)
     }
 
@@ -1485,8 +1648,8 @@ impl QueryBuilder {
     /// DB::table("posts").where_("id", id).increment("views", 1).await?;
     /// ```
     ///
-    /// 列名は英数字と `_` `.` だけが使えます。`update` と同じく、
-    /// **`updated_at` は自動で入れません。**
+    /// 列名は英数字と `_` だけが使えます（表名は付けられません）。
+    /// `update` と同じく、**`updated_at` は自動で入れません。**
     /// 使えない指定（`join` / `limit` など）は `update` と同じです。
     pub async fn increment(&self, column: &str, amount: i64) -> Result<u64> {
         self.step("increment", column, '+', amount).await
@@ -1506,7 +1669,7 @@ impl QueryBuilder {
         self.check()?;
         self.check_write(place)?;
         let (sql, bindings) = self.step_sql(place, column, sign, amount)?;
-        let affected = self.source.execute(&sql, &bindings).await?;
+        let affected = self.run(&sql, &bindings).await?;
         Ok(affected.rows)
     }
 
@@ -1518,7 +1681,8 @@ impl QueryBuilder {
         sign: char,
         amount: i64,
     ) -> Result<(String, Vec<Value>)> {
-        ensure_value_column(place, column)?;
+        // 書き込む列なので、表名付き（`posts.views`）は断る。
+        ensure_write_column(place, column)?;
         let quoted = grammar::quote(self.driver, column);
         let mut c = Compiler::new(self.driver);
         c.sql.push_str("update ");
@@ -1547,14 +1711,24 @@ impl QueryBuilder {
         c.sql.push_str("delete from ");
         c.sql.push_str(&grammar::quote(self.driver, &self.table));
         self.compile_wheres(&mut c);
-        let affected = self.source.execute(&c.sql, &c.bindings).await?;
+        let affected = self.run(&c.sql, &c.bindings).await?;
         Ok(affected.rows)
     }
 
-    /// 表を空にする。**条件は効きません。**
+    /// 表を空にする。**条件は効きません。** 自動採番も 1 に戻します。
     ///
     /// `where` を付けたときはエラーにします。黙って全件消すのを防ぐためです。
     /// `join` / `limit` などが使えないのも `delete` と同じです。
+    ///
+    /// | ドライバ   | 流す文                                         |
+    /// |------------|------------------------------------------------|
+    /// | SQLite     | `delete from` と、`sqlite_sequence` の行の削除 |
+    /// | MySQL      | `truncate table`                               |
+    /// | PostgreSQL | `truncate table … restart identity`            |
+    ///
+    /// **ほかの表から外部キーで指されている表は、MySQL と PostgreSQL では
+    /// 断られます**（指している側が空でも同じ）。SQLite は `delete` なので、
+    /// 指している行が無ければ通ります。
     pub async fn truncate(&self) -> Result<()> {
         self.check()?;
         self.check_write("truncate")?;
@@ -1566,24 +1740,32 @@ impl QueryBuilder {
         match self.driver {
             // SQLite に truncate は無い。条件なしの delete と同じ。
             // ただし delete だけでは `sqlite_sequence` が残り、採番が戻らない。
-            // MySQL / PostgreSQL の truncate は戻すので、2文に分けてそろえる。
+            // MySQL / PostgreSQL の truncate は戻すので、文を分けてそろえる。
             Driver::Sqlite => {
                 // `sqlite_sequence` は autoincrement の表が1つも無いと存在しない。
-                // その失敗はエラーにしない。
-                let reset = "delete from sqlite_sequence where name = ?";
-                let _ = self
-                    .source
-                    .execute(reset, &[Value::Text(self.table.clone())])
-                    .await;
+                // **有無を先に読んで確かめます。** 以前は消す文をそのまま流して
+                // 失敗を捨てていました。トランザクションの中では、1本失敗すると
+                // 以後が使えなくなるので、続く `delete` まで落ちていました。
+                let has_sequence = !self
+                    .fetch(
+                        "select 1 from sqlite_master \
+                         where type = 'table' and name = 'sqlite_sequence'",
+                        &[],
+                    )
+                    .await?
+                    .is_empty();
+                // 先に行を消す。外部キーで断られたときに、採番だけ戻るのを避ける。
                 let sql = format!("delete from {}", grammar::quote(self.driver, &self.table));
-                self.source.execute(&sql, &[]).await?;
+                self.run(&sql, &[]).await?;
+                if has_sequence {
+                    let reset = "delete from sqlite_sequence where name = ?";
+                    self.run(reset, &[Value::Text(self.table.clone())]).await?;
+                }
             }
+            // PostgreSQL は `restart identity` を付けて採番を戻す（`grammar::truncate`）。
             _ => {
-                let sql = format!(
-                    "truncate table {}",
-                    grammar::quote(self.driver, &self.table)
-                );
-                self.source.execute(&sql, &[]).await?;
+                let sql = grammar::truncate(self.driver, &self.table);
+                self.run(&sql, &[]).await?;
             }
         }
         Ok(())
@@ -1597,13 +1779,22 @@ impl QueryBuilder {
         let per_page = per_page.max(1);
         let page = page.max(1);
         let total = self.count().await?;
+        if total == 0 {
+            // 1件も無いなら、どのページも空。本体の問い合わせは流さない。
+            return Ok(Paginator {
+                data: Vec::new(),
+                total,
+                per_page,
+                current_page: page,
+            });
+        }
         // `count()` が `check()` を通している。ここでは組み立てるだけ。
         let (sql, bindings) = self.select_sql(&Shape {
             limit: Some(per_page),
             offset: Some(page_offset(page, per_page)),
             ..self.shape()
         });
-        let data = self.source.fetch_all(&sql, &bindings).await?;
+        let data = self.fetch(&sql, &bindings).await?;
         Ok(Paginator {
             data,
             total,
@@ -1631,6 +1822,22 @@ fn clamp_count(count: u64) -> u64 {
 /// ドライバの分かりにくいエラーになるので、手前で分割を案内します。
 const MAX_IN_VALUES: usize = 30_000;
 
+/// 束縛する値の総数が、ドライバの上限に収まっているか確かめる。
+///
+/// 超えたまま投げると、ドライバごとに違う分かりにくいエラーになります
+/// （SQLite は `too many SQL variables`、PostgreSQL は sqlx の
+/// `too many arguments for query`）。手前で止めて、分割を案内します。
+fn ensure_binding_count(driver: Driver, count: usize) -> Result<()> {
+    let max = grammar::max_bindings(driver);
+    if count <= max {
+        return Ok(());
+    }
+    Err(Error::msg(format!(
+        "1つの文に渡す値が多すぎます（{count} 個。{driver} の上限は {max} 個）。\
+         insert_many は行を、where_in は一覧を分割して、何回かに分けて流してください"
+    )))
+}
+
 /// 投げ先から、SQL の組み立てに使うドライバを決める。
 ///
 /// 設定が読めないときは SQLite を仮に使い、**理由を一緒に返します。**
@@ -1647,10 +1854,34 @@ fn resolve_driver(source: &Source) -> (Driver, Option<String>) {
     }
 }
 
+/// 書き込む列の名前として受け付けるか確かめる。
+///
+/// `insert` / `update` / `increment` / `decrement` の列名はここを通します。
+/// 組み立てが `Result` を返すので、`deferred_error` に積む必要がありません。
+///
+/// **表名付き（`posts.title`）は断ります。** `set "posts"."title" = ?` や
+/// `insert into "posts" ("posts"."title")` は、SQLite と PostgreSQL で
+/// SQL エラーになります（通るのは MySQL だけ）。書き込む表は1つに決まって
+/// いるので、表名を付ける必要がありません。
+fn ensure_write_column(place: &str, column: &str) -> Result<()> {
+    if grammar::is_bare_identifier(column) {
+        return Ok(());
+    }
+    if grammar::is_plain_identifier(column) {
+        return Err(Error::msg(format!(
+            "{place} に渡した列名 `{column}` は使えません。\
+             書き込む列に表名は付けられません。列の名前だけを渡してください"
+        )));
+    }
+    Err(Error::msg(format!(
+        "{place} に渡した列名 `{column}` は使えません。英数字と `_` だけが使えます"
+    )))
+}
+
 /// 列の名前として受け付けるか確かめる。その場でエラーを返せる所で使います。
 ///
-/// `insert` と `update` の列名はここを通します。組み立てが `Result` を返すので、
-/// `deferred_error` に積む必要がありません。
+/// 通るのは `insert_get_id_as` の主キーだけです。`returning` に置く名前なので、
+/// 表名付き（`t.id`）も通します。書き込む列は [`ensure_write_column`] を見てください。
 fn ensure_column(place: &str, column: &str) -> Result<()> {
     if grammar::is_plain_identifier(column) {
         return Ok(());
@@ -1662,9 +1893,10 @@ fn ensure_column(place: &str, column: &str) -> Result<()> {
 
 /// 値を1つ取り出す所の列名を確かめる。
 ///
-/// `sum` / `avg` / `min` / `max` / `pluck` / `value` / `increment` / `decrement`
-/// はここを通します。`grammar::quote` は空白や `(` を含む名前を式として素通しする
-/// ので、検査しないと列名がそのまま SQL に入ります。
+/// `sum` / `avg` / `min` / `max` / `pluck` / `value` はここを通します。
+/// `grammar::quote` は空白や `(` を含む名前を式として素通しするので、
+/// 検査しないと列名がそのまま SQL に入ります。
+/// `increment` / `decrement` は書き込む列なので、`ensure_write_column` で見ます。
 ///
 /// 式を書きたいときの逃げ道は `select(...)` ＋ `get()` です。
 fn ensure_value_column(place: &str, column: &str) -> Result<()> {
@@ -1939,11 +2171,376 @@ mod tests {
             "select * from \"posts\" where \"deleted_at\" is null or \"body\" is not null"
         );
         assert!(bindings.is_empty());
+    }
 
-        // NULL 以外の値はこれまでどおり値を渡す。
-        let (sql, bindings) = builder().where_op("flag", "is", true).to_sql();
-        assert_eq!(sql, "select * from \"posts\" where \"flag\" is ?");
-        assert_eq!(bindings, vec![Value::Bool(true)]);
+    #[test]
+    fn is_にnull以外を渡すと組み立てのエラーになる() {
+        // 以前は `"flag" is ?` を出していた。通るのは SQLite だけで、
+        // PostgreSQL と MySQL では構文エラーになる。
+        for query in [
+            builder().where_op("flag", "is", true),
+            builder().or_where_op("flag", "IS NOT", 1),
+            builder().group_by(&["flag"]).having_op("flag", " is ", "x"),
+            builder().where_group(|q| q.where_op("flag", "is not", 0)),
+        ] {
+            let message = query.check().expect_err("断られる").to_string();
+            assert!(message.contains("NULL だけ"), "{message}");
+            assert!(message.contains("where_null"), "{message}");
+        }
+    }
+
+    #[test]
+    fn nullと等しいかを比べると_is_null_になる() {
+        // `"c" = NULL` は真にも偽にもならず、エラーも無く必ず 0 件になる。
+        let none: Option<String> = None;
+        let (sql, bindings) = builder()
+            .where_("deleted_at", none.clone())
+            .or_where("body", Value::Null)
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"deleted_at\" is null or \"body\" is null"
+        );
+        assert!(bindings.is_empty(), "NULL は束縛しない");
+
+        // `!=` と `<>` は `is not null`。
+        let (sql, bindings) = builder()
+            .where_op("deleted_at", "!=", none.clone())
+            .or_where_op("body", "<>", Value::Null)
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"deleted_at\" is not null or \"body\" is not null"
+        );
+        assert!(bindings.is_empty());
+
+        // 束ねた後の条件も同じ。
+        let (sql, bindings) = builder()
+            .group_by(&["author_id"])
+            .having_op("author_id", "=", none.clone())
+            .having_op("status", "!=", none.clone())
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" group by \"author_id\" \
+             having \"author_id\" is null and \"status\" is not null"
+        );
+        assert!(bindings.is_empty());
+
+        // 括弧の中でも同じ。PostgreSQL でも番号がずれない。
+        let query = QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder()
+        };
+        let (sql, bindings) = query
+            .where_("a", 1)
+            .where_group(|q| q.where_("b", none.clone()).or_where("c", 2))
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"a\" = $1 and (\"b\" is null or \"c\" = $2)"
+        );
+        assert_eq!(bindings, vec![Value::Int(1), Value::Int(2)]);
+
+        // 値があるときは、これまでどおり束縛する。
+        let (sql, bindings) = builder().where_("body", Some("x")).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"body\" = ?");
+        assert_eq!(bindings, vec![Value::Text("x".into())]);
+
+        // 大小や like は読み替えない（これまでどおり値として渡す）。
+        let (sql, bindings) = builder().where_op("views", ">", none).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"views\" > ?");
+        assert_eq!(bindings, vec![Value::Null]);
+    }
+
+    #[tokio::test]
+    async fn findにnullを渡すと問い合わせずに無いを返す() {
+        // `where_` が NULL を `is null` に読み替えるので、そのまま渡すと
+        // 「id が NULL の行」を探してしまう。
+        // 「問い合わせていない」ことは `model.rs` のテストが、流れた SQL で確かめる。
+        let none: Option<i64> = None;
+        let row = builder().find(none).await;
+        assert!(matches!(row, Ok(None)), "{row:?}");
+
+        // 組み立ての間違いは、問い合わせないときも知らせる。
+        let message = builder()
+            .order_by("id; drop table posts")
+            .find(none)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+    }
+
+    #[test]
+    fn ドル記号の検査は終端のときのドライバで決まる() {
+        // SQLite で組み立ててから、PostgreSQL のトランザクションへ替えた形。
+        // 以前は書いた時点のドライバで決めていたので、検査を抜けていた。
+        let built = builder().where_raw("x > $1", &[]);
+        built.check().expect("SQLite のままなら通る");
+        let moved = QueryBuilder {
+            driver: Driver::Postgres,
+            ..built
+        };
+        let message = moved.check().expect_err("断られる").to_string();
+        assert!(message.contains("where_raw"), "{message}");
+        assert!(message.contains("`?` を使ってください"), "{message}");
+        assert!(format!("{moved:?}").contains("`?` を使ってください"));
+
+        // 逆向き。PostgreSQL で書いても、投げ先が SQLite になれば通る。
+        let built = QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder()
+        }
+        .order_by_raw("$1");
+        let moved = QueryBuilder {
+            driver: Driver::Sqlite,
+            ..built
+        };
+        moved.check().expect("SQLite なら通る");
+
+        // 括弧の中に書いた `$` も、外側の終端で見つかる。
+        let nested = QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder().where_group(|q| q.where_raw("x > $1", &[]))
+        };
+        let message = nested.check().expect_err("断られる").to_string();
+        assert!(message.contains("where_raw"), "{message}");
+    }
+
+    #[test]
+    fn 投げ先を替えたら接続の間違いは入れ直す() {
+        // 既定の接続が設定に無い状態で組み立てた形。
+        let broken = QueryBuilder {
+            driver_error: Some("`typo` という接続は設定にありません".to_string()),
+            ..builder()
+        };
+        let text = format!("{broken:?}");
+        assert!(text.contains("設定にありません"), "{text}");
+
+        // 有効な投げ先へ替えたら、元の接続の間違いは消える。
+        // 以前は `deferred_error` に積んだままで、終端でエラーになっていた。
+        let moved = broken.clone().with_source(Source::Default);
+        assert!(moved.driver_error.is_none());
+        moved.check().expect("替えた先が有効なら通る");
+        assert!(!format!("{moved:?}").contains("設定にありません"));
+
+        // 組み立てのときに見つけた間違いは、替えても残す。
+        let message = broken
+            .order_by("id; drop table posts")
+            .with_source(Source::Default)
+            .check()
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("使えません"), "{message}");
+    }
+
+    #[test]
+    fn 束縛する値の総数が上限を超えたら分割を案内する() {
+        for (driver, max) in [
+            (Driver::Sqlite, 32_766usize),
+            (Driver::MySql, 65_535),
+            (Driver::Postgres, 65_535),
+        ] {
+            ensure_binding_count(driver, max).expect("上限ちょうどは通る");
+            let message = ensure_binding_count(driver, max + 1)
+                .expect_err("断られる")
+                .to_string();
+            assert!(message.contains("分割"), "{message}");
+            assert!(message.contains(&max.to_string()), "{message}");
+            assert!(message.contains(driver.as_str()), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn where_inを重ねて上限を超えたら投げる前に止まる() {
+        // 1回ぶんは `where_in` の上限（30,000 件）に収まるが、合計は超える。
+        let ids: Vec<i64> = (0..20_000).collect();
+        let query = builder()
+            .where_in("id", &ids)
+            .where_not_in("author_id", &ids);
+        query.check().expect("組み立ては通る");
+        let message = query.get().await.expect_err("断られる").to_string();
+        assert!(message.contains("多すぎます"), "{message}");
+        assert!(message.contains("40000"), "{message}");
+
+        // 書き込みも同じ所を通る。
+        let message = query.delete().await.expect_err("断られる").to_string();
+        assert!(message.contains("多すぎます"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn insert_manyの行と列の積が上限を超えたら止まる() {
+        // 3 列 × 11,000 行 = 33,000 個。SQLite の上限（32,766）を超える。
+        let rows: Vec<Vec<(&str, Value)>> = (0..11_000)
+            .map(|i| {
+                vec![
+                    ("title", Value::Int(i)),
+                    ("body", Value::Int(i)),
+                    ("views", Value::Int(i)),
+                ]
+            })
+            .collect();
+        let message = builder()
+            .insert_many(&rows)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("多すぎます"), "{message}");
+        assert!(message.contains("insert_many は行を"), "{message}");
+    }
+
+    #[test]
+    fn insertは行を借りたまま同じsqlを組み立てる() {
+        // 1行の `insert` はスライスを、`insert_many` は `Vec` を渡す。出る SQL は同じ。
+        let values = [("title", Value::Text("x".into())), ("views", Value::Int(1))];
+        let (sql, bindings) = builder()
+            .insert_sql(&[&values[..]], "")
+            .expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "insert into \"posts\" (\"title\", \"views\") values (?, ?)"
+        );
+        assert_eq!(bindings, vec![Value::Text("x".into()), Value::Int(1)]);
+
+        let rows = vec![values.to_vec(), values.to_vec()];
+        let (sql, bindings) = builder().insert_sql(&rows, "").expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "insert into \"posts\" (\"title\", \"views\") values (?, ?), (?, ?)"
+        );
+        assert_eq!(bindings.len(), 4);
+
+        // 列の並びが違う行は、これまでどおり断る。
+        let rows = vec![
+            vec![("title", Value::Int(1)), ("views", Value::Int(1))],
+            vec![("views", Value::Int(1)), ("title", Value::Int(1))],
+        ];
+        let message = builder()
+            .insert_sql(&rows, "")
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("列の並びが違います"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn 書き込みの列名に表名は付けられない() {
+        // `set "posts"."title" = ?` は SQLite と PostgreSQL で SQL エラーになる。
+        let values = [("posts.title", Value::Text("x".into()))];
+        for message in [
+            builder().insert(&values).await.expect_err("断られる"),
+            builder()
+                .insert_many(&[values.to_vec()])
+                .await
+                .expect_err("断られる"),
+            builder()
+                .insert_get_id(&values)
+                .await
+                .expect_err("断られる"),
+        ] {
+            let message = message.to_string();
+            assert!(message.contains("表名は付けられません"), "{message}");
+            assert!(message.contains("posts.title"), "{message}");
+        }
+        let message = builder()
+            .where_("id", 1)
+            .update(&values)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("表名は付けられません"), "{message}");
+
+        for sign in ['+', '-'] {
+            let message = builder()
+                .step_sql("increment", "posts.views", sign, 1)
+                .expect_err("断られる")
+                .to_string();
+            assert!(message.contains("表名は付けられません"), "{message}");
+        }
+
+        // 点だけの名前や、区切りの間が空の名前も断る。
+        for broken in [".", "a..b", "title."] {
+            let values = [(broken, Value::Int(1))];
+            let message = builder()
+                .insert(&values)
+                .await
+                .expect_err("断られる")
+                .to_string();
+            assert!(message.contains("使えません"), "{message}");
+        }
+
+        // 読む側は、表名付きをこれまでどおり通す。
+        builder()
+            .where_("posts.title", "x")
+            .order_by("posts.id")
+            .check()
+            .expect("条件と並びは表名付きで書ける");
+        // `insert_get_id_as` の主キーは `returning` に置くだけなので、表名付きも通す。
+        let query = QueryBuilder {
+            driver: Driver::Postgres,
+            ..builder()
+        };
+        let returning = grammar::returning_id(query.driver, "posts.id");
+        let (sql, _) = query
+            .insert_sql(&[&[("title", Value::Int(1))][..]], &returning)
+            .expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "insert into \"posts\" (\"title\") values ($1) returning \"posts\".\"id\""
+        );
+    }
+
+    #[test]
+    fn 区切りの間が空の列名は条件でも断る() {
+        for broken in [".", "a..b", "users.", ".id"] {
+            for query in [
+                builder().where_(broken, 1),
+                builder().order_by(broken),
+                builder().join(broken, "a", "=", "b"),
+                QueryBuilder::new(Source::Default, broken),
+            ] {
+                let message = query.check().expect_err("断られる").to_string();
+                assert!(message.contains("使えません"), "{broken}: {message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn limitを付けたinsertは専用の文で断る() {
+        // 以前は update / delete と同じ「主キーを取り出して where_in で絞る」を
+        // 案内していた。行を足す場面には当てはまらない。
+        let values = [("title", Value::Text("x".into()))];
+        for query in [builder().limit(1), builder().offset(1)] {
+            let message = query
+                .insert(&values)
+                .await
+                .expect_err("断られる")
+                .to_string();
+            assert!(message.contains("limit / offset"), "{message}");
+            assert!(message.contains("外してください"), "{message}");
+            assert!(!message.contains("where_in"), "{message}");
+        }
+        for query in [
+            builder().group_by(&["author_id"]),
+            builder().distinct(),
+            builder().join("c", "c.post_id", "=", "posts.id"),
+        ] {
+            let message = query
+                .insert_get_id(&values)
+                .await
+                .expect_err("断られる")
+                .to_string();
+            assert!(message.contains("足す値だけを渡してください"), "{message}");
+            assert!(!message.contains("where_in"), "{message}");
+        }
+        // update / delete の案内は変えない。
+        let message = builder()
+            .limit(1)
+            .update(&values)
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("where_in"), "{message}");
     }
 
     #[test]
@@ -2690,6 +3287,126 @@ mod tests {
             .await
             .expect("入る");
         assert_eq!(id, 1, "truncate の後は 1 から");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 採番の表が無いsqliteでもトランザクションの中でtruncateできる() {
+        use super::super::{ConnectionConfig, Transaction};
+
+        // autoincrement の表が1つも無いので、`sqlite_sequence` が存在しない。
+        let backend = super::super::sqlite::connect(&ConnectionConfig::sqlite("test", ":memory:"))
+            .await
+            .expect("メモリ上の SQLite につながる");
+        backend
+            .execute(
+                "create table plain (id integer primary key, title text)",
+                &[],
+            )
+            .await
+            .expect("表が作れる");
+        let found = backend
+            .fetch_all(
+                "select 1 from sqlite_master where name = 'sqlite_sequence'",
+                &[],
+            )
+            .await
+            .expect("読める");
+        assert!(found.is_empty(), "前提: sqlite_sequence が無い");
+
+        let tx = Transaction::start(backend).await.expect("始められる");
+        let plain = tx.table("plain");
+        plain
+            .insert(&[("title", Value::Text("1本目".into()))])
+            .await
+            .expect("入る");
+
+        // 以前は `delete from sqlite_sequence` が失敗して、トランザクションが
+        // 使えなくなっていた（続く `delete from "plain"` が落ちる）。
+        plain.truncate().await.expect("空にできる");
+        assert_eq!(plain.count().await.expect("数えられる"), 0);
+
+        // トランザクションは生きている。続けて書けて、確定もできる。
+        plain
+            .insert(&[("title", Value::Text("やり直し".into()))])
+            .await
+            .expect("truncate の後も書ける");
+        assert_eq!(plain.count().await.expect("数えられる"), 1);
+        tx.commit().await.expect("確定できる");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn nullの条件は実際のsqliteでも当たる() {
+        let tx = live().await;
+        tx.statement("alter table posts add column body text", &[])
+            .await
+            .expect("列を足せる");
+        let posts = tx.table("posts");
+        posts
+            .insert(&[("title", Value::Text("本文なし".into()))])
+            .await
+            .expect("入る");
+        posts
+            .insert(&[
+                ("title", Value::Text("本文あり".into())),
+                ("body", Value::Text("x".into())),
+            ])
+            .await
+            .expect("入る");
+
+        // 以前は `"body" = NULL` になって、必ず 0 件だった。
+        let none: Option<String> = None;
+        let titles = tx
+            .table("posts")
+            .where_("body", none.clone())
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(titles, vec!["本文なし".to_string()]);
+        let titles = tx
+            .table("posts")
+            .where_op("body", "!=", none)
+            .pluck::<String>("title")
+            .await
+            .expect("読める");
+        assert_eq!(titles, vec!["本文あり".to_string()]);
+
+        // NULL がありうる列は `Option<T>` で読む。
+        let bodies = tx
+            .table("posts")
+            .order_by("id")
+            .pluck::<Option<String>>("body")
+            .await
+            .expect("読める");
+        assert_eq!(bodies, vec![None, Some("x".to_string())]);
+        assert!(tx.table("posts").pluck::<String>("body").await.is_err());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 空の表のページ分けは空で返る() {
+        let tx = live().await;
+        let page = tx
+            .table("posts")
+            .latest_by("id")
+            .paginate(15, 3)
+            .await
+            .expect("取れる");
+        assert_eq!(page.total, 0);
+        assert!(page.data.is_empty());
+        assert_eq!(page.per_page, 15);
+        assert_eq!(page.current_page, 3, "頼んだページ番号はそのまま返す");
+        assert_eq!(page.last_page(), 1);
+
+        // 1件でもあれば、これまでどおり本体も取る。
+        tx.table("posts")
+            .insert(&[("title", Value::Text("やきそば".into()))])
+            .await
+            .expect("入る");
+        let page = tx.table("posts").paginate(15, 1).await.expect("取れる");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.len(), 1);
     }
 
     #[cfg(feature = "sqlite")]

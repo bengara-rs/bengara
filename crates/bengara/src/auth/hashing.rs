@@ -419,7 +419,9 @@ mod tests {
         assert!(Parsed::parse(&dummy).is_some(), "照合できる形になっている");
         assert!(!Hash::check("bengara-dummy-password", &dummy), "必ず外れる");
 
-        // 回数は設定どおりで、本物の照合と同じだけかかる。
+        // 回数は渡した値がそのまま入る。渡すのは「最後に照合した値に書いてあった
+        // 回数」（まだ何も読んでいなければ、いまの設定）なので、本物の照合と
+        // 同じだけかかる。
         assert_eq!(Parsed::parse(&dummy_hash(123)).unwrap().iterations, 123);
         assert_eq!(Parsed::parse(&dummy).unwrap().salt.len(), SALT_BYTES);
 

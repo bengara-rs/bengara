@@ -142,10 +142,18 @@ fn build(message: &Message) -> Result<LettreMessage> {
         }
         builder = builder.to(mailbox("To", address)?);
     }
+    // 写しも宛先と同じく、空白だけのものは飛ばす。`log` と `array` は
+    // 空の写しをそのまま通すので、ここだけ断ると SMTP に切り替えて初めて落ちます。
     for address in &message.cc {
+        if address.trim().is_empty() {
+            continue;
+        }
         builder = builder.cc(mailbox("Cc", address)?);
     }
     for address in &message.bcc {
+        if address.trim().is_empty() {
+            continue;
+        }
         builder = builder.bcc(mailbox("Bcc", address)?);
     }
     if let Some(reply_to) = &message.reply_to {
@@ -269,6 +277,70 @@ mod tests {
         };
         let raw = String::from_utf8(build(&message).unwrap().formatted()).unwrap();
         assert!(raw.contains("alice@example.com"), "{raw}");
+    }
+
+    #[test]
+    fn 空白だけの写しも飛ばす() {
+        // 以前は「Cc のアドレスが読めません」で落ちた。`log` / `array` では
+        // 通るので、SMTP に切り替えて初めて分かった。
+        let message = Message {
+            cc: vec![String::new(), "  ".into(), "bob@example.com".into()],
+            bcc: vec![" ".into()],
+            ..message()
+        };
+        let built = build(&message).expect("空白だけの写しでは落ちない");
+        let raw = String::from_utf8(built.formatted()).unwrap();
+        assert!(raw.contains("bob@example.com"), "{raw}");
+        // 送り先（封筒）は宛先と、空でない写しの 2 つだけ。
+        assert_eq!(built.envelope().to().len(), 2);
+
+        // 読めない写しは、今までどおり欄の名前を添えて断る。
+        let broken = Message {
+            cc: vec!["これはアドレスではない".into()],
+            ..self::message()
+        };
+        let error = build(&broken).unwrap_err().to_string();
+        assert!(error.contains("Cc"), "{error}");
+    }
+
+    #[test]
+    fn 既定の差出人の形を組み立てに通せる() {
+        // `Mail::to` は差出人を `"名前" <アドレス>`（引用符つき）で作る。
+        // この形を lettre が読めることを押さえる。
+        for name in ["bengara", "べんがら商店", "Shop, Inc. \"本店\"", "a\\b"] {
+            let from = super::super::from_header(name, "noreply@example.com");
+            assert!(from.starts_with('"'), "引用符つきで作る: {from}");
+            let message = Message { from, ..message() };
+            let built = build(&message).unwrap_or_else(|e| panic!("{name}: {e}"));
+            // 封筒の差出人はアドレスだけになる。
+            assert_eq!(
+                built.envelope().from().map(|a| a.to_string()).as_deref(),
+                Some("noreply@example.com"),
+                "{name}"
+            );
+            let raw = String::from_utf8(built.formatted()).unwrap();
+            assert!(raw.contains("<noreply@example.com>"), "{name}: {raw}");
+        }
+
+        // 日本語の名前は符号化して出る（ヘッダーに生の日本語を書かない）。
+        let message = Message {
+            from: super::super::from_header("べんがら商店", "noreply@example.com"),
+            ..message()
+        };
+        let raw = String::from_utf8(build(&message).unwrap().formatted()).unwrap();
+        let from_line = raw
+            .lines()
+            .find(|line| line.starts_with("From:"))
+            .expect("From の行がある");
+        assert!(from_line.is_ascii(), "{from_line}");
+        assert!(from_line.contains("=?utf-8?b?"), "{from_line}");
+
+        // 名前が空なら、アドレスだけで通る。
+        let message = Message {
+            from: super::super::from_header("", "noreply@example.com"),
+            ..self::message()
+        };
+        assert!(build(&message).is_ok());
     }
 
     #[test]

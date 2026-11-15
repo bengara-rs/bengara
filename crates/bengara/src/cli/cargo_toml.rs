@@ -12,6 +12,8 @@ pub(crate) struct CargoToml {
     lines: Vec<String>,
     /// 元のファイルの改行（`\n` か `\r\n`）。書き戻すときに保ちます。
     newline: &'static str,
+    /// 元のファイルが BOM（先頭の `U+FEFF`）で始まっていたか。書き戻すときに保ちます。
+    bom: bool,
     /// 元の内容から変わったか。
     changed: bool,
 }
@@ -25,11 +27,20 @@ impl CargoToml {
     }
 
     /// 文字列から組み立てる。
+    ///
+    /// 先頭の BOM は外して読みます。Windows のメモ帳などが付けるもので、cargo は
+    /// BOM つきの `Cargo.toml` を受け付けます。外さないと 1 行目が見出しと
+    /// 認められず、`init` と `serve` が「name がありません」で止まっていました。
     fn from_text(text: &str) -> Self {
+        let (bom, text) = match text.strip_prefix(BOM) {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
         Self {
             lines: text.lines().map(str::to_string).collect(),
             // 1行足すだけで全行が差分になるのを避けるため、元の改行に合わせる。
             newline: if text.contains("\r\n") { "\r\n" } else { "\n" },
+            bom,
             changed: false,
         }
     }
@@ -39,11 +50,23 @@ impl CargoToml {
         if !self.changed {
             return Ok(false);
         }
-        let mut text = self.lines.join(self.newline);
-        text.push_str(self.newline);
-        std::fs::write(path, text)
+        std::fs::write(path, self.to_text())
             .map_err(|e| Error::msg(format!("{} を書けません: {e}", path.display())))?;
         Ok(true)
+    }
+
+    /// 書き戻す中身。改行と BOM は元のファイルに合わせます。
+    ///
+    /// BOM を保つのは改行と同じ理由です。足りない行を足すだけの処理が、
+    /// ファイルの先頭まで差分にしないためです。
+    fn to_text(&self) -> String {
+        let mut text = String::new();
+        if self.bom {
+            text.push(BOM);
+        }
+        text.push_str(&self.lines.join(self.newline));
+        text.push_str(self.newline);
+        text
     }
 
     /// 文字列から組み立てる（テスト用）。
@@ -99,15 +122,30 @@ impl CargoToml {
             .any(|line| key_of(line).is_some_and(|k| k == key || k.starts_with(&dotted)))
     }
 
-    /// `path = "main.rs"` のような行があるか。
+    /// `[[bin]]` の中に `path = "main.rs"` のような行があるか。
     ///
     /// 空白と引用符の書き方の違いは無視します（`path="main.rs"` も `path = 'main.rs'` も同じ）。
+    /// `./main.rs` も同じファイルと見ます。
+    ///
+    /// 見るのは見出しが `[[bin]]` の節だけです。以前はファイル全体から探していたので、
+    /// `[lib] path = "main.rs"` や `[[example]]` の `path` を bin と取り違え、
+    /// `init` が必要な `[[bin]]` を足しませんでした。
     pub(crate) fn has_path(&self, file: &str) -> bool {
-        self.plain_lines(0..self.lines.len())
+        self.bins().iter().any(|bin| bin.has_path(file))
+    }
+
+    /// `path = "main.rs"` を持つ `[[bin]]` の `name`。
+    ///
+    /// `cargo build --bin` と `cargo run --bin` に渡す名前を決めるのに使います。
+    /// bin の名前はパッケージ名と同じとは限りません
+    /// （`[[bin]] name = "server" path = "main.rs"`）。
+    ///
+    /// その `[[bin]]` が無いとき、`name` が書かれていないときは `None` です。
+    pub(crate) fn bin_name_for_path(&self, file: &str) -> Option<String> {
+        self.bins()
             .into_iter()
-            .any(|line| {
-                key_of(line).is_some_and(|k| k == "path") && value_of(line).as_deref() == Some(file)
-            })
+            .find(|bin| bin.has_path(file))
+            .and_then(|bin| bin.name)
     }
 
     /// `[[bin]]` の中に `name = "..."` の行があるか。
@@ -118,22 +156,41 @@ impl CargoToml {
     /// 見るのは見出しが `[[bin]]` の節だけです。`[package]` の `name` と
     /// 取り違えないためです。空白と引用符の書き方の違いは `has_path` と同じく無視します。
     pub(crate) fn has_bin_name(&self, name: &str) -> bool {
+        self.bins()
+            .iter()
+            .any(|bin| bin.name.as_deref() == Some(name))
+    }
+
+    /// `[[bin]]` の節を上から順に読む。
+    ///
+    /// 節ごとに分けて持ちます。`name` と `path` は**同じ節**のものどうしで
+    /// 組にしないと、別の bin の名前を拾ってしまうためです。
+    fn bins(&self) -> Vec<Bin> {
         let kinds = self.classify();
+        let mut bins: Vec<Bin> = Vec::new();
         let mut in_bin = false;
         for (line, kind) in self.lines.iter().zip(&kinds) {
             match kind {
-                LineKind::Header(header) => in_bin = header.as_str() == "[[bin]]",
-                LineKind::Plain
-                    if in_bin
-                        && key_of(line).is_some_and(|k| k == "name")
-                        && value_of(line).as_deref() == Some(name) =>
-                {
-                    return true;
+                LineKind::Header(header) => {
+                    in_bin = header.as_str() == "[[bin]]";
+                    if in_bin {
+                        bins.push(Bin::default());
+                    }
+                }
+                LineKind::Plain if in_bin => {
+                    let Some(bin) = bins.last_mut() else {
+                        continue;
+                    };
+                    match key_of(line).as_deref() {
+                        Some("name") => bin.name = value_of(line),
+                        Some("path") => bin.path = value_of(line),
+                        _ => {}
+                    }
                 }
                 _ => {}
             }
         }
-        false
+        bins
     }
 
     /// 節の最後に行を足す。節が無ければ作る。
@@ -245,6 +302,25 @@ impl CargoToml {
             out.push(kind);
         }
         out
+    }
+}
+
+/// ファイルの先頭に付くことがある印（BOM）。
+const BOM: char = '\u{feff}';
+
+/// 1つの `[[bin]]` の節から読んだ値。
+#[derive(Default)]
+struct Bin {
+    name: Option<String>,
+    path: Option<String>,
+}
+
+impl Bin {
+    /// この bin の入口がそのファイルか。`./main.rs` と `main.rs` は同じと見ます。
+    fn has_path(&self, file: &str) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|path| path.strip_prefix("./").unwrap_or(path) == file)
     }
 }
 
@@ -482,6 +558,65 @@ mod tests {
         // bin が1つも無いときは偽。
         let d = doc("[package]\nname = \"myapp\"\n");
         assert!(!d.has_bin_name("myapp"));
+    }
+
+    #[test]
+    fn mainのbinの名前を読める() {
+        // bin の名前がパッケージ名と違う形。`serve` と本体への受け渡しがこの名前を使う。
+        let d = doc(
+            "[package]\nname = \"myapp\"\n\n[[bin]]\nname = \"artisan\"\npath = \"artisan.rs\"\n\n\
+             [[bin]]\npath = './main.rs' # 入口\nname = \"server\"\n",
+        );
+        // 同じ節の name を返す（先に出てくる artisan を拾わない）。
+        assert_eq!(d.bin_name_for_path("main.rs").as_deref(), Some("server"));
+        assert_eq!(
+            d.bin_name_for_path("artisan.rs").as_deref(),
+            Some("artisan")
+        );
+        assert_eq!(d.bin_name_for_path("other.rs"), None);
+        // [package] の name は bin の名前ではない。
+        let d = doc("[package]\nname = \"myapp\"\npath = \"main.rs\"\n");
+        assert_eq!(d.bin_name_for_path("main.rs"), None);
+        // name の無い [[bin]] は None（呼ぶ側がパッケージ名などに倒す）。
+        let d = doc("[[bin]]\npath = \"main.rs\"\n");
+        assert_eq!(d.bin_name_for_path("main.rs"), None);
+    }
+
+    #[test]
+    fn bin以外の節のpathはbinと見なさない() {
+        // 以前はファイル全体から `path = "main.rs"` を探していたので、
+        // `[lib]` の path を bin と取り違え、init が `[[bin]]` を足さなかった。
+        let d = doc("[package]\nname = \"myapp\"\n\n[lib]\npath = \"main.rs\"\n");
+        assert!(!d.has_path("main.rs"));
+        let d = doc("[[example]]\nname = \"demo\"\npath = \"main.rs\"\n");
+        assert!(!d.has_path("main.rs"));
+        // `[[bin]]` の後ろに別の節が続いても、その節の path は数えない。
+        let d = doc("[[bin]]\nname = \"a\"\npath = \"a.rs\"\n\n[lib]\npath = \"main.rs\"\n");
+        assert!(d.has_path("a.rs"));
+        assert!(!d.has_path("main.rs"));
+        assert_eq!(d.bin_name_for_path("main.rs"), None);
+    }
+
+    #[test]
+    fn bomつきでも読めて書き戻すときに保つ() {
+        // Windows のメモ帳などが付ける。以前は 1 行目が見出しと認められず、
+        // init と serve が「name がありません」で止まっていた。
+        let mut d = doc("\u{feff}[package]\nname = \"myapp\"\n");
+        assert_eq!(d.package_name().as_deref(), Some("myapp"));
+        assert!(d.has_section("package"));
+        // 行を足しても BOM は先頭に 1 つだけ残る（先頭まで差分にしない）。
+        d.add_line("package", "autobins = false");
+        assert_eq!(
+            d.to_text(),
+            "\u{feff}[package]\nname = \"myapp\"\nautobins = false\n"
+        );
+        // BOM の無いファイルには付けない。
+        let mut d = doc("[package]\nname = \"myapp\"\n");
+        d.add_line("package", "autobins = false");
+        assert_eq!(
+            d.to_text(),
+            "[package]\nname = \"myapp\"\nautobins = false\n"
+        );
     }
 
     #[test]

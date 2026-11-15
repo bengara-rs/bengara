@@ -197,9 +197,30 @@ pub(crate) fn guard() -> Result<()> {
          \x20 カレントディレクトリ: {current}\n\
          どちらにも .env と storage/ がありません。\n\
          直し方（どちらか）:\n\
-         \x20 1. 実行ファイルの隣に .env を置き、cargo artisan storage:init を実行する\n\
+         \x20 1. 実行ファイルの隣に .env を置き、{STORAGE_INIT_HINT} を実行する\n\
          \x20 2. 環境変数 APP_BASE_PATH に絶対パスを指定する"
     )))
+}
+
+/// `storage:init` の案内に使う言い方。
+///
+/// **`cargo artisan storage:init` だけを書きません。** この案内が出るのは
+/// 主に本番で、そこに cargo はありません。コマンド名を先に出し、開発と本番の
+/// 打ち方を両方添えます。
+pub(crate) const STORAGE_INIT_HINT: &str =
+    "storage:init（開発では `cargo artisan storage:init`、本番では `./<実行ファイル> storage:init`）";
+
+/// `storage/` が無いときの案内。
+///
+/// **起動時の案内（`ops.rs`）・`Storage`・キャッシュ・セッション・スケジュールが
+/// 同じ文を出します。** 以前は置き場所ごとに文が違い、「デプロイのときに
+/// storage/ を作ってください」だけの所は、何を実行すればよいかが分かりませんでした。
+/// 本番には cargo が無いので、実行ファイルでの呼び方も並べます（[`STORAGE_INIT_HINT`]）。
+pub(crate) fn missing_storage_message(storage: &Path) -> String {
+    format!(
+        "{} がありません。{STORAGE_INIT_HINT} を実行してください",
+        storage.display()
+    )
 }
 
 /// `APP_BASE_PATH` の場所が無いときのエラー文。
@@ -218,8 +239,15 @@ fn explicit_missing_message(path: &Path) -> String {
 ///
 /// `APP_STORAGE_PATH` が相対パスのときはエラーにします。
 pub(crate) fn guard_storage() -> Result<()> {
-    if let Some(raw) = std::env::var_os("APP_STORAGE_PATH") {
-        let path = PathBuf::from(&raw);
+    check_storage(std::env::var_os("APP_STORAGE_PATH").as_deref())
+}
+
+/// `APP_STORAGE_PATH` の値を確かめる。`None` は「指定なし」です。
+///
+/// 値を引数で受けるのは、テストで環境変数を触らずに断る枝を通すためです。
+fn check_storage(raw: Option<&std::ffi::OsStr>) -> Result<()> {
+    if let Some(raw) = raw {
+        let path = Path::new(raw);
         if !path.is_absolute() {
             return Err(Error::msg(format!(
                 "APP_STORAGE_PATH には絶対パスを指定してください（いまの値: {}）",
@@ -330,8 +358,45 @@ mod tests {
 
     #[test]
     fn 相対のstorageは断る() {
+        use std::ffi::OsStr;
+
         // 実際の環境変数は触らずに、判定だけを確かめる。
-        assert!(!Path::new("storage").is_absolute());
-        assert!(guard_storage().is_ok(), "指定が無ければ通る");
+        // 以前は「指定が無ければ通る」しか見ておらず、断る枝を通していなかった。
+        for relative in ["storage", "./storage", "../shared/storage"] {
+            let error = check_storage(Some(OsStr::new(relative)))
+                .expect_err("相対パスは断る")
+                .to_string();
+            assert!(error.contains("APP_STORAGE_PATH"), "{error}");
+            assert!(error.contains("絶対パス"), "{error}");
+            assert!(error.contains(relative), "いまの値を添える: {error}");
+        }
+
+        // 絶対パスと、指定なしは通る。
+        let absolute = std::env::temp_dir().join("bengara_paths_storage");
+        assert!(absolute.is_absolute());
+        assert!(check_storage(Some(absolute.as_os_str())).is_ok());
+        assert!(check_storage(None).is_ok(), "指定が無ければ通る");
+        // このテストでは APP_STORAGE_PATH を指定していない。
+        assert!(guard_storage().is_ok());
+    }
+
+    #[test]
+    fn storage_initの案内は本番の打ち方も添える() {
+        // 本番に cargo は無い。`cargo artisan` だけを書くと、その場で詰まる。
+        assert!(STORAGE_INIT_HINT.starts_with("storage:init"));
+        assert!(STORAGE_INIT_HINT.contains("cargo artisan storage:init"));
+        assert!(STORAGE_INIT_HINT.contains("./<実行ファイル> storage:init"));
+    }
+
+    #[test]
+    fn storageが無いときの案内はどこでも同じ文になる() {
+        // セッションとスケジュールは「デプロイのときに storage/ を作ってください」
+        // だけで、何を実行すればよいかが分からなかった。起動時の案内・`Storage`・
+        // キャッシュと同じ文を、この 1 つの関数から出す。
+        let text = missing_storage_message(Path::new("/srv/app/storage"));
+        assert!(text.contains("storage がありません"), "{text}");
+        assert!(text.contains(STORAGE_INIT_HINT), "{text}");
+        assert!(text.ends_with("を実行してください"), "{text}");
+        assert!(!text.contains("デプロイのときに"), "{text}");
     }
 }

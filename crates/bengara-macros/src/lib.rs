@@ -24,8 +24,11 @@ use syn::{parse_macro_input, ItemFn};
 /// |---|---|---|
 /// | `#[model(table = "posts")]` | 構造体 | 必須 |
 /// | `#[model(primary)]` | フィールド | 列名が `id` の項目 |
-/// | `#[model(column = "名前")]` | フィールド | フィールド名と同じ |
+/// | `#[model(column = "名前")]` | フィールド | フィールド名と同じ（`r#type` は `type`） |
 /// | `#[model(skip)]` | フィールド | 表にない項目として扱う |
+///
+/// `table` と `column` の名前は、コンパイルのときに確かめます。使えるのは英数字と `_` です
+/// （表の名前は `スキーマ.表` の `.` も使えます）。
 #[proc_macro_derive(Model, attributes(model))]
 pub fn derive_model(item: TokenStream) -> TokenStream {
     model::derive(item)

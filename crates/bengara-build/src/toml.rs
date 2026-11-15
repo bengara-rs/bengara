@@ -86,6 +86,13 @@ pub(crate) fn parse(text: &str) -> Result<Vec<(String, String)>, String> {
                      （`\\` をそのまま出したいときは `\\\\` と書きます）"
                 ));
             }
+            Err(Unquote::Unclosed) => {
+                return Err(format!(
+                    "{line_number} 行目: 値の文字列が閉じていません。\
+                     終わりの `\\\"` は中の `\"` と読むので、閉じの引用符になりません\
+                     （`\\` で終わる値は `\\\\` と書いてから `\"` で閉じます）"
+                ));
+            }
             Err(Unquote::Shape) => {
                 return Err(format!(
                     "{line_number} 行目: 値は `\"値\"` の形にしてください。\
@@ -147,6 +154,8 @@ enum Unquote {
     Shape,
     /// 知らない逃げ方（`\q` など）。中の1文字を添えます。
     Escape(char),
+    /// 終わりの `"` が `\` で逃がされていて、文字列が閉じていない（`"abc\"`）。
+    Unclosed,
 }
 
 /// 引用符を外す。`"..."` は `\n` などを解釈し、`'...'` はそのままです。
@@ -188,8 +197,9 @@ fn unquote(value: &str) -> Result<String, Unquote> {
             // `"あ\qい"` が画面に `あ\qい` と出るだけで、書いた人には
             // 何も伝わりません（読めない形は通さない、という決まりです）。
             Some(other) => return Err(Unquote::Escape(other)),
-            // 値の終わりにある `\`。逃がす相手がいないので、そのまま1文字にします。
-            None => out.push('\\'),
+            // 値の終わりにある `\`。外した閉じの引用符を逃がしていたことになるので、
+            // 文字列が閉じていません（`"abc\"`）。以前は `abc\` という値で通していました。
+            None => return Err(Unquote::Unclosed),
         }
     }
     Ok(out)
@@ -301,6 +311,26 @@ mod tests {
         assert!(parse("a = \"x\"\"y\"\n").unwrap_err().contains("1 行目"));
         // 単引用符も同じ。
         assert!(parse("a = 'x''y'\n").unwrap_err().contains("1 行目"));
+    }
+
+    #[test]
+    fn 閉じの引用符を逃がした値はエラーにする() {
+        // 以前は `a = "abc\"` が `abc\` という値で通っていた。
+        let error = parse("[m]\na = \"abc\\\"\n").unwrap_err();
+        assert!(error.contains("2 行目"), "{error}");
+        assert!(error.contains("閉じていません"), "{error}");
+        // `\` だけの値も同じ。
+        assert!(parse("a = \"\\\"\n").unwrap_err().contains("1 行目"));
+        // 後ろにコメントを書いても閉じたことにはならない。
+        assert!(parse("a = \"abc\\\" # コメント\n")
+            .unwrap_err()
+            .contains("1 行目"));
+        // `\\` で終わる値は閉じている。今までどおり通る。
+        let pairs = parse("a = \"C:\\\\path\\\\\"\n").unwrap();
+        assert_eq!(pairs[0].1, "C:\\path\\");
+        // 単引用符の中の `\` は文字なので、`\` で終わってよい。
+        let pairs = parse("a = 'abc\\'\n").unwrap();
+        assert_eq!(pairs[0].1, "abc\\");
     }
 
     #[test]

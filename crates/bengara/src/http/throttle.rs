@@ -10,6 +10,7 @@
 //!
 //! 超えると 429 を返し、`Retry-After` と `X-RateLimit-*` を付けます。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +38,9 @@ const HARD_MAX_BUCKETS: usize = MAX_BUCKETS * 2;
 ///
 /// `10.0.0.0/8` のような範囲（CIDR）の書き方は読めません。依存クレートを増やさないため、
 /// 範囲の解析は実装していません。アドレスを1つずつ並べてください。
+///
+/// IPv4 のアドレスは `10.0.0.1` と書けば、相手が `::ffff:10.0.0.1` の形で
+/// 届いたときにも合います（`canonical` で形をそろえてから比べます）。
 const TRUSTED_PROXIES: &str = "TRUSTED_PROXIES";
 
 /// 数え方の置き場所。
@@ -44,13 +48,13 @@ const TRUSTED_PROXIES: &str = "TRUSTED_PROXIES";
 /// **プロセスのメモリに置きます。** プロセスを2つ動かすと、それぞれが別々に数えます
 /// （実際の上限は指定の2倍になります）。厳密に守りたいときは、
 /// 前段のプロキシか、共通の置き場所（Redis など）が要ります。
-/// いまは外部の置き場所を持っていないので、この形にしてあります。
+/// 外部の置き場所は持っていないので、この形にしてあります。
 ///
 /// **数え方は 1 つの `Mutex` で守ります。** そのため、回数の制限が掛かるルートへの
 /// リクエストは**全部がこの 1 つの錠で直列化します**（鍵が違っても同じです）。
 /// 数えるのは `HashMap` の読み書きだけなので短い時間ですが、`throttle` を
 /// 全ルートに掛けると、そこが詰まる場所になります。
-/// 鍵ごとに分ける作りには、いまはしていません。
+/// 鍵ごとに分ける作りにはしていません。
 pub struct Throttle {
     max: u32,
     window: Duration,
@@ -267,7 +271,8 @@ fn parse_trusted_proxies(raw: &str) -> Trusted {
             return Trusted::All;
         }
         match part.parse::<IpAddr>() {
-            Ok(ip) => list.push(ip),
+            // 一覧の側もそろえる。`::ffff:10.0.0.1` と書かれていても `10.0.0.1` と同じ相手。
+            Ok(ip) => list.push(canonical(ip)),
             Err(_) => tracing::warn!(
                 "{TRUSTED_PROXIES} の `{part}` は IP アドレスとして読めないため無視します\
                  （範囲の書き方には対応していません）"
@@ -279,6 +284,23 @@ fn parse_trusted_proxies(raw: &str) -> Trusted {
     } else {
         Trusted::List(list)
     }
+}
+
+/// IPv4 を IPv6 の形で表したアドレス（`::ffff:a.b.c.d`）を IPv4 に直す。
+///
+/// IPv6 と IPv4 の両方を受けるソケット（`APP_HOST=::`。Linux の既定）では、
+/// IPv4 でつないできた相手が `::ffff:10.0.0.1` の形で届きます。`IpAddr` の比較は
+/// 形が違えば不一致なので、直さないと次の 2 つが起きます。
+///
+/// | 場所 | 起きること |
+/// |---|---|
+/// | `TRUSTED_PROXIES=10.0.0.1` との照合 | 合わない。前段のヘッダーを見ず、**全員がプロキシのアドレス 1 つで数えられる** |
+/// | 鍵 | 同じ相手が、届き方によって `10.0.0.1` と `::ffff:10.0.0.1` の 2 つの枠を持つ |
+///
+/// **比べる前と鍵にする前に、必ずここを通します。** 接続元・`X-Forwarded-For`・
+/// `X-Real-IP`・`TRUSTED_PROXIES` の 4 か所です。
+fn canonical(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
 }
 
 /// 誰を数えるかを決める。鍵を作れないときは `None`。
@@ -300,7 +322,8 @@ fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
     }
     // 接続元が分からなければ鍵を作らない。`"unknown"` のような1つの鍵にまとめると、
     // 誰か1人が使い切るだけで全員を締め出せてしまいます。
-    let peer = req.ip()?;
+    // `::ffff:a.b.c.d` で届いた IPv4 は、照合と鍵の前に IPv4 に直す（`canonical`）。
+    let peer = canonical(req.ip()?);
     // ヘッダーから採るのも `IpAddr` です。`user:5` のような文字列は鍵になりません。
     let who = if trusted.allows(&peer) {
         forwarded_ip(req, trusted).unwrap_or(peer)
@@ -310,16 +333,38 @@ fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
     Some(format!("{who}|{target}"))
 }
 
-/// 何に対する回数かを表す文字列。
+/// 何に対する回数かを表す文字列。上から順に、最初にあるものを使います。
 ///
-/// **ルート名があればそちらを使います。** 生のパスを使うと、`/api/items/{id}` の
-/// ようなパス引数つきのルートで、1つの相手が `/api/items/1`…`/api/items/20000` と
-/// 叩くだけで鍵を好きなだけ増やせます。ルート名は起動時に一意だと確かめてあるので、
-/// パス引数の数だけ鍵が増えることがありません。
+/// | 順 | 使うもの | 例 |
+/// |---|---|---|
+/// | 1 | ルート名 | `items.show` |
+/// | 2 | 当たったルートの**登録パス** | `/api/items/{id}` |
+/// | 3 | ルートに当たらなかったときは、照合と同じ形にそろえたパス | `/missing` |
 ///
-/// 名前を付けていないルートと、ルートに当たらなかったときはパスを使います。
-fn target_of(req: &Request) -> &str {
-    req.route_name().unwrap_or_else(|| req.path())
+/// **届いたパス（`req.path()`）は、そのままでは鍵にしません。** 相手が形を変えられるからです。
+///
+/// | 相手がやること | 届いたパスを鍵にすると |
+/// |---|---|
+/// | 末尾に `/` を足す（`/login/` `/login//`） | 同じハンドラに届くのに、`/` の本数だけ枠が増える |
+/// | `%xx` の大文字小文字を変える（`%e3` と `%E3`） | 同じルートなのに枠が 2 倍以上になる |
+/// | パス引数を変える（`/api/items/1`…`/api/items/20000`） | 値の数だけ枠が増える |
+///
+/// 以前は「名前が無ければ届いたパス」だったので、名前の無いルートは 3 つとも通りました
+/// （この文書の先頭の例も、名前の無い `/login` でした）。ルート名と登録パスは起動時に
+/// 固定したものなので、相手には変えられません。
+///
+/// 3 は `Throttle` を共通のミドルウェアにして、404 や 405 に掛かったときの道です。
+/// `Routes::find` と同じ 2 つ（`match_path` と `upcase_hex`）を通します。
+/// 無いパスは相手がいくらでも作れるので、ここの鍵の数は抑えられません
+/// （件数の天井 `MAX_BUCKETS` で守ります）。
+fn target_of(req: &Request) -> Cow<'_, str> {
+    if let Some(name) = req.route_name() {
+        return Cow::Borrowed(name);
+    }
+    if let Some(path) = req.route_path() {
+        return Cow::Borrowed(path);
+    }
+    super::percent::upcase_hex(super::routing::match_path(req.path()))
 }
 
 /// 前段のプロキシが伝えてきた、元の相手。
@@ -348,7 +393,9 @@ fn target_of(req: &Request) -> &str {
 /// ヘッダー行を足す）の下で、相手が付けた 1 本目＝言い値を鍵にしていました。
 /// 値を毎回変えるだけで、回数の制限を無制限に回せました。
 fn forwarded_ip(req: &Request, trusted: &Trusted) -> Option<IpAddr> {
-    let parse = |part: &str| part.trim().parse::<IpAddr>().ok();
+    // 読めた値は IPv4 の形にそろえる。そろえないと、`::ffff:10.0.0.1` と書かれた
+    // 自分の前段を「信頼一覧に無い相手」と見て、そこで辿るのを止めてしまいます。
+    let parse = |part: &str| part.trim().parse::<IpAddr>().ok().map(canonical);
     // 届いた順に並べる。RFC 9110 では、これがカンマでつないだ 1 本と同じ意味です。
     let forwarded: Vec<&str> = req
         .header_all("x-forwarded-for")
@@ -385,7 +432,7 @@ fn real_ip(req: &Request) -> Option<IpAddr> {
     if values.next().is_some() {
         return None;
     }
-    only.trim().parse::<IpAddr>().ok()
+    only.trim().parse::<IpAddr>().ok().map(canonical)
 }
 
 impl Middleware for Throttle {
@@ -517,6 +564,143 @@ mod tests {
         assert_eq!(
             key_for_with(&first, &Trusted::None),
             Some("203.0.113.9|items.show".to_string())
+        );
+    }
+
+    /// 接続元とパスを決めてリクエストを作る。
+    fn at(path: &str) -> Request {
+        let addr: std::net::SocketAddr = "203.0.113.9:12345".parse().expect("アドレスの形");
+        Request::new("POST", path).with_remote_addr(addr)
+    }
+
+    #[test]
+    fn 名前が無ければ登録パスで数える() {
+        // 以前は届いたパスを鍵にしていたので、`/` を足すだけで枠が増えた。
+        // `Application` は当たったルートの登録パスを載せる。それを鍵にする。
+        let key = |sent: &str, registered: &str| {
+            let mut req = at(sent);
+            req.set_route_path(Some(registered.into()));
+            key_for_with(&req, &Trusted::None)
+        };
+        let expected = Some("203.0.113.9|/login".to_string());
+        for sent in ["/login", "/login/", "/login//"] {
+            assert_eq!(key(sent, "/login"), expected, "{sent}");
+        }
+        // パス引数を変えても同じ鍵。
+        assert_eq!(
+            key("/api/items/1", "/api/items/{id}"),
+            key("/api/items/20000", "/api/items/{id}")
+        );
+        assert_eq!(
+            key("/api/items/1", "/api/items/{id}"),
+            Some("203.0.113.9|/api/items/{id}".to_string())
+        );
+    }
+
+    #[test]
+    fn 名前があれば登録パスより名前を使う() {
+        let mut req = at("/login/");
+        req.set_route_path(Some("/login".into()));
+        req.set_route_name(Some("login".into()));
+        assert_eq!(
+            key_for_with(&req, &Trusted::None),
+            Some("203.0.113.9|login".to_string())
+        );
+    }
+
+    #[test]
+    fn ルートに当たらないパスは照合と同じ形にそろえて数える() {
+        // `Throttle` を共通のミドルウェアにしたときの 404 の道。
+        // 末尾の `/` と 16 進の大文字小文字で、同じパスの枠が増えないようにする。
+        let key = |sent: &str| key_for_with(&at(sent), &Trusted::None);
+        let expected = Some("203.0.113.9|/login".to_string());
+        for sent in ["/login", "/login/", "/login//"] {
+            assert_eq!(key(sent), expected, "{sent}");
+        }
+        assert_eq!(key("/%e3%81%82/"), key("/%E3%81%82"));
+        assert_eq!(
+            key("/%e3%81%82"),
+            Some("203.0.113.9|/%E3%81%82".to_string())
+        );
+        // `/` 単独はそのまま。
+        assert_eq!(key("/"), Some("203.0.113.9|/".to_string()));
+        assert_eq!(key("///"), Some("203.0.113.9|/".to_string()));
+    }
+
+    /// IPv4 を IPv6 の形で表したアドレスから届いたリクエスト。
+    fn from_mapped(v4: &str) -> Request {
+        let addr: std::net::SocketAddr = format!("[::ffff:{v4}]:12345")
+            .parse()
+            .expect("アドレスの形");
+        assert!(addr.is_ipv6(), "IPv6 の形で届いたことにする");
+        Request::new("GET", "/login").with_remote_addr(addr)
+    }
+
+    #[test]
+    fn ipv4射影のアドレスはipv4として数える() {
+        // `APP_HOST=::` のソケットは、IPv4 の相手を `::ffff:a.b.c.d` で渡すことがある。
+        // 届き方で鍵が変わると、同じ相手が 2 つの枠を持つ。
+        assert_eq!(
+            key_for_with(&from_mapped("203.0.113.9"), &Trusted::None),
+            key_for_with(&from("203.0.113.9"), &Trusted::None)
+        );
+        assert_eq!(
+            key_for_with(&from_mapped("203.0.113.9"), &Trusted::None),
+            Some("203.0.113.9|/login".to_string())
+        );
+        // 本物の IPv6 はそのまま。
+        let addr: std::net::SocketAddr = "[2001:db8::1]:12345".parse().unwrap();
+        let req = Request::new("GET", "/login").with_remote_addr(addr);
+        assert_eq!(
+            key_for_with(&req, &Trusted::None),
+            Some("2001:db8::1|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn ipv4射影で届いたプロキシも信頼一覧と合う() {
+        // 直す前は `::ffff:10.0.0.1` と `10.0.0.1` が不一致になり、前段のヘッダーを
+        // 見なかった。全員がプロキシのアドレス 1 つで数えられ、1 人が使い切ると
+        // 全員が 429 になる。
+        let trusted = parse_trusted_proxies("10.0.0.1");
+        let req = from_mapped("10.0.0.1")
+            .with_headers(vec![("x-forwarded-for".into(), "203.0.113.9".into())]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("203.0.113.9|/login".to_string())
+        );
+
+        // ヘッダーの中の値もそろえる。そろえないと、`::ffff:` の形で書かれた
+        // 自分の前段を「一覧に無い相手」と見て、そこで止まってしまう。
+        let req = from_mapped("10.0.0.1").with_headers(vec![(
+            "x-forwarded-for".into(),
+            "::ffff:203.0.113.9, ::ffff:10.0.0.1".into(),
+        )]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("203.0.113.9|/login".to_string())
+        );
+
+        // X-Real-IP も同じ。
+        let req = from_mapped("10.0.0.1")
+            .with_headers(vec![("x-real-ip".into(), "::ffff:203.0.113.9".into())]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("203.0.113.9|/login".to_string())
+        );
+
+        // 一覧の側が `::ffff:` の形で書かれていても合う。
+        assert_eq!(
+            parse_trusted_proxies("::ffff:10.0.0.1"),
+            Trusted::List(vec!["10.0.0.1".parse().unwrap()])
+        );
+
+        // 信頼していない相手は、形を変えても信頼されない。
+        let req = from_mapped("203.0.113.250")
+            .with_headers(vec![("x-forwarded-for".into(), "1.2.3.4".into())]);
+        assert_eq!(
+            key_for_with(&req, &trusted),
+            Some("203.0.113.250|/login".to_string())
         );
     }
 

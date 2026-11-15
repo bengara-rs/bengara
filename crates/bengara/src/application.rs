@@ -169,13 +169,16 @@ impl Application {
 
     /// 最内側のハンドラを決める（ルート本体・405・静的ファイル・404）。
     ///
-    /// パス引数とルート名は、ミドルウェアからも見えるように**ここで**載せます。
+    /// パス引数・ルート名・登録パスは、ミドルウェアからも見えるように**ここで**載せます。
     fn innermost(&self, req: &mut Request, options: &RenderOptions) -> Arc<dyn ErasedHandler> {
         match self.inner.routes.find(req.method(), req.path()) {
-            Matched::Found { def, params } => {
+            Matched::Found { def, path, params } => {
                 let name = def.name.clone();
                 req.set_params(params);
                 req.set_route_name(name);
+                // 登録パス（`/posts/{id}` の形）。回数の制限が鍵にします。
+                // 届いたパスは `/login/` のように相手が形を変えられるので、鍵にできません。
+                req.set_route_path(Some(path));
                 req.mark_matched();
 
                 // ルートごとの並びが無ければ、ハンドラをそのまま返す。
@@ -291,11 +294,11 @@ impl Application {
                 ) {
                     return Some(response);
                 }
-                // 3. ディスクの public/。
+                // 3. ディスクの public/。`public/storage/` の中は返さない（`serve_public`）。
                 let dir = self.inner.public_dir.clone();
                 let root = self.inner.public_canonical.clone();
                 let found = tokio::task::spawn_blocking(move || {
-                    crate::http::statics::serve(
+                    crate::http::statics::serve_public(
                         &dir,
                         root.as_deref(),
                         &path,
@@ -651,6 +654,97 @@ mod tests {
         let response = app.handle(Request::new("DELETE", "/report")).await;
         assert_eq!(response.status(), 405);
         assert_eq!(response.header("allow"), Some("POST"));
+    }
+
+    /// 接続元のアドレスを載せたリクエスト（回数の制限は、これが無いと数えない）。
+    fn from_peer(method: &str, path: &str) -> Request {
+        let addr: std::net::SocketAddr = "203.0.113.9:12345".parse().expect("アドレスの形");
+        Request::new(method, path).with_remote_addr(addr)
+    }
+
+    /// 1 回だけ通す回数の制限を、名前の無いルートに付けたアプリ。
+    fn throttled_app() -> Application {
+        Application::configure()
+            .with_middleware(|m| {
+                m.alias(
+                    "throttle",
+                    crate::http::Throttle::new(1, std::time::Duration::from_secs(60)),
+                )
+            })
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::post("/login", ok).middleware("throttle");
+                    Route::get("/items/{id}", ok).middleware("throttle");
+                    Route::get("/あ", ok).middleware("throttle");
+                    Route::get("/other", ok).middleware("throttle");
+                })
+            })
+            .create()
+    }
+
+    #[tokio::test]
+    async fn 名前の無いルートは末尾のスラッシュで回数の制限を回せない() {
+        // 以前は届いたパスを鍵にしていたので、`/login` `/login/` `/login//` が
+        // 別々の枠になり、`/` を足すだけで好きなだけ試せた（どれも同じハンドラに届く）。
+        let app = throttled_app();
+        let first = app.handle(from_peer("POST", "/login")).await;
+        assert_eq!(first.status(), 200);
+        for path in ["/login/", "/login//", "/login///", "/login"] {
+            let response = app.handle(from_peer("POST", path)).await;
+            assert_eq!(response.status(), 429, "{path} は同じ枠で数える");
+        }
+        // 別のルートは巻き込まない。
+        let other = app.handle(from_peer("GET", "/other")).await;
+        assert_eq!(other.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn 名前の無いルートはパス引数を変えても回数の制限を回せない() {
+        // 以前は `/items/1` と `/items/2` が別々の枠だった（名前を付けたときだけ防げた）。
+        let app = throttled_app();
+        assert_eq!(app.handle(from_peer("GET", "/items/1")).await.status(), 200);
+        for path in ["/items/2", "/items/20000", "/items/1/"] {
+            let response = app.handle(from_peer("GET", path)).await;
+            assert_eq!(response.status(), 429, "{path} は同じ枠で数える");
+        }
+    }
+
+    #[tokio::test]
+    async fn 名前の無いルートは十六進の大文字小文字で回数の制限を回せない() {
+        // `%E3` と `%e3` は同じルートに当たる。鍵も同じでないと枠が 2 倍になる。
+        let app = throttled_app();
+        let first = app.handle(from_peer("GET", "/%E3%81%82")).await;
+        assert_eq!(first.status(), 200);
+        for path in ["/%e3%81%82", "/%E3%81%82/", "/%e3%81%82//"] {
+            let response = app.handle(from_peer("GET", path)).await;
+            assert_eq!(response.status(), 429, "{path} は同じ枠で数える");
+        }
+    }
+
+    #[tokio::test]
+    async fn 当たったルートの登録パスをミドルウェアから読める() {
+        // 共通のミドルウェアからも見えること（照合は並びを回す前に済ませる）。
+        async fn show_route_path(req: Request, next: Next) -> AppResult<Response> {
+            let path = req.route_path().unwrap_or("(none)").to_string();
+            let response = next.run(req).await?;
+            Ok(response.with_header("x-route-path", path))
+        }
+        let app = Application::configure()
+            .with_middleware(|m| m.append(show_route_path))
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/posts/{id}", ok);
+                })
+            })
+            .create();
+        let response = app.handle(Request::new("GET", "/posts/12/")).await;
+        assert_eq!(response.header("x-route-path"), Some("/posts/{id}"));
+        // 当たらないとき（404・405）は載せない。
+        let response = app.handle(Request::new("GET", "/missing")).await;
+        assert_eq!(response.header("x-route-path"), Some("(none)"));
+        let response = app.handle(Request::new("POST", "/posts/12")).await;
+        assert_eq!(response.status(), 405);
+        assert_eq!(response.header("x-route-path"), Some("(none)"));
     }
 
     #[tokio::test]
