@@ -174,6 +174,7 @@ bengara: 終了しました
 | 待っている間に 2 回目の合図 | **待たずに終わる**（終了コード 130）。無制限のときも効く        |
 
 - **上限より長くかかるリクエストは切られます。** 長い処理は [キュー](queue.md) に回してください。
+- WebSocket の接続には 1001（サーバーが止まる）を送ります。待つのは上限と 5 秒の短いほうです（[websocket.md](websocket.md#止めるとき)）。
 - **Windows のサービス停止要求は受け取れません。** `nssm` などでサービスにすると、止めるときに強制終了になります。
 
 ### queue:work を止める
@@ -207,6 +208,7 @@ bengara: 終了しました
 | `CACHE_DRIVER=file`             | 同じ理由                             |
 | `migrate` は更新のたびに 1 回   | プロセスごとの起動時には流さない     |
 | `schedule:run` は 1 か所だけ    | 同じ処理を二重に走らせないため       |
+| `BROADCAST_CONNECTION=database` | WebSocket の配信をプロセスをまたいで届けるため（[下](#websocket-を通す)） |
 
 回数の制限（`Throttle`）はプロセスごとに数えます。2 つ動かすと、上限は約 2 倍になります。
 
@@ -240,6 +242,39 @@ server {
 
 **`POST` は送り直されません。** 止めたプロセスへの `POST` は失敗します。
 `non_idempotent` を足せば送り直しますが、処理が二重に走る危険があります。
+
+### WebSocket を通す
+
+WebSocket（[websocket.md](websocket.md)）を使うなら、その URL に切り替えのヘッダーを渡す設定を足します。
+
+```nginx
+location /gateway {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 120s;   # アプリのハートビートの間隔より長く
+}
+```
+
+- `proxy_read_timeout` の間に何も流れないと、nginx が接続を切ります。クライアントが定期的に送るか、`ping_interval` を使ってください。
+- HTTPS は nginx で受けます。ブラウザからは `wss://` でつなぎます。
+- 更新のときは、止めたプロセスの接続が 1001 で切れます。クライアントはつなぎ直すように作ります。
+
+配信の送り方は、次のどれかに当たるなら `database` にします。
+
+| 場面                                                   | 理由                                   |
+|--------------------------------------------------------|----------------------------------------|
+| 定期処理（`schedule:run`）から送る                     | 別のプロセスなので `memory` では届かない |
+| キュー（`queue:work`）やコマンドから送る               | 同じ理由                               |
+| サーバーを 2 つ以上動かす                              | 相手がどちらのプロセスにつないでいるか分からない |
+
+```ini
+BROADCAST_CONNECTION=database
+```
+
+中継の表を作るマイグレーションが要ります（[websocket.md](websocket.md#database-を使う)）。
 
 ### 接続元のアドレスを伝える
 

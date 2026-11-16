@@ -45,6 +45,10 @@ pub struct Request {
     input_cache: OnceLock<Vec<(String, String)>>,
     cookie_cache: OnceLock<Vec<(String, String)>>,
     query_cache: OnceLock<Vec<(String, String)>>,
+    /// WebSocket への切り替えの口（`server.rs` が載せる）。取り出せるのは 1 回だけ。
+    ///
+    /// ふつうのリクエストでは空で、確保もしません。
+    upgrade: crate::websocket::Slot<crate::websocket::Handoff>,
 }
 
 impl Request {
@@ -71,7 +75,44 @@ impl Request {
             input_cache: OnceLock::new(),
             cookie_cache: OnceLock::new(),
             query_cache: OnceLock::new(),
+            upgrade: crate::websocket::Slot::default(),
         }
+    }
+
+    /// WebSocket への切り替えの口を載せる。`server.rs` が入れます。
+    #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+    pub(crate) fn with_upgrade(mut self, handoff: crate::websocket::Handoff) -> Self {
+        self.upgrade = crate::websocket::Slot::new(handoff);
+        self
+    }
+
+    /// WebSocket への切り替えの口。
+    pub(crate) fn upgrade_slot(&self) -> &crate::websocket::Slot<crate::websocket::Handoff> {
+        &self.upgrade
+    }
+
+    /// WebSocket への切り替えを始める。
+    ///
+    /// ```ignore
+    /// req.websocket()?.on_upgrade(|mut socket| async move { /* ... */ })
+    /// ```
+    ///
+    /// | 起きたこと | 結果 |
+    /// |---|---|
+    /// | 切り替えの要求でない（GET・`Upgrade`・`Connection`・鍵） | Err（400） |
+    /// | `Sec-WebSocket-Version` が 13 でない | Err（426 ＋ `Sec-WebSocket-Version: 13`） |
+    /// | サーバーが停止の途中・同時接続の上限 | Err（503） |
+    /// | 機能フラグ `websocket` が無い | Err（「features に "websocket" を足してください」） |
+    ///
+    /// **`Origin` は確かめません。** 切り替えは GET なので CSRF の確認も掛かりません。
+    /// 他のサイトからの接続を断るには、`req.header("origin")` を自分で確かめてください。
+    pub fn websocket(&self) -> Result<crate::websocket::WebSocketUpgrade> {
+        crate::websocket::WebSocketUpgrade::from_request(self)
+    }
+
+    /// 切り替えの要求か（`Upgrade: websocket` と `Connection: upgrade` があるか）。
+    pub fn wants_websocket(&self) -> bool {
+        crate::websocket::wants_websocket(self)
     }
 
     pub(crate) fn with_query(mut self, query: impl Into<String>) -> Self {
@@ -572,6 +613,9 @@ const SENSITIVE: &[&str] = &[
     "backup",
     "answer",
     "signature",
+    // WebSocket はクエリで使い捨てのチケットを渡すのが普通です（`/gateway?ticket=...`）。
+    // 一覧に無いと、アクセスログに平文で残ります。
+    "ticket",
 ];
 
 /// `page()` が返すページ番号の上限。

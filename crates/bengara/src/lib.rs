@@ -23,6 +23,7 @@
 
 mod application;
 pub mod auth;
+pub mod broadcast;
 pub mod cache;
 mod cli;
 pub(crate) mod commands;
@@ -45,6 +46,7 @@ pub mod session;
 mod storage;
 mod support;
 pub mod validation;
+pub mod websocket;
 
 pub mod testing;
 

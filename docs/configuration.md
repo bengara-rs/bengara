@@ -79,6 +79,7 @@ let shop = config::<crate::config::shop::ShopConfig>();
 | `MailConfig`     | メールの送り先         | [mail.md](mail.md)                     | 作らない        |
 | `StorageConfig`  | ファイルの置き場所     | [storage.md](storage.md)               | 作らない        |
 | `HashConfig`     | パスワードの変換の回数 | [authentication.md](authentication.md) | 作らない        |
+| `BroadcastConfig` | 配信の送り方          | [websocket.md](websocket.md)           | 作らない        |
 
 ### いまの環境を調べる
 
@@ -246,6 +247,20 @@ Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C
 - `MAIL_HOST` から下の `MAIL_` は、送り先が `smtp` のときだけ使います。知らない `MAIL_MAILER` は送るときにエラーです。
 - くわしくは [cache.md](cache.md) / [mail.md](mail.md) / [localization.md](localization.md) にあります。
 
+### WebSocket と配信
+
+| 名前                          | 既定                            | 何に効くか                                          | 設定ファイル      |
+|-------------------------------|---------------------------------|-----------------------------------------------------|-------------------|
+| `BROADCAST_CONNECTION`        | （空なら `BROADCAST_DRIVER`）   | 配信の送り方（`memory` / `database`）               | `BroadcastConfig` |
+| `BROADCAST_DRIVER`            | `memory`                        | 古い名前。`BROADCAST_CONNECTION` が空のときだけ見る | `BroadcastConfig` |
+| `BROADCAST_POLL_MS`           | `250`                           | `database` のとき、表を読む間隔（ミリ秒。下限 10）  | `BroadcastConfig` |
+| `BROADCAST_RETENTION_SECONDS` | `60`                            | `database` のとき、行を残す秒数（下限 5）           | `BroadcastConfig` |
+| `WEBSOCKET_MAX_CONNECTIONS`   | `10000`                         | 1 プロセスの同時接続の上限。`0` は既定と同じ        | —                 |
+
+- `array` は `memory` と同じです。知らない送り方は、送るときにエラーです。
+- `BroadcastConfig` は `prelude` に入っていません。`bengara::broadcast::BroadcastConfig` から取り込みます。
+- くわしくは [websocket.md](websocket.md) にあります。
+
 ## APP_KEY
 
 署名と暗号化に使う鍵です。セッション・署名付き URL・暗号化（`encrypt` / `decrypt`）が使います。
@@ -313,6 +328,7 @@ bengara = { version = "0.1", features = ["sqlite", "mail"] }
 | `mariadb`    | 入っていない   | `mysql` と同じ                                                  |
 | `postgres`   | 入っていない   | PostgreSQL                                                      |
 | `mail`       | 入っていない   | SMTP でのメール送信（[mail.md](mail.md)）                       |
+| `websocket`  | 入っていない   | WebSocket の受け口（[websocket.md](websocket.md)）              |
 | `encryption` | 入っていない   | `encrypt` / `decrypt`（[authentication.md](authentication.md)） |
 | `log-filter` | **入っている** | `RUST_LOG=myapp=debug` のような絞り込み                         |
 
@@ -321,6 +337,7 @@ bengara = { version = "0.1", features = ["sqlite", "mail"] }
 - **キューとマイグレーションにも、データベースのフラグが要ります。**
 - 認証・キャッシュ・ファイル・多言語・イベント・定期処理は、フラグなしで使えます。
 - メールは、送り先が `log` と `array` ならフラグなしで使えます。
+- `Broadcast::publish` はフラグなしで呼べます。受け口（`req.websocket()`）には `websocket` が要ります。
 - `mysql` / `postgres` / `mail` のビルドには C コンパイラが要ります（通信の暗号化のため）。
 - `Cargo.toml` に見える `database` と `tls` は内部用です。自分では書きません。
 

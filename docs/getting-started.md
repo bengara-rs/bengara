@@ -22,6 +22,7 @@ cargo add bengara --features sqlite
 | MySQL / MariaDB     | `mysql`    |
 | PostgreSQL          | `postgres` |
 | SMTP でのメール送信 | `mail`     |
+| WebSocket           | `websocket` |
 
 フラグの一覧は [configuration.md](configuration.md#機能フラグ) にあります。
 

@@ -212,6 +212,7 @@ get("/").await
 | 溜まったメール（`Mail::sent()` / `Mail::clear_sent()`）  | `exclusive()`        |
 | いまの言語を変える（`Lang::set`）                        | `exclusive()`        |
 | イベントの登録を変えたアプリで `Event::dispatch` を呼ぶ  | `exclusive()`        |
+| 配信の記録（`Broadcast::fake()` / `published()`）        | `exclusive()`        |
 
 - 札は変数で受け取ります（`let _db = ...`）。受け取らないと、その場で手放されます。
 - 1 つのテストで同じ札を 2 回取ると、パニックします。
@@ -249,6 +250,8 @@ async fn 数を足し引きできる() {
 | メール   | `Mail::sent()` に溜まった中身を見る          | [mail.md](mail.md) の「テスト」   |
 | キュー   | 積まれた数を見る。中身は `handle` を直接呼ぶ | [queue.md](queue.md) の「テスト」 |
 | 定期処理 | `routes/console.rs` の関数を自分で呼ぶ       | 下の例                            |
+| 配信     | `Broadcast::fake()` で記録して見る           | 下の例                            |
+| WebSocket の受け口 | 切り替えのヘッダーを付けて送り、101 を見る | [websocket.md](websocket.md) の「テスト」 |
 
 ```rust
 #[bengara::test]
@@ -262,6 +265,41 @@ async fn 定期処理が登録されている() {
 }
 ```
 
+### 配信を確かめる
+
+`Broadcast::fake()` の後の `publish` は、送らずに記録だけします。
+記録はプロセスで 1 つなので、`exclusive()` の札を取ってから呼びます。
+
+```rust
+use bengara::broadcast::Broadcast;
+
+#[bengara::test]
+async fn 投稿すると配信される() {
+    let _lock = exclusive().await;
+    Broadcast::fake();
+
+    post("/api/posts", "title=hi").await.assert_status(201);
+
+    Broadcast::assert_published("posts", "hi");
+}
+```
+
+| 書き方                                        | すること                           |
+|-----------------------------------------------|------------------------------------|
+| `Broadcast::published(名前)`                  | そのチャンネルへの中身（送った順） |
+| `Broadcast::assert_published(名前, 含む文字)` | 含む中身が無ければパニック         |
+| `Broadcast::assert_nothing_published()`       | 何か記録があればパニック           |
+
+- **札を手放すと fake は終わり、記録も空になります。** 札を取らずに `fake()` を呼ばないでください。
+- `Broadcast` は `prelude` に入っていません。`use` で取り込みます。
+
+### WebSocket の受け口を確かめる
+
+`client.send` で切り替えのヘッダー（`upgrade`・`connection`・`sec-websocket-version`・`sec-websocket-key`）を付けて送ります。
+
+- 認証などを通れば、101 が返ります。**ソケットが無いので、`on_upgrade` のクロージャは動きません。**
+- 例は [websocket.md](websocket.md#テスト) にあります。
+
 ## 関連
 
 - [routing.md](routing.md)
@@ -270,3 +308,4 @@ async fn 定期処理が登録されている() {
 - [models.md](models.md) — モデルとシーダー
 - [authentication.md](authentication.md) — ログイン
 - [cache.md](cache.md) / [queue.md](queue.md) / [mail.md](mail.md) — 周辺機能
+- [websocket.md](websocket.md) — WebSocket と配信

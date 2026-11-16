@@ -149,6 +149,7 @@ pub(crate) fn reason_phrase(status: u16) -> &'static str {
         415 => "Unsupported Media Type",
         419 => "Page Expired",
         422 => "Unprocessable Content",
+        426 => "Upgrade Required",
         428 => "Precondition Required",
         429 => "Too Many Requests",
         451 => "Unavailable For Legal Reasons",

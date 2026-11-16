@@ -16,6 +16,7 @@ Laravel と同じディレクトリ構成で、Web アプリを Rust で書け�
 | 画面の状態 | セッション、Cookie、CSRF、認証、認可、多言語                              |
 | データ     | SQLite / MySQL / MariaDB / PostgreSQL、マイグレーション、モデル、シーダー |
 | 裏の処理   | キャッシュ、ファイルの置き場所、キュー、定期処理、イベント、メール        |
+| 双方向     | WebSocket、チャンネルへの配信（機能フラグ `websocket`）                   |
 | 道具       | `cargo artisan` のコマンド、自分のコマンド、テスト、本番への配置          |
 
 ページごとの案内は [docs/README.md](docs/README.md) にあります。

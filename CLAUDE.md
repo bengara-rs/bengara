@@ -39,7 +39,8 @@
   | 名前付きの DB 接続                  | `database/mod.rs`                                 | 読み取りだけ。書くのは接続ごとに初回の 1 回。既定の接続はロックなし |
   | 回数の制限                          | `http/throttle.rs`                                | 書き込み。数えるために要る                                 |
   | セッション（ID ごとの錠と中身）     | `session/middleware.rs`・`session/mod.rs`         | 利用者ごと。ID の表を引く間だけ共有のロックを取る          |
-  | テスト・手元用の置き場所            | `cache/store.rs`・`session/store.rs`・`mail.rs`   | `memory` のキャッシュとセッション、`array` のメール        |
+  | テスト・手元用の置き場所            | `cache/store.rs`・`session/store.rs`・`mail.rs`・`broadcast.rs` | `memory` のキャッシュとセッション、`array` のメール、`Broadcast::fake` の記録 |
+  | WebSocket の接続の表                | `websocket/registry.rs`                           | 接続・切断・join・leave で書き、publish・local_count で読む。送るのは放してから（接続とチャンネルはリクエスト処理中に増減するため） |
 - **実装していない機能をドキュメントに書かない。** 将来の話は `docs/backlog.md` だけに書く。
 - 依存クレートを安易に増やさない。入れる前に自前で書けないか考える。
 - `panic = "abort"` にしない。ハンドラのパニックは 1 リクエストに閉じ込めて 500 を返す。

@@ -39,6 +39,7 @@ bengara を使う人のための資料です。読むページをここで探し
 | [scheduling.md](scheduling.md)             | 定期処理                             |
 | [events.md](events.md)                     | イベントと、聞く側                   |
 | [mail.md](mail.md)                         | メール（`log` / `array` / SMTP）     |
+| [websocket.md](websocket.md)               | WebSocket と配信（`Broadcast`）      |
 | [localization.md](localization.md)         | 多言語                               |
 | [console-commands.md](console-commands.md) | 自分のコマンド                       |
 

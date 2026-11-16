@@ -57,6 +57,13 @@ encryption = ["chacha20poly1305"]
 # したときだけ「features に "mail" を足してください」というエラーになります。
 mail = ["lettre"]
 
+# WebSocket（`req.websocket()` で切り替える受け口）。既定では入りません。
+# フラグが無いときも websocket / broadcast モジュールはコンパイルされ、
+# `req.websocket()` を呼んだときだけ「features に "websocket" を足してください」
+# というエラーになります。`Broadcast::publish` はフラグが無くても呼べます。
+# フレームの処理は tokio-tungstenite に任せます（判断 10）。
+websocket = ["dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:futures-util"]
+
 [dependencies]
 bengara-macros = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -89,10 +96,33 @@ lettre = { version = "0.11", default-features = false, features = [
     "rustls-tls",     # TLS は rustls + webpki-roots（OS の証明書置き場に依存しない）
     "pool",           # つなぎっぱなしにして TLS の握り直しを減らす
 ], optional = true }
+# WebSocket。フレームの処理（マスク・断片・制御フレーム・Close の手順）だけを使います。
+# TLS は前段のプロキシが終端するので入れません。圧縮も使いません。
+# 切り替えの鍵（Sec-WebSocket-Accept）を作るために handshake を入れます。
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "handshake",
+], optional = true }
+# 切り替えの口（`hyper::upgrade::OnUpgrade`）を受け取るため。axum が使う hyper と同じものです。
+hyper = { version = "1.11", default-features = false, features = [
+    "http1",
+], optional = true }
+# 切り替えた後のソケットを tokio の読み書きの形に包む（`TokioIo`）。
+hyper-util = { version = "0.1.21", default-features = false, features = [
+    "tokio",
+], optional = true }
+# tokio-tungstenite の読み書き（Stream / Sink）を使うため。
+futures-util = { version = "0.3.34", default-features = false, features = [
+    "sink",
+    "std",
+], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# WebSocket の実ソケットのテストで、相手（クライアント）として使う。
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+] }
 
-# docs.rs では、つなげるドライバとメールを入れた状態で説明を出す。
+# docs.rs では、つなげるドライバとメールと WebSocket を入れた状態で説明を出す。
 [package.metadata.docs.rs]
-features = ["sqlite", "mysql", "postgres", "encryption", "mail"]
+features = ["sqlite", "mysql", "postgres", "encryption", "mail", "websocket"]

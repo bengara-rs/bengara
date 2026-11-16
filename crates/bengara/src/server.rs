@@ -49,12 +49,15 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
             display_addr(local)
         );
 
-        let router = axum::Router::new()
-            .fallback(axum::routing::any(dispatch))
-            .with_state(app)
-            // 接続元のアドレスを `dispatch` で受け取れるようにする。
-            // これが無いと `X-Forwarded-For` を信じるしかなくなり、回数制限を偽装で回せる。
-            .into_make_service_with_connect_info::<SocketAddr>();
+        // WebSocket の状態（停止の合図・同時接続の数）。切り替えた後の接続は
+        // axum の停止の待ちに入らないので、bengara が自分で数えて待つ。
+        let sockets = crate::websocket::ServerState::from_env();
+        let router = router(app, sockets.clone());
+
+        // 配信のために「このプロセスはサーバー」と覚え、database なら中継を立てる。
+        crate::broadcast::mark_server();
+        #[cfg(feature = "websocket")]
+        crate::broadcast::start_relay();
 
         // 合図を受け取ったことを、待ち受けを閉じる側と打ち切る側の両方に伝える。
         let (signalled, mut wait_signal) = tokio::sync::watch::channel(false);
@@ -88,7 +91,13 @@ pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
         let served = tokio::select! {
             result = &mut serving => Some(result),
             _ = wait_signal.wait_for(|signalled| *signalled) => {
-                drain(&mut serving, timeout).await
+                // HTTP の処理中のものと、WebSocket の接続を同時に待つ。
+                // WebSocket は全接続に 1001 を送り、上限と 5 秒の短いほうだけ待つ。
+                let (served, ()) = tokio::join!(
+                    drain(&mut serving, timeout),
+                    crate::websocket::shutdown(&sockets, timeout)
+                );
+                served
             }
         };
         match served {
@@ -167,13 +176,48 @@ fn display_addr(addr: SocketAddr) -> String {
     }
 }
 
+/// `dispatch` が受け取る状態。アプリと、WebSocket の状態。
+#[derive(Clone)]
+struct Served {
+    app: Application,
+    sockets: std::sync::Arc<crate::websocket::ServerState>,
+}
+
+/// 待ち受けに渡す axum の組み立て。`serve` とテストが使います。
+pub(crate) fn router(
+    app: Application,
+    sockets: std::sync::Arc<crate::websocket::ServerState>,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, SocketAddr> {
+    axum::Router::new()
+        .fallback(axum::routing::any(dispatch))
+        .with_state(Served { app, sockets })
+        // 接続元のアドレスを `dispatch` で受け取れるようにする。
+        // これが無いと `X-Forwarded-For` を信じるしかなくなり、回数制限を偽装で回せる。
+        .into_make_service_with_connect_info::<SocketAddr>()
+}
+
 /// axum から来たリクエストを `bengara` の形に直し、結果を axum の形に戻す。
 async fn dispatch(
-    State(app): State<Application>,
+    State(Served { app, sockets }): State<Served>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    let (parts, body) = request.into_parts();
+    #[cfg_attr(not(feature = "websocket"), allow(unused_mut))]
+    let (mut parts, body) = request.into_parts();
+
+    // WebSocket への切り替えの口。hyper は切り替えの要求（`Connection: upgrade`）にだけ入れる。
+    // 捨てずに `Request` へ載せ、`on_upgrade` で取り出す。
+    // ふつうのリクエストでは何も載せないので、確保は増えない。
+    #[cfg(feature = "websocket")]
+    let handoff = parts
+        .extensions
+        .remove::<hyper::upgrade::OnUpgrade>()
+        .map(|on_upgrade| crate::websocket::Handoff {
+            on_upgrade: Some(on_upgrade),
+            server: sockets,
+        });
+    #[cfg(not(feature = "websocket"))]
+    let _ = sockets;
 
     // アプリへ渡す前に返すときも、相手が JSON を欲しがっているなら JSON で返す。
     // 判定に使うヘッダーはこの時点で手元にあるので、先に求めておく。
@@ -231,6 +275,11 @@ async fn dispatch(
         .with_headers(headers)
         .with_body(bytes)
         .with_remote_addr(peer);
+    #[cfg(feature = "websocket")]
+    let req = match handoff {
+        Some(handoff) => req.with_upgrade(handoff),
+        None => req,
+    };
 
     // アクセスログに出す文字列は、ログが有効なときだけ作る。
     // `RUST_LOG=warn` で動かしているときに、リクエストごとの確保を 2 本減らせます。
@@ -240,6 +289,9 @@ async fn dispatch(
     // 行き先はルートを引いた**あと**で作る（`Application::handle_logged`）。
     // パス引数の名前が分からないと、`/reset/{token}` の値を伏せられないためです。
     let (response, target) = app.handle_logged(req, logging).await;
+    // 101 なら WebSocket の接続を動かすタスクを立てる（切り替えが載っていなければ 500 に直す）。
+    // ログより先に呼ぶのは、直した後のステータスを残すためです。
+    let response = crate::websocket::after_response(response, wants_json);
     if let (Some(method), Some(target)) = (method, target) {
         tracing::info!(
             "{method} {target} -> {} ({} ms)",
@@ -993,5 +1045,255 @@ mod tests {
         // 長くすると、systemd の `TimeoutStopSec`（文書の例は上限 + 10 秒）を超える。
         assert!(CUT_OFF_GRACE <= Duration::from_secs(5));
         assert!(CUT_OFF_GRACE >= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ログはwebsocketのチケットも伏せる() {
+        let req = Request::new("GET", "/gateway").with_query("ticket=abc&v=1");
+        assert_eq!(log_target(&req), "/gateway?ticket=***&v=1");
+    }
+
+    /// 実際に `127.0.0.1:0` で待ち受けて、tokio-tungstenite のクライアントで話す。
+    #[cfg(feature = "websocket")]
+    mod websocket {
+        use super::*;
+        use crate::http::Route;
+        use crate::websocket::{Message, ServerState, WebSocket};
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Arc;
+        use tokio_tungstenite::tungstenite::{self, Message as WsMessage};
+
+        type Client = tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >;
+
+        const WAIT: Duration = Duration::from_secs(10);
+
+        async fn echo(req: Request) -> Result<Response> {
+            req.websocket()?
+                .on_upgrade(|mut socket: WebSocket| async move {
+                    while let Some(Ok(message)) = socket.recv().await {
+                        let _ = match message {
+                            Message::Text(text) => socket.send_text(text),
+                            Message::Binary(bytes) => socket.send_binary(bytes),
+                        };
+                    }
+                })
+        }
+
+        async fn boom(req: Request) -> Result<Response> {
+            req.websocket()?.on_upgrade(|_socket| async move {
+                panic!("わざと");
+            })
+        }
+
+        /// 切り替えを載せずに 101 だけを返す（ミドルウェアが応答を作り直した場合の代わり）。
+        async fn bare_101(_req: Request) -> Result<Response> {
+            Ok(Response::new(101))
+        }
+
+        async fn joined(req: Request) -> Result<Response> {
+            let channel = req.query("c").unwrap_or_default();
+            req.websocket()?
+                .on_upgrade(move |mut socket: WebSocket| async move {
+                    socket.join(&channel);
+                    let _ = socket.send_text("joined");
+                    while socket.recv().await.is_some() {}
+                })
+        }
+
+        /// サーバーを立てる。返すのはアドレスと WebSocket の状態。
+        async fn start(limit: usize) -> (SocketAddr, Arc<ServerState>) {
+            let app = Application::configure()
+                .with_routing(|r| {
+                    r.web(|| {
+                        Route::get("/ws", echo);
+                        Route::get("/boom", boom);
+                        Route::get("/bare", bare_101);
+                        Route::get("/join", joined);
+                    })
+                })
+                .create();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let sockets = ServerState::new(limit);
+            let service = router(app, sockets.clone());
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, service).await;
+            });
+            (addr, sockets)
+        }
+
+        async fn connect(
+            addr: SocketAddr,
+            path: &str,
+        ) -> std::result::Result<Client, tungstenite::Error> {
+            tokio::time::timeout(
+                WAIT,
+                tokio_tungstenite::connect_async(format!("ws://{addr}{path}")),
+            )
+            .await
+            .expect("時間内につながる")
+            .map(|(client, _response)| client)
+        }
+
+        /// つなげなかったときの HTTP のステータス。
+        fn http_status(error: tungstenite::Error) -> u16 {
+            match error {
+                tungstenite::Error::Http(response) => response.status().as_u16(),
+                other => panic!("HTTP のエラーではありません: {other}"),
+            }
+        }
+
+        async fn next(client: &mut Client) -> Option<WsMessage> {
+            loop {
+                let message = tokio::time::timeout(WAIT, client.next())
+                    .await
+                    .expect("時間内に届く")?
+                    .ok()?;
+                if !matches!(message, WsMessage::Ping(_) | WsMessage::Pong(_)) {
+                    return Some(message);
+                }
+            }
+        }
+
+        async fn close_code(client: &mut Client) -> Option<u16> {
+            loop {
+                if let WsMessage::Close(frame) = next(client).await? {
+                    // もう一度読むと、クライアントが Close の返事を送り出す。
+                    let _ = tokio::time::timeout(WAIT, client.next()).await;
+                    return frame.map(|frame| u16::from(frame.code));
+                }
+            }
+        }
+
+        async fn wait_until(mut done: impl FnMut() -> bool) {
+            let started = std::time::Instant::now();
+            while !done() {
+                assert!(started.elapsed() < WAIT, "時間内に終わらない");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn 実際のソケットで送受信できる() {
+            let (addr, sockets) = start(10).await;
+            let mut client = connect(addr, "/ws").await.expect("つながる");
+            client.send(WsMessage::text("ping")).await.unwrap();
+            assert_eq!(next(&mut client).await, Some(WsMessage::text("ping")));
+            client.send(WsMessage::binary(vec![0, 1])).await.unwrap();
+            assert_eq!(next(&mut client).await, Some(WsMessage::binary(vec![0, 1])));
+            assert_eq!(sockets.active(), 1);
+
+            client.close(None).await.unwrap();
+            wait_until(|| sockets.active() == 0).await;
+        }
+
+        #[tokio::test]
+        async fn 上限の数を超えたら503() {
+            let (addr, sockets) = start(1).await;
+            let mut first = connect(addr, "/ws").await.expect("1 本目はつながる");
+            let second = connect(addr, "/ws").await.expect_err("2 本目は断る");
+            assert_eq!(http_status(second), 503);
+
+            first.close(None).await.unwrap();
+            wait_until(|| sockets.active() == 0).await;
+            let mut again = connect(addr, "/ws").await.expect("空いたらつながる");
+            again.close(None).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn パニックしてもほかの接続とサーバーは生きている() {
+            let (addr, _sockets) = start(10).await;
+            let mut alive = connect(addr, "/ws").await.unwrap();
+            let mut broken = connect(addr, "/boom").await.unwrap();
+            assert_eq!(close_code(&mut broken).await, Some(1011));
+
+            alive.send(WsMessage::text("still")).await.unwrap();
+            assert_eq!(next(&mut alive).await, Some(WsMessage::text("still")));
+            let mut fresh = connect(addr, "/ws").await.expect("新しくつなげる");
+            fresh.close(None).await.unwrap();
+            alive.close(None).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn 停止で全接続に1001を送り新しい切り替えは503() {
+            let (addr, sockets) = start(10).await;
+            let mut a = connect(addr, "/ws").await.unwrap();
+            let mut b = connect(addr, "/ws").await.unwrap();
+            wait_until(|| sockets.active() == 2).await;
+
+            let stopping = {
+                let sockets = sockets.clone();
+                tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    crate::websocket::shutdown(&sockets, Some(Duration::from_secs(30))).await;
+                    started.elapsed()
+                })
+            };
+            assert_eq!(close_code(&mut a).await, Some(1001));
+            assert_eq!(close_code(&mut b).await, Some(1001));
+            // クライアントは次に読むときに Close を返す。
+            let _ = a.next().await;
+            let _ = b.next().await;
+            // 相手が Close を返したら、5 秒を待たずに終わる。
+            let took = tokio::time::timeout(WAIT, stopping).await.unwrap().unwrap();
+            assert!(took < Duration::from_secs(5), "{took:?}");
+            assert_eq!(sockets.active(), 0);
+
+            let refused = connect(addr, "/ws").await.expect_err("停止の途中は断る");
+            assert_eq!(http_status(refused), 503);
+        }
+
+        #[tokio::test]
+        async fn 切り替えが載っていない101は500にする() {
+            let (addr, _sockets) = start(10).await;
+            let error = connect(addr, "/bare").await.expect_err("切り替わらない");
+            assert_eq!(http_status(error), 500);
+        }
+
+        #[tokio::test]
+        async fn 配信でチャンネルの接続にだけ届きdisconnectで閉じる() {
+            // fake と取り合わないように札を取る（Broadcast はプロセスで共有）。
+            let _lock = crate::testing::exclusive().await;
+            let (addr, _sockets) = start(10).await;
+
+            let channel = format!("test.server.broadcast.{}", addr.port());
+            let path = format!("/join?c={channel}");
+            let mut a = connect(addr, &path).await.unwrap();
+            let mut b = connect(addr, &path).await.unwrap();
+            let mut outside = connect(addr, "/join?c=test.server.elsewhere")
+                .await
+                .unwrap();
+            for client in [&mut a, &mut b, &mut outside] {
+                assert_eq!(next(client).await, Some(WsMessage::text("joined")));
+            }
+            assert_eq!(crate::broadcast::Broadcast::local_count(&channel), 2);
+
+            crate::broadcast::Broadcast::publish(&channel, "news")
+                .await
+                .unwrap();
+            assert_eq!(next(&mut a).await, Some(WsMessage::text("news")));
+            assert_eq!(next(&mut b).await, Some(WsMessage::text("news")));
+
+            crate::broadcast::Broadcast::disconnect(&channel, 4001, "session revoked")
+                .await
+                .unwrap();
+            assert_eq!(close_code(&mut a).await, Some(4001));
+            assert_eq!(close_code(&mut b).await, Some(4001));
+            let _ = a.next().await;
+            let _ = b.next().await;
+            wait_until(|| crate::broadcast::Broadcast::local_count(&channel) == 0).await;
+
+            // 入っていない接続には届かず、生きている。
+            outside.send(WsMessage::text("x")).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), outside.next())
+                    .await
+                    .is_err(),
+                "何も届かない"
+            );
+            outside.close(None).await.unwrap();
+        }
     }
 }

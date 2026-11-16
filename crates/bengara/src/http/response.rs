@@ -15,6 +15,11 @@ pub struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Cow<'static, [u8]>,
+    /// WebSocket に切り替えた後に動かすもの（`on_upgrade` が載せる）。取り出せるのは 1 回だけ。
+    ///
+    /// ふつうの応答では空で、確保もしません。`with_header` などは `self` を
+    /// 受け取って返すので、ミドルウェアがヘッダーを足しても残ります。
+    upgrade: crate::websocket::Slot<crate::websocket::Pending>,
 }
 
 impl Response {
@@ -26,7 +31,20 @@ impl Response {
             status: normalize_status(status),
             headers: Vec::new(),
             body: Cow::Borrowed(&[]),
+            upgrade: crate::websocket::Slot::default(),
         }
+    }
+
+    /// WebSocket に切り替えた後に動かすものを載せる。
+    #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+    pub(crate) fn with_upgrade(mut self, pending: crate::websocket::Pending) -> Self {
+        self.upgrade = crate::websocket::Slot::new(pending);
+        self
+    }
+
+    /// WebSocket に切り替えた後に動かすものを取り出す。
+    pub(crate) fn take_upgrade(&self) -> Option<crate::websocket::Pending> {
+        self.upgrade.take()
     }
 
     /// `text/plain` を返す。
@@ -372,7 +390,18 @@ impl RenderOptions {
 /// `wants_json` なら JSON、そうでなければ HTML の画面を返します。
 /// 本文を持てないステータス（1xx・204・304）では、本文を付けません。
 pub(crate) fn error_response(error: &Error, options: RenderOptions) -> Response {
-    without_forbidden_body(build_error_response(error, options))
+    let response = without_forbidden_body(build_error_response(error, options));
+    // WebSocket の版が違うときの 426 には、受け付ける版を添える（RFC 6455 の 4.4）。
+    // `Error` はヘッダーを持てないので、`req.websocket()` が作った 426 だけをここで見分けます。
+    match error {
+        Error::Http {
+            status: 426,
+            message,
+        } if message == crate::websocket::VERSION_MESSAGE => response
+            .with_header("sec-websocket-version", "13")
+            .with_header("upgrade", "websocket"),
+        _ => response,
+    }
 }
 
 fn build_error_response(error: &Error, options: RenderOptions) -> Response {

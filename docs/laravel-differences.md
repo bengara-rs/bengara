@@ -239,6 +239,19 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | 言語ファイルは PHP の配列                 | `resources/lang/<言語>.toml`。**ビルド時に読む**                         |
 | `make:command` ＋ `$signature`            | `app/Console/Commands/*.rs` に `DESCRIPTION` と `handle`。名前はファイル名から |
 
+## WebSocket と配信
+
+| Laravel                                              | bengara                                                           |
+|------------------------------------------------------|-------------------------------------------------------------------|
+| WebSocket は Reverb（別のプロセス）か Pusher などの外部サービス | **本体が受ける。** `Route::get` ＋ `req.websocket()?.on_upgrade(..)` |
+| Pusher 互換のプロトコルと Laravel Echo               | **ありません。** やり取りの形はアプリが決める                     |
+| `routes/channels.php` でチャンネルの認可を書く       | **ありません。** 切り替える前に確かめ、`socket.join` で入れる     |
+| `broadcast(new OrderShipped($order))`（イベントのクラス） | `Broadcast::publish("orders.1", 文字).await?`                 |
+| `BROADCAST_CONNECTION`（`reverb` / `pusher` / `log` など） | 同じ名前。値は `memory` / `database`。知らない名前は送るときにエラー |
+| `ShouldBroadcast` でキューから送る                   | `publish` は直接送る。別のプロセスから送るなら `database`         |
+
+くわしくは [websocket.md](websocket.md) にあります。
+
 ## パスを返す関数
 
 | Laravel                              | bengara                                                       |

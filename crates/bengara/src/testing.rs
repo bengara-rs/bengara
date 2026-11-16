@@ -569,6 +569,9 @@ impl std::fmt::Debug for ExclusiveGuard {
 
 impl Drop for ExclusiveGuard {
     fn drop(&mut self) {
+        // `Broadcast::fake()` はこの札の間だけ効く。手放すときに終えて、記録も空にする。
+        // 残すと、後から走るテストの publish が黙って記録に吸われる。
+        crate::broadcast::reset_fake();
         HOLDS_EXCLUSIVE.set(false);
     }
 }
