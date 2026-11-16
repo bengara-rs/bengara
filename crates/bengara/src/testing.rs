@@ -214,7 +214,7 @@ impl TestClient {
         )
     }
 
-    /// `Set-Cookie` を覚える。`Max-Age=0` のものは捨てます。
+    /// `Set-Cookie` を覚える。期限が切れたもの（[`cookie_expired`]）は捨てます。
     fn remember_cookies(&self, response: &Response) {
         let mut cookies = self.cookies.lock().unwrap_or_else(|e| e.into_inner());
         for (name, value) in response.headers() {
@@ -226,10 +226,7 @@ impl TestClient {
             let Some((key, val)) = pair.split_once('=') else {
                 continue;
             };
-            let removed = value
-                .split(';')
-                .any(|p| p.trim().eq_ignore_ascii_case("Max-Age=0"));
-            if removed {
+            if cookie_expired(value, crate::support::time::now_seconds()) {
                 cookies.remove(key.trim());
             } else {
                 cookies.insert(key.trim().to_string(), val.trim().to_string());
@@ -237,6 +234,55 @@ impl TestClient {
         }
     }
 }
+
+/// `Set-Cookie` の値が「消す」指示か（期限がもう切れているか）。
+///
+/// ブラウザと同じく次のどちらかなら消します。
+///
+/// - `Max-Age` が 0 以下（`Max-Age=-1` も含む）
+/// - `Expires` が `now` 以前（フレームワークは `Thu, 01 Jan 1970 00:00:00 GMT` を出す）
+///
+/// 以前は `Max-Age=0` ちょうどだけを見ていて、ほかの消し方では残っていました。
+/// `Max-Age` があれば `Expires` より優先します（RFC 6265 と同じ）。
+/// 読めない `Max-Age` と `Expires` は無いものとして扱います。
+fn cookie_expired(value: &str, now: i64) -> bool {
+    let mut expires = None;
+    // 最初の `名前=値` は飛ばす。
+    for attribute in value.split(';').skip(1) {
+        let Some((key, raw)) = attribute.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.eq_ignore_ascii_case("Max-Age") {
+            if let Ok(seconds) = raw.trim().parse::<i64>() {
+                return seconds <= 0;
+            }
+        } else if key.eq_ignore_ascii_case("Expires") {
+            expires = parse_http_date(raw);
+        }
+    }
+    expires.is_some_and(|at| at <= now)
+}
+
+/// `Thu, 01 Jan 1970 00:00:00 GMT` の形（RFC 1123）を UNIX 時刻（秒）にする。
+///
+/// テストの中で期限を見るだけなので、この形だけを読みます。
+fn parse_http_date(text: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // 曜日（`Thu,`）は見ない。
+    let text = text.trim();
+    let rest = text.split_once(',').map_or(text, |(_, rest)| rest);
+    let mut parts = rest.split_whitespace();
+    let day: u32 = parts.next()?.parse().ok()?;
+    let month = parts.next()?;
+    let month = MONTHS.iter().position(|m| m.eq_ignore_ascii_case(month))? + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    crate::support::time::parse_timestamp(&format!("{year:04}-{month:02}-{day:02} {time}"))
+}
+
 /// 返ってきた内容を確かめるための型。
 pub struct TestResponse {
     inner: Response,
@@ -584,6 +630,45 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 期限切れのクッキーを見分ける() {
+        let now = 1_800_000_000;
+        // Max-Age は 0 以下なら消す。以前は `Max-Age=0` ちょうどだけだった。
+        assert!(cookie_expired("a=; Max-Age=0", now));
+        assert!(cookie_expired("a=; Max-Age=-1", now));
+        assert!(cookie_expired("a=; path=/; max-age = -100", now));
+        assert!(!cookie_expired("a=1; Max-Age=60", now));
+        assert!(!cookie_expired("a=1; Path=/; HttpOnly", now));
+
+        // 過去の Expires も消す。フレームワークが出す 1970 年の日付を読む。
+        assert!(cookie_expired(
+            "a=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+            now
+        ));
+        assert!(!cookie_expired(
+            "a=1; Expires=Fri, 01 Jan 9999 00:00:00 GMT",
+            now
+        ));
+        // Max-Age があれば Expires より優先する。
+        assert!(!cookie_expired(
+            "a=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=60",
+            now
+        ));
+        // 読めない値は無いものとして扱う。
+        assert!(!cookie_expired("a=1; Max-Age=abc; Expires=someday", now));
+    }
+
+    #[test]
+    fn http_dateを読む() {
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date(" Fri, 02 Jan 1970 00:00:01 GMT"),
+            Some(86_401)
+        );
+        assert_eq!(parse_http_date("Thu, 01 Foo 1970 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date(""), None);
+    }
 
     thread_local! {
         /// テスト用の印。本物の錠には触らない。

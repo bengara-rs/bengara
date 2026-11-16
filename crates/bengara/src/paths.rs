@@ -72,7 +72,7 @@ struct Resolved {
 fn resolve() -> &'static Resolved {
     BASE.get_or_init(|| {
         // 1. 明示された場所。絶対パスでなければ、理由を覚えておいて後で止める。
-        if let Some(raw) = std::env::var_os("APP_BASE_PATH") {
+        if let Some(raw) = set_var_os("APP_BASE_PATH") {
             let path = PathBuf::from(&raw);
             if path.is_absolute() {
                 return Resolved {
@@ -242,11 +242,25 @@ pub(crate) fn guard_storage() -> Result<()> {
     check_storage(std::env::var_os("APP_STORAGE_PATH").as_deref())
 }
 
-/// `APP_STORAGE_PATH` の値を確かめる。`None` は「指定なし」です。
+/// 環境変数を読む。空と空白だけの値は「指定なし」として `None` にする。
+///
+/// `.env` の `APP_STORAGE_PATH=` は、空の環境変数として入ります。
+/// そのまま見ると「相対パス」と判定され、起動が止まります。
+/// `env()` の「空は未設定」と同じ扱いにそろえます。
+fn set_var_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|raw| !is_blank(raw))
+}
+
+/// 空か、空白だけの値か。
+fn is_blank(raw: &std::ffi::OsStr) -> bool {
+    raw.is_empty() || raw.to_str().is_some_and(|s| s.trim().is_empty())
+}
+
+/// `APP_STORAGE_PATH` の値を確かめる。`None` と空の値は「指定なし」です。
 ///
 /// 値を引数で受けるのは、テストで環境変数を触らずに断る枝を通すためです。
 fn check_storage(raw: Option<&std::ffi::OsStr>) -> Result<()> {
-    if let Some(raw) = raw {
+    if let Some(raw) = raw.filter(|raw| !is_blank(raw)) {
         let path = Path::new(raw);
         if !path.is_absolute() {
             return Err(Error::msg(format!(
@@ -281,7 +295,7 @@ pub fn storage_path(relative: impl AsRef<Path>) -> PathBuf {
 /// `storage/` そのもの。
 pub(crate) fn storage_root() -> &'static Path {
     STORAGE
-        .get_or_init(|| match std::env::var_os("APP_STORAGE_PATH") {
+        .get_or_init(|| match set_var_os("APP_STORAGE_PATH") {
             // 相対パスは guard_storage() が止めるので、ここでは絶対パスだけを見る。
             Some(raw) if Path::new(&raw).is_absolute() => PathBuf::from(raw),
             _ => app_path("storage"),
@@ -376,8 +390,23 @@ mod tests {
         assert!(absolute.is_absolute());
         assert!(check_storage(Some(absolute.as_os_str())).is_ok());
         assert!(check_storage(None).is_ok(), "指定が無ければ通る");
+        // `.env` の `APP_STORAGE_PATH=` は空の環境変数になる。指定なしと同じに扱う。
+        for blank in ["", " ", "\t"] {
+            assert!(check_storage(Some(OsStr::new(blank))).is_ok(), "{blank:?}");
+        }
         // このテストでは APP_STORAGE_PATH を指定していない。
         assert!(guard_storage().is_ok());
+    }
+
+    #[test]
+    fn 空の値は指定なしと見る() {
+        use std::ffi::OsStr;
+
+        assert!(is_blank(OsStr::new("")));
+        assert!(is_blank(OsStr::new("  ")));
+        assert!(is_blank(OsStr::new("\t\n")));
+        assert!(!is_blank(OsStr::new("/srv/app")));
+        assert!(!is_blank(OsStr::new(" storage ")));
     }
 
     #[test]

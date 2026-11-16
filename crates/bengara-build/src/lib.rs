@@ -261,8 +261,11 @@ impl Generator {
 
     /// あると分かっているディレクトリを見張る。
     ///
-    /// ディレクトリ自体の変化（ファイルの追加・削除）を見ます。取り込んだ `.rs` の
-    /// 中身の変化は、`#[path]` で取り込んだソースとして rustc 側が追跡します。
+    /// cargo はディレクトリを渡されると**中を再帰的にたどり**、いちばん新しい
+    /// 更新時刻を見ます。入れ子のディレクトリへのファイルの追加・削除も、
+    /// 中のファイル（言語の TOML など）の書き換えも、これ 1 行で気づけます。
+    /// そのため、見張るのは置き場所のいちばん上だけです。入れ子のディレクトリや
+    /// ファイルごとには出しません（同じものを二重に見るだけになります）。
     fn watch_existing(&mut self, dir: &Path) {
         self.watched.push(dir.to_path_buf());
         println!("cargo:rerun-if-changed={}", dir.display());
@@ -329,7 +332,8 @@ impl Generator {
                 format!("{prefix}/{name}")
             };
             if entry.is_dir {
-                self.watch_existing(&entry.path);
+                // 見張りは要らない。`public/` を `read_public` が見張っていて、
+                // cargo は中を再帰的にたどる。
                 self.collect_public(&entry.path, &key, total, depth + 1);
                 continue;
             }
@@ -498,7 +502,8 @@ impl Generator {
         locale: &str,
         table: &mut BTreeMap<String, Vec<(String, String, String)>>,
     ) {
-        self.watch_existing(dir);
+        // 見張りは要らない。`resources/lang/` を `read_lang` が見張っていて、
+        // cargo は中を再帰的にたどる。
         let Some(entries) = self.read_dir_sorted(dir) else {
             return;
         };
@@ -536,9 +541,10 @@ impl Generator {
     }
 
     /// 1つの TOML を読む。読めないときはエラーを記録して空を返す。
+    ///
+    /// ファイルごとの見張りは出しません。ビルド時に読むので rustc は追跡しませんが、
+    /// `resources/lang/` を見張っていれば、cargo が中のファイルの更新時刻まで見ます。
     fn read_toml(&mut self, path: &Path) -> Vec<(String, String)> {
-        // 中身が変わったら作り直す。ビルド時に読むので rustc は追跡しません。
-        println!("cargo:rerun-if-changed={}", path.display());
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) => {
@@ -573,11 +579,8 @@ impl Generator {
         }
         let _ = writeln!(self.tree, "#[allow(unused_imports)] pub mod {module} {{");
         self.stack.push(module);
-        // 入れ子のディレクトリも見張る。親だけ見張っても、下にファイルを足したときに
-        // 親の更新時刻は動かないので気づけません（いちばん上は `run` が見張っています）。
-        if depth > 0 {
-            self.watch_existing(dir);
-        }
+        // 入れ子のディレクトリは見張らない。いちばん上を `run` が見張っていて、
+        // cargo は中を再帰的にたどるので、下にファイルを足しても気づけます。
 
         let entries = match self.read_dir_sorted(dir) {
             Some(entries) => entries,
@@ -1913,7 +1916,8 @@ mod tests {
 
         // 置いた分は見張る。無いものとルートは出さない。
         assert!(generator.watched.contains(&root.join("app")));
-        assert!(generator.watched.contains(&root.join("app/Models")));
+        // 入れ子は出さない。cargo はいちばん上から再帰的にたどる。
+        assert!(!generator.watched.contains(&root.join("app/Models")));
         assert!(!generator.watched.contains(&root.to_path_buf()));
         assert!(!generator.watched.contains(&root.join("config")));
 

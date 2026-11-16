@@ -248,14 +248,19 @@ impl CacheStore for FileCache {
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => None,
             Err(e) => return Err(Error::Io(e)),
         };
+        // **壊れていても期限切れでも、ここでは消しません。** 読んでから消すまでの
+        // 間に別の `put` が新しい中身へ置き換えると、その新しい値を消していました。
+        // `increment` の数も、そこで 0 に戻って落ちました。
+        // 片付けは `cache:prune` が、置き換わっていないかを確かめてから行います。
         let Some(entry) = raw.as_deref().and_then(Entry::decode) else {
             // 壊れていたら無かったことにする。落とすほどのことではない。
-            tracing::warn!("キャッシュのファイルを読めませんでした: {}", path.display());
-            let _ = std::fs::remove_file(&path);
+            tracing::warn!(
+                "キャッシュのファイルを読めませんでした（cache:prune で片付きます）: {}",
+                path.display()
+            );
             return Ok(None);
         };
         if entry.expired() {
-            let _ = std::fs::remove_file(&path);
             return Ok(None);
         }
         Ok(Some(entry.value))
@@ -302,9 +307,9 @@ impl CacheStore for FileCache {
     /// 読み込んでいました。期限は `期限|値` の `|` より前にしかないので、
     /// `read_expires_at` で先頭だけ見れば足ります。
     ///
-    /// **期限切れのファイルはその場で消しません**（`get` は消します）。
+    /// **期限切れのファイルはその場で消しません**（`get` も消しません）。
     /// 「あるか」を聞かれただけで書き込みを起こさないほうが素直です。
-    /// 片づけは次の `get` と `cache:prune` が引き受けます。
+    /// 片づけは `cache:prune` が引き受けます。
     fn has(&self, key: &str) -> Result<bool> {
         let Some(expires_at) = read_expires_at(&self.path_of(key)) else {
             // 無い・読めない・壊れている。どれも「無い」とします。
@@ -336,7 +341,7 @@ impl CacheStore for FileCache {
     }
 
     fn prune(&self) -> Result<usize> {
-        sweep_expired(&self.dir)
+        sweep_expired(self)
     }
 
     fn prunable(&self) -> bool {
@@ -491,7 +496,12 @@ fn read_expires_at(path: &Path) -> Option<i64> {
 ///
 /// 呼び出し元は [`FileCache::prune`]（`cache:prune`）だけです。
 /// `cache:clear` は `flush()` を通るので、ここは通りません。
-fn sweep_expired(dir: &Path) -> Result<usize> {
+///
+/// 1 件ずつ [`remove_if_expired`] で消します。「期限切れだと読む」と
+/// 「消す」の間に `put` が新しい中身へ置き換えると、新しい値を消して
+/// しまうためです。
+fn sweep_expired(cache: &FileCache) -> Result<usize> {
+    let dir = cache.dir.as_path();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -515,13 +525,88 @@ fn sweep_expired(dir: &Path) -> Result<usize> {
             continue;
         }
         // 期限は 1 行目の `|` より前にしかない。値は読まない。
-        let expired = read_expires_at(&path)
-            .is_none_or(|expires_at| expires_at != 0 && expires_at <= time::now_seconds());
-        if expired && std::fs::remove_file(&path).is_ok() {
+        // ここでは候補を選ぶだけで、消すかどうかは `remove_if_expired` が決め直す。
+        if !expired_at(&path) {
+            continue;
+        }
+        let Some(key) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if remove_if_expired(cache, key) {
             removed += 1;
         }
     }
     Ok(removed)
+}
+
+/// 期限切れか、壊れているか（どちらも消してよいもの）。
+fn expired_at(path: &Path) -> bool {
+    read_expires_at(path)
+        .is_none_or(|expires_at| expires_at != 0 && expires_at <= time::now_seconds())
+}
+
+/// 錠を取る回数（1 回 10ms）。掃除は急がないので、すぐ諦めます。
+const SWEEP_LOCK_TRIES: u32 = 3;
+
+/// 鍵 1 つを、**置き換わっていなければ**消す。消したら真。
+///
+/// 次の 2 つで守ります。
+///
+/// | 相手 | 守り方 |
+/// |---|---|
+/// | `increment` | 同じ鍵の錠（`+locks/`）を取る。取れなければ使用中なので消さない |
+/// | `put`（錠を取らない） | 一時の名前へ退避してから中身を見直す。新しければ戻す |
+///
+/// 退避の `rename` は 1 回で済むので、「調べる → 消す」の間に `put` の
+/// `rename` が割り込んでも、退避したものを見れば分かります。戻すときは
+/// `hard_link` を使います。戻す先に既にファイルがあれば（その間にさらに
+/// `put` があれば）失敗するので、より新しい値を上書きしません。
+///
+/// 退避している一瞬は、その鍵の `get` が「無い」を返します。キャッシュなので
+/// 取りこぼしとして扱えます（作り直されるだけです）。
+fn remove_if_expired(cache: &FileCache, key: &str) -> bool {
+    let path = cache.path_of(key);
+    let Ok(_lock) = FileLock::acquire_tries(&cache.lock_path_of(key), SWEEP_LOCK_TRIES) else {
+        // `increment` の最中。いま書いている鍵は期限切れではない。
+        return false;
+    };
+    // 錠を取るまでに置き換わっているかもしれないので、見直す。
+    if !expired_at(&path) {
+        return false;
+    }
+    let tomb = cache.temp_path_of(key);
+    if std::fs::rename(&path, &tomb).is_err() {
+        // 既に無い（別の掃除が消した）か、使用中。どちらも任せる。
+        return false;
+    }
+    if expired_at(&tomb) {
+        let _ = std::fs::remove_file(&tomb);
+        return true;
+    }
+    // 退避する直前に `put` が新しい中身を置いていた。元へ戻す。
+    restore_entry(&tomb, &path);
+    false
+}
+
+/// 退避してしまった新しい中身を元の名前へ戻す。
+///
+/// `hard_link` は戻す先が既にあると失敗します。その間に入った `put` の
+/// ほうが新しいので、そちらを残して退避したものを捨てます。
+/// ハードリンクを作れないファイルシステム（FAT など）では、戻す先が
+/// 無いことを確かめてから `rename` します（確かめてから戻すまでの
+/// 一瞬に入った `put` は上書きします）。
+fn restore_entry(tomb: &Path, path: &Path) {
+    match std::fs::hard_link(tomb, path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            if !path.exists() {
+                let _ = std::fs::rename(tomb, path);
+                return;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(tomb);
 }
 
 #[cfg(test)]
@@ -610,13 +695,15 @@ mod tests {
         assert_eq!(store.get("a").unwrap(), None);
         store.forget("a").unwrap();
 
-        // 期限切れは読めず、ファイルも消える。
+        // 期限切れは読めない。ファイルは `get` では消さず、掃除が消す。
         store.put("old", "古い", Some(0)).unwrap();
         assert_eq!(store.get("old").unwrap(), None);
+        assert!(dir.join("old").exists(), "`get` は消さない");
+        assert_eq!(sweep_expired(&store).unwrap(), 1);
         assert!(!dir.join("old").exists());
 
         store.put("b", "2", None).unwrap();
-        assert_eq!(sweep_expired(&dir).unwrap(), 0, "期限なしは消さない");
+        assert_eq!(sweep_expired(&store).unwrap(), 0, "期限なしは消さない");
         store.flush().unwrap();
         assert_eq!(store.get("b").unwrap(), None);
 
@@ -634,7 +721,7 @@ mod tests {
         store.put("gone", "2", Some(0)).unwrap();
         std::fs::write(dir.join("broken"), "こわれた中身").unwrap();
 
-        assert_eq!(sweep_expired(&dir).unwrap(), 2, "期限切れと壊れたもの");
+        assert_eq!(sweep_expired(&store).unwrap(), 2, "期限切れと壊れたもの");
         assert!(dir.join("keep").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -688,7 +775,7 @@ mod tests {
 
         // 前は `cache:prune` で期限なしでも消えていた。
         store.put("report.2024.12", "1", None).unwrap();
-        assert_eq!(sweep_expired(&dir).unwrap(), 0);
+        assert_eq!(sweep_expired(&store).unwrap(), 0);
         assert_eq!(store.get("report.2024.12").unwrap().as_deref(), Some("1"));
 
         // `cache:clear`（flush）では消える。前は「書き込み中」として飛ばしていた。
@@ -711,7 +798,7 @@ mod tests {
         let expires = read_expires_at(&store.path_of("keep")).unwrap();
         assert!(expires > time::now_seconds());
 
-        assert_eq!(sweep_expired(&dir).unwrap(), 1);
+        assert_eq!(sweep_expired(&store).unwrap(), 1);
         assert!(!store.path_of("big").exists());
         assert_eq!(store.get("keep").unwrap().as_deref(), Some(big.as_str()));
 
@@ -728,8 +815,18 @@ mod tests {
             std::fs::write(store.path_of(key), raw).unwrap();
             assert!(read_expires_at(&store.path_of(key)).is_none(), "{key}");
         }
-        assert_eq!(sweep_expired(&dir).unwrap(), 4);
-        assert!(std::fs::read_dir(&dir).unwrap().flatten().count() == 0);
+        assert_eq!(sweep_expired(&store).unwrap(), 4);
+        // 残るのは錠の置き場所（ディレクトリ）だけ。ファイルも錠も残らない。
+        let files = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .count();
+        assert_eq!(files, 0);
+        let locks = std::fs::read_dir(dir.join(LOCK_DIR))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(locks, 0, "錠は手放したら残らない");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -745,14 +842,17 @@ mod tests {
 
         // 以前は `Err(Io)` が返り、リクエストが 500 になっていた。
         assert_eq!(store.get("bad").unwrap(), None, "`get` も無いと答える");
-        assert!(!store.path_of("bad").exists(), "壊れたファイルは消す");
 
         // 値だけが UTF-8 でないものも、読めないので同じ扱い。
         std::fs::write(store.path_of("half"), [b'0', b'|', 0xff, 0xfe]).unwrap();
         assert_eq!(store.get("half").unwrap(), None);
-        assert!(!store.path_of("half").exists());
 
-        // 消えたあとは普通に書ける。
+        // 消すのは `get` ではなく掃除。期限の部分が読めない `bad` は壊れた
+        // ものとして消す。`half` は期限なし（`0|`）と読めるので残す。
+        assert_eq!(sweep_expired(&store).unwrap(), 1);
+        assert!(!store.path_of("bad").exists(), "壊れたファイルは掃除が消す");
+
+        // 上書きすれば普通に読める。
         store.put("bad", "値", None).unwrap();
         assert_eq!(store.get("bad").unwrap().as_deref(), Some("値"));
 
@@ -778,7 +878,11 @@ mod tests {
             .unwrap();
 
         // 以前は 2 件と数え、「期限切れのキャッシュを 2 件」と出していた。
-        assert_eq!(sweep_expired(&dir).unwrap(), 1, "期限切れの 1 件だけ数える");
+        assert_eq!(
+            sweep_expired(&store).unwrap(),
+            1,
+            "期限切れの 1 件だけ数える"
+        );
         assert!(!stale.exists(), "残骸は消す");
         assert!(!store.path_of("gone").exists());
 
@@ -841,7 +945,7 @@ mod tests {
         assert!(is_temp_path(&dir.join("a.tmp.+tmp.1234.5")));
 
         store.put("b", "2", Some(0)).unwrap();
-        assert_eq!(sweep_expired(&dir).unwrap(), 1, "期限切れの b だけ");
+        assert_eq!(sweep_expired(&store).unwrap(), 1, "期限切れの b だけ");
         assert!(dir.join("a.tmp").exists());
 
         store.flush().unwrap();
@@ -859,7 +963,11 @@ mod tests {
         let writing = store.temp_path_of("key");
         std::fs::write(&writing, "まだ書いている途中").unwrap();
 
-        assert_eq!(sweep_expired(&dir).unwrap(), 0, "新しい一時ファイルは残す");
+        assert_eq!(
+            sweep_expired(&store).unwrap(),
+            0,
+            "新しい一時ファイルは残す"
+        );
         assert!(writing.exists());
 
         store.flush().unwrap();
@@ -945,12 +1053,12 @@ mod tests {
         std::fs::write(store.path_of("broken"), "ごみ").unwrap();
         assert!(!store.has("broken").unwrap());
 
-        // 期限切れは偽。`has` は消さず、`get` が消す。
+        // 期限切れは偽。`has` も `get` も消さない（掃除に任せる）。
         store.put("old", &big, Some(0)).unwrap();
         assert!(!store.has("old").unwrap());
         assert!(store.path_of("old").exists(), "`has` は消さない");
         assert_eq!(store.get("old").unwrap(), None);
-        assert!(!store.path_of("old").exists(), "`get` が消す");
+        assert!(store.path_of("old").exists(), "`get` も消さない");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1009,9 +1117,59 @@ mod tests {
     }
 
     #[test]
+    fn 掃除は置き換わった新しい値を消さない() {
+        let dir = temp_dir("prunerace");
+        let store = FileCache::new(&dir);
+
+        // 候補に選んだ後で `put` が新しい値に置き換えた形。見直して消さない。
+        store.put("k", "新しい", Some(600)).unwrap();
+        assert!(!remove_if_expired(&store, "k"));
+        assert_eq!(store.get("k").unwrap().as_deref(), Some("新しい"));
+
+        // 退避した後で新しいと分かったら戻す。戻す先が空いていれば戻る。
+        let tomb = store.temp_path_of("k");
+        std::fs::rename(store.path_of("k"), &tomb).unwrap();
+        restore_entry(&tomb, &store.path_of("k"));
+        assert_eq!(store.get("k").unwrap().as_deref(), Some("新しい"));
+        assert!(!tomb.exists(), "退避先は残さない");
+
+        // 戻すまでの間にさらに `put` があれば、そちらを残す（上書きしない）。
+        let tomb = store.temp_path_of("k");
+        std::fs::rename(store.path_of("k"), &tomb).unwrap();
+        store.put("k", "もっと新しい", Some(600)).unwrap();
+        restore_entry(&tomb, &store.path_of("k"));
+        assert_eq!(store.get("k").unwrap().as_deref(), Some("もっと新しい"));
+        assert!(!tomb.exists(), "退避先は残さない");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 数えている最中の鍵は掃除しない() {
+        let dir = temp_dir("prunelock");
+        let store = FileCache::new(&dir);
+
+        store.put("n", "5", Some(0)).unwrap();
+        // `increment` が錠を握っている間は、期限切れに見えても消さない。
+        // 消すと、書き直したばかりの数を消して落とすことがある。
+        let held = FileLock::acquire(&store.lock_path_of("n")).unwrap();
+        assert_eq!(sweep_expired(&store).unwrap(), 0);
+        assert!(store.path_of("n").exists());
+        drop(held);
+
+        assert_eq!(sweep_expired(&store).unwrap(), 1);
+        assert!(!store.path_of("n").exists());
+        // 期限切れからは 0 で数え直す（今までどおり）。
+        store.put("n", "5", Some(0)).unwrap();
+        assert_eq!(store.increment("n", 1).unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 無いディレクトリの掃除は0件() {
         assert_eq!(
-            sweep_expired(Path::new("存在しないディレクトリ")).unwrap(),
+            sweep_expired(&FileCache::new("存在しないディレクトリ")).unwrap(),
             0
         );
     }

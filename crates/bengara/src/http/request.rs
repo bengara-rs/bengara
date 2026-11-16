@@ -480,6 +480,22 @@ impl Request {
             .map(|(_, v)| v.clone())
     }
 
+    /// **本文だけ**から、名前で1つ取り出す（クエリは見ない）。
+    ///
+    /// 本文はフォームなら組として、JSON なら最上位の値だけを読みます。
+    /// CSRF のトークンを探すのに使います（URL に載った値は漏れやすいため）。
+    ///
+    /// [`input_pairs`](Self::input_pairs) は「本文 → クエリ」の順に並べているので、
+    /// 末尾のクエリのぶんを除いた前半が本文です。解析し直しません。
+    pub(crate) fn body_input(&self, key: &str) -> Option<String> {
+        let pairs = self.input_pairs();
+        let body_len = pairs.len().saturating_sub(self.query_pairs().len());
+        pairs[..body_len]
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
     /// 入力を検査する。
     ///
     /// ```ignore

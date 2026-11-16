@@ -4,6 +4,7 @@
 
 use super::migrator::{self, Migration, Migrator, Seeder};
 use crate::error::{Error, Result};
+use crate::support::text;
 
 /// DB のコマンドの一覧（ヘルプに出す）。
 pub(crate) const COMMANDS: &[(&str, &str)] = &[
@@ -143,6 +144,10 @@ async fn execute(
     seeders: &[Seeder],
 ) -> Result<()> {
     guard_seed_connection(command, options, &super::database_config().default)?;
+    // 本番の保護は、つなぐ前・札を取る前に見る。以前は札を取った後に見ていたので、
+    // 断る `migrate:fresh` でも札の表を作って札を出し入れしていた。
+    // 他のプロセスが札を持っていると、本番の保護ではなく札のエラーが出ていた。
+    guard_destructive(command, options)?;
     let migrator = Migrator::connect(options.database.as_deref()).await?;
 
     // 複数のプロセスから同時に流さない（決定記録 #067）。
@@ -167,10 +172,6 @@ async fn run_one(
     seeders: &[Seeder],
     migrator: &Migrator,
 ) -> Result<()> {
-    if DESTRUCTIVE.contains(&command) {
-        // 腕ごとに書くと足し忘れるので、一覧で見る。
-        guard_destructive(options)?;
-    }
     match command {
         "migrate" => {
             report("実行した", migrator.run(migrations).await?);
@@ -240,48 +241,110 @@ async fn run_one(
     Ok(())
 }
 
-/// 消す系のコマンドを本番で止める。
-fn guard_destructive(options: &Options) -> Result<()> {
-    if options.force || !crate::config_registry::app_config().is_production() {
+/// 消す系のコマンドを本番で止める。つなぐ前に呼びます。
+fn guard_destructive(command: &str, options: &Options) -> Result<()> {
+    if !DESTRUCTIVE.contains(&command) {
         return Ok(());
     }
-    Err(Error::msg(
-        "APP_ENV=production では表を消すコマンドを実行しません。本当に消すなら --force を付けてください",
-    ))
+    check_destructive(
+        command,
+        options,
+        crate::config_registry::app_config().is_production(),
+    )
+}
+
+/// [`guard_destructive`] の中身。本番かどうかを外から渡せるように分けてあります。
+fn check_destructive(command: &str, options: &Options, production: bool) -> Result<()> {
+    // 腕ごとに書くと足し忘れるので、一覧で見る。
+    if !DESTRUCTIVE.contains(&command) || options.force || !production {
+        return Ok(());
+    }
+    Err(Error::msg(format!(
+        "APP_ENV=production では表を消すコマンド（`{command}`）を実行しません。\
+         本当に消すなら --force を付けてください。何も実行していません"
+    )))
 }
 
 fn report(label: &str, items: Vec<String>) {
+    for line in report_lines(label, &items) {
+        println!("{line}");
+    }
+}
+
+/// 結果の行を作る。
+///
+/// 1件も無いときの文はコマンドに合わせます。以前はどれにも「（すべて最新です）」を
+/// 付けていたので、`migrate:rollback` や `db:wipe` でも「最新」と出ていました。
+fn report_lines(label: &str, items: &[String]) -> Vec<String> {
     if items.is_empty() {
-        println!("{label}ものはありません（すべて最新です）");
-        return;
+        let message = match label {
+            "実行した" => "実行するマイグレーションはありません（すべて最新です）",
+            "巻き戻した" => "巻き戻すマイグレーションはありません",
+            "消した" => "消す表はありません",
+            "流した" => "流したシーダーはありません",
+            _ => return vec![format!("{label}ものはありません")],
+        };
+        return vec![message.to_string()];
     }
-    for item in &items {
-        println!("  {item}");
-    }
-    println!("{label}のは {} 件です", items.len());
+    let mut lines: Vec<String> = items.iter().map(|item| format!("  {item}")).collect();
+    lines.push(format!("{label}のは {} 件です", items.len()));
+    lines
 }
 
 fn print_status(rows: &[migrator::Status]) {
-    if rows.is_empty() {
-        println!("マイグレーションは1本もありません（database/migrations/ を確かめてください）");
-        return;
+    for line in status_lines(rows) {
+        println!("{line}");
     }
-    let width = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
-    println!("{:<width$}  状態      バッチ", "名前");
+}
+
+/// `migrate:status` の行を作る。
+///
+/// 桁は表示の幅でそろえます（[`text::width`]）。以前はバイト数で数えていたので、
+/// 日本語の見出し（`名前`・`状態`）や状態（`実行済み`）の桁がずれていました。
+fn status_lines(rows: &[migrator::Status]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec![
+            "マイグレーションは1本もありません（database/migrations/ を確かめてください）"
+                .to_string(),
+        ];
+    }
+    let state_of = |row: &migrator::Status| match (row.batch, row.present) {
+        (Some(_), true) => "実行済み",
+        (None, true) => "未実行",
+        (_, false) => "ファイルなし",
+    };
+    let name_width = rows
+        .iter()
+        .map(|r| text::width(&r.name))
+        .max()
+        .unwrap_or(0)
+        .max(text::width("名前"));
+    let state_width = rows
+        .iter()
+        .map(|r| text::width(state_of(r)))
+        .max()
+        .unwrap_or(0)
+        .max(text::width("状態"));
+    let mut lines = vec![format!(
+        "{}  {}  バッチ",
+        text::pad("名前", name_width),
+        text::pad("状態", state_width)
+    )];
     for row in rows {
-        let state = match (row.batch, row.present) {
-            (Some(_), true) => "実行済み",
-            (None, true) => "未実行  ",
-            (_, false) => "ファイルなし",
-        };
         let batch = row
             .batch
             .map(|b| b.to_string())
             .unwrap_or_else(|| "-".to_string());
-        println!("{:<width$}  {state}  {batch}", row.name);
+        lines.push(format!(
+            "{}  {}  {batch}",
+            text::pad(&row.name, name_width),
+            text::pad(state_of(row), state_width)
+        ));
     }
     let done = rows.iter().filter(|r| r.batch.is_some()).count();
-    println!("\n{} 本中 {done} 本が実行済みです", rows.len());
+    lines.push(String::new());
+    lines.push(format!("{} 本中 {done} 本が実行済みです", rows.len()));
+    lines
 }
 
 /// コマンドに渡せる指定。
@@ -527,7 +590,99 @@ mod tests {
             force: true,
             ..Options::default()
         };
-        guard_destructive(&forced).expect("--force なら通る");
+        check_destructive("migrate:fresh", &forced, true).expect("--force なら通る");
+
+        let plain = Options::default();
+        let error = check_destructive("migrate:fresh", &plain, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("APP_ENV=production"), "{error}");
+        assert!(error.contains("migrate:fresh"), "{error}");
+        // 本番でなければ通る。足すだけのコマンドは本番でも通る。
+        check_destructive("migrate:fresh", &plain, false).expect("本番でなければ通る");
+        check_destructive("migrate", &plain, true).expect("足すだけなら通る");
+        check_destructive("db:seed", &plain, true).expect("足すだけなら通る");
+        // 一覧に無いコマンドは、本番かどうかを読まずに通る（つなぐ前に呼ぶため）。
+        guard_destructive("migrate:status", &plain).expect("読むだけなら通る");
+    }
+
+    #[test]
+    fn 本番の保護は札より先に見る() {
+        // 断るコマンドで札の表を作ったり、札のエラーで本番の保護を隠したりしない。
+        // `execute` の中で、つなぐ・札を取るより前に呼んでいることを確かめる。
+        let source = include_str!("commands.rs");
+        let body = source
+            .split("async fn execute(")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn run_one(").next())
+            .expect("execute がある");
+        let guard = body.find("guard_destructive(").expect("保護を呼ぶ");
+        let connect = body.find("Migrator::connect(").expect("つなぐ");
+        let lock = body.find(".lock()").expect("札を取る");
+        assert!(guard < connect && guard < lock, "{body}");
+    }
+
+    #[test]
+    fn 結果の文はコマンドに合わせる() {
+        // 以前はどれにも「（すべて最新です）」を付けていた。
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            report_lines("実行した", &empty),
+            ["実行するマイグレーションはありません（すべて最新です）"]
+        );
+        for label in ["巻き戻した", "消した", "流した"] {
+            let lines = report_lines(label, &empty);
+            assert_eq!(lines.len(), 1);
+            assert!(!lines[0].contains("最新"), "{label}: {lines:?}");
+        }
+        assert_eq!(
+            report_lines("巻き戻した", &empty),
+            ["巻き戻すマイグレーションはありません"]
+        );
+
+        let items = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            report_lines("消した", &items),
+            ["  a", "  b", "消したのは 2 件です"]
+        );
+    }
+
+    #[test]
+    fn 状態の一覧は表示の幅で桁をそろえる() {
+        let rows = [
+            migrator::Status {
+                name: "2026_01_01_000000_create_posts".to_string(),
+                batch: Some(1),
+                present: true,
+            },
+            migrator::Status {
+                name: "x".to_string(),
+                batch: None,
+                present: true,
+            },
+            migrator::Status {
+                name: "y".to_string(),
+                batch: Some(2),
+                present: false,
+            },
+        ];
+        let lines = status_lines(&rows);
+        // 見出しと各行で、「状態」と「バッチ」の始まる桁が同じ。
+        let column_of = |line: &str, needle: &str| {
+            let at = line.rfind(needle).expect(needle);
+            text::width(&line[..at])
+        };
+        let state_at = column_of(&lines[0], "状態");
+        let batch_at = column_of(&lines[0], "バッチ");
+        for (line, state, batch) in [
+            (&lines[1], "実行済み", "1"),
+            (&lines[2], "未実行", "-"),
+            (&lines[3], "ファイルなし", "2"),
+        ] {
+            assert_eq!(column_of(line, state), state_at, "{lines:#?}");
+            assert_eq!(column_of(line, batch), batch_at, "{lines:#?}");
+        }
+        assert_eq!(lines.last().unwrap(), "3 本中 2 本が実行済みです");
     }
 
     #[test]

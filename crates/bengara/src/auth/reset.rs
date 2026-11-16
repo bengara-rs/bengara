@@ -16,6 +16,9 @@ const TABLE: &str = "password_resets";
 /// トークンが使える時間（分）。Laravel の既定と同じ。
 const LIFETIME_MINUTES: i64 = 60;
 
+/// 同じアドレスにトークンを作り直せるまでの秒数。Laravel の既定（`throttle`）と同じ。
+const THROTTLE_SECONDS: i64 = 60;
+
 /// パスワード再設定のトークン。
 ///
 /// ```ignore
@@ -31,6 +34,39 @@ pub struct PasswordReset;
 impl PasswordReset {
     /// 表の名前。マイグレーションを書くときに使います。
     pub const TABLE: &'static str = TABLE;
+
+    /// 同じアドレスにトークンを作り直せるまでの秒数（60 秒）。
+    ///
+    /// [`recently_created`](Self::recently_created) がこの秒数で判定します。
+    /// Laravel の `config/auth.php` の `passwords.users.throttle` の既定と同じです。
+    pub const THROTTLE_SECONDS: i64 = THROTTLE_SECONDS;
+
+    /// そのアドレスのトークンを、**60 秒以内に作ったか**
+    /// （[`THROTTLE_SECONDS`](Self::THROTTLE_SECONDS)）。
+    ///
+    /// 「再設定のメールを送る」口で、[`create`](Self::create) の前に呼びます。
+    /// 同じアドレスに何通もメールを送りつける嫌がらせを防ぐためです
+    /// （Laravel の `recentlyCreatedToken` と同じ考え方）。
+    ///
+    /// ```ignore
+    /// if !PasswordReset::recently_created(&email).await? {
+    ///     let token = PasswordReset::create(&email).await?;
+    ///     // リンクを作って送る
+    /// }
+    /// // 送ったかどうかに関わらず、同じ応答を返す
+    /// ```
+    ///
+    /// - `create` そのものは止めません。呼ぶかどうかは呼ぶ側が決めます。
+    /// - 記録が無い・作った時刻が読めないときは偽です。
+    /// - 真のときに応答を変えると、「そのアドレスは登録されている」ことが分かります。
+    ///   応答は同じにしてください。
+    pub async fn recently_created(email: &str) -> Result<bool> {
+        let Some(row) = DB::table(TABLE).where_("email", email).first().await? else {
+            return Ok(false);
+        };
+        let created_at: String = row.get("created_at")?;
+        Ok(Self::within_throttle(&created_at))
+    }
 
     /// トークンを作って表に入れ、**平文のトークン**を返す。
     ///
@@ -181,6 +217,16 @@ impl PasswordReset {
         LIFETIME_MINUTES
     }
 
+    /// 作った時刻が [`THROTTLE_SECONDS`] 以内か。読めない値は偽。
+    ///
+    /// 時計が戻って作った時刻が未来になっているときも真（作ったばかりとみなす）。
+    fn within_throttle(created_at: &str) -> bool {
+        match time::parse_timestamp(created_at) {
+            Some(created) => time::now_seconds() - created < THROTTLE_SECONDS,
+            None => false,
+        }
+    }
+
     /// 作った時刻が古すぎるか。読めない値は期限切れとして扱う。
     fn expired(created_at: &str) -> bool {
         match time::parse_timestamp(created_at) {
@@ -243,6 +289,26 @@ mod tests {
         assert!(PasswordReset::expired(&old), "61 分前は期限切れ");
         assert!(PasswordReset::expired("こわれた値"), "読めない値は期限切れ");
         assert_eq!(PasswordReset::lifetime_minutes(), 60);
+    }
+
+    #[test]
+    fn 作り直しを控える時間の判定() {
+        assert_eq!(PasswordReset::THROTTLE_SECONDS, 60);
+        let now = time::format_timestamp(time::now_seconds());
+        let recent = time::format_timestamp(time::now_seconds() - 30);
+        let old = time::format_timestamp(time::now_seconds() - 61);
+        let future = time::format_timestamp(time::now_seconds() + 30);
+        assert!(PasswordReset::within_throttle(&now));
+        assert!(PasswordReset::within_throttle(&recent), "30 秒前");
+        assert!(!PasswordReset::within_throttle(&old), "61 秒前");
+        assert!(
+            PasswordReset::within_throttle(&future),
+            "時計が戻ったときは真"
+        );
+        assert!(
+            !PasswordReset::within_throttle("こわれた値"),
+            "読めない値は偽"
+        );
     }
 
     #[test]
@@ -454,6 +520,36 @@ mod tests {
             assert!(!PasswordReset::verify("nobody@example.com", "とーくん")
                 .await
                 .unwrap());
+        }
+
+        #[tokio::test]
+        async fn 作ったばかりなら作り直しを控える() {
+            let _db = setup().await;
+            let email = "throttle@example.com";
+            assert!(
+                !PasswordReset::recently_created(email).await.unwrap(),
+                "記録が無ければ偽"
+            );
+
+            PasswordReset::create(email).await.unwrap();
+            assert!(
+                PasswordReset::recently_created(email).await.unwrap(),
+                "作った直後は真"
+            );
+
+            // 61 秒前に作ったことにする。
+            let old = time::format_timestamp(time::now_seconds() - 61);
+            DB::table(TABLE)
+                .where_("email", email)
+                .update(&[("created_at", old.into())])
+                .await
+                .unwrap();
+            assert!(!PasswordReset::recently_created(email).await.unwrap());
+
+            // `create` そのものは止めない（呼ぶかどうかは呼ぶ側が決める）。
+            PasswordReset::create(email).await.unwrap();
+            let again = PasswordReset::create(email).await.unwrap();
+            assert!(PasswordReset::verify(email, &again).await.unwrap());
         }
     }
 }

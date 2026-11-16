@@ -262,6 +262,11 @@ impl Redirect {
     }
 
     /// ステータスを自分で決める。
+    ///
+    /// 使えるのは転送のステータスだけです（201・301・302・303・307・308。
+    /// Symfony の `isRedirect` と同じ組）。それ以外を決めると、`to`・`route`・
+    /// `route_with` が**エラーを返します。** `with_status(200)` のまま返すと、
+    /// `Location` が付いた空の 200 になり、ブラウザは転送せずに白い画面を出すためです。
     pub fn with_status(mut self, status: u16) -> Self {
         self.status = status;
         self
@@ -277,7 +282,15 @@ impl Redirect {
     /// ブラウザは何も表示せず、白い画面になって原因を追いにくくなります。
     /// エラーにすれば普段のエラーの道を通るので、直前のミドルウェアが付けた
     /// `Set-Cookie` は残ったまま 500 になります。
+    ///
+    /// `with_status` で転送でないステータスを決めていたときもエラーにします。
     pub fn to(self, path: impl Into<String>) -> Result<Response> {
+        if !is_redirect_status(self.status) {
+            return Err(Error::msg(format!(
+                "転送のステータスではありません: {}（201・301・302・303・307・308 のどれかにしてください）",
+                self.status
+            )));
+        }
         let path = path.into();
         if path.chars().any(|c| c.is_control()) {
             return Err(Error::msg(
@@ -296,6 +309,11 @@ impl Redirect {
     pub fn route_with(self, name: &str, params: &[(&str, &str)]) -> Result<Response> {
         self.to(super::routing::route_with(name, params)?)
     }
+}
+
+/// 転送に使えるステータスか。Symfony の `Response::isRedirect` と同じ組です。
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 201 | 301 | 302 | 303 | 307 | 308)
 }
 
 /// そのステータスで処理を打ち切る。
@@ -544,6 +562,23 @@ mod tests {
         assert_eq!(res.header("location"), Some("/login"));
         let res = redirect().permanent().to("/new").unwrap();
         assert_eq!(res.status(), 301);
+    }
+
+    #[test]
+    fn 転送でないステータスはエラーにする() {
+        for status in [201, 301, 302, 303, 307, 308] {
+            let res = redirect().with_status(status).to("/a").unwrap();
+            assert_eq!(res.status(), status);
+            assert_eq!(res.header("location"), Some("/a"));
+        }
+        // Location の付いた 200 は、ブラウザが転送せず白い画面になる。
+        for status in [200, 204, 300, 304, 305, 306, 404, 500] {
+            let err = redirect().with_status(status).to("/a").unwrap_err();
+            assert!(
+                err.to_string().contains("転送のステータス"),
+                "{status}: {err}"
+            );
+        }
     }
 
     #[test]

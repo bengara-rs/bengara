@@ -26,12 +26,29 @@ pub(crate) fn run_before_init() {
         }
         _ => {
             print_before_init_help(command);
+            // 知らないコマンドは失敗で終える。0 で終えると、スクリプトや CI が
+            // 打ち間違いに気づけない。一覧を聞いただけのときは 0 のまま。
+            let code = before_init_exit_code(command);
+            if code != 0 {
+                std::process::exit(code);
+            }
             Ok(())
         }
     };
     if let Err(error) = result {
         eprintln!("エラー: {error}");
         std::process::exit(1);
+    }
+}
+
+/// `init` の前の入口で、案内を出したあとの終了コード。
+///
+/// 引数なしと一覧を聞く言葉は 0、それ以外（知らないコマンド）は 1 です。
+fn before_init_exit_code(command: &str) -> i32 {
+    if command.is_empty() || is_help(command) {
+        0
+    } else {
+        1
     }
 }
 
@@ -301,6 +318,17 @@ mod tests {
         }
         for word in ["", "serve", "init", "migrate", "-v"] {
             assert!(!is_help(word) && !is_version(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn init前の知らないコマンドは失敗で終える() {
+        // 以前は案内を出して 0 で終えていた。CI が打ち間違いに気づけない。
+        for word in ["serve", "migrate", "-v", "inti"] {
+            assert_eq!(before_init_exit_code(word), 1, "{word}");
+        }
+        for word in ["", "list", "help", "--help", "-h"] {
+            assert_eq!(before_init_exit_code(word), 0, "{word}");
         }
     }
 }

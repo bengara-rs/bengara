@@ -195,7 +195,11 @@ fn is_identifier_part(part: &str) -> bool {
 ///
 /// 大文字小文字は区別しません。語の間の空白はいくつでもかまいません。
 ///
-/// **値1つと比べる側では使えないものが混ざっています。** そちらは
+/// **`in` / `between` 系と `is` / `is not` は入れていません。** 列と列の間に置くと
+/// SQL として成り立たないためです（`is` は SQLite だけが通し、PostgreSQL と MySQL では
+/// 構文エラーになります）。以前は入っていて、実行するまで気づけませんでした。
+///
+/// `<=>` は入っています。MySQL だけの演算子です。値1つと比べる側の一覧は
 /// [`VALUE_OPERATORS`] を見てください。
 pub(crate) const OPERATORS: &[&str] = &[
     "=",
@@ -210,12 +214,6 @@ pub(crate) const OPERATORS: &[&str] = &[
     "not like",
     "ilike",
     "not ilike",
-    "in",
-    "not in",
-    "is",
-    "is not",
-    "between",
-    "not between",
 ];
 
 /// 値1つと比べるのに使える演算子の一覧。
@@ -488,7 +486,7 @@ mod tests {
         assert!(is_allowed_operator(">="));
         assert!(is_allowed_operator("LIKE"));
         assert!(is_allowed_operator("not   like"));
-        assert!(is_allowed_operator(" is not "));
+        assert!(is_allowed_operator(" not   ilike "));
         assert!(!is_allowed_operator(""));
         assert!(!is_allowed_operator("= 1 or 1"));
         assert!(!is_allowed_operator("glob"));
@@ -506,9 +504,16 @@ mod tests {
         assert!(!is_allowed_value_operator("not between"));
         // MySQL だけの書き方。
         assert!(!is_allowed_value_operator("<=>"));
-        // 列と列を比べる側では今までどおり通る。
-        assert!(is_allowed_operator("between"));
+        // 列と列を比べる側では `<=>` だけが通る。
         assert!(is_allowed_operator("<=>"));
+    }
+
+    #[test]
+    fn 列と列を比べる演算子に_in_や_is_は入らない() {
+        // 列と列の間に置くと SQL として成り立たない。`is` は SQLite だけが通す。
+        for operator in ["in", "NOT IN", "is", "is not", "between", "not  between"] {
+            assert!(!is_allowed_operator(operator), "{operator}");
+        }
     }
 
     #[test]

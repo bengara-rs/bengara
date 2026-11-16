@@ -218,8 +218,7 @@ fn listener_failed(event: &str, error: Error) -> Error {
 /// 通さないので、テストが並んで走っても互いの登録を踏みません。
 pub(crate) async fn dispatch_in(events: &Events, event: &str, payload: &str) -> Result<()> {
     for listener in events.get(event) {
-        listener
-            .call(payload.to_string())
+        call_isolated(listener.as_ref(), payload)
             .await
             .map_err(|e| listener_failed(event, e))?;
     }
@@ -227,13 +226,70 @@ pub(crate) async fn dispatch_in(events: &Events, event: &str, payload: &str) -> 
 }
 
 /// 登録順に全部呼び、**失敗しても次を呼ぶ**（[`Event::try_dispatch`] の本体）。
+///
+/// **パニックも失敗の 1 つとして扱います。** 以前はそのまま呼び出し元まで
+/// 巻き戻り、残りの聞く側を飛ばしたうえ、本体の処理（DB の確定など）が
+/// 終わった後のリクエストが 500 になりました。
 pub(crate) async fn try_dispatch_in(events: &Events, event: &str, payload: &str) -> Result<()> {
     for listener in events.get(event) {
-        if let Err(e) = listener.call(payload.to_string()).await {
+        if let Err(e) = call_isolated(listener.as_ref(), payload).await {
             tracing::error!("イベント `{event}` の処理に失敗しました: {e}");
         }
     }
     Ok(())
+}
+
+/// 聞く側を 1 つ、別のタスクで呼ぶ。**パニックは `Err` にします。**
+///
+/// `tokio::spawn` で包むのは、キューの `run_one` とスケジューラの
+/// `run_task` と同じ考え方です（決定記録 #008）。包まないと、聞く側の
+/// パニックが `dispatch` を呼んだ側まで巻き戻ります。
+///
+/// 包むと失われるものを 2 つ補います。
+///
+/// | 失われるもの | 補い方 |
+/// |---|---|
+/// | `Lang::with` の言語（タスクごとの値） | いまの言語を取り、新しいタスクでも `Lang::with` で包む |
+/// | 呼び出し元の取り消し | 待っている側が捨てられたら、タスクも止める（[`AbortOnDrop`]） |
+async fn call_isolated(listener: &dyn Listener, payload: &str) -> Result<()> {
+    let future = listener.call(payload.to_string());
+    let task = match crate::lang::Lang::request_locale() {
+        Some(locale) => tokio::spawn(crate::lang::Lang::with(locale, future)),
+        None => tokio::spawn(future),
+    };
+    let mut task = AbortOnDrop(task);
+    match (&mut task.0).await {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => Err(Error::msg(format!(
+            "聞く側がパニックしました: {}",
+            panic_message(e.into_panic())
+        ))),
+        Err(e) => Err(Error::msg(format!("聞く側を動かせませんでした: {e}"))),
+    }
+}
+
+/// 待っている側が捨てられたら、タスクを止める。
+///
+/// 包む前は、リクエストが取り消されると聞く側の処理も一緒に止まりました。
+/// `tokio::spawn` だけだと、呼び出し元が居なくなっても聞く側が走り続けます。
+/// 前と同じ止まり方にそろえます。
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// パニックの中身を文字にする。文字でなければ決まった文にします。
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return (*text).to_string();
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    "（中身は文字ではありません）".to_string()
 }
 
 /// 出来事を知らせる入口。
@@ -249,6 +305,9 @@ impl Event {
     /// **聞く側のエラーの種類を保ちます。** ステータスを持つエラー
     /// （`abort(404)` や検査の 422）はそのまま返します。それ以外は出来事の
     /// 名前を添えて包み、元のエラーを `source()` に残します（500 になります）。
+    ///
+    /// 聞く側がパニックしたら、そこで止めて 500 のエラーを返します
+    /// （呼び出し元まで巻き戻しません）。
     pub async fn dispatch<T: serde::Serialize>(event: &str, payload: &T) -> Result<()> {
         let text = serde_json::to_string(payload)?;
         Self::dispatch_raw(event, &text).await
@@ -260,6 +319,8 @@ impl Event {
     }
 
     /// 知らせる。**失敗しても次を呼びます。** エラーはログに出します。
+    ///
+    /// 聞く側のパニックも失敗として扱い、ログに出して次を呼びます。
     ///
     /// 「ついでの処理」（通知など）で、本体を止めたくないときに使います。
     pub async fn try_dispatch<T: serde::Serialize>(event: &str, payload: &T) -> Result<()> {
@@ -443,6 +504,74 @@ mod tests {
             vec!["1:{}".to_string(), "3:{}".to_string()],
             "失敗の後も呼ぶ"
         );
+    }
+
+    async fn boom(_payload: String) -> Result<()> {
+        panic!("わざと落ちる")
+    }
+
+    #[tokio::test]
+    async fn try_dispatchはパニックしても次を呼ぶ() {
+        let log = Log::new();
+        let events = Events::new()
+            .listen("mixed", log.recorder("1"))
+            .listen("mixed", boom)
+            .listen("mixed", log.recorder("3"));
+
+        // 以前はパニックが呼び出し元まで巻き戻り、3 件目が呼ばれなかった。
+        try_dispatch_in(&events, "mixed", "{}").await.unwrap();
+        assert_eq!(
+            log.taken(),
+            vec!["1:{}".to_string(), "3:{}".to_string()],
+            "パニックの後も呼ぶ"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatchはパニックを500のエラーにする() {
+        let log = Log::new();
+        let events = Events::new()
+            .listen("mixed", boom)
+            .listen("mixed", log.recorder("2"));
+
+        let error = dispatch_in(&events, "mixed", "{}").await.unwrap_err();
+        assert_eq!(error.status(), 500);
+        let text = error.to_string();
+        assert!(text.contains("パニックしました"), "{text}");
+        assert!(text.contains("わざと落ちる"), "{text}");
+        assert!(log.taken().is_empty(), "パニックした所で止まる");
+    }
+
+    #[tokio::test]
+    async fn 聞く側にもいまの言語が届く() {
+        async fn check_locale(_payload: String) -> Result<()> {
+            assert_eq!(crate::lang::Lang::current(), "en-test");
+            Ok(())
+        }
+        let events = Events::new().listen("a", check_locale);
+        // 別のタスクで呼んでも、`Lang::with` の言語は引き継ぐ。
+        crate::lang::Lang::with("en-test", dispatch_in(&events, "a", "{}"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn 待つ側が捨てられたら聞く側も止まる() {
+        static FINISHED: AtomicUsize = AtomicUsize::new(0);
+        async fn slow(_payload: String) -> Result<()> {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            FINISHED.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        let events = Events::new().listen("a", slow);
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            dispatch_in(&events, "a", "{}"),
+        )
+        .await;
+        assert!(waited.is_err(), "途中で捨てる");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(FINISHED.load(Ordering::SeqCst), 0, "続きは動かない");
     }
 
     #[tokio::test]

@@ -45,7 +45,12 @@ const MAX_ITERATIONS: u32 = 10_000_000;
 /// PBKDF2 の計算量は長さに左右されませんが、入口の `sha256` だけは長さに比例します。
 /// 2 MB の文字列を毎回ハッシュする意味は無いので、ここで断ります。
 /// 人が覚えて入力するパスワードは、これより桁違いに短いです。
-const MAX_PASSWORD_BYTES: usize = 1024;
+///
+/// **4096 なのは、検査の `max:1024`（文字数で数える）が必ず収まるようにするためです。**
+/// UTF-8 は 1 文字が最大 4 バイトなので、1024 文字は最大 4096 バイトです。
+/// 1024 バイトにしていたころは、`max:1024` を付けていても、日本語の長いパスワードで
+/// 登録した人が二度とログインできませんでした。
+const MAX_PASSWORD_BYTES: usize = 4096;
 
 /// ハッシュの設定。`config/hashing.rs` が返します。
 ///
@@ -77,11 +82,19 @@ static TEST_OVERRIDE: OnceLock<u32> = OnceLock::new();
 /// **`.env` を読む前**に呼ばれるので、見るのは本物の環境変数だけです。
 /// `HASH_ITERATIONS=50000 cargo test` のように指定したときだけ、その値を使います。
 /// `.env` に書いた値（開発用に下げた値など）はテストに影響しません。
+///
+/// **空の値（`HASH_ITERATIONS=`）は指定していない扱いです**（`APP_KEY` と同じ）。
+/// 空を「指定あり」と見ると、テストが既定の 120,000 回で走り、1 件 3 秒以上かかります。
 pub(crate) fn install_test_iterations() {
-    if std::env::var("HASH_ITERATIONS").is_ok() {
+    if hash_iterations_given(std::env::var("HASH_ITERATIONS").ok().as_deref()) {
         return;
     }
     let _ = TEST_OVERRIDE.set(TEST_ITERATIONS);
+}
+
+/// 環境変数 `HASH_ITERATIONS` の値が「指定あり」か。前後の空白を落として空なら偽。
+fn hash_iterations_given(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
 }
 
 /// いま使う回数。
@@ -116,12 +129,14 @@ impl Hash {
     /// # 登録の検査に `max:1024` を必ず付けてください
     ///
     /// `make` は長さを断れません（`String` を返すので、エラーを返す手段がありません）。
-    /// 一方 [`check`](Hash::check) は **1024 バイトを超える平文を計算せずに偽とします。**
-    /// つまり **1024 バイトを超える値で作ったハッシュは、`check` が必ず偽を返します。**
+    /// 一方 [`check`](Hash::check) は **4096 バイトを超える平文を計算せずに偽とします。**
+    /// つまり **4096 バイトを超える値で作ったハッシュは、`check` が必ず偽を返します。**
     /// その利用者は登録はできるのに、二度とログインできません。
     ///
     /// 付け忘れを防ぐために、パスワードを受け取る検査には**例外なく**
     /// `max:1024` を書いてください（`"required|min:8|max:1024|confirmed"` の形）。
+    /// `max` は文字数で数えます。UTF-8 は 1 文字が最大 4 バイトなので、
+    /// 1024 文字までなら、どの文字でも 4096 バイトに収まります。
     /// 上限を超える平文を渡したときは `error` でログに出しますが、
     /// 処理は止まりません。ログを見ていなければ気付けません。
     pub fn make(password: &str) -> String {
@@ -147,7 +162,7 @@ impl Hash {
     /// 回数を指定して変える。
     ///
     /// [`make`](Hash::make) と同じで、長さは断りません。
-    /// **1024 バイトを超える値で作ったハッシュは [`check`](Hash::check) が必ず偽を返します。**
+    /// **4096 バイトを超える値で作ったハッシュは [`check`](Hash::check) が必ず偽を返します。**
     /// 登録の検査に `max:1024` を必ず付けてください。
     pub fn make_with(password: &str, iterations: u32) -> String {
         // 上限を超える平文は、作れても二度と照合できない（`check` が断る）。
@@ -157,7 +172,7 @@ impl Hash {
             tracing::error!(
                 "パスワードが長すぎます（{} バイト、上限は {MAX_PASSWORD_BYTES} バイト）。\
                  この値は `check` が常に偽を返すので、ログインできません。\
-                 登録の検査に `max:{MAX_PASSWORD_BYTES}` を足してください",
+                 登録の検査に `max:1024`（文字数）を足してください",
                 password.len()
             );
         }
@@ -174,37 +189,68 @@ impl Hash {
     /// 平文と、保存してある値を照合する。
     ///
     /// 値の形が壊れているときは偽を返します（エラーにはしません）。
-    /// 平文が 1024 バイトを超えるときも、計算せずに偽を返します。
+    /// 平文が 4096 バイトを超えるときも、計算せずに偽を返します。
     ///
     /// **非同期の処理の中では [`check_async`](Hash::check_async) を使ってください。**
     /// ここでは 0.2 秒ほどスレッドを塞ぎます。
     pub fn check(password: &str, hashed: &str) -> bool {
-        // 長すぎる入力は計算せずに断る。合うはずのない値に時間を使わない。
-        if password.len() > MAX_PASSWORD_BYTES {
-            tracing::warn!(
-                "パスワードが長すぎます（{} バイト、上限は {MAX_PASSWORD_BYTES} バイト）",
-                password.len()
-            );
-            return false;
-        }
-        let Some(parsed) = Parsed::parse(hashed) else {
-            tracing::warn!("保存されているパスワードの形が正しくありません");
-            return false;
-        };
-        // 回数は保存されている値から取るので、上限を決めておく。
-        if parsed.iterations > MAX_ITERATIONS {
-            tracing::warn!(
-                "保存されているパスワードの繰り返し回数が多すぎます（{} 回、上限は {MAX_ITERATIONS} 回）",
-                parsed.iterations
-            );
-            return false;
-        }
-        // 空回しが同じだけ計算できるよう、実際に保存されていた回数を覚えておく。
-        LAST_SEEN_ITERATIONS.store(parsed.iterations, Ordering::Relaxed);
-        let digest = crypto::pbkdf2_sha256(password.as_bytes(), &parsed.salt, parsed.iterations);
-        crypto::constant_time_eq(&digest, &parsed.digest)
+        check_inner(password, hashed, true)
     }
+}
 
+/// [`Hash::check`] の本体。
+///
+/// `remember` が真なら、読めた回数を [`LAST_SEEN_ITERATIONS`] に覚えます。
+/// 空回し（[`Hash::waste_time`]）は偽を渡します。空回しの回数で上書きすると、
+/// 覚えている値が本物の照合と関係なく動くためです。
+///
+/// # 読めない値・回数が多すぎる値でも、同じだけ計算する
+///
+/// 計算せずにすぐ偽を返すと、「この利用者の保存値は壊れている」ことが応答の速さで
+/// 分かります。外れると決まっていても、空回しと同じ回数の PBKDF2 を 1 回通します。
+fn check_inner(password: &str, hashed: &str, remember: bool) -> bool {
+    // 長すぎる入力は計算せずに断る。合うはずのない値に時間を使わない。
+    // 入力の長さは送った本人が知っている値なので、速さで漏れるものはありません。
+    if password.len() > MAX_PASSWORD_BYTES {
+        tracing::warn!(
+            "パスワードが長すぎます（{} バイト、上限は {MAX_PASSWORD_BYTES} バイト）",
+            password.len()
+        );
+        return false;
+    }
+    let Some(parsed) = Parsed::parse(hashed) else {
+        tracing::warn!("保存されているパスワードの形が正しくありません");
+        burn(password);
+        return false;
+    };
+    // 回数は保存されている値から取るので、上限を決めておく。
+    if parsed.iterations > MAX_ITERATIONS {
+        tracing::warn!(
+            "保存されているパスワードの繰り返し回数が多すぎます（{} 回、上限は {MAX_ITERATIONS} 回）",
+            parsed.iterations
+        );
+        burn(password);
+        return false;
+    }
+    // 空回しが同じだけ計算できるよう、実際に保存されていた回数を覚えておく。
+    if remember {
+        LAST_SEEN_ITERATIONS.store(parsed.iterations, Ordering::Relaxed);
+    }
+    let digest = crypto::pbkdf2_sha256(password.as_bytes(), &parsed.salt, parsed.iterations);
+    crypto::constant_time_eq(&digest, &parsed.digest)
+}
+
+/// 外れると決まった照合で、空回しと同じだけ PBKDF2 を回す。
+fn burn(password: &str) {
+    let salt = [0u8; SALT_BYTES];
+    std::hint::black_box(crypto::pbkdf2_sha256(
+        password.as_bytes(),
+        &salt,
+        dummy_iterations(),
+    ));
+}
+
+impl Hash {
     /// `check` を裏のスレッドで行う。**非同期の処理の中ではこちらを使ってください。**
     ///
     /// ```ignore
@@ -248,13 +294,18 @@ impl Hash {
     /// 登録済みの側にだけ効き、登録の有無が時間差で分かってしまいます。
     /// 比べる相手だけが固定のダミーです。
     ///
-    /// **回数は「最後に照合した値に書いてあった回数」を使います。**
-    /// いまの設定（`iterations()`）で計算していたころは、`HASH_ITERATIONS` を
-    /// 上げて再ハッシュしていない間だけ空回しのほうが重くなり、
-    /// 1 リクエストで利用者の有無が分かりました
-    /// （120,000 回で 0.23 秒、600,000 回で 1.15 秒）。
+    /// **回数は「いまの設定」と「最後に照合した値に書いてあった回数」の大きいほう**
+    /// を使います。
+    ///
+    /// - いまの設定だけで計算していたころは、`HASH_ITERATIONS` を上げて再ハッシュして
+    ///   いない間だけ空回しのほうが重くなり、1 リクエストで利用者の有無が分かりました
+    ///   （120,000 回で 0.23 秒、600,000 回で 1.15 秒）。
+    /// - 最後に見た回数だけで計算していたころは、古い回数の利用者を照合した直後に
+    ///   空回しが軽くなり、新しい回数の利用者と見分けられました。
+    ///
+    /// 大きいほうにそろえれば、空回しが本物の照合より速くなることはありません。
     pub(crate) fn waste_time(password: &str) {
-        let _ = Hash::check(password, &dummy_hash(dummy_iterations()));
+        let _ = check_inner(password, &dummy_hash(dummy_iterations()), false);
     }
 }
 
@@ -264,7 +315,7 @@ impl Hash {
 /// 空回しをそれに合わせるため、読めた回数をここに覚えます。
 static LAST_SEEN_ITERATIONS: AtomicU32 = AtomicU32::new(0);
 
-/// 空回しに使う回数。まだ何も読んでいなければ、いまの設定にそろえます。
+/// 空回しに使う回数。いまの設定と、最後に読んだ回数の大きいほうです。
 fn dummy_iterations() -> u32 {
     dummy_iterations_from(LAST_SEEN_ITERATIONS.load(Ordering::Relaxed))
 }
@@ -273,11 +324,11 @@ fn dummy_iterations() -> u32 {
 ///
 /// 覚えている値を引数にして、テストから確かめられる形にしています
 /// （静的な値はテストが並んで走ると書き換わります）。
+///
+/// 上限（[`MAX_ITERATIONS`]）を超えることはありません。覚えるのは上限を通った値だけで、
+/// 設定のほうも念のためここで抑えます。
 fn dummy_iterations_from(last_seen: u32) -> u32 {
-    match last_seen {
-        0 => iterations(),
-        found => found,
-    }
+    iterations().max(last_seen).min(MAX_ITERATIONS)
 }
 
 /// `waste_time` が照合する相手。合うことはありません。
@@ -364,6 +415,8 @@ mod tests {
 
     #[test]
     fn 壊れた値は偽になる() {
+        // 壊れた値でも空回しと同じだけ計算するので、回数を下げておく。
+        install_test_iterations();
         for broken in [
             "",
             "ただの文字列",
@@ -395,8 +448,10 @@ mod tests {
     }
 
     #[test]
-    fn 回数が上限を超えていれば計算せずに偽になる() {
-        // 1 回も PBKDF2 を回さないこと（回すと終わらない）を、時間でも確かめる。
+    fn 回数が上限を超えていれば保存された回数では計算せずに偽になる() {
+        // 保存された回数で PBKDF2 を回さないこと（回すと終わらない）を、時間でも確かめる。
+        // 空回しの回数（テストでは下げてある）だけは回す。
+        install_test_iterations();
         let huge = format!(
             "$pbkdf2-sha256$i={}$00${}",
             MAX_ITERATIONS + 1,
@@ -432,16 +487,20 @@ mod tests {
     }
 
     #[test]
-    fn 空回しは保存されている回数に合わせる() {
-        // いまの設定で計算していたころは、`HASH_ITERATIONS` を上げて
-        // 再ハッシュしていない間だけ空回しのほうが重くなり、
-        // 1 リクエストで利用者の有無が時間差で分かった。
+    fn 空回しは設定と保存されている回数の大きいほうに合わせる() {
+        // 設定だけで計算していたころは、`HASH_ITERATIONS` を上げて再ハッシュして
+        // いない間だけ空回しのほうが重くなった。最後に見た回数だけで計算していた
+        // ころは、古い回数の利用者を照合した直後だけ空回しが軽くなった。
         install_test_iterations();
 
-        // 覚えている回数をそのまま使う。
-        assert_eq!(dummy_iterations_from(37), 37);
+        // 設定より多い回数を覚えていれば、そちら。
+        assert_eq!(dummy_iterations_from(iterations() + 37), iterations() + 37);
+        // 設定より少ない回数を覚えていても、設定まで上げる。
+        assert_eq!(dummy_iterations_from(37), iterations().max(37));
         // まだ何も読んでいなければ、いまの設定にそろえる。
         assert_eq!(dummy_iterations_from(0), iterations());
+        // 上限は超えない。
+        assert_eq!(dummy_iterations_from(u32::MAX), MAX_ITERATIONS);
 
         // 照合すると、保存されていた回数を覚える。
         // 値そのものは、ほかのテストが並んで走ると書き換わるので見ません。
@@ -456,6 +515,48 @@ mod tests {
         // 空回しも、その回数で計算できる形になっている。
         assert!(Parsed::parse(&dummy_hash(dummy_iterations())).is_some());
         Hash::waste_time("ひみつ");
+    }
+
+    #[test]
+    fn 空の環境変数は回数の指定とみなさない() {
+        assert!(!hash_iterations_given(None));
+        assert!(!hash_iterations_given(Some("")));
+        assert!(!hash_iterations_given(Some("  ")));
+        assert!(hash_iterations_given(Some("50000")));
+    }
+
+    #[test]
+    fn 上限は1024文字ならどの文字でも収まる() {
+        // 検査の `max:1024` は文字数で数える。UTF-8 は 1 文字が最大 4 バイト。
+        let emoji = "😀".repeat(1024);
+        assert_eq!(emoji.chars().count(), 1024);
+        assert_eq!(emoji.len(), MAX_PASSWORD_BYTES);
+        let stored = Hash::make_with(&emoji, FAST);
+        assert!(Hash::check(&emoji, &stored), "登録した人がログインできる");
+
+        let kana = "あ".repeat(1024);
+        let stored = Hash::make_with(&kana, FAST);
+        assert!(Hash::check(&kana, &stored));
+    }
+
+    #[test]
+    fn 読めない値でも空回しと同じだけ計算する() {
+        // すぐ偽を返していたころは、「保存値が壊れている利用者」が速さで分かった。
+        // ここでは時間は測らず、経路が落ちずに偽を返すことと、覚えている回数を
+        // 書き換えないことを確かめる。
+        install_test_iterations();
+        let huge = format!(
+            "$pbkdf2-sha256$i={}$00${}",
+            MAX_ITERATIONS + 1,
+            "ab".repeat(32)
+        );
+        assert!(!Hash::check("x", &huge));
+        assert!(!Hash::check("x", "壊れた値"));
+        assert_ne!(
+            LAST_SEEN_ITERATIONS.load(Ordering::Relaxed),
+            MAX_ITERATIONS + 1,
+            "上限を超えた回数は覚えない"
+        );
     }
 
     #[test]

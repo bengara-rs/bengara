@@ -8,7 +8,8 @@
 //!     .await?;
 //! ```
 //!
-//! **送り先は3つです。** `MAIL_DRIVER` で選びます。
+//! **送り先は3つです。** `MAIL_MAILER`（Laravel と同じ名前）で選びます。
+//! 空なら `MAIL_DRIVER` を見ます。知らない名前は送るときにエラーになります。
 //!
 //! | 送り先 | 何をするか | 要るもの |
 //! |---|---|---|
@@ -38,6 +39,9 @@ mod smtp;
 #[derive(Debug, Clone)]
 pub struct MailConfig {
     /// 送り先の名前（`log` / `array` / `smtp`）。`memory` は `array` の別名です。
+    ///
+    /// 大文字小文字と前後の空白は見ません。知らない名前は `log` に落とさず、
+    /// 送るときにエラーにします。
     pub driver: String,
     /// 差出人（`.from(..)` を書かなかったときに使う）。
     pub from: String,
@@ -49,6 +53,10 @@ pub struct MailConfig {
     /// （`tls` は 465、`starttls` は 587、`none` は 25）。
     pub port: u16,
     /// 暗号化の仕方（`tls` / `starttls` / `none`）。
+    ///
+    /// `tls`（`ssl`）は、ポートが 465 か 0 のときだけ「つないだ直後から暗号化」
+    /// します。ほかのポート（587 など）では `STARTTLS` を使います（Laravel と同じ）。
+    /// `smtps` はポートに関係なく、つないだ直後から暗号化します。
     pub encryption: String,
     /// SMTP の利用者名。空のときは認証しません。
     pub username: String,
@@ -70,19 +78,20 @@ impl Default for MailConfig {
     ///
     /// | 環境変数          | 既定値                 |
     /// |-------------------|------------------------|
+    /// | `MAIL_MAILER`     | 空なら `MAIL_DRIVER`   |
     /// | `MAIL_DRIVER`     | `log`                  |
     /// | `MAIL_FROM`       | `noreply@example.com`  |
     /// | `MAIL_FROM_NAME`  | `bengara`              |
     /// | `MAIL_HOST`       | `127.0.0.1`            |
     /// | `MAIL_PORT`       | 0（暗号化から決める）  |
-    /// | `MAIL_ENCRYPTION` | `starttls`             |
+    /// | `MAIL_ENCRYPTION` | `starttls`（空も同じ。暗号化しないなら `none`） |
     /// | `MAIL_USERNAME`   | 空（認証しない）       |
     /// | `MAIL_PASSWORD`   | 空                     |
     /// | `MAIL_EHLO_NAME`  | 空                     |
     /// | `MAIL_TIMEOUT`    | 10（秒）               |
     fn default() -> Self {
         Self {
-            driver: crate::env("MAIL_DRIVER", "log"),
+            driver: driver_from_env(),
             from: crate::env("MAIL_FROM", "noreply@example.com"),
             from_name: crate::env("MAIL_FROM_NAME", "bengara"),
             host: crate::env("MAIL_HOST", "127.0.0.1"),
@@ -94,6 +103,50 @@ impl Default for MailConfig {
             timeout: crate::env::<u64>("MAIL_TIMEOUT", 10u64),
         }
     }
+}
+
+/// 送り先の名前を環境変数から読む。`MAIL_MAILER` が先、空なら `MAIL_DRIVER`。
+///
+/// Laravel は `MAIL_MAILER` です。`MAIL_DRIVER` は古い Laravel（6 まで）の
+/// 名前で、bengara は最初こちらだけを読んでいました。Laravel の `.env` を
+/// 持ってくると `MAIL_MAILER=smtp` が効かず、黙って `log` に書き出していました。
+fn driver_from_env() -> String {
+    driver_from(
+        std::env::var("MAIL_MAILER").ok().as_deref(),
+        std::env::var("MAIL_DRIVER").ok().as_deref(),
+    )
+}
+
+/// [`driver_from_env`] の中身（環境変数を触らずに確かめるため）。
+fn driver_from(mailer: Option<&str>, driver: Option<&str>) -> String {
+    [mailer, driver]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .unwrap_or("log")
+        .to_string()
+}
+
+/// 送り先を環境変数で決めてあるか（`MAIL_MAILER` か `MAIL_DRIVER` が空でない）。
+fn driver_set_in_env() -> bool {
+    driver_set(
+        std::env::var("MAIL_MAILER").ok().as_deref(),
+        std::env::var("MAIL_DRIVER").ok().as_deref(),
+    )
+}
+
+/// [`driver_set_in_env`] の中身。
+fn driver_set(mailer: Option<&str>, driver: Option<&str>) -> bool {
+    [mailer, driver]
+        .into_iter()
+        .flatten()
+        .any(|name| !name.trim().is_empty())
+}
+
+/// いまの送り先の名前（`about` の表示用）。
+pub(crate) fn driver_label() -> String {
+    config().driver.trim().to_ascii_lowercase()
 }
 
 /// いまの設定。
@@ -234,8 +287,12 @@ pub fn install_mailer(mailer: Box<dyn Mailer>) {
 }
 
 /// テストのときに `array` を使う。`#[bengara::test]` が呼びます。
+///
+/// `MAIL_MAILER` か `MAIL_DRIVER` に**空でない**値があれば、そちらに従います。
+/// 以前は `MAIL_DRIVER=`（空）でも「決めてある」と見て、テストが
+/// `log` に書き出していました（`env()` は空を既定値として扱うのに）。
 pub(crate) fn install_test_mailer() {
-    if std::env::var("MAIL_DRIVER").is_ok() {
+    if driver_set_in_env() {
         return;
     }
     install_mailer(Box::new(ArrayMailer));
@@ -256,20 +313,37 @@ impl Mailer for UnavailableMailer {
     }
 }
 
-/// 名前から送り先を作る。**知らない名前は `log`** にします。
+/// 名前から送り先を作る。
+///
+/// 大文字小文字と前後の空白は見ません（`SMTP` も `smtp`）。空は既定の `log` です。
+///
+/// **知らない名前は `log` に落としません。** [`UnavailableMailer`] にして、
+/// 送ろうとしたときにエラーにします（機能フラグの無い `smtp` と同じ扱い）。
+/// 以前は `log` に落としていたので、`MAIL_MAILER=ses` のような打ち間違いや
+/// 未対応の名前で、送れたつもりのまま 1 通も届きませんでした。
 ///
 /// `mailer()` から切り出してあります。`MAILER` は 1 回しか決まらないので、
 /// 中に書くと選び方をテストから確かめられません。
 fn make_mailer(driver: &str) -> Box<dyn Mailer> {
-    match driver {
+    let name = driver.trim().to_ascii_lowercase();
+    match name.as_str() {
         "array" | "memory" => Box::new(ArrayMailer) as Box<dyn Mailer>,
-        "log" => Box::new(LogMailer),
+        "log" | "" => Box::new(LogMailer),
         "smtp" => make_smtp_mailer(),
         other => {
-            tracing::warn!("MAIL_DRIVER `{other}` は知りません。log を使います");
-            Box::new(LogMailer)
+            let reason = unknown_driver_message(other);
+            tracing::warn!("{reason}");
+            Box::new(UnavailableMailer { reason })
         }
     }
+}
+
+/// 知らない送り先の名前の説明文。
+fn unknown_driver_message(name: &str) -> String {
+    format!(
+        "メールの送り先 `{name}` は知りません（MAIL_MAILER / MAIL_DRIVER）。\
+         使えるのは log・array（memory）・smtp です"
+    )
 }
 
 /// 機能フラグ `mail` が無いときの案内。
@@ -706,20 +780,57 @@ mod tests {
             ..Message::default()
         };
 
-        // `array` と `memory` は溜める送り先。
-        for driver in ["array", "memory"] {
+        // `array` と `memory` は溜める送り先。大文字と前後の空白は見ない。
+        for driver in ["array", "memory", " Array ", "MEMORY"] {
             Mail::clear_sent();
             make_mailer(driver).send(&message).unwrap();
             assert_eq!(Mail::sent().len(), 1, "{driver}");
         }
 
-        // `log` と知らない名前は書き出す送り先。溜まりません。
-        for driver in ["log", "nowhere", ""] {
+        // `log` と空は書き出す送り先。溜まりません。
+        for driver in ["log", "LOG", " log ", ""] {
             Mail::clear_sent();
             make_mailer(driver).send(&message).unwrap();
             assert!(Mail::sent().is_empty(), "{driver}");
         }
+
+        // 知らない名前は log に落とさず、送るときに断る。
+        // 以前は log に書き出し、送れたつもりのまま届かなかった。
+        for driver in ["nowhere", "ses"] {
+            Mail::clear_sent();
+            let error = make_mailer(driver).send(&message).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("`{driver}` は知りません")),
+                "{error}"
+            );
+            assert!(error.contains("MAIL_MAILER"), "{error}");
+            assert!(Mail::sent().is_empty(), "{driver}");
+        }
         Mail::clear_sent();
+    }
+
+    #[test]
+    fn 送り先の名前はmail_mailerを先に見る() {
+        // Laravel の名前。
+        assert_eq!(driver_from(Some("smtp"), None), "smtp");
+        // 両方あれば `MAIL_MAILER` が勝つ。
+        assert_eq!(driver_from(Some("smtp"), Some("log")), "smtp");
+        // 空や空白だけなら `MAIL_DRIVER` を見る。
+        assert_eq!(driver_from(Some("  "), Some("array")), "array");
+        assert_eq!(driver_from(None, Some(" smtp ")), "smtp");
+        // どちらも無ければ log。
+        assert_eq!(driver_from(None, None), "log");
+        assert_eq!(driver_from(Some(""), Some("")), "log");
+    }
+
+    #[test]
+    fn 空の環境変数は決めていない扱い() {
+        // 以前は `MAIL_DRIVER=`（空）でも決めてあると見て、テストが
+        // array を使わずに log へ書き出していた。
+        assert!(!driver_set(None, None));
+        assert!(!driver_set(Some(""), Some("  ")));
+        assert!(driver_set(Some("log"), None));
+        assert!(driver_set(None, Some("smtp")));
     }
 
     #[test]

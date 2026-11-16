@@ -174,13 +174,20 @@ jobs:
       # main は README だけの置き場だからです。
       # 非公開なら、読み取り権限のある SANDBOX_TOKEN を登録する。
       # 公開なら登録不要で、既定のトークンで取得できる。
+      #
+      # ブランチ名は、プルリクエストでは `head_ref`（出した側のブランチ）を使う。
+      # `ref_name` はプルリクエストだと `<番号>/merge` になり、必ず develop に
+      # 落ちていた。push では `head_ref` が空なので `ref_name` を使う。
+      # 値は環境変数で渡す。ブランチ名は出した人が自由に付けられるので、
+      # `run:` に `${{ }}` で直に埋めると、シェルのコマンドとして解釈されうる。
       - name: bengara-sandbox を取得する
         shell: bash
         env:
           TOKEN: ${{ secrets.SANDBOX_TOKEN || github.token }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           URL="https://x-access-token:${TOKEN}@github.com/bengara-rs/bengara-sandbox.git"
-          for ref in "${{ github.ref_name }}" develop; do
+          for ref in "$BRANCH" develop; do
             if git clone --depth 1 --branch "$ref" "$URL" sandbox 2>/dev/null; then
               echo "bengara-sandbox の $ref を使います"
               exit 0

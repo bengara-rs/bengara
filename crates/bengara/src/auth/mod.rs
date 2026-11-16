@@ -19,7 +19,7 @@ mod reset;
 mod encryption;
 
 pub use hashing::{Hash, HashConfig};
-pub use middleware::Authenticate;
+pub use middleware::{Authenticate, RedirectIfAuthenticated};
 pub use reset::PasswordReset;
 
 pub(crate) use hashing::install_test_iterations;
@@ -157,7 +157,9 @@ impl<'a> Auth<'a> {
         };
         let store = session.store()?;
         let (removed, logged_in_at) = revoke_others(&*store, &user_id, &session.id())?;
-        session.put(AUTH_AT_KEY, logged_in_at.to_string());
+        if let Some(at) = logged_in_at {
+            session.put(AUTH_AT_KEY, at.to_string());
+        }
         Ok(removed)
     }
 
@@ -180,7 +182,9 @@ impl<'a> Auth<'a> {
         let keep_id = session.id();
         let (removed, logged_in_at) =
             crate::support::blocking(move || revoke_others(&*store, &user_id, &keep_id)).await??;
-        session.put(AUTH_AT_KEY, logged_in_at.to_string());
+        if let Some(at) = logged_in_at {
+            session.put(AUTH_AT_KEY, at.to_string());
+        }
         Ok(removed)
     }
 
@@ -350,22 +354,40 @@ impl<'a> Auth<'a> {
 ///
 /// # 印と同じミリ秒にならないこと
 ///
-/// 比較は「印 > ログインの時刻」です。同じミリ秒なら残りますが、時計が戻った
-/// ときや、別のプロセスが同時に切った印のほうが新しいときにも負けないよう、
-/// **印の時刻 + 1 と、いまの時刻の大きいほう**にします。
+/// 比較は「印 > ログインの時刻」です。時計が戻ったときにも負けないよう、
+/// **自分が付けた印の時刻 + 1 と、いまの時刻の大きいほう**にします。
 ///
 /// 印の時刻は、どのセッションとも重ならない空の ID で置き場所に聞きます
 /// （除外した ID で聞くと `None` が返るため）。印を持たない置き場所
 /// （`mark_revoked` を実装していないもの）では、いまの時刻になります。
+///
+/// # 別の所が続けて切ったとき（返す時刻が `None`）
+///
+/// 印は利用者ごとに 1 つで、新しいもので置き換わります。自分が印を付けてから
+/// 読み直すまでのあいだに、別の所が `logout_user`（除外なし）などで印を付け直すと、
+/// 読んだ印は**相手のもの**です。それより後に時刻を進めると、本人まで切るはずの
+/// 操作から本人だけが逃げてしまいます。
+///
+/// そこで、**残す ID（`keep_id`）で印を聞き直します。** 自分の印なら除外に当たって
+/// `None` が返ります。値が返るなら、最新の印は本人も切る相手の印です。
+/// このときは時刻を進めず `None` を返し、本人のセッションは次の保存で切られます。
+///
+/// 聞き直したあとに相手の印が付いた場合は、同じミリ秒に重なったときだけ逃げられます。
+/// 印を比べる仕組み（`SessionStore` の形）を変えずに塞げるのはここまでです。
 fn revoke_others(
     store: &dyn crate::session::SessionStore,
     user_id: &str,
     keep_id: &str,
-) -> Result<(usize, i64)> {
+) -> Result<(usize, Option<i64>)> {
     let removed = store.destroy_for_user_except(user_id, keep_id)?;
-    let mark = store.revoked_at(user_id, "").unwrap_or(0);
-    let logged_in_at = crate::support::time::now_millis().max(mark.saturating_add(1));
-    Ok((removed, logged_in_at))
+    let mark = store.revoked_at(user_id, "");
+    // 最新の印が本人にも効くなら、自分の印ではない（上の説明を参照）。
+    if store.revoked_at(user_id, keep_id).is_some() {
+        tracing::info!("他の端末を切っている間に、別の所がこの利用者を切りました");
+        return Ok((removed, None));
+    }
+    let logged_in_at = crate::support::time::now_millis().max(mark.unwrap_or(0).saturating_add(1));
+    Ok((removed, Some(logged_in_at)))
 }
 
 /// 許されていなければ 403 で止める。
@@ -636,20 +658,71 @@ mod tests {
         let future = now + 60_000;
         let (removed, at) = revoke_others(&Marked(Some(future)), "7", "mine").unwrap();
         assert_eq!(removed, 3);
-        assert_eq!(at, future + 1, "印 + 1 ミリ秒");
+        assert_eq!(at, Some(future + 1), "印 + 1 ミリ秒");
 
         // 印がいまと同じミリ秒でも、同じ値にはならない。
         let (_, at) = revoke_others(&Marked(Some(now)), "7", "mine").unwrap();
-        assert!(at > now, "{at} > {now}");
+        assert!(at.unwrap() > now, "{at:?} > {now}");
 
         // 印を持たない置き場所では、いまの時刻。
         let (_, at) = revoke_others(&Marked(None), "7", "mine").unwrap();
+        let at = at.unwrap();
         assert!(at >= now);
         assert!(at < now + 60_000);
 
         // 端までいってもあふれない。
         let (_, at) = revoke_others(&Marked(Some(i64::MAX)), "7", "mine").unwrap();
-        assert_eq!(at, i64::MAX);
+        assert_eq!(at, Some(i64::MAX));
+    }
+
+    #[test]
+    fn 切っている間に別の所が全部切ったら本人も逃げない() {
+        // 印を付けてから読み直すまでに `logout_user`（除外なし）が割り込むと、
+        // 読み直した印は相手のもの。以前はその後に時刻を進めたので、本人まで切る
+        // はずの操作から本人だけが逃げていた。
+        use crate::session::{MemoryStore, SessionStore};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        /// 自分の印を付けた直後に、別の所の「全部切る」が割り込む置き場所。
+        struct Interrupted(MemoryStore);
+        impl SessionStore for Interrupted {
+            fn read(&self, id: &str) -> Result<Option<BTreeMap<String, String>>> {
+                self.0.read(id)
+            }
+            fn write(&self, id: &str, data: &BTreeMap<String, String>) -> Result<()> {
+                self.0.write(id, data)
+            }
+            fn destroy(&self, id: &str) -> Result<()> {
+                self.0.destroy(id)
+            }
+            fn destroy_for_user_except(&self, user_id: &str, keep_id: &str) -> Result<usize> {
+                let removed = self.0.destroy_for_user_except(user_id, keep_id)?;
+                // 別のリクエストの `logout_user`。印は除外なしで置き換わる。
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                self.0.mark_revoked(user_id, None);
+                Ok(removed)
+            }
+            fn mark_revoked(&self, user_id: &str, except: Option<&str>) {
+                self.0.mark_revoked(user_id, except);
+            }
+            fn revoked_at(&self, user_id: &str, session_id: &str) -> Option<i64> {
+                self.0.revoked_at(user_id, session_id)
+            }
+        }
+
+        let store = Arc::new(Interrupted(MemoryStore::new(60)));
+        let session = Session::empty().with_store(store.clone());
+        let auth = Auth::new(Some(&session));
+        auth.login_using_id(7).unwrap();
+        let before = logged_in_at(&session);
+
+        auth.logout_other_devices().unwrap();
+        assert_eq!(logged_in_at(&session), before, "時刻を進めない");
+        let mark = store
+            .revoked_at("7", &session.id())
+            .expect("本人にも効く印");
+        assert!(mark > before, "次の保存で本人も切られる: {mark} > {before}");
     }
 
     #[test]

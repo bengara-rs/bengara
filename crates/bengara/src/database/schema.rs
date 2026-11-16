@@ -331,6 +331,8 @@ impl Blueprint {
     /// - `Schema::table`（alter）の中の列の `.primary()`。`add column .. primary key` は
     ///   SQLite では必ず、MySQL と PostgreSQL では主キーが既にあると失敗します。
     ///   表の `primary(&[..])` が SQL を出さないのに、こちらだけ出していました。
+    /// - `Schema::create` の中の 2 つ目の主キー（`id()` と `primary(&[..])` など）。
+    ///   `primary key` が 2 回出て、どのドライバでも必ず失敗します。
     fn collect_errors(&mut self) -> Vec<String> {
         let table = self.table.clone();
         let alter = self.mode == Mode::Alter;
@@ -368,9 +370,48 @@ impl Blueprint {
                 }
                 true
             });
+        } else {
+            self.check_single_primary(&mut errors);
         }
 
         errors
+    }
+
+    /// 主キーの指定が 1 つだけか確かめる（表を作るときだけ）。
+    ///
+    /// 主キーを決めるものは 3 つあります。`id()` / `increments()`、列の `.primary()`、
+    /// 表の `primary(&[..])` です。2 つ以上あると `primary key` が 2 回出て、
+    /// `create table` がどのドライバでも失敗します。以前は検査せず、
+    /// migrate を流したところで SQL エラーになっていました。
+    ///
+    /// 最初の指定だけを残し、後の指定は組み立てから外します。
+    fn check_single_primary(&mut self, errors: &mut Vec<String>) {
+        let mut sources: Vec<String> = Vec::new();
+        for column in &mut self.columns {
+            if column.kind == ColumnType::Id {
+                sources.push(format!("{}（id() / increments()）", column.name));
+            } else if column.primary {
+                sources.push(format!("{}（列の primary()）", column.name));
+                if sources.len() > 1 {
+                    column.primary = false;
+                }
+            }
+        }
+        if !self.primary.is_empty() {
+            sources.push(format!("primary(&[{}])", self.primary.join(", ")));
+            if sources.len() > 1 {
+                self.primary.clear();
+            }
+        }
+        if sources.len() > 1 {
+            errors.push(format!(
+                "{} に主キーが {} つあります（{}）。表の主キーは 1 つだけです。\
+                 複合主キーにするときは、id() を使わずに primary(&[..]) だけで指定してください",
+                self.table,
+                sources.len(),
+                sources.join("、")
+            ));
+        }
     }
 
     fn build_create(self, if_not_exists: bool) -> Vec<String> {
@@ -1045,8 +1086,13 @@ fn constraint_name_for(
 }
 
 /// これまでと同じ作り方の名前。
+///
+/// **`.` と `-` は `_` に置き換えます**（Laravel の `createIndexName` と同じ）。
+/// `main.posts` のような表名がそのまま入ると、名前を引用符でくくるときに
+/// `.` で区切られて `"main_posts"` ではなく `"main"."posts_..."` になり、
+/// 索引が作れませんでした。
 fn base_constraint_name(table: &str, columns: &[String], suffix: &str) -> String {
-    format!("{table}_{}_{suffix}", columns.join("_"))
+    format!("{table}_{}_{suffix}", columns.join("_")).replace(['.', '-'], "_")
 }
 
 /// 重なるときの名前。列の並びから作ったハッシュを後ろに付けます。
@@ -1535,20 +1581,159 @@ mod tests {
     #[test]
     fn 自動採番の主キーは型名1つで全部書く() {
         // `type_sql` には Id の腕が無い。書くのは `column_sql` の1箇所だけ。
+        // 主キーは表に 1 つなので、別の表で試す。
         let mut schema = sqlite();
         schema.create("posts", |t| {
             t.id();
+        });
+        schema.create("others", |t| {
             t.increments("other");
         });
-        let sql = &schema.to_sql()[0];
+        assert!(schema.take_errors().is_empty());
+        let sql = schema.to_sql();
         assert!(
-            sql.contains("\"id\" integer primary key autoincrement not null"),
-            "{sql}"
+            sql[0].contains("\"id\" integer primary key autoincrement not null"),
+            "{sql:?}"
         );
         assert!(
-            sql.contains("\"other\" integer primary key autoincrement not null"),
-            "{sql}"
+            sql[1].contains("\"other\" integer primary key autoincrement not null"),
+            "{sql:?}"
         );
+    }
+
+    #[test]
+    fn 主キーを2つ指定すると実行の前のエラーになる() {
+        // 以前は `primary key` が 2 回出て、migrate を流したところで SQL エラーになっていた。
+        type Build = fn(&mut Blueprint);
+        let cases: [(Build, &str); 4] = [
+            (
+                |t| {
+                    t.id();
+                    t.primary(&["id"]);
+                },
+                "primary(&[id])",
+            ),
+            (
+                |t| {
+                    t.uuid("key").primary();
+                    t.primary(&["key"]);
+                },
+                "primary(&[key])",
+            ),
+            (
+                |t| {
+                    t.uuid("a").primary();
+                    t.uuid("b").primary();
+                },
+                "b（列の primary()）",
+            ),
+            (
+                |t| {
+                    t.id();
+                    t.increments("other");
+                },
+                "other（id() / increments()）",
+            ),
+        ];
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            for (build, named) in cases {
+                let mut schema = Schema::new(driver);
+                schema.create("posts", build);
+                let errors = schema.take_errors();
+                assert_eq!(errors.len(), 1, "{driver}: {errors:?}");
+                assert!(errors[0].contains("posts に主キーが 2 つ"), "{}", errors[0]);
+                assert!(errors[0].contains(named), "{}", errors[0]);
+            }
+        }
+
+        // 1 つだけなら今までどおり。
+        let mut schema = sqlite();
+        schema.create("pairs", |t| {
+            t.integer("a");
+            t.integer("b");
+            t.primary(&["a", "b"]);
+        });
+        assert!(schema.take_errors().is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 主キーを2つ指定したマイグレーションは1本も流さない() {
+        use super::super::{ConnectionConfig, Transaction};
+
+        let backend = super::super::sqlite::connect(&ConnectionConfig::sqlite("test", ":memory:"))
+            .await
+            .expect("メモリ上の SQLite につながる");
+        let mut schema = sqlite();
+        schema.create("posts", |t| {
+            t.id();
+            t.primary(&["id"]);
+        });
+        let errors = schema.take_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        // 外した後の SQL は流せる（`primary key` は 1 回だけ）。
+        let tx = Transaction::start(backend).await.expect("始められる");
+        for sql in schema.into_statements() {
+            assert_eq!(sql.matches("primary key").count(), 1, "{sql}");
+            tx.statement(&sql, &[]).await.expect("流せる");
+        }
+    }
+
+    #[test]
+    fn 表名に_dot_があっても索引の名前は1つの名前になる() {
+        // 以前は `main.posts_title_index` を引用符でくくるときに `.` で区切られ、
+        // `"main"."posts_title_index"` になって索引が作れなかった。
+        let mut schema = sqlite();
+        schema.create("main.posts", |t| {
+            t.string("title").index();
+            t.string("slug").unique();
+            t.index(&["my-col"]);
+        });
+        let sql = schema.to_sql();
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("index \"main_posts_title_index\" on \"main\".\"posts\"")),
+            "{sql:?}"
+        );
+        assert!(
+            sql.iter().any(|s| s.contains("\"main_posts_slug_unique\"")),
+            "{sql:?}"
+        );
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("\"main_posts_my_col_index\"")),
+            "{sql:?}"
+        );
+
+        // 落とすときも同じ名前を作る。
+        let mut dropped = sqlite();
+        dropped.drop_index("main.posts", &["title"]);
+        dropped.drop_unique("main.posts", &["slug"]);
+        assert_eq!(
+            dropped.to_sql(),
+            [
+                "drop index if exists \"main_posts_title_index\"",
+                "drop index if exists \"main_posts_slug_unique\"",
+            ]
+        );
+
+        // MySQL の表定義の中の名前も同じ。
+        let mut schema = Schema::new(Driver::MySql);
+        schema.create("app.posts", |t| {
+            t.string("title").index();
+        });
+        assert!(
+            schema.to_sql()[0].contains("key `app_posts_title_index` (`title`)"),
+            "{:?}",
+            schema.to_sql()
+        );
+
+        // `.` の無い表名は、これまでと同じ名前。
+        let mut schema = sqlite();
+        schema.create("posts", |t| {
+            t.string("title").index();
+        });
+        assert!(schema.to_sql()[1].contains("\"posts_title_index\""));
     }
 
     #[test]

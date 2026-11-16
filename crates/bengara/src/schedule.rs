@@ -37,14 +37,45 @@ pub type TaskFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 pub enum Every {
     /// 呼ばれるたびに動かす（1分ごとに呼ぶ前提）。
     Minute,
-    /// n 分ごと。
+    /// n 分ごと。**0 は登録できません**（[`Schedule::job`] がパニックします）。
     Minutes(u32),
     /// 1 時間ごと。
     Hour,
     /// 1 日ごと。
     Day,
-    /// n 秒ごと。
+    /// n 秒ごと。**0 は登録できません。**
+    ///
+    /// 60 秒以上は `Minutes` と同じ扱いです（30 秒の許容と、分の頭への丸め）。
+    /// 60 秒未満を指定しても、`schedule:run` を呼ぶ間隔（ふつう 1 分）より
+    /// 細かくは動きません。登録のときに警告を出します。
     Seconds(u64),
+}
+
+impl Every {
+    /// 登録できない間隔なら、その理由を返す（0 分・0 秒）。
+    fn invalid_reason(&self) -> Option<&'static str> {
+        match self {
+            Every::Minutes(0) => Some("Every::Minutes(0)"),
+            Every::Seconds(0) => Some("Every::Seconds(0)"),
+            _ => None,
+        }
+    }
+
+    /// 秒で指定した、1 分より短い間隔か。
+    ///
+    /// `schedule:run` は外から 1 分ごとに呼ぶので、この間隔では動きません。
+    fn finer_than_runs(&self) -> bool {
+        matches!(self, Every::Seconds(n) if *n < 60)
+    }
+
+    /// 分の粒度で扱う間隔か（30 秒の許容と、分の頭への丸めを使う）。
+    ///
+    /// 60 秒以上なら、`Seconds` で書いても `Minutes` と同じに扱います。
+    /// 以前は `Seconds` だけ許容も丸めも無く、`Every::Seconds(60)` が
+    /// 動いた秒のぶれで 1 回ぶん飛び、**2 分ごと**になることがありました。
+    fn minute_grained(&self) -> bool {
+        self.seconds() >= 60
+    }
 }
 
 impl Every {
@@ -120,12 +151,33 @@ impl Schedule {
     /// 同じ名前を 2 回登録するとパニックします。名前は前回の時刻と錠の鍵なので、
     /// 2 件目は 1 件目が書いた時刻を見て、`Every::Minute` 以外は**二度と動きません。**
     /// 起動時に止めるのは、未登録のミドルウェア名と同じ考え方です（決定記録 #087）。
+    ///
+    /// `Every::Minutes(0)` と `Every::Seconds(0)` もパニックします。以前は
+    /// 「0 分ごと」と表示したまま、`schedule:run` のたびに動いていました。
+    /// 毎回動かしたいなら `Every::Minute` を書いてください。
+    ///
+    /// `Every::Seconds(n)` で `n` が 60 未満なら、警告を出して登録します。
+    /// `schedule:run` を呼ぶ間隔（ふつう 1 分）より細かくは動かないためです。
     pub fn job<F, Fut>(&mut self, name: impl Into<String>, every: Every, run: F) -> &mut Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
     {
         let name = name.into();
+        if let Some(written) = every.invalid_reason() {
+            panic!(
+                "定期処理 `{name}` の間隔 {written} は登録できません。\
+                 0 は「毎回」と区別できないためです。\
+                 毎回動かすなら Every::Minute を書いてください（routes/console.rs）"
+            );
+        }
+        if every.finer_than_runs() {
+            tracing::warn!(
+                "定期処理 `{name}` は {} ですが、schedule:run を呼ぶ間隔より細かくは動きません\
+                 （1 分ごとに呼んでいれば 1 分に 1 回です）",
+                every.label()
+            );
+        }
         if let Some(existing) = self.tasks.iter().find(|t| t.name == name) {
             panic!(
                 "定期処理 `{name}` は既に登録されています（{}）。\
@@ -176,14 +228,19 @@ impl std::fmt::Debug for Schedule {
 /// なので、1 回ぶん飛んで 6 分ごとになります。間隔が 1 分以上のものだけ、
 /// この秒数だけ早くても動かします。
 ///
-/// **ずれがこの秒数を超えると、やはり 1 回ぶん飛びます。** 30 秒より長く
-/// 遅れて動く環境では、`Every::Seconds` で間隔を指定してください。
+/// **ずれがこの秒数を超えると、やはり 1 回ぶん飛びます。** 書く時刻は
+/// 分の頭に丸めるので（[`remembered_at`]）、ずれが積もることはありません。
+/// 飛ぶのは、`schedule:run` そのものが毎回 30 秒より長く遅れて呼ばれる
+/// 環境だけです。
+///
+/// `Every::Seconds(n)` も、`n` が 60 以上ならこの許容を使います。
 const DUE_SLACK_SECS: i64 = 30;
 
 /// いま動かすべきか。前回の時刻（UNIX 秒）と間隔から決めます。
 ///
-/// 間隔が 1 分以上のときは [`DUE_SLACK_SECS`] だけ早くても動かします。
-/// `Every::Seconds(n)` には許容を付けません（秒を指定した意図を崩さないため）。
+/// 間隔が 1 分以上のときは、`Minutes` でも `Seconds` でも
+/// [`DUE_SLACK_SECS`] だけ早くても動かします。60 秒未満の `Seconds(n)` は
+/// 秒のまま比べます（どのみち `schedule:run` の間隔でしか動きません）。
 ///
 /// **前回が未来なら動かします。** 時計が一時的に先へ飛ぶと（NTP の補正、
 /// スナップショットからの復元、RTC の狂ったコンテナ）未来の時刻が書かれます。
@@ -205,12 +262,11 @@ pub(crate) fn is_due(last_run: Option<i64>, every: Every, now: i64) -> bool {
             // 「ほぼ動かない」つもりが毎回動いていました。あふれは上限で
             // 切り詰めます（`queue/mod.rs` の `available_at` と同じ形）。
             let seconds = i64::try_from(every.seconds()).unwrap_or(i64::MAX);
-            // 秒を指定したものは、秒のまま守る。
-            let exact = matches!(every, Every::Seconds(_)) || seconds < 60;
-            let need = if exact {
-                seconds
-            } else {
+            // 60 秒以上は `Seconds` でも分の粒度で扱う（[`Every::minute_grained`]）。
+            let need = if every.minute_grained() {
                 seconds.saturating_sub(DUE_SLACK_SECS)
+            } else {
+                seconds
             };
             now.saturating_sub(last) >= need
         }
@@ -283,7 +339,10 @@ fn write_last_run_file(dir: &Path, state_file: &str, task_name: &str, now: i64) 
     let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 一時ファイルの名前は、覚えるファイル（SHA-256 の16進）とぶつからない
     // ように印を入れる。プロセス番号と連番で、同時に走っても重ならない。
-    let temp = dir.join(format!("{state_file}+tmp.{}.{seq}", std::process::id()));
+    let temp = dir.join(format!(
+        "{state_file}{TEMP_MARK}{}.{seq}",
+        std::process::id()
+    ));
     // Windows の「使用中」のやり直しと、失敗時の片付けは `write_atomic` が持ちます。
     let body = format!("{name}\n{now}\n");
     crate::support::fs::write_atomic(
@@ -335,10 +394,11 @@ fn lock_path_for(dir: &Path, state_file: &str) -> PathBuf {
 /// 判定のほうは取りたての `now` のままにします。先頭で 1 回だけ取った時刻で
 /// 判定すると、後ろのタスクが「前回が未来」と誤検知して二重に動きました。
 ///
-/// `Every::Seconds(_)` と間隔 60 秒未満のタスクは丸めません。秒を指定した
-/// 意図を崩さないためです（[`is_due`] の `exact` と同じ考え方）。
+/// 間隔 60 秒未満のタスクは丸めません（[`is_due`] と同じ線引き）。
+/// `Every::Seconds(n)` も `n` が 60 以上なら丸めます。丸めないと
+/// `Every::Seconds(60)` で上と同じずれが積もり、2 分ごとになりました。
 fn remembered_at(every: Every, now: i64) -> i64 {
-    if matches!(every, Every::Seconds(_)) || every.seconds() < 60 {
+    if !every.minute_grained() {
         return now;
     }
     now - now.rem_euclid(60)
@@ -460,7 +520,50 @@ impl Outcome {
 pub(crate) async fn run_due(schedule: &Schedule) -> Result<Outcome> {
     let dir = state_dir();
     ensure_state_dir(&dir)?;
+    // 落ちたプロセスの書きかけを片付ける。毎分 1 回で足ります。
+    // 失敗しても動かす処理には響かないので、結果は見ません。
+    let sweep_dir = dir.clone();
+    let _ = crate::support::blocking(move || sweep_stale_temps(&sweep_dir)).await;
     Ok(run_in(&dir, schedule).await)
+}
+
+/// 一時ファイルの名前に入れる印（[`write_last_run_file`]）。
+///
+/// 覚えるファイルは SHA-256 の16進なので、`+` を含む名前とはぶつかりません。
+const TEMP_MARK: &str = "+tmp.";
+
+/// 一時ファイルがこの秒数より古ければ、書きかけの残骸と見なして消す。
+///
+/// キャッシュの掃除（`cache/store.rs` の `TEMP_STALE_SECS`）と同じ 300 秒です。
+/// 書き込みは一瞬で終わるので、生きている書き込みを消すことはありません。
+const TEMP_STALE_SECS: u64 = 300;
+
+/// 古い一時ファイル（`<hash>+tmp.<pid>.<seq>`）を消し、消した件数を返す。
+///
+/// 書いている途中にプロセスが落ちると、一時ファイルが残ります。
+/// 以前は誰も消さず、`storage/framework/schedule/` に溜まる一方でした。
+/// 錠のディレクトリ（`+locks/`）はディレクトリなので触りません。
+fn sweep_stale_temps(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_temp = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.contains(TEMP_MARK));
+        if !is_temp || !path.is_file() {
+            continue;
+        }
+        if crate::support::lock::is_stale(&path, TEMP_STALE_SECS)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// 置き場所を指定して動かし、動かした名前だけを返す（テストから使います）。
@@ -630,13 +733,55 @@ mod tests {
     }
 
     #[test]
-    fn 秒の指定には許容を付けない() {
+    fn 一分未満の秒の指定には許容を付けない() {
         let now = 100_000;
         assert!(is_due(Some(now - 30), Every::Seconds(30), now));
         assert!(!is_due(Some(now - 29), Every::Seconds(30), now));
-        // 60 秒以上でも、秒を指定したものは秒のまま守る。
-        assert!(!is_due(Some(now - 299), Every::Seconds(300), now));
-        assert!(is_due(Some(now - 300), Every::Seconds(300), now));
+    }
+
+    #[test]
+    fn 六十秒以上の秒の指定は分と同じ許容を使う() {
+        let now = 100_000;
+        // 以前は許容が無く、`Every::Seconds(60)` が秒のぶれで 1 回ぶん飛び、
+        // 2 分ごとになることがあった。
+        assert!(is_due(Some(now - 60 + 30), Every::Seconds(60), now));
+        assert!(is_due(Some(now - 300 + 30), Every::Seconds(300), now));
+        assert!(!is_due(Some(now - 300 + 31), Every::Seconds(300), now));
+        // `Minutes` と同じ判定になる。
+        for elapsed in [0, 29, 30, 31, 59, 60, 61, 269, 270, 271, 300] {
+            assert_eq!(
+                is_due(Some(now - elapsed), Every::Seconds(300), now),
+                is_due(Some(now - elapsed), Every::Minutes(5), now),
+                "{elapsed} 秒"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Every::Minutes(0)")]
+    fn 零分は登録できない() {
+        // 以前は「0 分ごと」と出たまま、呼ぶたびに動いていた。
+        Schedule::new().job("a", Every::Minutes(0), || async { Ok(()) });
+    }
+
+    #[test]
+    #[should_panic(expected = "Every::Seconds(0)")]
+    fn 零秒は登録できない() {
+        Schedule::new().job("a", Every::Seconds(0), || async { Ok(()) });
+    }
+
+    #[test]
+    fn 一分未満の秒は警告して登録する() {
+        assert!(Every::Seconds(30).finer_than_runs());
+        assert!(!Every::Seconds(60).finer_than_runs());
+        assert!(!Every::Minute.finer_than_runs());
+        // 登録そのものはできる。
+        let mut schedule = Schedule::new();
+        schedule.job("a", Every::Seconds(30), || async { Ok(()) });
+        assert_eq!(schedule.len(), 1);
+        // 毎分は 0 秒でも登録できる（「毎回」の意味で決めてある）。
+        schedule.job("b", Every::Minute, || async { Ok(()) });
+        assert_eq!(schedule.len(), 2);
     }
 
     #[test]
@@ -658,8 +803,9 @@ mod tests {
         // 「ほぼ動かない」つもりが毎回動いていた。
         assert!(!is_due(Some(now), Every::Seconds(u64::MAX), now));
         assert!(!is_due(Some(0), Every::Seconds(u64::MAX), now));
+        // 上限で切り詰めた間隔にも 30 秒の許容が付くので、31 秒ぶん手前で見る。
         assert!(!is_due(
-            Some(1),
+            Some(31),
             Every::Seconds(i64::MAX as u64 + 1),
             i64::MAX
         ));
@@ -755,9 +901,11 @@ mod tests {
         assert_eq!(remembered_at(Every::Hour, now), now - 20);
         assert_eq!(remembered_at(Every::Day, now), now - 20);
 
-        // 秒を指定したものと 1 分未満は丸めない（秒の意図を崩さない）。
+        // 60 秒以上なら `Seconds` でも丸める（`Seconds(60)` が 2 分ごとにならない）。
+        assert_eq!(remembered_at(Every::Seconds(60), now), now - 20);
+        assert_eq!(remembered_at(Every::Seconds(300), now), now - 20);
+        // 1 分未満は丸めない。
         assert_eq!(remembered_at(Every::Seconds(30), now), now);
-        assert_eq!(remembered_at(Every::Seconds(300), now), now);
         assert_eq!(remembered_at(Every::Minute, now), now);
     }
 
@@ -871,6 +1019,37 @@ mod tests {
             .filter(|name| *name != task.state_file())
             .collect();
         assert!(left.is_empty(), "残っている: {left:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 古い書きかけだけを片付ける() {
+        let dir = temp_dir("sweep-temps");
+        std::fs::create_dir_all(dir.join(LOCK_DIR)).unwrap();
+        let state = "a".repeat(64);
+        std::fs::write(dir.join(&state), "名前\n1\n").unwrap();
+        let old = dir.join(format!("{state}{TEMP_MARK}1.0"));
+        let fresh = dir.join(format!("{state}{TEMP_MARK}1.1"));
+        std::fs::write(&old, "名前\n").unwrap();
+        std::fs::write(&fresh, "名前\n").unwrap();
+        // 落ちたプロセスが 10 分前に残した形。
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        // 以前は誰も消さず、溜まる一方だった。
+        assert_eq!(sweep_stale_temps(&dir), 1);
+        assert!(!old.exists(), "古い書きかけは消す");
+        assert!(fresh.exists(), "書いている途中かもしれないものは残す");
+        assert!(dir.join(&state).exists(), "覚えるファイルは消さない");
+        assert!(dir.join(LOCK_DIR).is_dir(), "錠の置き場所は消さない");
+        // 置き場所が無くても落ちない。
+        assert_eq!(sweep_stale_temps(&dir.join("none")), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

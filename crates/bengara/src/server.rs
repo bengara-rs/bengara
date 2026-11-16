@@ -236,9 +236,11 @@ async fn dispatch(
     // `RUST_LOG=warn` で動かしているときに、リクエストごとの確保を 2 本減らせます。
     let logging = tracing::enabled!(tracing::Level::INFO);
     let started = std::time::Instant::now();
-    let line = logging.then(|| (req.method().to_string(), log_target(&req)));
-    let response = app.handle(req).await;
-    if let Some((method, target)) = line {
+    let method = logging.then(|| req.method().to_string());
+    // 行き先はルートを引いた**あと**で作る（`Application::handle_logged`）。
+    // パス引数の名前が分からないと、`/reset/{token}` の値を伏せられないためです。
+    let (response, target) = app.handle_logged(req, logging).await;
+    if let (Some(method), Some(target)) = (method, target) {
         tracing::info!(
             "{method} {target} -> {} ({} ms)",
             response.status(),
@@ -254,13 +256,29 @@ async fn dispatch(
 /// 署名付き URL の `signature` やパスワードの再設定の `token` は、**それ自体が
 /// 認証情報**です。そのままログに書くと、ログを読める人がリンクを使い回せます。
 /// 伏せる名前の判定は、セッションに覚えない入力と同じ一覧（`request::is_sensitive`）です。
-fn log_target(req: &Request) -> String {
+///
+/// **パス引数も伏せます。** `/reset/{token}` のようなルートでは、パスの中に秘密が入ります。
+/// 名前が伏せる一覧に当たるパス引数の値を `***` にします（`mask_path_params`）。
+/// そのため、ルートを引いたあとのリクエスト（`Application::handle_logged` の中）で呼びます。
+pub(crate) fn log_target(req: &Request) -> String {
+    let path = match req.route_path() {
+        // 伏せる名前のパス引数があるときだけ組み直す。ふつうは確保を増やさない。
+        Some(pattern)
+            if req
+                .params()
+                .iter()
+                .any(|(name, _)| crate::http::request::is_sensitive(name)) =>
+        {
+            std::borrow::Cow::Owned(mask_path_params(req.path(), pattern))
+        }
+        _ => std::borrow::Cow::Borrowed(req.path()),
+    };
     let query = req.query_string();
     if query.is_empty() {
-        return req.path().to_string();
+        return path.into_owned();
     }
-    let mut out = String::with_capacity(req.path().len() + query.len() + 1);
-    out.push_str(req.path());
+    let mut out = String::with_capacity(path.len() + query.len() + 1);
+    out.push_str(&path);
     out.push('?');
     for (index, pair) in query.split('&').enumerate() {
         if index > 0 {
@@ -281,6 +299,93 @@ fn log_target(req: &Request) -> String {
         }
     }
     out
+}
+
+/// 届いたパスのうち、伏せる名前のパス引数に当たる部分を `***` にする。
+///
+/// `pattern` は当たったルートの登録パス（`/reset/{token}` の形）です。
+/// 照合は区間（`/` の間）ごとなので、登録パスと届いたパスを区間ごとに並べて見ます。
+///
+/// | 登録パスの区間 | 出すもの |
+/// |---|---|
+/// | 固定文字だけ | 届いた区間そのまま |
+/// | `file-{name}`（伏せない名前） | 届いた区間そのまま |
+/// | `file-{token}`（伏せる名前） | `file-***` |
+/// | `{*token}`（末尾まで。伏せる名前） | `***`（後ろの区間もまとめて） |
+///
+/// 届いたパスは照合の前に `%xx` の大文字化と末尾の `/` 落としを受けますが、
+/// どちらも区間の数と前置きの長さを変えません。なので生のパスのまま並べられます。
+fn mask_path_params(path: &str, pattern: &str) -> String {
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut out = String::with_capacity(path.len());
+    let mut used = 0;
+    for (index, piece) in pattern.split('/').enumerate() {
+        let Some(segment) = segments.get(index) else {
+            break;
+        };
+        if index > 0 {
+            out.push('/');
+        }
+        used = index + 1;
+        let Some((prefix, name, catch_all)) = path_param(piece) else {
+            out.push_str(segment);
+            continue;
+        };
+        if catch_all {
+            // 末尾までの引数。残りの区間も値の一部です。
+            used = segments.len();
+            if crate::http::request::is_sensitive(name) {
+                out.push_str(segment.get(..prefix).unwrap_or(""));
+                out.push_str("***");
+            } else {
+                out.push_str(&segments[index..].join("/"));
+            }
+            break;
+        }
+        if crate::http::request::is_sensitive(name) {
+            out.push_str(segment.get(..prefix).unwrap_or(""));
+            out.push_str("***");
+        } else {
+            out.push_str(segment);
+        }
+    }
+    // 登録パスより後ろ（末尾の `/` など）はそのまま出す。
+    for segment in &segments[used.min(segments.len())..] {
+        out.push('/');
+        out.push_str(segment);
+    }
+    out
+}
+
+/// 登録パスの 1 区間から、パス引数を探す。
+///
+/// 返すのは「前の固定文字の長さ（届いたパスでのバイト数）」「名前」「末尾までの引数か」です。
+/// `{{` と `}}` は固定文字の `{` `}`（matchit の書き方）なので、1 文字と数えます。
+fn path_param(piece: &str) -> Option<(usize, &str, bool)> {
+    let bytes = piece.as_bytes();
+    let mut index = 0;
+    let mut literal = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'}' if bytes.get(index + 1) == Some(&bytes[index]) => {
+                index += 2;
+                literal += 1;
+            }
+            b'{' => {
+                let end = index + piece[index..].find('}')?;
+                let name = &piece[index + 1..end];
+                return Some(match name.strip_prefix('*') {
+                    Some(name) => (literal, name, true),
+                    None => (literal, name, false),
+                });
+            }
+            _ => {
+                index += 1;
+                literal += 1;
+            }
+        }
+    }
+    None
 }
 
 /// 伏せる名前か。**符号化した名前も元に戻してから見ます。**
@@ -632,6 +737,60 @@ mod tests {
             log_target(&req),
             "/pay?token[]=***&cvc=***&recovery_code=***&keyword=rust"
         );
+    }
+
+    /// ルートに当たったあとのリクエストを作る（`Application` が載せるものを手で載せる）。
+    fn routed(path: &str, pattern: &str, params: &[(&str, &str)]) -> Request {
+        let mut req = Request::new("GET", path);
+        req.set_route_path(Some(pattern.into()));
+        req.set_params(
+            params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        req
+    }
+
+    #[test]
+    fn ログはパス引数の秘密も伏せる() {
+        // 以前はクエリだけを伏せていたので、`/reset/{token}` の値が INFO で残っていた。
+        let req = routed("/reset/abc123", "/reset/{token}", &[("token", "abc123")]);
+        assert_eq!(log_target(&req), "/reset/***");
+
+        // 伏せない名前はそのまま。クエリの伏せ方とも組み合わさる。
+        let req = routed(
+            "/users/5/reset/abc",
+            "/users/{id}/reset/{token}",
+            &[("id", "5"), ("token", "abc")],
+        )
+        .with_query("signature=9f3c&page=2");
+        assert_eq!(log_target(&req), "/users/5/reset/***?signature=***&page=2");
+
+        // 前置きの固定文字は残す。符号化された前置きも長さは変わらない。
+        let req = routed("/t-abc", "/t-{token}", &[("token", "abc")]);
+        assert_eq!(log_target(&req), "/t-***");
+        let req = routed("/%e3%81%82-abc", "/%E3%81%82-{token}", &[("token", "abc")]);
+        assert_eq!(log_target(&req), "/%e3%81%82-***");
+
+        // 末尾までの引数は、後ろの区間もまとめて伏せる。
+        let req = routed("/k/a/b/c", "/k/{*api_key}", &[("api_key", "a/b/c")]);
+        assert_eq!(log_target(&req), "/k/***");
+        let req = routed("/files/a/b", "/files/{*path}", &[("path", "a/b")]);
+        assert_eq!(
+            log_target(&req),
+            "/files/a/b",
+            "伏せる名前が無ければそのまま"
+        );
+
+        // 末尾の `/` は残す。
+        let req = routed("/reset/abc/", "/reset/{token}", &[("token", "abc")]);
+        assert_eq!(log_target(&req), "/reset/***/");
+
+        // `{{` は固定文字の `{`。
+        assert_eq!(path_param("a{{b-{token}"), Some((4, "token", false)));
+        assert_eq!(path_param("{*rest}"), Some((0, "rest", true)));
+        assert_eq!(path_param("plain"), None);
     }
 
     #[test]

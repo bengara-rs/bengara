@@ -53,7 +53,7 @@ tls = ["sqlx/tls-rustls-ring-webpki"]
 encryption = ["chacha20poly1305"]
 
 # SMTP でメールを送る。既定では入りません。
-# フラグが無いときも mail モジュールはコンパイルされ、MAIL_DRIVER=smtp に
+# フラグが無いときも mail モジュールはコンパイルされ、MAIL_MAILER=smtp に
 # したときだけ「features に "mail" を足してください」というエラーになります。
 mail = ["lettre"]
 

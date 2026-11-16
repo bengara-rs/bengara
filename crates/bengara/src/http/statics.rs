@@ -407,12 +407,16 @@ fn not_modified(etag: &str) -> Response {
 }
 
 /// ディスクのファイルの弱い ETag。長さと更新時刻から作ります。
+///
+/// 更新時刻は**ナノ秒まで**使います（ファイルシステムが持つ精度のまま）。
+/// 秒で丸めていたころは、1 秒の中で同じ長さに書き換えると ETag が変わらず、
+/// ブラウザに古い中身を使わせ続けていました。
 fn disk_etag(metadata: &std::fs::Metadata) -> String {
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|elapsed| elapsed.as_secs())
+        .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     format!("W/\"{:x}-{:x}\"", metadata.len(), modified)
 }
@@ -942,6 +946,27 @@ mod tests {
         assert_eq!(again.status(), 304);
         assert!(again.body().is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 一秒の中の書き換えでもetagが変わる() {
+        // 秒で丸めていたころは、同じ長さの書き換えを 1 秒の中ですると ETag が同じだった。
+        let dir = temp_dir("subsec");
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "0123456789").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+        file.set_modified(base + std::time::Duration::from_millis(100))
+            .unwrap();
+        let first = disk_etag(&file.metadata().unwrap());
+        file.set_modified(base + std::time::Duration::from_millis(600))
+            .unwrap();
+        let second = disk_etag(&file.metadata().unwrap());
+        assert_ne!(first, second, "同じ秒・同じ長さでも違う ETag になる");
+
+        drop(file);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

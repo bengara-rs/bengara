@@ -166,12 +166,15 @@ pub(crate) fn run(root: &Path) -> Result<()> {
         &mut report,
     )?;
 
+    // Cargo.toml に足りない行を足す（書き戻すのは最後）。
+    // `src/` を片付ける**前**に済ませる。片付けてよいかは、直したあとの
+    // `[[bin]]` がまだ `src/main.rs` を指しているかで決めるため。
+    update_manifest(&mut manifest, &name);
+
     // 入口（main.rs）を用意し、cargo new が作った src/ を片付ける。
     update_main(root, existing.main_rs.as_deref(), &mut report)?;
-    clean_src(root, &mut report)?;
+    clean_src(root, manifest.has_path("src/main.rs"), &mut report)?;
 
-    // Cargo.toml に足りない行を足す。
-    update_manifest(&mut manifest, &name);
     if manifest.save(&manifest_path)? {
         report.updated.push("Cargo.toml".to_string());
     }
@@ -486,12 +489,72 @@ fn merge_cargo_config(root: &Path, config: Option<CargoToml>, report: &mut Repor
         report.kept.push(relative.to_string());
         return Ok(());
     }
+    match root_alias(&config) {
+        RootAlias::None => {}
+        RootAlias::HasArtisan => {
+            report.kept.push(relative.to_string());
+            return Ok(());
+        }
+        RootAlias::Other => {
+            // 見出しの前で `alias` を書いているファイルに `[alias]` を足すと、
+            // 同じ表を 2 回定義したことになり、cargo が設定を読めなくなる。
+            // 書き方は人によるので、書き換えずに足す行を案内する。
+            report.kept.push(relative.to_string());
+            println!(
+                ".cargo/config.toml の見出しより前で alias を書いているため、書き換えませんでした。\n\
+                 cargo artisan を使うには、同じ書き方で次の別名を足してください。\n\n  alias.{}\n",
+                artisan_alias_line()
+            );
+            return Ok(());
+        }
+    }
     config.add_line("alias", artisan_alias_line());
     if config.save(&path)? {
         report.updated.push(relative.to_string());
         println!("cargo artisan が使えるように、.cargo/config.toml に別名を足しました。\n");
     }
     Ok(())
+}
+
+/// 見出しより前（ルート）での `alias` の書き方。
+#[derive(Debug, PartialEq, Eq)]
+enum RootAlias {
+    /// 書いていない。
+    None,
+    /// `alias.artisan = ...` か、`alias = { artisan = ... }`。
+    HasArtisan,
+    /// `alias` を書いているが、`artisan` は無い。
+    Other,
+}
+
+/// `.cargo/config.toml` の見出しより前に書いた `alias` を調べる。
+///
+/// `has_key` は `[alias]` の節しか見ません。`alias.b = [...]` や
+/// `alias = { ... }` を見落として `[alias]` を足すと、ファイルが壊れていました。
+fn root_alias(config: &CargoToml) -> RootAlias {
+    let mut found = RootAlias::None;
+    for (key, line) in config.root_keys() {
+        match key.as_slice() {
+            [first, second, ..] if first == "alias" && second == "artisan" => {
+                return RootAlias::HasArtisan;
+            }
+            // 1 行の表。中に `artisan =` があれば足りている。
+            [only] if only == "alias" => {
+                let inline = line.split_once('=').map_or("", |(_, v)| v);
+                let has = inline
+                    .split(['{', ','])
+                    .filter_map(|item| item.split_once('='))
+                    .any(|(k, _)| k.trim().trim_matches(['"', '\'']) == "artisan");
+                if has {
+                    return RootAlias::HasArtisan;
+                }
+                found = RootAlias::Other;
+            }
+            [first, ..] if first == "alias" => found = RootAlias::Other,
+            _ => {}
+        }
+    }
+    found
 }
 
 /// 雛形から `artisan` の別名の行を取り出す。
@@ -587,12 +650,23 @@ fn update_main(root: &Path, current: Option<&str>, report: &mut Report) -> Resul
 ///
 /// 入口は直下の `main.rs` と `artisan.rs` なので、`src/` は使いません。
 /// 手で書いたコードが入っている場合は消さずに案内だけ出します。
-fn clean_src(root: &Path, report: &mut Report) -> Result<()> {
+///
+/// `in_use` は「`Cargo.toml` の `[[bin]]` がまだ `src/main.rs` を指しているか」です。
+/// 指しているのに消すと、その bin のファイルが無くなって `cargo build` が落ちます。
+/// そのときは消さずに案内だけ出します。
+fn clean_src(root: &Path, in_use: bool, report: &mut Report) -> Result<()> {
     let src = root.join("src");
     if !src.is_dir() {
         return Ok(());
     }
     let main = src.join("main.rs");
+    if main.is_file() && in_use {
+        println!(
+            "Cargo.toml の [[bin]] が src/main.rs を指しているので、src/main.rs は消しませんでした。\n\
+             その bin の path を main.rs に直すか、bin ごと消してから src/ を消してください。\n"
+        );
+        return Ok(());
+    }
     if main.is_file() {
         let text = std::fs::read_to_string(&main).unwrap_or_default();
         if !is_replaceable_main(&text) && !text.contains("bengara::app!") {
@@ -681,6 +755,12 @@ fn update_manifest(manifest: &mut CargoToml, name: &str) {
     }
     // 繰り返しの節なので、末尾にまとめて足す。
     // 空白と引用符の書き方が違っても二重に足さないよう、値で見る。
+    //
+    // パッケージ名の `[[bin]]` がすでにあれば（`path = "src/main.rs"` など）、
+    // 足さずに入口だけ `main.rs` に直す。同じ名前の bin を 2 つ書くと cargo が落ちる。
+    if !manifest.has_path("main.rs") && manifest.set_bin_path(name, "main.rs") {
+        println!("Cargo.toml の [[bin]] name = \"{name}\" の path を main.rs に直しました。\n");
+    }
     if !manifest.has_path("main.rs") {
         manifest.append_block(&[
             "[[bin]]",
@@ -1046,8 +1126,17 @@ mod tests {
         assert!(missing_lines(stub("gitignore"), stub("gitignore")).is_empty());
         // 前後の空白と並びの違いは無視する。
         let current = "  /.env  \n/database/*.sqlite-wal\n/storage/framework\n\
-                       /database/*.sqlite\n/database/*.sqlite-shm\n/target\n";
+                       /database/*.sqlite\n/database/*.sqlite-shm\n/target\n/.vscode\n/.idea\n";
         assert!(missing_lines(current, stub("gitignore")).is_empty());
+    }
+
+    #[test]
+    fn エディタの設定もgitignoreに入る() {
+        // Laravel の既定の .gitignore と同じく、/.idea と /.vscode を外す。
+        let missing = missing_lines("/target\n/.idea\n", stub("gitignore"));
+        assert!(missing.iter().any(|l| l == "/.vscode"), "{missing:?}");
+        assert!(!missing.iter().any(|l| l == "/.idea"), "あるものは足さない");
+        assert!(!missing.iter().any(|l| l == "# IDE"), "コメントは足さない");
     }
 
     #[test]
@@ -1060,6 +1149,104 @@ mod tests {
         assert!(!config.has_key("alias", "artisan"));
         config.add_line("alias", line);
         assert!(config.has_key("alias", "artisan"));
+    }
+
+    #[test]
+    fn パッケージ名のbinは足さずに入口を直す() {
+        // 以前は同じ名前の `[[bin]]` をもう 1 つ足し、cargo が落ちていた。
+        let mut manifest = CargoToml::load_for_test(
+            "[package]\nname = \"myapp\"\n\n[[bin]]\nname = \"myapp\"\npath = \"src/main.rs\"\n",
+        );
+        update_manifest(&mut manifest, "myapp");
+        assert_eq!(
+            manifest.count_lines("name = \"myapp\""),
+            2,
+            "package と bin の 2 つだけ"
+        );
+        assert_eq!(
+            manifest.bin_name_for_path("main.rs").as_deref(),
+            Some("myapp")
+        );
+        assert!(!manifest.has_path("src/main.rs"));
+        assert!(manifest.contains("default-run = \"myapp\""));
+    }
+
+    #[test]
+    fn binが指すsrc_mainは消さない() {
+        // パッケージ名と違う bin が `src/main.rs` を指している。消すと bin のファイルが無くなる。
+        let root = temp_project("bin-src");
+        let cargo = "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                     [[bin]]\nname = \"server\"\npath = \"src/main.rs\"\n";
+        std::fs::write(root.join("Cargo.toml"), cargo).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { bengara::run() }\n").unwrap();
+
+        run(&root).unwrap();
+        assert!(
+            root.join("src/main.rs").is_file(),
+            "bin が指すファイルは残す"
+        );
+
+        // パッケージ名の bin なら、入口を直したうえで src/main.rs を片付ける。
+        let root2 = temp_project("bin-own");
+        let cargo = "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                     [[bin]]\nname = \"myapp\"\npath = \"src/main.rs\"\n";
+        std::fs::write(root2.join("Cargo.toml"), cargo).unwrap();
+        std::fs::create_dir(root2.join("src")).unwrap();
+        std::fs::write(root2.join("src/main.rs"), "fn main() { bengara::run() }\n").unwrap();
+
+        run(&root2).unwrap();
+        let manifest = CargoToml::load(&root2.join("Cargo.toml")).unwrap();
+        assert_eq!(manifest.count_lines("name = \"myapp\""), 2);
+        assert!(manifest.has_path("main.rs"));
+        assert!(!manifest.has_path("src/main.rs"));
+        assert!(!root2.join("src").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn ルートのaliasがあるconfigは書き換えない() {
+        let config = |text: &str| CargoToml::load_for_test(text);
+        assert_eq!(root_alias(&config("[build]\njobs = 4\n")), RootAlias::None);
+        assert_eq!(
+            root_alias(&config("alias.artisan = [\"run\"]\n")),
+            RootAlias::HasArtisan
+        );
+        assert_eq!(
+            root_alias(&config("alias = { b = \"build\", artisan = [\"run\"] }\n")),
+            RootAlias::HasArtisan
+        );
+        assert_eq!(
+            root_alias(&config("alias = { b = \"build\" }\n")),
+            RootAlias::Other
+        );
+        assert_eq!(
+            root_alias(&config("alias.b = \"build\"\n\n[build]\njobs = 4\n")),
+            RootAlias::Other
+        );
+        // 見出しの後ろの `alias.x` はその節のキー。ルートではない。
+        assert_eq!(
+            root_alias(&config("[env]\nalias.x = \"1\"\n")),
+            RootAlias::None
+        );
+
+        // 実際に init を通しても、ファイルはそのまま。
+        for (index, text) in ["alias.b = \"build\"\n", "alias = { b = \"build\" }\n"]
+            .iter()
+            .enumerate()
+        {
+            let root = temp_project(&format!("root-alias{index}"));
+            std::fs::create_dir_all(root.join(".cargo")).unwrap();
+            std::fs::write(root.join(".cargo/config.toml"), text).unwrap();
+            run(&root).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join(".cargo/config.toml")).unwrap(),
+                *text
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

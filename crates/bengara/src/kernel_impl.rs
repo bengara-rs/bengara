@@ -77,7 +77,8 @@ const BUILTINS: &[Builtin] = &[
         names: &["serve"],
         target: Target::App(AppCommand::Serve),
         label: "(引数なし) / serve",
-        description: "HTTP サーバーを起動する",
+        // 名前を省いて旗だけでも起動する（`--port 9000`）。`split_command` を参照。
+        description: "HTTP サーバーを起動する（名前は省ける。例: --port 9000）",
         flags: &[
             (
                 "--host <ホスト>",
@@ -201,7 +202,7 @@ fn needs_base(command: &str) -> bool {
 /// 本体の入口。`bengara::app!()` から呼ばれます。
 pub fn main(hooks: Hooks, factory: fn() -> Application) {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().map(String::as_str).unwrap_or("serve");
+    let (command, _) = split_command(&args);
 
     // 置き場所が決まらないまま動き出さない（決定記録 #064）。
     // **`.env` を読む前**に確かめる。読む場所そのものが決まっていないため。
@@ -254,12 +255,30 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     }
 }
 
-fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Result<()> {
-    let (command, rest) = match args.split_first() {
+/// 引数を「コマンドの名前」と「残り」に分ける。
+///
+/// - 引数なしは `serve`。
+/// - 最初が `serve` の旗（`--host` / `--port`）なら、名前を省いた `serve` と見る。
+///   ヘルプの「(引数なし) / serve」のとおり、`cargo run -- --port 9000` でも起動します。
+///   以前は `--port` をコマンドの名前と読み、「ありません」で止まっていました。
+fn split_command(args: &[String]) -> (&str, &[String]) {
+    match args.split_first() {
+        Some((first, _)) if is_serve_flag(first) => ("serve", args),
         Some((first, rest)) => (first.as_str(), rest),
-        // 引数なしはサーバーの起動。
-        None => ("serve", &[] as &[String]),
-    };
+        None => ("serve", &[]),
+    }
+}
+
+/// `serve` の旗か（`--host` `--port` と、`=` で値を続けた形）。
+fn is_serve_flag(arg: &str) -> bool {
+    ["--host", "--port"]
+        .iter()
+        .any(|flag| arg == *flag || arg.strip_prefix(flag).is_some_and(|r| r.starts_with('=')))
+}
+
+fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Result<()> {
+    // 引数なしと、旗から始まる引数はサーバーの起動。
+    let (command, rest) = split_command(args);
 
     // 振り分けは [`resolve`] に任せる。フレームワークのコマンドが必ず先。
     let kind = match resolve(command, (hooks.commands)()) {
@@ -555,19 +574,30 @@ fn newline_of(body: &str) -> &'static str {
 ///
 /// 先頭の BOM も外します（読み込みが外すため。Windows のメモ帳が付けます）。
 /// 残すと 1 行目の `APP_KEY=` を見落とし、同じく末尾に 2 行目を足します。
+///
+/// キーの切り出しも読み込みと同じです（**最初の `=` で分け、キーの前後の空白を外す**）。
+/// `APP_KEY=` で始まるかだけを見ていたころは、`APP_KEY = ` や `APP_KEY =値` を
+/// 見落としていました。読み込みはどちらも `APP_KEY` と読むので、末尾に足した
+/// 2 行目は使われず、空の鍵のまま「書き込みました」と出ていました。
 fn app_key_value(line: &str) -> Option<&str> {
-    env_vars::strip_export(line.trim_start_matches('\u{feff}').trim()).strip_prefix("APP_KEY=")
+    let line = env_vars::strip_export(line.trim_start_matches('\u{feff}').trim());
+    if line.starts_with('#') {
+        return None;
+    }
+    let (key, rest) = line.split_once('=')?;
+    (key.trim() == "APP_KEY").then_some(rest)
 }
 
 /// `APP_KEY` の行なら値を差し替える。そうでなければそのまま返す。
 ///
-/// `export ` と行頭の空白は残します。利用者の書き方を変えないためです。
+/// 最初の `=` までは残します（`export `・行頭の空白・`=` の前の空白）。
+/// 利用者の書き方を変えないためです。
 fn replace_app_key(line: &str, key: &str) -> String {
     if app_key_value(line).is_none() {
         return line.to_string();
     }
-    match line.find("APP_KEY=") {
-        Some(at) => format!("{}APP_KEY={key}", &line[..at]),
+    match line.find('=') {
+        Some(at) => format!("{}{key}", &line[..=at]),
         None => line.to_string(),
     }
 }
@@ -698,7 +728,8 @@ fn print_about(hooks: &Hooks) {
         ),
         ("セッション", env("SESSION_DRIVER", "file".to_string())),
         ("キャッシュ", env("CACHE_DRIVER", "file".to_string())),
-        ("メール", env("MAIL_DRIVER", "log".to_string())),
+        // `MAIL_MAILER` → `MAIL_DRIVER` の順に見る（`config/mail.rs` があればそちら）。
+        ("メール", crate::mail::driver_label()),
         ("停止の上限", crate::server::shutdown_timeout_label()),
         ("マイグレーション", (hooks.migrations)().len().to_string()),
         ("シーダー", (hooks.seeders)().len().to_string()),
@@ -1114,6 +1145,36 @@ mod tests {
     }
 
     #[test]
+    fn 旗から始まる引数はserveと見る() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // 引数なしは serve。
+        assert_eq!(split_command(&[]), ("serve", &[] as &[String]));
+
+        // 名前を省いて旗だけ。旗は残りとして serve に渡す。
+        let given = args(&["--port", "9000"]);
+        assert_eq!(split_command(&given), ("serve", given.as_slice()));
+        let given = args(&["--host=0.0.0.0"]);
+        assert_eq!(split_command(&given), ("serve", given.as_slice()));
+        let given = args(&["--host", "0.0.0.0", "--port=9000"]);
+        let (command, rest) = split_command(&given);
+        assert_eq!(command, "serve");
+        assert!(ServeOptions::parse(rest).is_ok_and(|o| o.port == 9000 && o.host == "0.0.0.0"));
+
+        // 名前があればこれまでどおり。
+        let given = args(&["serve", "--port", "9000"]);
+        assert_eq!(split_command(&given), ("serve", &given[1..]));
+        let given = args(&["migrate"]);
+        assert_eq!(split_command(&given), ("migrate", &[] as &[String]));
+
+        // 似ているだけの言葉は旗と見ない（知らないコマンドとして断る）。
+        for word in ["--hostname", "--ports", "--help", "-p"] {
+            assert!(!is_serve_flag(word), "{word}");
+        }
+        assert!(is_serve_flag("--port=8080"));
+    }
+
+    #[test]
     fn ヘルプは表から作る() {
         let help = kernel_help();
         // 表にあるものは、全部ヘルプに出る。
@@ -1123,7 +1184,7 @@ mod tests {
         }
         // 桁は端末での幅でそろえる（名前の欄に日本語が入る）。
         assert!(
-            help.contains("  (引数なし) / serve   HTTP サーバーを起動する\n"),
+            help.contains("  (引数なし) / serve   HTTP サーバーを起動する（"),
             "{help}"
         );
         assert!(
@@ -1273,6 +1334,30 @@ mod tests {
         assert_eq!(updated, "APP_NAME=myapp\nexport APP_KEY=new\n");
         // `APP_KEY` の行は1本だけ。
         assert_eq!(updated.matches("APP_KEY=").count(), 1);
+    }
+
+    #[test]
+    fn イコールの前後に空白がある行も読み込みと同じに見つける() {
+        // 読み込みは最初の `=` で分けてキーの空白を外す。判定と置き換えもそろえる。
+        // 以前は見落として末尾に 2 行目を足し、空の 1 行目が勝っていた。
+        assert_eq!(app_key_value("APP_KEY = "), Some(""));
+        assert_eq!(app_key_value("APP_KEY =abc"), Some("abc"));
+        assert_eq!(app_key_value("  export  APP_KEY\t= abc"), Some(" abc"));
+        assert_eq!(app_key_value("APP_KEYS=abc"), None);
+        assert_eq!(app_key_value("#APP_KEY=abc"), None);
+        assert!(!app_key_is_set("APP_KEY = \n"));
+        assert!(app_key_is_set("APP_KEY = abc\n"));
+
+        // `=` までの書き方は残し、`APP_KEY` の行は 1 本のまま。
+        let updated = write_app_key("APP_NAME=myapp\nAPP_KEY = \n", "new");
+        assert_eq!(updated, "APP_NAME=myapp\nAPP_KEY =new\n");
+        assert_eq!(updated.matches("APP_KEY").count(), 1);
+        assert_eq!(
+            write_app_key("export APP_KEY =old\n", "new"),
+            "export APP_KEY =new\n"
+        );
+        // 値に `=` が入っていても、最初の `=` の後ろを差し替える。
+        assert_eq!(write_app_key("APP_KEY=a=b\n", "new"), "APP_KEY=new\n");
     }
 
     #[test]

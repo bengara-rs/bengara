@@ -6,3 +6,7 @@
 /database/*.sqlite
 /database/*.sqlite-shm
 /database/*.sqlite-wal
+
+# IDE
+/.idea
+/.vscode

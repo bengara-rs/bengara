@@ -358,9 +358,14 @@ impl Storage {
 ///
 /// `storage/app/nul` へ書くと、`std::fs::write` は成功を返すのに中身は
 /// 0 バイトになります（画面に出さずに捨てられます）。`con` は読み戻しで止まります。
+///
+/// 上付きの数字（`COM¹` `COM²` `COM³` と `LPT` の同じ形）と、コンソールの
+/// `CONIN$` `CONOUT$` も装置です。`COM0` と `LPT0` は装置ではない版も
+/// ありますが、断っても困る名前ではないので入れます。
 const RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+    "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³", "CONIN$", "CONOUT$",
 ];
 
 /// パスの 1 要素として使える名前か。使えないときは理由を返します。
@@ -373,7 +378,11 @@ const RESERVED_NAMES: &[&str] = &[
 pub(crate) fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
     // 装置の名前は拡張子を付けても装置のまま（`nul.txt` も `nul`）。
     // 最初の `.` より前だけを見ます。
-    let stem = part.split('.').next().unwrap_or(part);
+    //
+    // Windows は名前の末尾の空白を落としてから装置かを見るので、
+    // `nul .txt` も `nul` です。比べる前に末尾の空白を落とします
+    // （`.` より前なので、末尾の `.` はここには来ません）。
+    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
     if RESERVED_NAMES
         .iter()
         .any(|name| stem.eq_ignore_ascii_case(name))
@@ -603,8 +612,34 @@ mod tests {
         }
 
         // 装置の名前を含むだけの名前は通す。
-        for ok in ["null", "nula", "console", "com10", "com", "lpt0", "a.nul"] {
+        for ok in [
+            "null", "nula", "console", "com10", "com", "lpt", "a.nul", "conin",
+        ] {
             assert!(disk.absolute(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn 見落としていた装置の名前も断る() {
+        // 上付きの数字・コンソール・末尾に空白のある名前は、以前は通っていた。
+        for bad in [
+            "COM¹",
+            "com².txt",
+            "LPT³",
+            "lpt¹.log",
+            "CONIN$",
+            "conout$.txt",
+            "nul .txt",
+            "con  .log",
+            "aux ",
+            "com0",
+            "LPT0.txt",
+        ] {
+            assert!(usable_name(bad).is_err(), "{bad}");
+        }
+        // 装置の名前に似ているだけなら通す。
+        for ok in ["com4²", "conin", "conout", "a nul.txt", "com¹0"] {
+            assert!(usable_name(ok).is_ok(), "{ok}");
         }
     }
 

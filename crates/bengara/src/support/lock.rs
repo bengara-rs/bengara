@@ -1,7 +1,16 @@
 //! ファイルで取る錠。プロセスをまたいで1つだけ通します。
 //!
-//! `create_new(true)` で作れた側だけが進めます。依存クレートを増やさずに、
-//! どの OS でも同じように動く排他にするためです（同じプロセスのスレッド同士にも効きます）。
+//! 錠ファイルを置けた側だけが進めます。置くのは `hard_link` で、付ける先が
+//! 既にあれば失敗するので 1 つだけが通ります（使えない所では `create_new(true)`）。
+//! 依存クレートを増やさずに、どの OS でも同じように動く排他にするためです
+//! （同じプロセスのスレッド同士にも効きます）。
+//!
+//! # 残る弱点
+//!
+//! OS の助言ロック（`flock` など）を使わないので、**古い錠を外す処理**には
+//! 狭い隙間が残ります。古いと見た錠が、外す直前に別の持ち主の生きた錠へ
+//! 入れ替わっていた場合、退避して戻すまでの一瞬に第三の側が錠を取れます。
+//! 落ちたプロセスの錠を 10 秒たってから外すときにだけ起きる形です。
 //!
 //! キャッシュの `increment`（`cache/store.rs`）と、`schedule:run`
 //! （`schedule.rs`）の両方から使います。回数の制限（`http/throttle.rs`）は
@@ -74,17 +83,8 @@ impl FileLock {
         }
         for _ in 0..tries {
             let stamp = new_stamp();
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    // 印は `create_new` で作れたハンドルにそのまま書く。
-                    // 開き直すと、その間に奪われた錠へ書き足してしまう。
-                    use std::io::Write;
-                    file.write_all(stamp.as_bytes())?;
-                    file.flush()?;
+            match create_with_stamp(path, &stamp) {
+                Ok(()) => {
                     return Ok(Self {
                         path: path.to_path_buf(),
                         stamp,
@@ -113,6 +113,47 @@ impl FileLock {
             path.display()
         )))
     }
+}
+
+/// 印を書いた錠ファイルを、**中身ごと一度に**置く。既にあれば `AlreadyExists`。
+///
+/// `create_new` で作ってから印を書くと、その間は**印の無い錠**が見えます。
+/// そこへ別のプロセスの [`remove_stale`] が来ると、空の印を「調べたときの印」と
+/// して扱い、退避と戻しの食い違いで錠が二重に持たれることがありました。
+///
+/// 印を一時ファイルに書いてから `hard_link` で錠の名前を付けます。
+/// `hard_link` は付ける先が既にあると失敗するので、`create_new` と同じく
+/// 1 つだけが通り、しかも通った瞬間から印が入っています。
+///
+/// ハードリンクを作れないファイルシステム（FAT など）では、今までどおり
+/// `create_new` で作ってから書きます（印の無い一瞬が残ります）。
+fn create_with_stamp(path: &Path, stamp: &str) -> std::io::Result<()> {
+    let seq = STALE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("new.{}.{seq}", std::process::id()));
+    if std::fs::write(&temp, stamp.as_bytes()).is_ok() {
+        let linked = std::fs::hard_link(&temp, path);
+        let _ = std::fs::remove_file(&temp);
+        match linked {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+            // ハードリンクが使えない。下の作り方に落とす。
+            Err(_) => {}
+        }
+    }
+    create_then_write(path, stamp)
+}
+
+/// `create_new` で作ってから印を書く（ハードリンクが使えないときの作り方）。
+fn create_then_write(path: &Path, stamp: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    // 印は `create_new` で作れたハンドルにそのまま書く。
+    // 開き直すと、その間に奪われた錠へ書き足してしまう。
+    file.write_all(stamp.as_bytes())?;
+    file.flush()
 }
 
 /// 古い錠を外す。**別名へ退避できた側だけが片付けます。**
@@ -146,27 +187,33 @@ fn remove_stale(path: &Path, expected: Option<&str>) -> bool {
     let moved_stamp = read_stamp(&moved);
     let taken = moved_stamp.as_deref() == expected;
     if !taken {
-        if let Some(stamp) = &moved_stamp {
-            restore(path, stamp);
-        }
         tracing::warn!("{} は生きた錠だったので戻します", path.display());
+        if !restore(path, &moved, moved_stamp.as_deref()) {
+            tracing::warn!(
+                "{} を戻す前に別の側が錠を取りました。\
+                 しばらくの間、2 つの処理が同じ錠を持ったつもりで動くことがあります",
+                path.display()
+            );
+        }
     }
     let _ = std::fs::remove_file(&moved);
     taken
 }
 
-/// 退避してしまった錠を元の場所へ戻す。
+/// 退避してしまった錠を元の場所へ戻す。戻せたら真。
 ///
-/// `create_new` なので、すでに別の側が錠を取っていたら何もしません。
-/// その側の錠は印が違うので、戻せなかった持ち主の `Drop` には消されません。
-fn restore(path: &Path, stamp: &str) {
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        let _ = file.write_all(stamp.as_bytes());
+/// `hard_link` で退避先にもう一度元の名前を付けます。中身も更新時刻も
+/// そのままなので、持ち主の `Drop` も「古い錠」の判定も前と変わりません。
+/// 付ける先が既にあれば失敗するので、すでに別の側が錠を取っていたら
+/// 何もしません。その側の錠は印が違うので、戻せなかった持ち主の `Drop` には
+/// 消されません。
+///
+/// ハードリンクを作れないファイルシステムでは、印を書き直して作ります。
+fn restore(path: &Path, moved: &Path, stamp: Option<&str>) -> bool {
+    match std::fs::hard_link(moved, path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => stamp.is_some_and(|stamp| create_then_write(path, stamp).is_ok()),
     }
 }
 
@@ -302,6 +349,82 @@ mod tests {
             .filter(|name| name != "a.lock")
             .collect();
         assert!(left.is_empty(), "残っている: {left:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 錠は印ごと一度に置く() {
+        let dir = temp_dir("atomic-stamp");
+        let path = dir.join("a.lock");
+
+        // 置けた瞬間から印が入っている。以前は作ってから書いたので、
+        // 間に別のプロセスが印の無い錠を見ることがあった。
+        create_with_stamp(&path, "印").unwrap();
+        assert_eq!(read_stamp(&path).as_deref(), Some("印"));
+
+        // 既にあれば置けない（中身も変えない）。
+        let error = create_with_stamp(&path, "別の印").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(read_stamp(&path).as_deref(), Some("印"));
+
+        // 下書きの一時ファイルは残らない。
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "a.lock")
+            .collect();
+        assert!(left.is_empty(), "残っている: {left:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 戻すときは中身ごと戻し先に錠があれば触らない() {
+        let dir = temp_dir("restore");
+        let path = dir.join("a.lock");
+        let moved = dir.join("a.stale.0.0");
+
+        // 退避した生きた錠を戻す。印はそのまま。
+        std::fs::write(&moved, "持ち主").unwrap();
+        assert!(restore(&path, &moved, Some("持ち主")));
+        assert_eq!(read_stamp(&path).as_deref(), Some("持ち主"));
+        std::fs::remove_file(&path).unwrap();
+
+        // 戻す前に別の側が取っていたら、そちらを残す。
+        std::fs::write(&path, "新しい持ち主").unwrap();
+        assert!(!restore(&path, &moved, Some("持ち主")));
+        assert_eq!(read_stamp(&path).as_deref(), Some("新しい持ち主"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 錠を取り合っても1つだけ通る() {
+        let dir = temp_dir("race");
+        let path = dir.join("a.lock");
+        let holders = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let holders = holders.clone();
+                let max = max.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _lock = FileLock::acquire(&path).unwrap();
+                        let now = holders.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        max.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        holders.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(max.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

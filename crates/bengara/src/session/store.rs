@@ -39,12 +39,14 @@ pub trait SessionStore: Send + Sync + 'static {
     /// 画面を見て回っていた人が突然ログアウトされます。
     ///
     /// **既定は `read` して、同じ中身で `write` し直すだけです。**
-    /// 置き場所が期限を知っているなら、残りが半分を切ったときだけ書く形にして
-    /// ください（`FileStore` と `MemoryStore` はそうしています）。
+    /// 置き場所が期限を知っているなら、最後に書いてから少し（組み込みの置き場所は
+    /// `min(60 秒, 期限の 1/10)`）過ぎたときだけ書く形にしてください
+    /// （`FileStore` と `MemoryStore` はそうしています）。間引きすぎると、
+    /// 放っておいて切れるまでの時間が期限より短くなります。
     /// 置き場所に無い ID のときは何もしません。
     ///
-    /// **期限切れを延命してはいけません。** 残りが 0 秒のものは「残りが半分を切った」
-    /// にも当たるので、期限を確かめずに書き直すと、切れたセッションに満額の寿命を
+    /// **期限切れを延命してはいけません。** 残りが 0 秒のものは「書いてから時間が
+    /// 過ぎた」にも当たるので、期限を確かめずに書き直すと、切れたセッションに満額の寿命を
     /// 与え直すことになります（`FileStore` が実際にそうなっていました）。
     /// 既定の実装は `read` が期限切れを捨てるので、ここは守れています。
     fn touch(&self, id: &str) -> Result<()> {
@@ -191,7 +193,12 @@ const SWEEP_LOTTERY: (u8, u8) = (2, 100);
 ///
 /// 上限が無いと、抽選に当たった 1 回が置き場所の全ファイルを解析します。
 /// セッションが数万件ある所では掃除のスレッドが長時間ふさがるので、ここで
-/// 打ち切って最悪の時間を決めます。見落としたぶんは次の機会に当たります。
+/// 打ち切って最悪の時間を決めます。
+///
+/// 見る範囲は**毎回でたらめな位置から**始めます（末尾まで来たら先頭に戻る）。
+/// 先頭から数えていたころは、`read_dir` の順が毎回ほぼ同じなので、
+/// 501 件目より後ろのファイルが永久に掃除されませんでした。
+/// 名前の一覧は毎回全部取りますが、開いて解析するのは上限の数だけです。
 ///
 /// `session:gc` から呼ぶ経路は**上限なし**で全部見ます（コマンドは待ってよい）。
 const SWEEP_MAX_ENTRIES: usize = 500;
@@ -422,7 +429,7 @@ impl FileStore {
         Ok(Some(stored))
     }
 
-    /// 読めた中身の期限を、残りが半分を切っていれば延ばす。
+    /// 読めた中身の期限を、最後に書いてから少し過ぎていれば延ばす（[`needs_touch`]）。
     ///
     /// **期限切れでないことは呼ぶ側が確かめておきます。**
     ///
@@ -509,7 +516,7 @@ impl SessionStore for FileStore {
             return Ok(());
         };
         // 期限切れは延命しない。`needs_touch` だけを見ていたころは、
-        // 残り 0 秒が「半分を切った」に当たり、満額の寿命を与え直していた。
+        // 残り 0 秒が「延ばす時期」に当たり、満額の寿命を与え直していた。
         // `MemoryStore::touch` には最初からこの確認がある。
         if stored.expires_at <= now_seconds_u64() {
             return Ok(());
@@ -572,13 +579,33 @@ impl SessionStore for FileStore {
     }
 }
 
-/// 期限を延ばし直すか。**残りが半分を切ったときだけ**書きます。
+/// 期限を延ばす書き込みを間引く秒数の上限。
+///
+/// 最後に書いてからこの秒数（期限が短いときは期限の 1/10）が過ぎていれば延ばします。
+const TOUCH_SLACK_MAX_SECS: u64 = 60;
+
+/// 延ばす書き込みを間引く秒数。`min(60 秒, 期限の 1/10)` です。
+fn touch_slack(lifetime_secs: u64) -> u64 {
+    TOUCH_SLACK_MAX_SECS.min(lifetime_secs / 10)
+}
+
+/// 期限を延ばし直すか。**最後に書いてから [`touch_slack`] が過ぎたときだけ**書きます。
 ///
 /// 毎リクエスト書くと、GET の画面を開くたびにファイルを置き換えることになります。
-/// 半分を境にすれば、書く回数は多くても期限の半分に1回で済みます。
+/// 間引くので、書く回数は 1 セッションにつき多くても 60 秒に 1 回です。
+///
+/// 何もしないでいられる時間（放っておいて切れるまで）は、**期限からこの秒数を
+/// 引いたぶん以上**が保証されます（既定の 7200 秒なら 7140 秒以上）。
+/// ブラウザの Cookie の `Max-Age` は毎リクエスト延ばすので、置き場所の期限を
+/// 大きく遅らせると、Cookie はあるのに中身が先に切れます。「残りが半分を切ったら
+/// 延ばす」にしていたころは、期限の半分ほど放っておくだけでログアウトされていました。
+///
+/// 「最後に書いた時刻」は `expires_at - lifetime_secs` と見なします
+/// （書くたびに `expires_at` を「いま + 期限」にしているため）。
 fn needs_touch(expires_at: u64, lifetime_secs: u64) -> bool {
     let remaining = expires_at.saturating_sub(now_seconds_u64());
-    remaining <= lifetime_secs / 2
+    let elapsed = lifetime_secs.saturating_sub(remaining);
+    elapsed >= touch_slack(lifetime_secs)
 }
 
 /// 置き場所のディレクトリを、所有者だけが入れるようにする（Unix のみ）。
@@ -767,6 +794,7 @@ pub(crate) fn sweep(dir: &Path) -> Result<usize> {
 ///
 /// `max` を渡すと、見るファイルの数をそこで打ち切ります。書き込みのついでの
 /// 掃除（`maybe_sweep`）は上限つきで、`session:gc` は `None`（全部）です。
+/// 上限つきのときは、見始める位置を毎回でたらめに変えます（[`SWEEP_MAX_ENTRIES`]）。
 ///
 /// 返す数には**一時ファイルを数えません。** 数えると `session:gc` の
 /// 「N 件消しました」が期限切れセッションの数と合わなくなります。
@@ -777,14 +805,28 @@ fn sweep_limited(dir: &Path, max: Option<usize>) -> Result<usize> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(Error::Io(e)),
     };
+    // 名前の一覧だけを先に取ります（ファイルは開かない）。
+    //
+    // 上限つきのときは、**毎回でたらめな位置から**見始めて、末尾まで来たら
+    // 先頭に戻ります。`read_dir` の順は毎回ほぼ同じなので、先頭から数えると
+    // 同じ 500 件だけを見続け、それより後ろのファイルは永久に掃除されません。
+    // 始める位置を毎回変えれば、どのファイルもいずれ見られます。
+    let entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
+    let start = match max {
+        Some(max) if entries.len() > max => random_index(entries.len()),
+        _ => 0,
+    };
+    let take = max.unwrap_or(entries.len());
+    if take < entries.len() {
+        tracing::debug!(
+            "セッションの掃除は {} 件のうち {take} 件だけ見ます（{start} 件目から）",
+            entries.len()
+        );
+    }
     let mut removed = 0;
     let mut temps = 0;
-    for (seen, entry) in entries.flatten().enumerate() {
-        if max.is_some_and(|max| seen >= max) {
-            // 続きは次の機会に見ます。
-            tracing::debug!("セッションの掃除を {seen} 件で打ち切りました");
-            break;
-        }
+    for index in window(entries.len(), start, take) {
+        let entry = &entries[index];
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         if name == REVOKED_DIR {
@@ -820,6 +862,23 @@ fn sweep_limited(dir: &Path, max: Option<usize>) -> Result<usize> {
         tracing::info!("セッションの一時ファイルを {temps} 件片付けました");
     }
     Ok(removed)
+}
+
+/// `start` から `take` 件ぶんの位置を、末尾で先頭に戻りながら返す。
+///
+/// `take` が `len` より大きくても、同じ位置は 2 回返しません。
+fn window(len: usize, start: usize, take: usize) -> impl Iterator<Item = usize> {
+    (0..take.min(len)).map(move |offset| (start + offset) % len)
+}
+
+/// `0..len` のでたらめな位置。`len` は 1 以上で呼びます。
+///
+/// 8 バイトの乱数の余りなので、わずかに偏ります。掃除の始める位置に使うだけなので
+/// かまいません。
+fn random_index(len: usize) -> usize {
+    let draw = u64::from_le_bytes(crypto::random_bytes::<8>());
+    // `usize` が 64 ビットより狭い環境でも、余りは `len` 未満なので収まる。
+    usize::try_from(draw % len as u64).unwrap_or(0)
 }
 
 /// 「切った」印の置き場所を掃除する。
@@ -1174,12 +1233,12 @@ mod tests {
     }
 
     #[test]
-    fn 残りが半分を切ったらファイルの期限を延ばす() {
+    fn 書いてから少し過ぎたらファイルの期限を延ばす() {
         let dir = temp_dir("touch-file");
         let store = FileStore::new(&dir, 60);
         store.write("abc", &data(&[("a", "1")])).unwrap();
 
-        // 書いた直後は残り 60 秒。半分（30 秒）を切っていないので書かない。
+        // 書いた直後は残り 60 秒。間引く秒数（期限の 1/10 = 6 秒）が過ぎていないので書かない。
         let before = expires_of(&dir, "abc");
         store.touch("abc").unwrap();
         assert_eq!(expires_of(&dir, "abc"), before, "まだ延ばさない");
@@ -1235,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn 残りが半分を切ったらメモリの期限も延ばす() {
+    fn 書いてから少し過ぎたらメモリの期限も延ばす() {
         let store = MemoryStore::new(60);
         store.write("abc", &data(&[("a", "1")])).unwrap();
 
@@ -1674,5 +1733,117 @@ mod tests {
         }
         let len = store.entries.lock().unwrap().len();
         assert!(len <= 1, "期限切れ（寿命 0 秒）が残らない: {len}");
+    }
+
+    #[test]
+    fn 延ばす間隔は60秒か期限の10分の1の短いほう() {
+        assert_eq!(touch_slack(7200), 60);
+        assert_eq!(touch_slack(300), 30);
+        assert_eq!(touch_slack(5), 0, "とても短い期限では毎回延ばす");
+
+        let now = now_seconds_u64();
+        // 既定の 7200 秒。書いてから 59 秒なら書かない、60 秒なら書く。
+        assert!(!needs_touch(now + 7200 - 59, 7200));
+        assert!(needs_touch(now + 7200 - 60, 7200));
+        // 「残りが半分を切ったら」だったころは、ここ（残り 6000 秒）で書かず、
+        // Cookie だけ延びて置き場所の期限が先に切れた。
+        assert!(needs_touch(now + 6000, 7200));
+        assert!(needs_touch(now, 7200), "期限ちょうども延ばす側");
+    }
+
+    #[test]
+    fn 放っておける時間は期限からほとんど減らない() {
+        // 最後に延ばしてから間引く秒数ぶん経ったところで延ばすので、
+        // そのあと何もしなくても「期限 - 間引く秒数」以上は残る。
+        let store = MemoryStore::new(7200);
+        store.write("abc", &data(&[("a", "1")])).unwrap();
+
+        // 61 秒前に書いた形にする（残り 7139 秒）。
+        store.entries.lock().unwrap().get_mut("abc").unwrap().0 = now_seconds_u64() + 7200 - 61;
+        store.read_and_touch("abc").unwrap();
+        let expires_at = store.entries.lock().unwrap().get("abc").unwrap().0;
+        assert!(expires_at >= now_seconds_u64() + 7200 - 1, "満額に戻る");
+
+        // 書いた直後は延ばさない（書く回数を抑える）。
+        let dir = temp_dir("touch-slack");
+        let file = FileStore::new(&dir, 7200);
+        file.write("abc", &data(&[("a", "1")])).unwrap();
+        let stored = Stored {
+            expires_at: now_seconds_u64() + 7200 - 30,
+            data: data(&[("a", "1")]),
+        };
+        std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
+        file.read_and_touch("abc").unwrap();
+        assert_eq!(
+            expires_of(&dir, "abc"),
+            stored.expires_at,
+            "30 秒では書かない"
+        );
+
+        let stored = Stored {
+            expires_at: now_seconds_u64() + 7200 - 61,
+            data: data(&[("a", "1")]),
+        };
+        std::fs::write(dir.join("abc"), serde_json::to_string(&stored).unwrap()).unwrap();
+        file.read_and_touch("abc").unwrap();
+        assert!(
+            expires_of(&dir, "abc") >= now_seconds_u64() + 7200 - 1,
+            "61 秒なら延ばす"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 見る範囲は末尾で先頭に戻る() {
+        assert_eq!(window(5, 3, 3).collect::<Vec<_>>(), vec![3, 4, 0]);
+        assert_eq!(window(5, 0, 2).collect::<Vec<_>>(), vec![0, 1]);
+        // 上限が数より多くても、同じ位置を 2 回見ない。
+        assert_eq!(window(3, 2, 10).collect::<Vec<_>>(), vec![2, 0, 1]);
+        assert_eq!(window(0, 0, 10).count(), 0);
+        for _ in 0..100 {
+            assert!(random_index(7) < 7);
+        }
+        assert_eq!(random_index(1), 0);
+    }
+
+    #[test]
+    fn 上限つきの掃除を繰り返せば全部に届く() {
+        // 先頭から数えていたころは、毎回同じ 2 件だけを見て、残りは永久に残った。
+        let dir = temp_dir("sweep-rotate");
+        let body = |expires_at: u64| {
+            serde_json::to_string(&Stored {
+                expires_at,
+                data: data(&[("a", "1")]),
+            })
+            .unwrap()
+        };
+        // 生きているファイル 9 件と、期限切れ 1 件。
+        for i in 0..9 {
+            std::fs::write(
+                dir.join(format!("alive{i}")),
+                body(now_seconds_u64() + 3600),
+            )
+            .unwrap();
+        }
+        let expired = dir.join("zzexpired");
+        std::fs::write(&expired, body(now_seconds_u64().saturating_sub(10))).unwrap();
+
+        // 1 回に 1 件しか見なくても、始める位置が毎回変わるので、いずれ当たる。
+        // 外れ続ける確率は (9/10)^500 で、事実上 0。
+        for _ in 0..500 {
+            sweep_limited(&dir, Some(1)).unwrap();
+            if !expired.exists() {
+                break;
+            }
+        }
+        assert!(!expired.exists(), "期限切れに届く");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            9,
+            "生きているものは残る"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

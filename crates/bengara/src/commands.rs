@@ -32,7 +32,15 @@ pub(crate) fn is_command(name: &str) -> bool {
 /// コマンドを実行する。
 pub(crate) fn run(name: &str, args: &[String], hooks: Hooks) -> Result<()> {
     let options = Options::parse(name, args)?;
-    runtime()?.block_on(execute(name, &options, hooks))
+    let runtime = runtime()?;
+    let result = runtime.block_on(execute(name, &options, hooks));
+    if name == "queue:work" {
+        // 打ち切っても止まらないジョブがあると、ワーカーはエラーで終わります。
+        // 普通に `drop` すると、そのジョブのスレッドが終わるまで待ってしまい、
+        // プロセスが終わりません。待たずに手放します（`queue/worker.rs` の `run_one`）。
+        runtime.shutdown_background();
+    }
+    result
 }
 
 /// 自作コマンドを実行する。

@@ -1,12 +1,19 @@
-//! ログインしていなければ止めるミドルウェア。
+//! ログインの有無で止めるミドルウェア。
+//!
+//! | 型 | 止める相手 | Laravel |
+//! |---|---|---|
+//! | `Authenticate` | ログインしていない人 | `auth` |
+//! | `RedirectIfAuthenticated` | ログイン中の人 | `guest` |
 //!
 //! ```ignore
 //! // bootstrap/app.rs
 //! .alias("auth", Authenticate::new())
+//! .alias("guest", RedirectIfAuthenticated::new())
 //! ```
 //!
 //! ```ignore
 //! Route::get("/profile", UserController::show).middleware("auth");
+//! Route::post("/login", AuthController::login).middleware("guest");
 //! ```
 
 use crate::error::Error;
@@ -139,9 +146,127 @@ impl Middleware for Authenticate {
     }
 }
 
+/// ログイン中の人を止めるミドルウェア。Laravel の `guest` に当たります。
+///
+/// ログイン・登録・パスワード再設定の口に掛けます。
+///
+/// | 状況 | 返すもの |
+/// |---|---|
+/// | ログインしていない | そのまま通す |
+/// | JSON を期待している | 403 |
+/// | 転送先を指定していない | 403 |
+/// | 転送先を指定している | 302 |
+///
+/// **回数の制限と組み合わせるときに要ります。** `Throttle` はログイン中の人を
+/// `user:{id}` ごとに数えます。ログイン中でも登録の口を叩けると、登録し直すたびに
+/// 新しい枠を得て、制限を回せてしまいます。`guest` で止めるか、
+/// `Throttle::by_ip` で接続元ごとに数えてください。
+///
+/// Laravel は転送だけを返しますが、ここでは転送先を決めないと 403 を返します。
+/// 行き先（ログイン後の画面）はアプリごとに違い、決め打ちにできないためです。
+pub struct RedirectIfAuthenticated {
+    redirect_to: Option<String>,
+}
+
+impl RedirectIfAuthenticated {
+    /// 403 を返す形で作る。
+    pub fn new() -> Self {
+        Self { redirect_to: None }
+    }
+
+    /// 画面からの場合に転送する先を決める。
+    ///
+    /// JSON を期待しているリクエストには、転送ではなく 403 を返します。
+    pub fn redirect_to(path: impl Into<String>) -> Self {
+        Self {
+            redirect_to: Some(path.into()),
+        }
+    }
+}
+
+impl Default for RedirectIfAuthenticated {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Middleware for RedirectIfAuthenticated {
+    fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        if req.auth().guest() {
+            return next.run(req);
+        }
+
+        let options = next.render_options();
+        let redirect_to = self.redirect_to.clone();
+        Box::pin(async move {
+            match redirect_to {
+                // JSON が欲しいなら、転送ではなく 403 を返す。
+                Some(path) if !options.wants_json => crate::http::redirect().to(path),
+                _ => {
+                    let error = Error::http(403, "ログイン中は使えません");
+                    tracing::debug!("{error}");
+                    Ok(crate::http::response::error_response(&error, options))
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// リクエストを 1 本通し、状態を返す。
+    async fn guest_status(mw: RedirectIfAuthenticated, logged_in: bool, wants_json: bool) -> u16 {
+        use crate::http::handler::Erased;
+        use std::sync::Arc;
+
+        let mut req = Request::new("POST", "/login");
+        req.set_session(crate::session::Session::empty());
+        if logged_in {
+            req.auth().login_using_id(5).expect("ログインできる");
+        }
+
+        let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+        let handler = Arc::new(Erased::<_, ()>::new(|| async {
+            Ok(crate::http::Response::text("ok"))
+        }));
+        let options = crate::http::response::RenderOptions::new(false, wants_json);
+        mw.handle(req, Next::new(stack, handler, options))
+            .await
+            .expect("応答が返る")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn ログイン中の人を止める() {
+        // ログインしていなければ通す。
+        assert_eq!(
+            guest_status(RedirectIfAuthenticated::new(), false, false).await,
+            200
+        );
+        assert_eq!(
+            guest_status(RedirectIfAuthenticated::redirect_to("/home"), false, true).await,
+            200
+        );
+
+        // ログイン中なら止める。
+        assert_eq!(
+            guest_status(RedirectIfAuthenticated::new(), true, false).await,
+            403
+        );
+        assert_eq!(
+            guest_status(RedirectIfAuthenticated::redirect_to("/home"), true, false).await,
+            302
+        );
+        // JSON が欲しい相手には、転送先があっても 403。
+        assert_eq!(
+            guest_status(RedirectIfAuthenticated::redirect_to("/home"), true, true).await,
+            403
+        );
+
+        assert!(RedirectIfAuthenticated::default().redirect_to.is_none());
+    }
 
     #[test]
     fn 転送先は任意() {

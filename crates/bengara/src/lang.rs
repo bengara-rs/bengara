@@ -60,11 +60,14 @@ tokio::task_local! {
 }
 
 /// 見つからないときに見る言語。
-fn fallback() -> String {
+///
+/// 最初の 1 回だけ読み、以後は借りて渡します。以前は `String` を複製して
+/// 返していたので、いまの言語に無い鍵を引くたびに 1 本確保していました。
+fn fallback() -> &'static str {
     static FALLBACK: OnceLock<String> = OnceLock::new();
     FALLBACK
         .get_or_init(|| crate::env("APP_FALLBACK_LOCALE", "ja"))
-        .clone()
+        .as_str()
 }
 
 /// 言語の切り替え。
@@ -93,6 +96,14 @@ impl Lang {
         }
         let current = current_lock().read().unwrap_or_else(|e| e.into_inner());
         f(current.as_str())
+    }
+
+    /// [`Lang::with`] の中なら、その言語を返す。外なら `None`。
+    ///
+    /// 別のタスクへ処理を渡すとき（イベントの聞く側など）に、言語を
+    /// 引き継ぐために使います。タスクごとの値は新しいタスクに届かないためです。
+    pub(crate) fn request_locale() -> Option<String> {
+        REQUEST_LOCALE.try_with(|locale| locale.clone()).ok()
     }
 
     /// 言語を変える。
@@ -162,7 +173,7 @@ fn lookup_or_key(key: &str) -> &str {
         }
         let fallback = fallback();
         if fallback != current {
-            if let Some(found) = Lang::lookup(&fallback, key) {
+            if let Some(found) = Lang::lookup(fallback, key) {
                 return found;
             }
         }
@@ -259,6 +270,15 @@ pub fn __with(key: &str, values: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 予備の言語は同じ文字を借りて渡す() {
+        // 毎回複製せず、同じ置き場所を指す。
+        let first = fallback();
+        let second = fallback();
+        assert!(!first.is_empty());
+        assert!(std::ptr::eq(first, second));
+    }
 
     /// **鍵は昇順に並べます**（`lookup` が二分探索するため）。
     const JA: &[(&str, &str)] = &[

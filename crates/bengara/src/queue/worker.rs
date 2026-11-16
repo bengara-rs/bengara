@@ -436,6 +436,44 @@ fn timed_out_message(limit: Duration) -> String {
     )
 }
 
+/// 止まらないジョブを見つけたときの説明文（ワーカーを終えるときに使う）。
+fn stuck_message(job: &str, id: i64, limit: Option<Duration>) -> String {
+    format!(
+        "{job} #{id} が {} 秒で終わらず、打ち切っても止まりませんでした\
+         （CPU を回し続けているか、同期の入出力で止まっています）。\
+         同じジョブが二重に動かないよう、ワーカーを終了します。\
+         supervisor などで自動で起動し直してください",
+        limit.map_or(0, |l| l.as_secs())
+    )
+}
+
+/// 打ち切った後、タスクが本当に止まったかを見るまでの待ち。
+///
+/// `abort` は次の `.await` で効くので、待ちで固まったジョブはすぐ止まります。
+/// この間に止まらなければ、CPU を回し続けているか、同期の入出力で
+/// 止まっていると見なします。
+const ABORT_GRACE: Duration = Duration::from_millis(500);
+
+/// [`run_one`] の失敗。
+#[derive(Debug)]
+struct Failure {
+    /// 失敗の理由（`failed_jobs` と画面に出す文）。
+    message: String,
+    /// 打ち切っても止まらなかったか。
+    ///
+    /// 真のときは、失敗を記録したあとワーカーを終えます（[`stuck_message`]）。
+    stuck: bool,
+}
+
+impl Failure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            stuck: false,
+        }
+    }
+}
+
 /// ジョブを 1 件動かす。パニックと時間切れも失敗として扱います。
 ///
 /// `timeout` を超えたら、ジョブのタスクを打ち切って（`abort`）失敗にします。
@@ -444,17 +482,31 @@ fn timed_out_message(limit: Duration) -> String {
 ///
 /// **止められるのは「待ち」で固まったジョブだけです。** `abort` は次の
 /// `.await` で効きます。`.await` を挟まずに CPU を回し続ける処理や、
-/// 同期の入出力で止まっている処理は打ち切れません。その間はワーカーの
-/// スレッドを 1 本ふさぎますが、ワーカー自体は次のジョブへ進みます。
-/// 打ち切ったタスクの終わりは**待ちません**（待つと、止められないジョブで
-/// ワーカーごと固まります）。
+/// 同期の入出力で止まっている処理は打ち切れません。
+///
+/// 打ち切ったあと [`ABORT_GRACE`] だけ様子を見ます。止まらなければ
+/// [`Failure::stuck`] を立てて返し、呼ぶ側は失敗を記録してから**ワーカーを
+/// 終えます。** 以前は止まらないまま次のジョブへ進んでいました。失敗は
+/// 10 秒後に再挑戦されるので、止まらない 1 本目と取り直した 2 本目が
+/// **同時に動きました。** Laravel も時間切れではワーカーのプロセスを
+/// 終わらせます。プロセスが終われば、止まらないスレッドも一緒に消えます。
 async fn run_one(
     jobs: &[Job],
     reserved: &Reserved,
     timeout: Option<Duration>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), Failure> {
+    run_one_with(jobs, reserved, timeout, ABORT_GRACE).await
+}
+
+/// [`run_one`] の中身。様子を見る時間を引数で受け取ります（テストで短くするため）。
+async fn run_one_with(
+    jobs: &[Job],
+    reserved: &Reserved,
+    timeout: Option<Duration>,
+    grace: Duration,
+) -> std::result::Result<(), Failure> {
     let Some(job) = jobs.iter().find(|j| j.name == reserved.job) else {
-        return Err(unknown_job_message(&reserved.job));
+        return Err(Failure::new(unknown_job_message(&reserved.job)));
     };
 
     let handle = job.handle;
@@ -467,15 +519,21 @@ async fn run_one(
             Ok(joined) => joined,
             Err(_) => {
                 task.abort();
-                return Err(timed_out_message(limit));
+                // 止まったかを確かめる。待ちで固まったものはここで終わる。
+                // 止まらないものの終わりは**待ちません**（待つとワーカーごと固まる）。
+                let stopped = tokio::time::timeout(grace, &mut task).await.is_ok();
+                return Err(Failure {
+                    message: timed_out_message(limit),
+                    stuck: !stopped,
+                });
             }
         },
     };
     match joined {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(e) if e.is_panic() => Err("ジョブがパニックしました".to_string()),
-        Err(e) => Err(format!("ジョブを動かせませんでした: {e}")),
+        Ok(Err(e)) => Err(Failure::new(e.to_string())),
+        Err(e) if e.is_panic() => Err(Failure::new("ジョブがパニックしました")),
+        Err(e) => Err(Failure::new(format!("ジョブを動かせませんでした: {e}"))),
     }
 }
 
@@ -688,7 +746,8 @@ async fn run_with(
                     started.elapsed().as_millis()
                 );
             }
-            Err(message) => {
+            Err(failure) => {
+                let message = failure.message;
                 let gave_up = with_retries("失敗", &stop, retry_unit, || {
                     fail(&reserved, options.tries, &message)
                 })
@@ -708,6 +767,15 @@ async fn run_with(
                         reserved.attempts.saturating_add(1),
                         backoff_secs(reserved.attempts.saturating_add(1))
                     );
+                }
+                // 打ち切っても止まらなかった。動いたまま次へ進むと、再挑戦で
+                // 同じジョブが二重に動くので、ワーカーごと終える（[`run_one`]）。
+                if failure.stuck {
+                    return Err(crate::error::Error::msg(stuck_message(
+                        &reserved.job,
+                        reserved.id,
+                        timeout,
+                    )));
                 }
             }
         }
@@ -892,13 +960,16 @@ mod tests {
 
         // 以前は上限が無く、ジョブが返るまでワーカーが止まり続けた。
         let started = std::time::Instant::now();
-        let error = run_one(
+        let failure = run_one(
             &jobs,
             &reserved_of("Stuck"),
             Some(Duration::from_millis(30)),
         )
         .await
         .unwrap_err();
+        // 待ちで固まったものは打ち切れば止まる。ワーカーは続けてよい。
+        assert!(!failure.stuck, "止まったのでワーカーは続ける");
+        let error = failure.message;
         assert!(error.contains("打ち切りました"), "{error}");
         assert!(error.contains("--timeout"), "{error}");
         assert!(
@@ -919,6 +990,79 @@ mod tests {
             .await
             .unwrap();
         run_one(&jobs, &reserved_of("Quick"), None).await.unwrap();
+    }
+
+    /// `.await` を挟まずにスレッドをふさぐジョブ。`abort` では止められない。
+    fn block_thread(_payload: String) -> crate::queue::JobFuture {
+        Box::pin(async {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(())
+        })
+    }
+
+    // 止まらないジョブがスレッドを 1 本ふさいでも、時計を進められるよう
+    // スレッドを 2 本にする。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn 打ち切っても止まらないジョブは印を付けて返す() {
+        let jobs = [Job {
+            name: "Blocking",
+            handle: block_thread,
+        }];
+        let started = std::time::Instant::now();
+        let failure = run_one_with(
+            &jobs,
+            &reserved_of("Blocking"),
+            Some(Duration::from_millis(30)),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        // 以前は止まらないまま次のジョブへ進み、再挑戦で二重に動いた。
+        assert!(failure.stuck, "止まらなかったと分かる");
+        assert!(
+            failure.message.contains("打ち切りました"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "ジョブの終わりは待たない"
+        );
+
+        let message = stuck_message("Blocking", 7, Some(Duration::from_secs(60)));
+        assert!(message.contains("Blocking #7"), "{message}");
+        assert!(message.contains("ワーカーを終了します"), "{message}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn 止まらないジョブは失敗を記録してからワーカーを終える() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        let id = 待っているジョブを入れる("Blocking").await;
+
+        let jobs = [Job {
+            name: "Blocking",
+            handle: |_| {
+                Box::pin(async {
+                    std::thread::sleep(Duration::from_millis(2500));
+                    Ok(())
+                })
+            },
+        }];
+        let stop = Arc::new(AtomicBool::new(false));
+        let options = Options {
+            timeout: 1,
+            ..Options::default()
+        };
+        // `once` でなくても、止まらないジョブを見たらエラーで終わる。
+        let error = run(&jobs, &options, stop).await.unwrap_err().to_string();
+        assert!(error.contains("ワーカーを終了します"), "{error}");
+
+        // 失敗 1 回として記録してから終わる（今までの時間切れと同じ記録）。
+        let row = DB::table(TABLE).find(id).await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>("attempts").unwrap(), 1);
+        assert!(row.value("reserved_at").unwrap().is_null(), "予約を外す");
     }
 
     #[tokio::test]

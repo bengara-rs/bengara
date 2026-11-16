@@ -161,6 +161,118 @@ impl CargoToml {
             .any(|bin| bin.name.as_deref() == Some(name))
     }
 
+    /// `name` が一致する最初の `[[bin]]` の入口を `file` に書き換える。
+    ///
+    /// `path` の行があれば差し替え（行頭の字下げは保つ）、無ければ `name` の行の
+    /// 次に足します。書き換えたら真を返します。その `[[bin]]` が無いとき、
+    /// すでに `file` を指しているときは何もせず偽です。
+    ///
+    /// `init` が `[[bin]] name = "<パッケージ名>" path = "src/main.rs"` を
+    /// 持つプロジェクトに、同じ名前の `[[bin]]` をもう 1 つ足さないためです
+    /// （cargo は同じ名前の bin を 2 つ持てません）。
+    pub(crate) fn set_bin_path(&mut self, name: &str, file: &str) -> bool {
+        let kinds = self.classify();
+        // 対象の `[[bin]]` の範囲（見出しの次の行から、次の見出しまで）を探す。
+        let mut range: Option<std::ops::Range<usize>> = None;
+        let mut start: Option<usize> = None;
+        for (index, kind) in kinds.iter().enumerate() {
+            if let LineKind::Header(header) = kind {
+                if let Some(begin) = start.take() {
+                    if self.bin_name_in(begin..index, &kinds) == Some(name.to_string()) {
+                        range = Some(begin..index);
+                        break;
+                    }
+                }
+                if header.as_str() == "[[bin]]" {
+                    start = Some(index + 1);
+                }
+            }
+        }
+        if range.is_none() {
+            if let Some(begin) = start {
+                let end = self.lines.len();
+                if self.bin_name_in(begin..end, &kinds) == Some(name.to_string()) {
+                    range = Some(begin..end);
+                }
+            }
+        }
+        let Some(range) = range else {
+            return false;
+        };
+
+        let wanted = format!("path = \"{file}\"");
+        let mut name_at = None;
+        for index in range {
+            if kinds[index] != LineKind::Plain {
+                continue;
+            }
+            match key_of(&self.lines[index]).as_deref() {
+                Some("path") => {
+                    let bin = Bin {
+                        name: None,
+                        path: value_of(&self.lines[index]),
+                    };
+                    if bin.has_path(file) {
+                        return false;
+                    }
+                    let line = &self.lines[index];
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    self.lines[index] = format!("{indent}{wanted}");
+                    self.changed = true;
+                    return true;
+                }
+                Some("name") if name_at.is_none() => name_at = Some(index),
+                _ => {}
+            }
+        }
+        // `path` の行が無い。cargo は `src/main.rs` などを探すので、明示する。
+        let Some(at) = name_at else {
+            return false;
+        };
+        self.lines.insert(at + 1, wanted);
+        self.changed = true;
+        true
+    }
+
+    /// その範囲（1 つの `[[bin]]` の中身）に書かれた `name`。
+    fn bin_name_in(&self, range: std::ops::Range<usize>, kinds: &[LineKind]) -> Option<String> {
+        range
+            .filter(|index| kinds[*index] == LineKind::Plain)
+            .map(|index| &self.lines[index])
+            .find(|line| key_of(line).as_deref() == Some("name"))
+            .and_then(|line| value_of(line))
+    }
+
+    /// 最初の見出しより前（ルート）に書かれたキー。ドットで分けて返す。
+    ///
+    /// `alias.artisan = [...]` は `["alias", "artisan"]`、`alias = { ... }` は
+    /// `["alias"]` です。2 つ目には行そのものも添えます。
+    ///
+    /// `has_key` は見出しの節しか見ません。ルートで `alias` を書いているファイルに
+    /// `init` が `[alias]` を足すと、同じ表を 2 回定義したことになり、cargo が
+    /// `.cargo/config.toml` を読めなくなります。それを避けるために使います。
+    pub(crate) fn root_keys(&self) -> Vec<(Vec<String>, &str)> {
+        let kinds = self.classify();
+        self.lines
+            .iter()
+            .zip(&kinds)
+            .take_while(|(_, kind)| !matches!(kind, LineKind::Header(_)))
+            .filter(|(_, kind)| matches!(kind, LineKind::Plain))
+            .filter_map(|(line, _)| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (key, _) = line.split_once('=')?;
+                let parts = key
+                    .split('.')
+                    .map(|part| unquote(part.trim()).to_string())
+                    .collect();
+                Some((parts, line))
+            })
+            .collect()
+    }
+
     /// `[[bin]]` の節を上から順に読む。
     ///
     /// 節ごとに分けて持ちます。`name` と `path` は**同じ節**のものどうしで
@@ -513,6 +625,103 @@ mod tests {
 
     fn doc(text: &str) -> CargoToml {
         CargoToml::from_text(text)
+    }
+
+    #[test]
+    fn 同じ名前のbinの入口を書き換える() {
+        // cargo new のあとに自分で書いた `[[bin]]`。足さずに入口だけ直す。
+        let mut d = doc("[package]
+name = \"myapp\"
+
+[[bin]]
+name = \"myapp\"
+  path = 'src/main.rs' # 元の入口
+
+[dependencies]
+");
+        assert!(d.set_bin_path("myapp", "main.rs"));
+        assert!(d.has_path("main.rs"));
+        assert!(!d.has_path("src/main.rs"));
+        assert!(d.contains("  path = \"main.rs\""), "字下げは保つ");
+        assert_eq!(d.count_lines("[[bin]]"), 1);
+        // 2 回目は何もしない。
+        assert!(!d.set_bin_path("myapp", "main.rs"));
+
+        // `path` の行が無い bin には、`name` の次に足す。最後の節でも探せる。
+        let mut d = doc("[package]
+name = \"myapp\"
+
+[[bin]]
+name = \"myapp\"
+");
+        assert!(d.set_bin_path("myapp", "main.rs"));
+        assert_eq!(
+            d.lines.join(
+                "
+"
+            ),
+            "[package]
+name = \"myapp\"
+
+[[bin]]
+name = \"myapp\"
+path = \"main.rs\""
+        );
+
+        // 名前の違う bin には触らない。
+        let mut d = doc("[[bin]]
+name = \"server\"
+path = \"src/main.rs\"
+");
+        assert!(!d.set_bin_path("myapp", "main.rs"));
+        assert!(d.has_path("src/main.rs"));
+        // 2 つ目の bin でも探せる。
+        let mut d = doc("[[bin]]
+name = \"artisan\"
+path = \"artisan.rs\"
+
+[[bin]]
+name = \"myapp\"
+path = \"src/main.rs\"
+
+[profile.release]
+lto = true
+");
+        assert!(d.set_bin_path("myapp", "main.rs"));
+        assert_eq!(d.bin_name_for_path("main.rs").as_deref(), Some("myapp"));
+        assert_eq!(
+            d.bin_name_for_path("artisan.rs").as_deref(),
+            Some("artisan")
+        );
+    }
+
+    #[test]
+    fn ルートのキーを読める() {
+        let d = doc("# 設定
+alias.artisan = [\"run\"]
+\"alias\" . b = [
+  \"x = 1\",
+]
+alias = { c = \"d\" }
+
+[build]
+alias.e = 1
+");
+        let keys: Vec<Vec<String>> = d.root_keys().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                vec!["alias".to_string(), "artisan".to_string()],
+                vec!["alias".to_string(), "b".to_string()],
+                vec!["alias".to_string()],
+            ],
+            "配列の続きと、見出しの後ろは見ない"
+        );
+        assert!(doc("[alias]
+artisan = []
+")
+        .root_keys()
+        .is_empty());
     }
 
     #[test]

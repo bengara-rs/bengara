@@ -43,6 +43,17 @@ const HARD_MAX_BUCKETS: usize = MAX_BUCKETS * 2;
 /// 届いたときにも合います（`canonical` で形をそろえてから比べます）。
 const TRUSTED_PROXIES: &str = "TRUSTED_PROXIES";
 
+/// ルートに当たらなかったパスを、そのまま鍵に使ってよい長さ（バイト）。
+///
+/// 超えたら SHA-256 の 16 進（64 文字）に置き換えます。詳しくは `target_of`。
+const MAX_TARGET_LEN: usize = 128;
+
+/// 長いパスを置き換えた鍵の頭に付ける印。
+///
+/// `#` は届いたパスに入りません（URL の `#` 以降はブラウザが送らない）。
+/// なので、本物のパスと同じ鍵にはなりません。
+const HASHED_TARGET_PREFIX: &str = "/#sha256:";
+
 /// 数え方の置き場所。
 ///
 /// **プロセスのメモリに置きます。** プロセスを2つ動かすと、それぞれが別々に数えます
@@ -63,6 +74,8 @@ pub struct Throttle {
     warned: AtomicBool,
     /// 件数の天井で鍵を落としたことを、1回だけ知らせるための目印。
     evicted: AtomicBool,
+    /// ログイン中でも接続元のアドレスで数えるか（`by_ip`）。
+    by_ip: bool,
 }
 
 /// 数え方の中身と、最後に掃除した時刻。
@@ -90,7 +103,23 @@ impl Throttle {
             }),
             warned: AtomicBool::new(false),
             evicted: AtomicBool::new(false),
+            by_ip: false,
         }
+    }
+
+    /// ログインしていても、**接続元のアドレス**で数える。
+    ///
+    /// 既定では、ログイン中の人は `user:{id}` ごとに数えます。ログイン・登録・
+    /// パスワード再設定のように「ログインしていない人のための口」では、これが穴になります。
+    /// 登録し直すたびに新しい ID になり、枠も新しくなるためです。
+    /// こうした口には `by_ip()` を付けてください。
+    ///
+    /// ```ignore
+    /// .alias("throttle.login", Throttle::per_minute(5).by_ip())
+    /// ```
+    pub fn by_ip(mut self) -> Self {
+        self.by_ip = true;
+        self
     }
 
     /// 1分あたりの回数で作る。
@@ -311,14 +340,18 @@ fn canonical(ip: IpAddr) -> IpAddr {
 ///
 /// `X-Forwarded-For` と `X-Real-IP` は、接続元が `TRUSTED_PROXIES` に書かれた相手の
 /// ときだけ見ます。無条件に信じると、偽の値を送るだけで回数制限を無制限に回せます。
-fn key_for(req: &Request) -> Option<String> {
-    key_for_with(req, trusted_proxies())
+///
+/// `by_ip` が真なら、ログインしていても接続元のアドレスで数えます（`Throttle::by_ip`）。
+fn key_for(req: &Request, by_ip: bool) -> Option<String> {
+    key_for_with(req, trusted_proxies(), by_ip)
 }
 
-fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
+fn key_for_with(req: &Request, trusted: &Trusted, by_ip: bool) -> Option<String> {
     let target = target_of(req);
-    if let Some(id) = req.auth().id() {
-        return Some(format!("user:{id}|{target}"));
+    if !by_ip {
+        if let Some(id) = req.auth().id() {
+            return Some(format!("user:{id}|{target}"));
+        }
     }
     // 接続元が分からなければ鍵を作らない。`"unknown"` のような1つの鍵にまとめると、
     // 誰か1人が使い切るだけで全員を締め出せてしまいます。
@@ -357,6 +390,11 @@ fn key_for_with(req: &Request, trusted: &Trusted) -> Option<String> {
 /// `Routes::find` と同じ 2 つ（`match_path` と `upcase_hex`）を通します。
 /// 無いパスは相手がいくらでも作れるので、ここの鍵の数は抑えられません
 /// （件数の天井 `MAX_BUCKETS` で守ります）。
+///
+/// **3 は長さも抑えます。** `MAX_TARGET_LEN` を超えたら、SHA-256 の 16 進に置き換えます。
+/// 以前は長さを見ていなかったので、1 つの鍵が数百 KB になれました。
+/// 鍵は最大 2 万件まで残るため、それだけで大量のメモリを握られます。
+/// 置き換えた鍵には `HASHED_TARGET_PREFIX` を付け、ふつうのパスと混ざらないようにします。
 fn target_of(req: &Request) -> Cow<'_, str> {
     if let Some(name) = req.route_name() {
         return Cow::Borrowed(name);
@@ -364,7 +402,15 @@ fn target_of(req: &Request) -> Cow<'_, str> {
     if let Some(path) = req.route_path() {
         return Cow::Borrowed(path);
     }
-    super::percent::upcase_hex(super::routing::match_path(req.path()))
+    let target = super::percent::upcase_hex(super::routing::match_path(req.path()));
+    if target.len() <= MAX_TARGET_LEN {
+        return target;
+    }
+    let digest = crate::support::crypto::sha256(target.as_bytes());
+    Cow::Owned(format!(
+        "{HASHED_TARGET_PREFIX}{}",
+        crate::support::crypto::to_hex(&digest)
+    ))
 }
 
 /// 前段のプロキシが伝えてきた、元の相手。
@@ -440,7 +486,7 @@ impl Middleware for Throttle {
         // 鍵を作れないときは、制限を掛けずに通します。全員で1つの鍵を共有すると、
         // 1人が使い切るだけで他の全員を締め出せる（止めたい攻撃そのものになる）ためです。
         // 実際のサーバーでは接続元が必ず分かるので、ここに来るのはテストのときだけです。
-        let Some(key) = key_for(&req) else {
+        let Some(key) = key_for(&req, self.by_ip) else {
             self.warn_no_key();
             return next.run(req);
         };
@@ -535,14 +581,14 @@ mod tests {
     #[test]
     fn 接続元が分からなければ鍵を作らない() {
         let req = Request::new("GET", "/login");
-        assert_eq!(key_for_with(&req, &Trusted::All), None);
+        assert_eq!(key_for_with(&req, &Trusted::All, false), None);
     }
 
     #[test]
     fn 既定では接続元のアドレスで数える() {
         let req = from("203.0.113.9");
         assert_eq!(
-            key_for_with(&req, &Trusted::None),
+            key_for_with(&req, &Trusted::None, false),
             Some("203.0.113.9|/login".to_string())
         );
     }
@@ -557,12 +603,12 @@ mod tests {
         second.set_route_name(Some("items.show".into()));
 
         assert_eq!(
-            key_for_with(&first, &Trusted::None),
-            key_for_with(&second, &Trusted::None),
+            key_for_with(&first, &Trusted::None, false),
+            key_for_with(&second, &Trusted::None, false),
             "同じルートなら、パスが違っても同じ鍵になる"
         );
         assert_eq!(
-            key_for_with(&first, &Trusted::None),
+            key_for_with(&first, &Trusted::None, false),
             Some("203.0.113.9|items.show".to_string())
         );
     }
@@ -580,7 +626,7 @@ mod tests {
         let key = |sent: &str, registered: &str| {
             let mut req = at(sent);
             req.set_route_path(Some(registered.into()));
-            key_for_with(&req, &Trusted::None)
+            key_for_with(&req, &Trusted::None, false)
         };
         let expected = Some("203.0.113.9|/login".to_string());
         for sent in ["/login", "/login/", "/login//"] {
@@ -603,7 +649,7 @@ mod tests {
         req.set_route_path(Some("/login".into()));
         req.set_route_name(Some("login".into()));
         assert_eq!(
-            key_for_with(&req, &Trusted::None),
+            key_for_with(&req, &Trusted::None, false),
             Some("203.0.113.9|login".to_string())
         );
     }
@@ -612,7 +658,7 @@ mod tests {
     fn ルートに当たらないパスは照合と同じ形にそろえて数える() {
         // `Throttle` を共通のミドルウェアにしたときの 404 の道。
         // 末尾の `/` と 16 進の大文字小文字で、同じパスの枠が増えないようにする。
-        let key = |sent: &str| key_for_with(&at(sent), &Trusted::None);
+        let key = |sent: &str| key_for_with(&at(sent), &Trusted::None, false);
         let expected = Some("203.0.113.9|/login".to_string());
         for sent in ["/login", "/login/", "/login//"] {
             assert_eq!(key(sent), expected, "{sent}");
@@ -625,6 +671,84 @@ mod tests {
         // `/` 単独はそのまま。
         assert_eq!(key("/"), Some("203.0.113.9|/".to_string()));
         assert_eq!(key("///"), Some("203.0.113.9|/".to_string()));
+    }
+
+    #[test]
+    fn 長いパスはハッシュに置き換えて数える() {
+        // 以前は長さを見ていなかったので、1 つの鍵が数百 KB になれた。
+        let long = format!("/{}", "a".repeat(10_000));
+        let key = key_for_with(&at(&long), &Trusted::None, false).expect("鍵を作る");
+        let target = key.strip_prefix("203.0.113.9|").expect("相手の部分");
+        assert!(target.starts_with(HASHED_TARGET_PREFIX), "{target}");
+        assert_eq!(
+            target.len(),
+            HASHED_TARGET_PREFIX.len() + 64,
+            "長さは決まっている"
+        );
+
+        // 同じパスなら同じ鍵、違うパスなら違う鍵（数える意味は変わらない）。
+        assert_eq!(
+            key_for_with(&at(&format!("{long}/")), &Trusted::None, false),
+            Some(key.clone()),
+            "照合と同じ形にそろえてから置き換える"
+        );
+        let other = format!("/{}", "b".repeat(10_000));
+        assert_ne!(key_for_with(&at(&other), &Trusted::None, false), Some(key));
+
+        // 上限ちょうどまでは、そのまま使う。
+        let edge = format!("/{}", "a".repeat(MAX_TARGET_LEN - 1));
+        assert_eq!(
+            key_for_with(&at(&edge), &Trusted::None, false),
+            Some(format!("203.0.113.9|{edge}"))
+        );
+
+        // ルートに当たっていれば、長いパスでも登録パスを使う（置き換えない）。
+        let mut req = at(&long);
+        req.set_route_path(Some("/{any}".into()));
+        assert_eq!(
+            key_for_with(&req, &Trusted::None, false),
+            Some("203.0.113.9|/{any}".to_string())
+        );
+    }
+
+    /// ログイン済みのセッションを載せたリクエスト。
+    fn logged_in(peer: &str, id: u32) -> Request {
+        let mut req = from(peer);
+        let session = crate::session::Session::empty();
+        req.set_session(session);
+        req.auth().login_using_id(id).expect("ログインできる");
+        req
+    }
+
+    #[test]
+    fn ログイン中は既定で利用者ごとに数える() {
+        assert_eq!(
+            key_for_with(&logged_in("203.0.113.9", 5), &Trusted::None, false),
+            Some("user:5|/login".to_string())
+        );
+    }
+
+    #[test]
+    fn by_ipならログイン中でも接続元で数える() {
+        // 登録し直すと ID が変わり、`user:{id}` の枠も新しくなる。
+        // ログインや登録の口では、接続元で数えないと回数の制限を回せてしまう。
+        assert_eq!(
+            key_for_with(&logged_in("203.0.113.9", 5), &Trusted::None, true),
+            Some("203.0.113.9|/login".to_string())
+        );
+        assert_eq!(
+            key_for_with(&logged_in("203.0.113.9", 5), &Trusted::None, true),
+            key_for_with(&logged_in("203.0.113.9", 6), &Trusted::None, true),
+            "ID が変わっても同じ枠"
+        );
+        // ログインしていなければ、既定と同じ。
+        assert_eq!(
+            key_for_with(&from("203.0.113.9"), &Trusted::None, true),
+            key_for_with(&from("203.0.113.9"), &Trusted::None, false)
+        );
+
+        assert!(!Throttle::per_minute(5).by_ip);
+        assert!(Throttle::per_minute(5).by_ip().by_ip);
     }
 
     /// IPv4 を IPv6 の形で表したアドレスから届いたリクエスト。
@@ -641,18 +765,18 @@ mod tests {
         // `APP_HOST=::` のソケットは、IPv4 の相手を `::ffff:a.b.c.d` で渡すことがある。
         // 届き方で鍵が変わると、同じ相手が 2 つの枠を持つ。
         assert_eq!(
-            key_for_with(&from_mapped("203.0.113.9"), &Trusted::None),
-            key_for_with(&from("203.0.113.9"), &Trusted::None)
+            key_for_with(&from_mapped("203.0.113.9"), &Trusted::None, false),
+            key_for_with(&from("203.0.113.9"), &Trusted::None, false)
         );
         assert_eq!(
-            key_for_with(&from_mapped("203.0.113.9"), &Trusted::None),
+            key_for_with(&from_mapped("203.0.113.9"), &Trusted::None, false),
             Some("203.0.113.9|/login".to_string())
         );
         // 本物の IPv6 はそのまま。
         let addr: std::net::SocketAddr = "[2001:db8::1]:12345".parse().unwrap();
         let req = Request::new("GET", "/login").with_remote_addr(addr);
         assert_eq!(
-            key_for_with(&req, &Trusted::None),
+            key_for_with(&req, &Trusted::None, false),
             Some("2001:db8::1|/login".to_string())
         );
     }
@@ -666,7 +790,7 @@ mod tests {
         let req = from_mapped("10.0.0.1")
             .with_headers(vec![("x-forwarded-for".into(), "203.0.113.9".into())]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("203.0.113.9|/login".to_string())
         );
 
@@ -677,7 +801,7 @@ mod tests {
             "::ffff:203.0.113.9, ::ffff:10.0.0.1".into(),
         )]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("203.0.113.9|/login".to_string())
         );
 
@@ -685,7 +809,7 @@ mod tests {
         let req = from_mapped("10.0.0.1")
             .with_headers(vec![("x-real-ip".into(), "::ffff:203.0.113.9".into())]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("203.0.113.9|/login".to_string())
         );
 
@@ -699,7 +823,7 @@ mod tests {
         let req = from_mapped("203.0.113.250")
             .with_headers(vec![("x-forwarded-for".into(), "1.2.3.4".into())]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("203.0.113.250|/login".to_string())
         );
     }
@@ -739,12 +863,12 @@ mod tests {
         ]);
         // 偽の値を送られても、接続元のアドレスで数える。
         assert_eq!(
-            key_for_with(&req, &Trusted::None),
+            key_for_with(&req, &Trusted::None, false),
             Some("203.0.113.9|/login".to_string())
         );
         let others = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
         assert_eq!(
-            key_for_with(&req, &others),
+            key_for_with(&req, &others, false),
             Some("203.0.113.9|/login".to_string())
         );
     }
@@ -755,12 +879,12 @@ mod tests {
             .with_headers(vec![("x-forwarded-for".into(), "1.2.3.4, 5.6.7.8".into())]);
         let trusted = Trusted::List(vec!["10.0.0.1".parse().unwrap()]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("5.6.7.8|/login".to_string()),
             "一覧で絞るときは右端から（1.2.3.4 は相手が足した値かもしれない）"
         );
         assert_eq!(
-            key_for_with(&req, &Trusted::All),
+            key_for_with(&req, &Trusted::All, false),
             Some("1.2.3.4|/login".to_string()),
             "すべて信頼するときは右端から辿れないので先頭"
         );
@@ -768,14 +892,14 @@ mod tests {
         // X-Forwarded-For が無ければ X-Real-IP を見る。
         let req = from("10.0.0.1").with_headers(vec![("x-real-ip".into(), "9.9.9.9".into())]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("9.9.9.9|/login".to_string())
         );
 
         // どちらも無ければ接続元のアドレス。
         let req = from("10.0.0.1");
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("10.0.0.1|/login".to_string())
         );
     }
@@ -791,7 +915,7 @@ mod tests {
             ("X-Forwarded-For".into(), "203.0.113.9, 10.0.0.1".into()),
         ]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("203.0.113.9|/login".to_string()),
             "つないだ 1 本として、右端から辿る"
         );
@@ -807,7 +931,7 @@ mod tests {
             ("x-real-ip".into(), "203.0.113.9".into()),
         ]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("10.0.0.1|/login".to_string())
         );
     }
@@ -819,12 +943,12 @@ mod tests {
         // `user:5` を鍵にすると、その利用者の枠を外から使い切れてしまう。
         let req = from("10.0.0.1").with_headers(vec![("x-forwarded-for".into(), "user:5".into())]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("10.0.0.1|/login".to_string()),
             "読めない値は捨てて接続元のアドレスに落ちる"
         );
         assert_eq!(
-            key_for_with(&req, &Trusted::All),
+            key_for_with(&req, &Trusted::All, false),
             Some("10.0.0.1|/login".to_string())
         );
 
@@ -834,11 +958,11 @@ mod tests {
             "nonsense, 1.2.3.4, , bad".into(),
         )]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("1.2.3.4|/login".to_string())
         );
         assert_eq!(
-            key_for_with(&req, &Trusted::All),
+            key_for_with(&req, &Trusted::All, false),
             Some("1.2.3.4|/login".to_string()),
             "先頭が読めなければ次を見る"
         );
@@ -846,7 +970,7 @@ mod tests {
         // X-Real-IP も検査を通す。
         let req = from("10.0.0.1").with_headers(vec![("x-real-ip".into(), "user:5".into())]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("10.0.0.1|/login".to_string())
         );
 
@@ -856,7 +980,7 @@ mod tests {
             ("x-real-ip".into(), "9.9.9.9".into()),
         ]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("9.9.9.9|/login".to_string())
         );
     }
@@ -873,7 +997,7 @@ mod tests {
             "1.2.3.4, 203.0.113.9, 10.0.0.2, 10.0.0.1".into(),
         )]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("203.0.113.9|/login".to_string()),
             "相手が足した 1.2.3.4 は使わない"
         );
@@ -884,7 +1008,7 @@ mod tests {
             "10.0.0.2, 10.0.0.1".into(),
         )]);
         assert_eq!(
-            key_for_with(&req, &trusted),
+            key_for_with(&req, &trusted, false),
             Some("10.0.0.1|/login".to_string())
         );
     }

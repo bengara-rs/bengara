@@ -33,16 +33,46 @@ impl Encryption {
     ///
     /// Laravel の `MAIL_ENCRYPTION` に合わせて `tls` / `ssl` / `starttls` /
     /// `null` を受け付けます。知らない語は `starttls` にします。
+    ///
+    /// **空の値は「書かなかった」と同じ `starttls` です。** `.env` の空の値は
+    /// `env()` が既定値（`starttls`）に読み替えます。`config/mail.rs` で空の文字列を
+    /// 渡したときだけ暗号化なしになると、同じ「空」で意味が食い違うためです。
+    /// 暗号化なしにしたいときは `none` と書きます。
     pub(super) fn parse(name: &str) -> Encryption {
         match name.trim().to_ascii_lowercase().as_str() {
             "tls" | "ssl" | "smtps" => Encryption::Tls,
-            "none" | "null" | "" | "false" => Encryption::None,
-            "starttls" => Encryption::StartTls,
+            "none" | "null" | "false" => Encryption::None,
+            "starttls" | "" => Encryption::StartTls,
             other => {
                 tracing::warn!("MAIL_ENCRYPTION `{other}` は知りません。starttls を使います");
                 Encryption::StartTls
             }
         }
+    }
+
+    /// 設定の文字列とポートから、使う暗号化とポートを決める。
+    ///
+    /// `tls` と `ssl` は、ポートが 465 か 0（書かなかった）のときだけ
+    /// つないだ直後から暗号化します。**ほかのポートでは `STARTTLS`** にします。
+    /// Laravel（Symfony Mailer）と同じ決め方です。Laravel の `.env` は
+    /// `MAIL_ENCRYPTION=tls` と `MAIL_PORT=587` の組み合わせがふつうで、
+    /// 以前はこれを 587 番へいきなり TLS でつなぎ、握手に失敗していました。
+    ///
+    /// `smtps` はポートに関係なく、つないだ直後から暗号化します
+    /// （名前そのものが「最初から TLS」の意味なので）。
+    pub(super) fn resolve(name: &str, port: u16) -> (Encryption, u16) {
+        let parsed = Encryption::parse(name);
+        let implicit_only = name.trim().eq_ignore_ascii_case("smtps");
+        let encryption = match parsed {
+            Encryption::Tls if !implicit_only && port != 0 && port != 465 => Encryption::StartTls,
+            other => other,
+        };
+        let port = if port == 0 {
+            encryption.default_port()
+        } else {
+            port
+        };
+        (encryption, port)
     }
 
     /// ポートを書かなかったときに使う番号。
@@ -66,7 +96,7 @@ impl SmtpMailer {
     /// 実際につなぐのは1通目を送るときです。`lettre` が接続を溜めておくので、
     /// 2通目からは TLS の握り直しが起きません。
     pub(super) fn new(config: &MailConfig) -> Result<Self> {
-        let encryption = Encryption::parse(&config.encryption);
+        let (encryption, port) = Encryption::resolve(&config.encryption, config.port);
         if config.host.trim().is_empty() {
             return Err(Error::msg(
                 "MAIL_HOST が空です。SMTP サーバの名前を書いてください",
@@ -86,11 +116,6 @@ impl SmtpMailer {
             ))
         })?;
 
-        let port = if config.port == 0 {
-            encryption.default_port()
-        } else {
-            config.port
-        };
         builder = builder.port(port).timeout(Some(Duration::from_secs(
             // 0 を渡すとすぐ諦めるので、下限を 1 秒にする。
             config.timeout.max(1),
@@ -193,9 +218,36 @@ mod tests {
         assert_eq!(Encryption::parse("starttls"), Encryption::StartTls);
         assert_eq!(Encryption::parse("none"), Encryption::None);
         assert_eq!(Encryption::parse("null"), Encryption::None);
-        assert_eq!(Encryption::parse(""), Encryption::None);
+        // 空の値は「書かなかった」と同じ。`.env` の空の値（`env()` が既定値の
+        // starttls に読み替える）と同じ意味にそろえる。
+        assert_eq!(Encryption::parse(""), Encryption::StartTls);
+        assert_eq!(Encryption::parse("  "), Encryption::StartTls);
+        assert_eq!(Encryption::resolve("", 0), (Encryption::StartTls, 587));
         // 知らない語は、暗号化する側に倒す。
         assert_eq!(Encryption::parse("なにか"), Encryption::StartTls);
+    }
+
+    #[test]
+    fn tlsは465番以外ではstarttlsにする() {
+        // Laravel の `.env` によくある組み合わせ。以前は 587 番へいきなり
+        // TLS でつないで、握手に失敗していた。
+        assert_eq!(Encryption::resolve("tls", 587), (Encryption::StartTls, 587));
+        assert_eq!(
+            Encryption::resolve("ssl", 2525),
+            (Encryption::StartTls, 2525)
+        );
+        // 465 番と、ポートを書かないときは最初から TLS。
+        assert_eq!(Encryption::resolve("tls", 465), (Encryption::Tls, 465));
+        assert_eq!(Encryption::resolve("TLS", 0), (Encryption::Tls, 465));
+        // `smtps` はポートに関係なく最初から TLS。
+        assert_eq!(Encryption::resolve("smtps", 2465), (Encryption::Tls, 2465));
+        // ほかの語はポートで変えない。
+        assert_eq!(
+            Encryption::resolve("starttls", 0),
+            (Encryption::StartTls, 587)
+        );
+        assert_eq!(Encryption::resolve("none", 0), (Encryption::None, 25));
+        assert_eq!(Encryption::resolve("none", 1025), (Encryption::None, 1025));
     }
 
     #[test]

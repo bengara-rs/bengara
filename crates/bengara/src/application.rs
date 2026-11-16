@@ -107,13 +107,27 @@ impl Application {
     }
 
     /// 1本のリクエストを処理する。ソケットを使わないので、テストからも呼べます。
-    pub(crate) async fn handle(&self, mut req: Request) -> Response {
+    pub(crate) async fn handle(&self, req: Request) -> Response {
+        self.handle_logged(req, false).await.0
+    }
+
+    /// 1本のリクエストを処理し、`log` が真ならアクセスログに出す行き先も返す。
+    ///
+    /// 行き先はルートを引いた**直後**に作ります。パス引数の名前が分かってからでないと、
+    /// `/reset/{token}` の値を伏せられないためです（`server::log_target`）。
+    /// 共有の表には触らないので、ロックは増えません。
+    pub(crate) async fn handle_logged(
+        &self,
+        mut req: Request,
+        log: bool,
+    ) -> (Response, Option<String>) {
         let is_head = req.method() == "HEAD";
         let options = self.render_options(&req);
 
         // 共通ミドルウェアは、ルートに当たらなかったときも通します（Laravel と同じ）。
         // そのため、ここでは並びを1本だけ回し、分岐は最内側のハンドラに寄せます。
         let inner = self.innermost(&mut req, &options);
+        let target = log.then(|| crate::server::log_target(&req));
         let future = Next::new(self.inner.global.clone(), inner, options.clone()).run(req);
 
         // ミドルウェアとハンドラのパニックを1リクエストに閉じ込める。
@@ -164,7 +178,10 @@ impl Application {
         // `Response::new(204).with_body(..)` のように**自分で組んだ**応答はそのまま来ます。
         // 本文が付いた 204 は HTTP として正しくなく、枠組みの長さが相手と食い違います。
         // 全部の応答が通るここで落とします。
-        crate::http::response::without_forbidden_body(response)
+        (
+            crate::http::response::without_forbidden_body(response),
+            target,
+        )
     }
 
     /// 最内側のハンドラを決める（ルート本体・405・静的ファイル・404）。
@@ -627,6 +644,36 @@ mod tests {
         assert_eq!(response.header("x-powered-by"), Some("bengara"));
         // HEAD は GET で受けるので、GET があれば HEAD も並べる。
         assert_eq!(response.header("allow"), Some("GET, HEAD"));
+    }
+
+    #[tokio::test]
+    async fn アクセスログの行き先はパス引数の秘密を伏せる() {
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/reset/{token}", ok);
+                })
+            })
+            .create();
+
+        let req = Request::new("GET", "/reset/abc123").with_query("email=a%40b&signature=x");
+        let (response, target) = app.handle_logged(req, true).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            target.as_deref(),
+            Some("/reset/***?email=a%40b&signature=***")
+        );
+
+        // 当たらなかったパスは、届いたパスのまま（クエリだけ伏せる）。
+        let req = Request::new("GET", "/missing/abc").with_query("token=x");
+        let (_, target) = app.handle_logged(req, true).await;
+        assert_eq!(target.as_deref(), Some("/missing/abc?token=***"));
+
+        // ログを出さないときは作らない。
+        let (_, target) = app
+            .handle_logged(Request::new("GET", "/reset/abc123"), false)
+            .await;
+        assert_eq!(target, None);
     }
 
     #[tokio::test]

@@ -271,7 +271,19 @@ impl QueryBuilder {
 
     /// 列と列を比べる演算子として受け付けるか確かめる。
     fn check_operator(&mut self, place: &str, operator: &str) {
-        if !grammar::is_allowed_operator(operator) {
+        if grammar::is_allowed_operator(operator) {
+            return;
+        }
+        // 以前は通していた演算子。列と列の間では SQL が成り立たないので、
+        // 代わりの書き方を添える。
+        if grammar::is_set_operator(operator) || grammar::is_null_operator(operator).is_some() {
+            self.defer(format!(
+                "{place} に渡した演算子 `{operator}` は、列と列の比較には使えません。\
+                 一覧や範囲で絞るときは where_in / where_between、\
+                 NULL かどうかは where_null / where_not_null を使ってください（使えるもの: {}）",
+                grammar::OPERATORS.join(", ")
+            ));
+        } else {
             self.defer(format!(
                 "{place} に渡した演算子 `{operator}` は使えません（使えるもの: {}）",
                 grammar::OPERATORS.join(", ")
@@ -1431,7 +1443,16 @@ impl QueryBuilder {
                  重なりを除いて集計できるのは、ただの列名を渡したときだけです"
             )));
         }
-        let quoted = if column == "*" {
+        let star = column.trim() == "*";
+        if star && function != "count" {
+            // `*` を渡せるのは `count` だけ。`sum(*)` は SQL として成り立たない。
+            // 以前はそのまま組み立てて、実行したところで SQL エラーになっていた。
+            return Err(Error::msg(format!(
+                "{function}() には `*` を渡せません（`*` が使えるのは count() だけです）。\
+                 集計する列の名前を渡してください"
+            )));
+        }
+        let quoted = if star {
             // `count(*)` と同じ書き方。ここだけ別扱いにする。
             "*".to_string()
         } else {
@@ -1519,8 +1540,8 @@ impl QueryBuilder {
     /// 名前だけでは見分けられないので（`id` 以外でも普通に正しい）、
     /// 警告は出しません。毎回の `insert` で鳴って雑音になるためです。
     ///
-    /// **採番されない表に使うと、MySQL ではエラー（「insert が ID を返しませんでした」）
-    /// になります。行は入っています。** `last_insert_id()` は `auto_increment` が
+    /// **採番されない表に使うと、MySQL ではエラー（「行は入りましたが、採番された値が
+    /// 返りませんでした」）になります。行は入っています。** `last_insert_id()` は `auto_increment` が
     /// 働かなかったときに `0` を返し、bengara はその `0` を「番号なし」と見なすためです
     /// （`0` を主キーとして返しません）。`auto_increment` を持たない表（主キーが
     /// 文字列の表や、値を自分で入れる表）がこれに当たります。そういう表には
@@ -1552,9 +1573,20 @@ impl QueryBuilder {
         }
 
         let affected = self.run(&sql, &bindings).await?;
-        affected
-            .last_insert_id
-            .ok_or_else(|| Error::msg("insert が ID を返しませんでした"))
+        match affected.last_insert_id {
+            Some(id) => Ok(id),
+            // MySQL は `auto_increment` の無い表で `last_insert_id()` が 0 になり、
+            // 「番号なし」として届く。**行はもう入っています。** 以前は
+            // 「ID を返しませんでした」だけを伝えていて、入ったことが分からなかった。
+            None if self.driver == Driver::MySql && affected.rows > 0 => Err(Error::msg(format!(
+                "{} に行は入りましたが、採番された {primary_key} の値が返りませんでした\
+                     （行は入っています）。主キーが自動採番（auto_increment）か確かめてください。\
+                     主キーを自分で決める表の行は、`DB::table(..).insert(..)` で入れてください。\
+                     モデルの `save()` で新しく入れられるのは、自動採番の主キーの行だけです",
+                self.table
+            ))),
+            None => Err(Error::msg("insert が ID を返しませんでした")),
+        }
     }
 
     /// `insert` の SQL を組み立てる。列の名前と並びは最初の行から取ります。
@@ -1742,14 +1774,27 @@ impl QueryBuilder {
             // ただし delete だけでは `sqlite_sequence` が残り、採番が戻らない。
             // MySQL / PostgreSQL の truncate は戻すので、文を分けてそろえる。
             Driver::Sqlite => {
+                // `main.posts` のようにデータベース名が付いた表は、名前を分ける。
+                // `sqlite_sequence` の `name` は表の名前だけで、データベースごとに
+                // 別の `sqlite_sequence` がある。以前は `name = 'main.posts'` で探して
+                // 1件も当たらず、採番が戻らなかった。
+                let table = self.table.trim();
+                let (prefix, name) = match table.rsplit_once('.') {
+                    Some((schema, name)) => {
+                        (format!("{}.", grammar::quote(self.driver, schema)), name)
+                    }
+                    None => (String::new(), table),
+                };
                 // `sqlite_sequence` は autoincrement の表が1つも無いと存在しない。
                 // **有無を先に読んで確かめます。** 以前は消す文をそのまま流して
                 // 失敗を捨てていました。トランザクションの中では、1本失敗すると
                 // 以後が使えなくなるので、続く `delete` まで落ちていました。
                 let has_sequence = !self
                     .fetch(
-                        "select 1 from sqlite_master \
-                         where type = 'table' and name = 'sqlite_sequence'",
+                        &format!(
+                            "select 1 from {prefix}sqlite_master \
+                             where type = 'table' and name = 'sqlite_sequence'"
+                        ),
                         &[],
                     )
                     .await?
@@ -1758,8 +1803,8 @@ impl QueryBuilder {
                 let sql = format!("delete from {}", grammar::quote(self.driver, &self.table));
                 self.run(&sql, &[]).await?;
                 if has_sequence {
-                    let reset = "delete from sqlite_sequence where name = ?";
-                    self.run(reset, &[Value::Text(self.table.clone())]).await?;
+                    let reset = format!("delete from {prefix}sqlite_sequence where name = ?");
+                    self.run(&reset, &[Value::Text(name.to_string())]).await?;
                 }
             }
             // PostgreSQL は `restart identity` を付けて採番を戻す（`grammar::truncate`）。
@@ -3068,6 +3113,21 @@ mod tests {
         assert_eq!(sql, "select count(*) as bengara_aggregate from \"posts\"");
     }
 
+    #[test]
+    fn 米印はcount以外の集計では断る() {
+        // 以前は `sum(*)` を組み立てて、実行したところで SQL エラーになっていた。
+        for function in ["sum", "avg", "min", "max"] {
+            for star in ["*", " * "] {
+                let message = builder()
+                    .aggregate_sql(function, star)
+                    .expect_err("断られる")
+                    .to_string();
+                assert!(message.contains("count() だけ"), "{message}");
+                assert!(message.contains(function), "{message}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn pluckとvalueの列名も検査する() {
         let danger = "name from users --";
@@ -3110,11 +3170,35 @@ mod tests {
             .expect_err("断られる")
             .to_string();
         assert!(message.contains("使えません"), "{message}");
-        // 列と列を比べる側は今までどおり通る。
+        // 列と列を比べる側では `<=>` が通る。
         builder()
-            .where_column("a", "between", "b")
+            .where_column("a", "<=>", "b")
             .check()
-            .expect("列と列の比較はこれまでどおり");
+            .expect("列と列の比較では通る");
+    }
+
+    #[test]
+    fn 列と列の比較に_in_や_is_を渡すと案内付きで断る() {
+        // 以前は通していた。`is` は SQLite だけが通し、ほかは構文エラーになる。
+        for operator in ["between", "not between", "in", "not in", "is", "is not"] {
+            for query in [
+                builder().where_column("a", operator, "b"),
+                builder().join("users", "users.id", operator, "posts.user_id"),
+                builder().left_join("users", "users.id", operator, "posts.user_id"),
+            ] {
+                let message = query.check().expect_err("断られる").to_string();
+                assert!(message.contains("列と列の比較には使えません"), "{message}");
+                assert!(message.contains("where_in"), "{message}");
+            }
+        }
+        // 比較の演算子と `like` はこれまでどおり通る。
+        for operator in ["=", "!=", "<>", "<", ">=", "like", "not ilike", "<=>"] {
+            builder()
+                .where_column("a", operator, "b")
+                .join("users", "users.id", operator, "posts.user_id")
+                .check()
+                .expect("通る");
+        }
     }
 
     #[tokio::test]
@@ -3282,6 +3366,37 @@ mod tests {
         posts.truncate().await.expect("空にできる");
 
         // `sqlite_sequence` を消さないと 3 になる。
+        let id = posts
+            .insert_get_id(&[("title", Value::Text("やり直し".into()))])
+            .await
+            .expect("入る");
+        assert_eq!(id, 1, "truncate の後は 1 から");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn データベース名付きの表でもtruncateの後は採番が1から始まる() {
+        let tx = live().await;
+        let posts = tx.table("main.posts");
+        for title in ["1本目", "2本目"] {
+            posts
+                .insert_get_id(&[("title", Value::Text(title.into()))])
+                .await
+                .expect("入る");
+        }
+
+        posts.truncate().await.expect("空にできる");
+
+        // 米印の集計は、問い合わせる前に断る（以前は SQL エラーだった）。
+        let message = posts
+            .sum::<i64>("*")
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("count() だけ"), "{message}");
+        assert_eq!(posts.count().await.expect("数えられる"), 0);
+
+        // 以前は `name = 'main.posts'` で探して当たらず、3 になっていた。
         let id = posts
             .insert_get_id(&[("title", Value::Text("やり直し".into()))])
             .await

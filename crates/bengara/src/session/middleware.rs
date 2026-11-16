@@ -287,7 +287,8 @@ async fn serve(
     // 2. 置き場所から中身を読む。
     //
     // ルートに当たったときは、**同じ読みで期限も延ばします**
-    // （`read_and_touch`。残りが半分を切ったときだけ書く）。
+    // （`read_and_touch`。最後に書いてから `min(60 秒, 期限の 1/10)` が
+    // 過ぎたときだけ書く）。
     // `expires_at` は「最後に書いたとき」から数えるので、延ばさないと GET の
     // 画面を見て回っていた人が、ログインや POST から `SESSION_LIFETIME` で
     // 突然ログアウトされます。終わりに `touch` を別に呼んでいたころは、
@@ -330,6 +331,9 @@ async fn serve(
     let session = session.with_store(store.clone());
 
     let id_before = session.id();
+    // 読めた時点でログインしていたか。ID を作り直したとき、古い ID を消せなければ
+    // 500 にするかどうかの判定に使います（[`save_session`] を参照）。
+    let authenticated_before = loaded && session.get(crate::auth::AUTH_ID_KEY).is_some();
     req.set_session(session.clone());
 
     // 3. ハンドラへ。
@@ -396,6 +400,9 @@ async fn serve(
         let flushed = session.was_flushed() && data.is_empty();
         // 作り直す前の ID。切られたときも、保存したときも残しません。
         let old = id_changed.then(|| id_before.clone());
+        // 古い ID が**必ず消えていなければならない**か。ログインしていたもの・
+        // ログアウトで捨てたものが残ると、盗まれた Cookie がそのまま使えます。
+        let old_must_go = authenticated_before || session.was_flushed();
 
         // 4.1. ルートに当たらなかったリクエストが書き換えたとき。
         //
@@ -414,17 +421,12 @@ async fn serve(
         let store = store.clone();
         let id = id_after.clone();
         let before = id_before.clone();
-        let outcome = tokio::task::spawn_blocking(move || match merge {
-            Some(base) => save_merged(
-                &*store,
-                &before,
-                &base,
-                &id,
-                &data,
-                revoke_check,
-                old.as_deref(),
-            ),
-            None => save_session(&*store, &id, &data, revoke_check, flushed, old.as_deref()),
+        let outcome = tokio::task::spawn_blocking(move || {
+            let old = old.as_deref().map(|id| OldId::new(id, old_must_go));
+            match merge {
+                Some(base) => save_merged(&*store, &before, &base, &id, &data, revoke_check, old),
+                None => save_session(&*store, &id, &data, revoke_check, flushed, old),
+            }
         })
         .await
         .map_err(|_| Error::msg("セッションの保存が中断されました"))??;
@@ -522,13 +524,30 @@ fn save_merged(
     id: &str,
     ours: &BTreeMap<String, String>,
     revoke_check: Option<(String, i64)>,
-    old: Option<&str>,
+    old: Option<OldId<'_>>,
 ) -> Result<SaveOutcome> {
     let Some(fresh) = store.read(id_before)? else {
         return Ok(SaveOutcome::Gone);
     };
     let merged = merge_changes(base, ours, fresh);
     save_session(store, id, &merged, revoke_check, false, old)
+}
+
+/// ID を作り直したときの、**作り直す前の** ID。
+#[derive(Debug, Clone, Copy)]
+struct OldId<'a> {
+    id: &'a str,
+    /// 消せなければエラー（500）にするか。
+    ///
+    /// 古いセッションがログインしていたとき・中身を捨てたとき（ログアウト）に真です。
+    /// 残ると、盗まれた Cookie がそのまま使えます。
+    must_go: bool,
+}
+
+impl<'a> OldId<'a> {
+    fn new(id: &'a str, must_go: bool) -> Self {
+        Self { id, must_go }
+    }
 }
 
 /// `base` から `ours` への変更（入れた・変えた・消した鍵）を `fresh` に当てる。
@@ -566,18 +585,27 @@ fn merge_changes(
 /// `old` は ID を作り直したときの**作り直す前の** ID です。切られたときも
 /// 保存したときも残しません。残すと、切ったはずのセッションが古い ID で
 /// 生き残ります。「切った印」の判定にも使います（下のコメントを参照）。
+///
+/// `old.must_go` が真なら、古い ID を**消せなければエラー（500）**にします
+/// （[`OldId`] を参照）。
 fn save_session(
     store: &dyn SessionStore,
     id: &str,
     data: &BTreeMap<String, String>,
     revoke_check: Option<(String, i64)>,
     flushed: bool,
-    old: Option<&str>,
+    old: Option<OldId<'_>>,
 ) -> Result<SaveOutcome> {
     if let Some(old) = old {
-        // 消せなくても応答は返す（新しいほうは正しく保存できている）。
-        // 古い ID の Cookie はもう誰も持っていないので、致命的ではない。
-        if let Err(e) = store.destroy(old) {
+        if let Err(e) = store.destroy(old.id) {
+            // ログインしていた古い ID・ログアウトで捨てた古い ID は、**消せなければ 500**。
+            // 握り潰すと、ログアウトが 200 を返しながらログイン中のファイルが残り、
+            // 盗まれた Cookie が期限まで使えてしまいます。新しい ID は保存しません。
+            if old.must_go {
+                return Err(e);
+            }
+            // それ以外（ログイン前の ID を作り直しただけ）は致命的ではない。
+            // 新しいほうを保存して応答を返す。
             tracing::error!("作り直す前のセッションを消せませんでした: {e}");
         }
     }
@@ -598,7 +626,7 @@ fn save_session(
                 .revoked_at(&user, target)
                 .is_some_and(|at| at > logged_in_at)
         };
-        if revoked(id) && old.is_none_or(revoked) {
+        if revoked(id) && old.is_none_or(|old| revoked(old.id)) {
             store.destroy(id)?;
             return Ok(SaveOutcome::Revoked);
         }
@@ -916,9 +944,22 @@ impl Middleware for VerifyCsrfToken {
             if no_route {
                 return next.run(req).await;
             }
-            // 読むだけの操作は確かめない。トークンだけ用意しておく。
+            // 読むだけの操作と、外したルートは確かめない。
+            //
+            // トークンは**ここでは作りません**（要るときに作る）。作ると `put` で
+            // 保存が要る状態になり、Cookie 無しの GET（ロードバランサーが数秒ごとに
+            // 叩く `/up` など）のたびにセッションのファイルが 1 つ増えます。
+            //
+            // - 置き場所から読めたセッションの読むだけの操作では、ここで用意しておく
+            //   （ID の作り直しで消えたトークンを、次の画面で付け直すため）。
+            //   すでにあれば何も書かないので、保存は増えません。
+            // - 新しく作ったセッションでは作らない。フォームや SPA が
+            //   `req.csrf_token()` を呼んだときに、その場で作って保存します。
+            // - 外したルートでは作らない（確かめないので要らない）。
             if safe || excepted {
-                ensure_token(session);
+                if safe && !excepted && session.was_loaded() {
+                    ensure_token(session);
+                }
                 return next.run(req).await;
             }
 
@@ -940,6 +981,9 @@ impl Middleware for VerifyCsrfToken {
 }
 
 /// セッションにトークンが無ければ作る。
+///
+/// 作ったときは保存が要る状態になります（新しいセッションならファイルが 1 つできる）。
+/// 呼ぶのは `req.csrf_token()` と、置き場所から読めたセッションの GET だけです。
 pub(crate) fn ensure_token(session: &Session) -> String {
     if let Some(token) = session.get(CSRF_KEY) {
         if !token.is_empty() {
@@ -954,18 +998,23 @@ pub(crate) fn ensure_token(session: &Session) -> String {
 
 /// リクエストからトークンを探す。
 ///
-/// 探す順は、`X-CSRF-TOKEN` ヘッダー → フォームの `_token` です。
+/// 探す順は、`X-CSRF-TOKEN` ヘッダー → 本文の `_token`（フォーム、または JSON の
+/// 最上位）です。
 ///
 /// `_token` を先に見ると、ヘッダーで送ってくる SPA の JSON 本文（最大 2 MiB）を
 /// トークンを探すためだけに毎回解析することになります。ハンドラの `req.json()` と
 /// 二重になるので、ヘッダーが無いときだけ本文を見ます。
+///
+/// **クエリ文字列の `_token` は見ません**（Laravel は見ます。わざと変えています）。
+/// URL に載ったトークンは、アクセスログ・ブラウザの履歴・`Referer` ヘッダーから
+/// 外に漏れます。
 fn token_from_request(req: &Request) -> String {
     if let Some(token) = req.header("x-csrf-token") {
         if !token.is_empty() {
             return token.to_string();
         }
     }
-    req.input("_token").unwrap_or_default()
+    req.body_input("_token").unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1043,6 +1092,41 @@ mod tests {
 
         // どちらも無ければ空。
         assert_eq!(token_from_request(&Request::new("post", "/")), "");
+
+        // JSON の最上位の `_token` も読む。
+        let req = Request::new("post", "/")
+            .with_headers(vec![("content-type".into(), "application/json".into())])
+            .with_body(b"{\"_token\":\"from-json\"}".to_vec());
+        assert_eq!(token_from_request(&req), "from-json");
+    }
+
+    #[test]
+    fn クエリ文字列のトークンは読まない() {
+        // URL に載ったトークンは、ログ・履歴・Referer から漏れる。
+        let req = Request::new("post", "/").with_query("_token=from-query");
+        assert_eq!(token_from_request(&req), "");
+
+        // 本文に無ければ、同じ名前のクエリがあっても空。
+        let req = Request::new("post", "/")
+            .with_query("_token=from-query")
+            .with_headers(vec![(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )])
+            .with_body(b"name=x".to_vec());
+        assert_eq!(token_from_request(&req), "");
+        // `input` からは今までどおりクエリも読める。
+        assert_eq!(req.input("_token").as_deref(), Some("from-query"));
+
+        // 両方にあれば本文のほう。
+        let req = Request::new("post", "/")
+            .with_query("_token=from-query")
+            .with_headers(vec![(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )])
+            .with_body(b"_token=from-form".to_vec());
+        assert_eq!(token_from_request(&req), "from-form");
     }
 
     #[test]
@@ -1377,7 +1461,7 @@ mod tests {
             &data,
             Some(("7".into(), 1_000)),
             false,
-            Some("old"),
+            Some(OldId::new("old", true)),
         )
         .unwrap();
         assert_eq!(outcome, SaveOutcome::Revoked);
@@ -1403,7 +1487,7 @@ mod tests {
             &data,
             Some(("7".into(), 1_000)),
             false,
-            Some("old"),
+            Some(OldId::new("old", true)),
         )
         .unwrap();
         assert_eq!(outcome, SaveOutcome::Done, "自分のセッションは残す");
@@ -1443,10 +1527,110 @@ mod tests {
         let data = logged_in(1_000);
         store.write("old", &data).unwrap();
 
-        let outcome = save_session(&store, "new", &data, None, false, Some("old")).unwrap();
+        let outcome = save_session(
+            &store,
+            "new",
+            &data,
+            None,
+            false,
+            Some(OldId::new("old", false)),
+        )
+        .unwrap();
         assert_eq!(outcome, SaveOutcome::Done);
         assert!(store.read("new").unwrap().is_some());
         assert!(store.read("old").unwrap().is_none());
+    }
+
+    /// `old` という ID だけ消せない置き場所。
+    struct CannotDestroyOld(crate::session::MemoryStore);
+
+    impl SessionStore for CannotDestroyOld {
+        fn read(&self, id: &str) -> Result<Option<BTreeMap<String, String>>> {
+            self.0.read(id)
+        }
+        fn write(&self, id: &str, data: &BTreeMap<String, String>) -> Result<()> {
+            self.0.write(id, data)
+        }
+        fn destroy(&self, id: &str) -> Result<()> {
+            if id == "old" {
+                return Err(Error::msg("消せません"));
+            }
+            self.0.destroy(id)
+        }
+    }
+
+    #[test]
+    fn ログインしていた古いidを消せなければエラーにする() {
+        // 以前は握り潰していた。ログアウトが 200 を返しながら、ログイン中の
+        // ファイルが残り、盗まれた Cookie が使い続けられた。
+        let store = CannotDestroyOld(crate::session::MemoryStore::new(60));
+        store.write("old", &logged_in(1_000)).unwrap();
+
+        // ログアウト（中身を捨てて ID を作り直す）。
+        let result = save_session(
+            &store,
+            "new",
+            &BTreeMap::new(),
+            None,
+            true,
+            Some(OldId::new("old", true)),
+        );
+        assert!(result.is_err(), "500 にする");
+
+        // ログイン中の ID を作り直して保存するとき。新しいほうも書かない。
+        let result = save_session(
+            &store,
+            "new",
+            &logged_in(1_000),
+            None,
+            false,
+            Some(OldId::new("old", true)),
+        );
+        assert!(result.is_err());
+        assert!(store.read("new").unwrap().is_none(), "新しい ID は書かない");
+    }
+
+    #[test]
+    fn ログイン前の古いidを消せなくても保存する() {
+        // ログインの直後の `regenerate()`。古い ID はログインしていないので、
+        // 残っても害は無い。ログだけ出して、新しいほうを保存する。
+        let store = CannotDestroyOld(crate::session::MemoryStore::new(60));
+        store.write("old", &BTreeMap::new()).unwrap();
+
+        let outcome = save_session(
+            &store,
+            "new",
+            &logged_in(1_000),
+            None,
+            false,
+            Some(OldId::new("old", false)),
+        )
+        .unwrap();
+        assert_eq!(outcome, SaveOutcome::Done);
+        assert!(store.read("new").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn ログアウトで古いidを消せなければ500になる() {
+        let store = Arc::new(CannotDestroyOld(crate::session::MemoryStore::new(60)));
+        store.write("old", &logged_in(1_000)).unwrap();
+
+        let mut req = Request::new("POST", "/logout").with_headers(vec![(
+            "cookie".to_string(),
+            format!("bengara_session={}", sign("old", TEST_KEY)),
+        )]);
+        req.mark_matched();
+        let next = Next::new(
+            Arc::from(Vec::new()),
+            handler(|req: Request| async move {
+                req.auth().logout()?;
+                Ok(Response::text("ok"))
+            }),
+            crate::http::response::RenderOptions::new(false, false),
+        );
+        let result = serve(store.clone(), SessionConfig::default(), TEST_KEY, req, next).await;
+        assert!(result.is_err(), "200 を返さない");
+        assert!(store.read("old").unwrap().is_some());
     }
 
     #[tokio::test]
@@ -2022,5 +2206,195 @@ mod tests {
         assert!(!session.should_save(), "触る前は保存が要らない");
         ensure_token(&session);
         assert!(session.should_save(), "トークンを入れると保存が要る");
+    }
+
+    /// 1 リクエストを `StartSession` → `VerifyCsrfToken` → ハンドラの順に通す。
+    ///
+    /// ルートには当たったことにします。`token` は `X-CSRF-TOKEN` ヘッダーで送ります。
+    async fn send_csrf(
+        store: &Arc<Counting>,
+        csrf: VerifyCsrfToken,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        token: Option<&str>,
+        handler: Arc<dyn ErasedHandler>,
+    ) -> Result<Response> {
+        let mut headers = Vec::new();
+        if let Some(cookie) = cookie {
+            headers.push(("cookie".to_string(), format!("bengara_session={cookie}")));
+        }
+        if let Some(token) = token {
+            headers.push(("x-csrf-token".to_string(), token.to_string()));
+        }
+        let mut req = Request::new(method, path).with_headers(headers);
+        req.mark_matched();
+        let stack: Arc<[Arc<dyn Middleware>]> =
+            Arc::from(vec![Arc::new(csrf) as Arc<dyn Middleware>]);
+        let next = Next::new(
+            stack,
+            handler,
+            crate::http::response::RenderOptions::new(false, false),
+        );
+        serve(store.clone(), SessionConfig::default(), TEST_KEY, req, next).await
+    }
+
+    #[tokio::test]
+    async fn cookie無しのgetではセッションを作らない() {
+        // ロードバランサーが数秒ごとに叩く `/up` のようなルート。
+        // 以前は 1 回ごとにセッションのファイルが 1 つ増えていた。
+        let store = Counting::new();
+        for _ in 0..3 {
+            let res = send_csrf(
+                &store,
+                VerifyCsrfToken::new(),
+                "GET",
+                "/up",
+                None,
+                None,
+                idle(),
+            )
+            .await
+            .unwrap();
+            assert!(res.header("set-cookie").is_none(), "Cookie を配らない");
+        }
+        assert_eq!(store.counts(), (0, 0, 0, 0), "置き場所に書かない");
+    }
+
+    #[tokio::test]
+    async fn 外したルートではトークンを作らない() {
+        let store = Counting::new();
+        let res = send_csrf(
+            &store,
+            VerifyCsrfToken::new().except("/webhook"),
+            "POST",
+            "/webhook",
+            None,
+            None,
+            idle(),
+        )
+        .await
+        .unwrap();
+        assert!(res.header("set-cookie").is_none());
+        assert_eq!(store.counts().3, 0, "書かない");
+
+        // 読めたセッションでも、外したルートでは足さない。
+        store.seed("csrf-except", &[("cart", "1")]);
+        let cookie = sign("csrf-except", TEST_KEY);
+        send_csrf(
+            &store,
+            VerifyCsrfToken::new().except("/webhook"),
+            "GET",
+            "/webhook",
+            Some(&cookie),
+            None,
+            idle(),
+        )
+        .await
+        .unwrap();
+        assert!(!store.peek("csrf-except").unwrap().contains_key(CSRF_KEY));
+    }
+
+    #[tokio::test]
+    async fn トークンは求められたときに作って保存する() {
+        // SPA の `GET /csrf-token` やフォームの画面は `req.csrf_token()` を呼ぶ。
+        // Cookie 無しでも、そこで作って保存し、Cookie を返す。
+        let store = Counting::new();
+        let res = send_csrf(
+            &store,
+            VerifyCsrfToken::new(),
+            "GET",
+            "/csrf-token",
+            None,
+            None,
+            handler(|req: Request| async move { Ok(Response::text(req.csrf_token())) }),
+        )
+        .await
+        .unwrap();
+        let token = res.body_text();
+        assert_eq!(token.len(), 64);
+        let cookie = cookie_of(&res).expect("作ったセッションの Cookie");
+
+        // そのトークンで POST が通る。
+        let res = send_csrf(
+            &store,
+            VerifyCsrfToken::new(),
+            "POST",
+            "/posts",
+            Some(&cookie),
+            Some(&token),
+            idle(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.body_text(), "ok");
+
+        // 確かめる経路は変わらない。違うトークン・無いトークンは 419。
+        for given in [Some("ちがう"), None] {
+            let res = send_csrf(
+                &store,
+                VerifyCsrfToken::new(),
+                "POST",
+                "/posts",
+                Some(&cookie),
+                given,
+                idle(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(res.status(), 419);
+        }
+
+        // Cookie 無しの POST も 419。セッションのファイルは作らない。
+        let before = store.counts().3;
+        let res = send_csrf(
+            &store,
+            VerifyCsrfToken::new(),
+            "POST",
+            "/posts",
+            None,
+            Some(&token),
+            idle(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), 419);
+        assert_eq!(store.counts().3, before);
+    }
+
+    #[tokio::test]
+    async fn 読めたセッションのgetではトークンを付け直す() {
+        // ID を作り直す（ログイン）とトークンは消える。次の GET の画面で付け直す。
+        let store = Counting::new();
+        store.seed("csrf-reload", &[("cart", "1")]);
+        let cookie = sign("csrf-reload", TEST_KEY);
+        send_csrf(
+            &store,
+            VerifyCsrfToken::new(),
+            "GET",
+            "/",
+            Some(&cookie),
+            None,
+            idle(),
+        )
+        .await
+        .unwrap();
+        let token = store.peek("csrf-reload").unwrap().get(CSRF_KEY).cloned();
+        assert_eq!(token.map(|t| t.len()), Some(64), "付け直して保存する");
+
+        // すでにあれば書かない。
+        let writes = store.counts().3;
+        send_csrf(
+            &store,
+            VerifyCsrfToken::new(),
+            "GET",
+            "/",
+            Some(&cookie),
+            None,
+            idle(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.counts().3, writes, "保存は増えない");
     }
 }

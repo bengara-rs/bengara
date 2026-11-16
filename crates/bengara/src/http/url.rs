@@ -66,6 +66,11 @@ pub fn route_url_with(name: &str, params: &[(&str, &str)]) -> Result<String> {
 /// ```ignore
 /// let link = signed_url("/unsubscribe", &[("user", "12")])?;
 /// ```
+///
+/// 渡すのは **`/` で始まるパス**です。`https://example.com/unsubscribe` のような
+/// 絶対 URL は**エラーにします。** 確かめる側は `APP_URL` と届いたパスから
+/// URL を組み直すので、絶対 URL で作った署名は決して合わないためです。
+/// 空文字は `/` として扱います。
 pub fn signed_url(path: &str, params: &[(&str, &str)]) -> Result<String> {
     build_signed(path, params, None)
 }
@@ -97,6 +102,16 @@ fn build_signed_with(
     // 空の path はルートとして扱う。ブラウザが開くと `req.path()` は `/` になるので、
     // ここで `/` にそろえないと末尾の 1 文字差で必ず署名が合わなくなる。
     let path = if path.is_empty() { "/" } else { path };
+    // 絶対 URL（`https://...`）と `//` で始まるもの（ほかのホスト）は断る。
+    // 確かめる側は `APP_URL` + 届いたパスで組み直すので、こうしたリンクは必ず 403 になる。
+    // `/` の無い相対パス（`unsubscribe`）は、`url()` が頭に `/` を足すので今までどおり通す。
+    if path.contains("://") || path.starts_with("//") {
+        return Err(Error::msg(format!(
+            "署名付き URL にはパスを渡してください（`{}` は使えません）。\
+             確かめる側は APP_URL と届いたパスから URL を組み直すので、絶対 URL の署名は合いません",
+            path.chars().take(64).collect::<String>()
+        )));
+    }
     // 末尾の `/` は、照合する側（`verify_signature`）と同じ規則で落とす。
     let path = super::routing::match_path(path);
     check_signable_path(path)?;
@@ -392,6 +407,31 @@ mod tests {
         assert!(!verify_signature(KEY, "/x", &[], &given));
         // 短すぎるものも同じ。
         assert!(!verify_signature(KEY, "/x", &[], &["ab".to_string()]));
+    }
+
+    #[test]
+    fn 絶対urlは作る時点で断る() {
+        // 確かめる側は APP_URL + 届いたパスで組み直すので、絶対 URL の署名は必ず合わない。
+        for bad in [
+            "https://example.com/unsubscribe",
+            "HTTPS://example.com/unsubscribe",
+            "http://localhost:8000",
+            "//example.com/unsubscribe",
+        ] {
+            let error = build_signed_with(KEY, bad, &[], None).unwrap_err();
+            assert!(
+                error.to_string().contains("パスを渡してください"),
+                "{bad} は断るはず: {error}"
+            );
+        }
+        // `/` で始まるパスと空文字（`/` として扱う）は今までどおり。
+        assert!(build_signed_with(KEY, "/unsubscribe", &[], None).is_ok());
+        assert!(build_signed_with(KEY, "", &[], None).is_ok());
+        // `/` の無い相対パスも今までどおり。`/` 付きと同じ署名になる。
+        assert_eq!(
+            build_signed_with(KEY, "unsubscribe", &[("user", "1")], None).unwrap(),
+            build_signed_with(KEY, "/unsubscribe", &[("user", "1")], None).unwrap()
+        );
     }
 
     #[test]

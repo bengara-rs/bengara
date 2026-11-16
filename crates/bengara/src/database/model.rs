@@ -243,23 +243,11 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
     let query = QueryBuilder::new(source, T::TABLE);
     if creating {
         let id = query.insert_get_id_as(&attributes, T::PRIMARY_KEY).await?;
+        // 採番が返らなかった（MySQL の `auto_increment` の無い表）ときは、
+        // `insert_get_id_as` が「行は入っています」と案内するエラーを返します。
         model.set_key(Value::Int(id));
         if model.is_new() {
             // 主キーが空のままなので、もう一度 `save()` すると2行目が入ります。
-            // 止める理由は同じですが、**原因は2つあって文を分けます。**
-            if id == 0 {
-                // 採番そのものが返っていない。MySQL は `auto_increment` を持たない表で
-                // `last_insert_id()` が 0 を返します。行はもう入っているので、
-                // 「入れられなかった」と言うと実態と食い違います。
-                return Err(Error::msg(format!(
-                    "{}.{} に採番された値が返りませんでした（行は入っています）。\
-                     主キーが自動採番か確かめてください。主キーを自分で決める表の行は、\
-                     `DB::table(..).insert(..)` で入れてください。`save()` で新しく\
-                     入れられるのは、自動採番の主キーの行だけです",
-                    T::TABLE,
-                    T::PRIMARY_KEY
-                )));
-            }
             // `set_key` が値を入れられなかった（主キーの型に収まらない）。
             // `u8` を主キーにして 256 行目を入れると、以前はそこで静かに重複していました。
             return Err(Error::msg(format!(
@@ -490,52 +478,161 @@ impl<T: Model> ModelQuery<T> {
 
     /// 列が値と等しい。値が `NULL`（`None`）のときは `is null` になります。
     ///
-    /// **整数の主キーの列に、整数として読めない文字列を渡すと、必ず 0 件になります**
-    /// （`1 = 0` を置きます）。`req.model::<Post>("post")` や
-    /// `req.auth().user::<User>()` は、外から来た文字列をここへ渡します。
-    /// そのまま比べると、PostgreSQL だけ `bigint = text` の SQL エラー（500）に
-    /// なるためです（[`Model::INTEGER_KEY`]）。
+    /// **整数の主キーの列には、値を主キーの型に合わせて渡します**（[`Model::key_value`]）。
+    ///
+    /// | 渡した値                       | 置く条件                       |
+    /// |--------------------------------|--------------------------------|
+    /// | 整数に読める文字列（`"12"`）   | 整数として比べる（`id = 12`）  |
+    /// | 整数として読めない文字列       | 必ず 0 件（`1 = 0`）           |
+    ///
+    /// `req.model::<Post>("post")` や `req.auth().user::<User>()` は、外から来た
+    /// 文字列をここへ渡します。文字列のまま比べると、PostgreSQL だけ
+    /// `bigint = text` の SQL エラー（500）になるためです（[`Model::INTEGER_KEY`]）。
+    /// 主キー以外の列は、渡した値のまま比べます。
     pub fn where_(self, column: &str, value: impl IntoValue) -> Self {
-        let value = value.into_value();
-        if T::INTEGER_KEY
-            && is_primary_key::<T>(column)
-            && never_matches_integer_key(&value, self.inner.driver())
-        {
-            // 空の一覧との `where_in` は `1 = 0` になる。列名の検査もそのまま通る。
-            let nothing: [i64; 0] = [];
-            return self.map(|q| q.where_in(column, &nothing));
+        match self.key_condition(column, value.into_value()) {
+            Some(value) => self.map(|q| q.where_(column, value)),
+            None => self.nothing(column, false),
         }
-        self.map(|q| q.where_(column, value))
     }
 
     /// 列と値を演算子で比べる。
+    ///
+    /// 整数の主キーの列を `=` `!=` `<>` `<` `<=` `>` `>=` で比べるときは、
+    /// [`where_`](Self::where_) と同じく値を直します。整数として読めない文字列は、
+    /// `!=` `<>` なら必ず当たる条件（`1 = 1`）、それ以外なら必ず 0 件（`1 = 0`）です。
     pub fn where_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.map(|q| q.where_op(column, operator, value))
+        self.compare(false, column, operator, value.into_value())
     }
 
-    /// `or` でつないで、列が値と等しい。
+    /// `or` でつないで、列が値と等しい。整数の主キーの扱いは [`where_`](Self::where_) と同じです。
     pub fn or_where(self, column: &str, value: impl IntoValue) -> Self {
-        self.map(|q| q.or_where(column, value))
+        match self.key_condition(column, value.into_value()) {
+            Some(value) => self.map(|q| q.or_where(column, value)),
+            None => self.nothing(column, true),
+        }
     }
 
-    /// `or` でつないで、列と値を演算子で比べる。
+    /// `or` でつないで、列と値を演算子で比べる。整数の主キーの扱いは
+    /// [`where_op`](Self::where_op) と同じです。
     pub fn or_where_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.map(|q| q.or_where_op(column, operator, value))
+        self.compare(true, column, operator, value.into_value())
     }
 
     /// 列が一覧のどれかと等しい。
+    ///
+    /// 整数の主キーの列では、一覧の値を1つずつ直します。整数として読めない文字列は
+    /// 当たる行が無いので外します。全部外れたときは必ず 0 件（`1 = 0`）です。
     pub fn where_in<V: IntoValue + Clone>(self, column: &str, values: &[V]) -> Self {
-        self.map(|q| q.where_in(column, values))
+        match self.key_list(column, values) {
+            Some(values) => self.map(|q| q.where_in(column, &values)),
+            None => self.map(|q| q.where_in(column, values)),
+        }
     }
 
     /// 列が一覧のどれとも等しくない。
+    ///
+    /// 整数の主キーの列では、一覧の値を1つずつ直します。整数として読めない文字列は
+    /// どの行とも等しくないので外します。全部外れたときは必ず当たる条件（`1 = 1`）です。
     pub fn where_not_in<V: IntoValue + Clone>(self, column: &str, values: &[V]) -> Self {
-        self.map(|q| q.where_not_in(column, values))
+        match self.key_list(column, values) {
+            Some(values) => self.map(|q| q.where_not_in(column, &values)),
+            None => self.map(|q| q.where_not_in(column, values)),
+        }
     }
 
-    /// `or` でつないで、列が一覧のどれかと等しい。
+    /// `or` でつないで、列が一覧のどれかと等しい。整数の主キーの扱いは
+    /// [`where_in`](Self::where_in) と同じです。
     pub fn or_where_in<V: IntoValue + Clone>(self, column: &str, values: &[V]) -> Self {
-        self.map(|q| q.or_where_in(column, values))
+        match self.key_list(column, values) {
+            Some(values) => self.map(|q| q.or_where_in(column, &values)),
+            None => self.map(|q| q.or_where_in(column, values)),
+        }
+    }
+
+    /// 主キーの列に渡す値を、主キーの型に合わせて直す。
+    /// **当たる行が無いと分かっている値のときは `None`。**
+    ///
+    /// 整数の主キーでない列と、`INTEGER_KEY` が偽のモデルは、そのまま返します。
+    /// `NULL` もそのまま返します（`is null` への読み替えは `QueryBuilder` がします）。
+    /// 直し方は `find` と同じです（`lookup_key`）。
+    fn key_condition(&self, column: &str, value: Value) -> Option<Value> {
+        if !(T::INTEGER_KEY && is_primary_key::<T>(column)) {
+            return Some(value);
+        }
+        let value = T::key_value(value);
+        if never_matches_integer_key(&value, self.inner.driver()) {
+            return None;
+        }
+        Some(value)
+    }
+
+    /// 一覧と比べるときの `key_condition`。
+    ///
+    /// 直す必要が無い列では `None`（渡された一覧をそのまま使う）。
+    /// 主キーの列では、直した値の一覧を返します。当たらない値は外します。
+    fn key_list<V: IntoValue + Clone>(&self, column: &str, values: &[V]) -> Option<Vec<Value>> {
+        if !(T::INTEGER_KEY && is_primary_key::<T>(column)) {
+            return None;
+        }
+        Some(
+            values
+                .iter()
+                .cloned()
+                .filter_map(|value| self.key_condition(column, value.into_value()))
+                .collect(),
+        )
+    }
+
+    /// `where_op` と `or_where_op` の中身。
+    fn compare(self, or: bool, column: &str, operator: &str, value: Value) -> Self {
+        // 値を直すのは、整数どうしで比べられる演算子だけ。`like` などはそのまま渡す。
+        let operator_trimmed = operator.trim();
+        let comparable = matches!(
+            operator_trimmed,
+            "=" | "!=" | "<>" | "<" | "<=" | ">" | ">="
+        );
+        let value = if comparable {
+            match self.key_condition(column, value) {
+                Some(value) => value,
+                // 整数として読めない文字列とは、どの行も等しくない。
+                None if matches!(operator_trimmed, "!=" | "<>") => {
+                    return self.everything(column, or);
+                }
+                None => return self.nothing(column, or),
+            }
+        } else {
+            value
+        };
+        if or {
+            self.map(|q| q.or_where_op(column, operator, value))
+        } else {
+            self.map(|q| q.where_op(column, operator, value))
+        }
+    }
+
+    /// 必ず 0 件になる条件（`1 = 0`）を置く。
+    ///
+    /// 空の一覧との `where_in` がこの形になる。列名の検査もそのまま通る。
+    fn nothing(self, column: &str, or: bool) -> Self {
+        let nothing: [i64; 0] = [];
+        if or {
+            self.map(|q| q.or_where_in(column, &nothing))
+        } else {
+            self.map(|q| q.where_in(column, &nothing))
+        }
+    }
+
+    /// 必ず当たる条件（`1 = 1`）を置く。
+    fn everything(self, column: &str, or: bool) -> Self {
+        if or {
+            // 列は主キーと分かっているので、検査は要らない。
+            self.map(|q| q.or_where_raw("1 = 1", &[]))
+        } else {
+            // 空の一覧との `where_not_in` がこの形になる。
+            let nothing: [i64; 0] = [];
+            self.map(|q| q.where_not_in(column, &nothing))
+        }
     }
 
     /// 列が `NULL`。
@@ -882,12 +979,12 @@ mod tests {
         }
     }
 
-    /// 決まった結果だけを返す接続。件数と採番された ID を自由に決められます。
-    struct Fixed(Affected);
+    /// 決まった結果だけを返す接続。件数と採番された ID とドライバを自由に決められます。
+    struct Fixed(Affected, Driver);
 
     impl Backend for Fixed {
         fn driver(&self) -> Driver {
-            Driver::Sqlite
+            self.1
         }
 
         fn fetch_all<'a>(&'a self, _sql: &'a str, _b: &'a [Value]) -> DbFuture<'a, Vec<Row>> {
@@ -932,7 +1029,12 @@ mod tests {
 
     /// 決まった結果を返す接続から、トランザクションを始める。
     async fn fixed(affected: Affected) -> Transaction {
-        let backend: Arc<dyn Backend> = Arc::new(Fixed(affected));
+        fixed_on(Driver::Sqlite, affected).await
+    }
+
+    /// ドライバを決めて、決まった結果を返す接続からトランザクションを始める。
+    async fn fixed_on(driver: Driver, affected: Affected) -> Transaction {
+        let backend: Arc<dyn Backend> = Arc::new(Fixed(affected, driver));
         Transaction::start(backend)
             .await
             .expect("トランザクションが始まる")
@@ -1190,10 +1292,14 @@ mod tests {
         assert_eq!(sql, "select * from \"posts\" where 1 = 0");
         assert!(bindings.is_empty());
 
-        // 整数に読める値と、主キー以外の列は、これまでどおり。
+        // 整数に読める値は整数で束縛する。以前は文字列のままで、
+        // PostgreSQL では `bigint = text` の SQL エラー（500）になっていた。
         let (sql, bindings) = Post::query().where_("id", "12").to_sql();
         assert_eq!(sql, "select * from \"posts\" where \"id\" = ?");
-        assert_eq!(bindings, vec![Value::Text("12".into())]);
+        assert_eq!(bindings, vec![Value::Int(12)]);
+        let (_, bindings) = Post::query().where_("posts.id", " 12 ").to_sql();
+        assert_eq!(bindings, vec![Value::Int(12)]);
+        // 主キー以外の列は、これまでどおり渡した値のまま。
         let (sql, _) = Post::query().where_("title", "abc").to_sql();
         assert_eq!(sql, "select * from \"posts\" where \"title\" = ?");
         let (sql, _) = Post::query().where_("comments.id", "abc").to_sql();
@@ -1208,6 +1314,150 @@ mod tests {
         assert!(is_primary_key::<Post>(" id "));
         assert!(!is_primary_key::<Post>("posts.title"));
         assert!(!is_primary_key::<Post>("postsid"));
+    }
+
+    #[test]
+    fn 主キーを取るほかの条件も値を直す() {
+        // or_where も where_ と同じ。
+        let (sql, bindings) = Post::query()
+            .where_("title", "x")
+            .or_where("id", "12")
+            .or_where("id", "abc")
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"title\" = ? or \"id\" = ? or 1 = 0"
+        );
+        assert_eq!(bindings, vec![Value::Text("x".into()), Value::Int(12)]);
+
+        // 比べる演算子では直す。読めない文字列は `!=` だけ必ず当たる。
+        let (sql, bindings) = Post::query()
+            .where_op("id", ">", "5")
+            .where_op("id", "=", "abc")
+            .or_where_op("id", "<>", "abc")
+            .where_op("id", " != ", "abc")
+            .or_where_op("id", "<=", "abc")
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"id\" > ? and 1 = 0 or 1 = 1 and 1 = 1 or 1 = 0"
+        );
+        assert_eq!(bindings, vec![Value::Int(5)]);
+
+        // `like` などはそのまま渡す。演算子の検査も今までどおり効く。
+        let (_, bindings) = Post::query().where_op("id", "like", "1%").to_sql();
+        assert_eq!(bindings, vec![Value::Text("1%".into())]);
+        let text = format!("{:?}", Post::query().where_op("id", "in", "abc"));
+        assert!(text.contains("値1つとは比べられません"), "{text}");
+        // NULL は `is null` / `is not null` のまま。
+        let (sql, _) = Post::query().where_op("id", "!=", None::<i64>).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"id\" is not null");
+
+        // 一覧は1つずつ直し、読めない値は外す。
+        let (sql, bindings) = Post::query().where_in("id", &["1", "abc", " 3 "]).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where \"id\" in (?, ?)");
+        assert_eq!(bindings, vec![Value::Int(1), Value::Int(3)]);
+        let (sql, bindings) = Post::query().where_not_in("posts.id", &["2", "x"]).to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"posts\".\"id\" not in (?)"
+        );
+        assert_eq!(bindings, vec![Value::Int(2)]);
+
+        // 全部外れたら、空の一覧と同じ（`in` は 1 = 0、`not in` は 1 = 1）。
+        let (sql, bindings) = Post::query()
+            .where_in("id", &["abc"])
+            .where_not_in("id", &["x", "y"])
+            .or_where_in("id", &["z"])
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where 1 = 0 and 1 = 1 or 1 = 0"
+        );
+        assert!(bindings.is_empty());
+
+        // 主キー以外の列と、文字列の主キーは、渡した値のまま。
+        let (_, bindings) = Post::query().where_in("title", &["1", "abc"]).to_sql();
+        assert_eq!(
+            bindings,
+            vec![Value::Text("1".into()), Value::Text("abc".into())]
+        );
+        let (_, bindings) = Coded::query()
+            .where_in("code", &["12", "a1"])
+            .where_op("code", "=", "007")
+            .to_sql();
+        assert_eq!(
+            bindings,
+            vec![
+                Value::Text("12".into()),
+                Value::Text("a1".into()),
+                Value::Text("007".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mysqlではi64を超える主キーも条件に残す() {
+        // MySQL の `id()` は `bigint unsigned` なので、その値の行がありうる。
+        // find（never_matches_integer_key）と同じ扱いにそろえる。
+        let big = u64::MAX.to_string();
+        let tx = fixed_on(Driver::MySql, affected()).await;
+        let (sql, bindings) = Post::on(&tx)
+            .where_in("id", &[big.as_str(), "abc"])
+            .to_sql();
+        assert_eq!(sql, "select * from `posts` where `id` in (?)");
+        assert_eq!(bindings, vec![Value::Text(big.clone())]);
+        // SQLite と PostgreSQL では当たる行が無い。
+        let (sql, _) = Post::query().where_("id", big.as_str()).to_sql();
+        assert_eq!(sql, "select * from \"posts\" where 1 = 0");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 主キーの条件を文字列で渡しても実際に当たる() {
+        use super::super::{ConnectionConfig, Schema};
+
+        let backend = super::super::sqlite::connect(&ConnectionConfig::sqlite("test", ":memory:"))
+            .await
+            .expect("メモリ上の SQLite につながる");
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.create("posts", |t| {
+            t.id();
+            t.string("title");
+        });
+        for sql in schema.into_statements() {
+            backend.execute(&sql, &[]).await.expect("表が作れる");
+        }
+        let tx = Transaction::start(backend).await.expect("始められる");
+        for title in ["1本目", "2本目", "3本目"] {
+            tx.table("posts")
+                .insert(&[("title", Value::Text(title.into()))])
+                .await
+                .expect("入る");
+        }
+
+        let posts = Post::on(&tx)
+            .where_in("id", &["1", "abc", "3"])
+            .order_by("id")
+            .get()
+            .await
+            .expect("取れる");
+        let ids: Vec<i64> = posts.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+
+        let count = Post::on(&tx)
+            .where_("id", "2")
+            .or_where_op("id", "!=", "abc")
+            .count()
+            .await
+            .expect("数えられる");
+        assert_eq!(count, 3);
+        let count = Post::on(&tx)
+            .where_not_in("id", &["x"])
+            .count()
+            .await
+            .expect("数えられる");
+        assert_eq!(count, 3);
     }
 
     #[test]
@@ -1281,10 +1531,15 @@ mod tests {
         assert!(message.contains("DB::table(..).insert(..)"), "{message}");
 
         // 採番が返らない表（MySQL の `last_insert_id()` が 0）でも、同じ入れ方を案内する。
-        let tx = fixed(Affected {
-            rows: 1,
-            last_insert_id: Some(0),
-        })
+        // MySQL の接続は 0 を「番号なし」（`None`）にして返す。以前はここで
+        // 「insert が ID を返しませんでした」とだけ出ていた。
+        let tx = fixed_on(
+            Driver::MySql,
+            Affected {
+                rows: 1,
+                last_insert_id: None,
+            },
+        )
         .await;
         let mut post = Post {
             id: 0,
@@ -1295,10 +1550,8 @@ mod tests {
             .await
             .expect_err("断られる")
             .to_string();
-        assert!(
-            message.contains("採番された値が返りませんでした"),
-            "{message}"
-        );
+        assert!(message.contains("行は入っています"), "{message}");
+        assert!(message.contains("posts"), "{message}");
         assert!(message.contains("DB::table(..).insert(..)"), "{message}");
         // 以前の案内。その通りにすると「行が無い」で落ちるので、出さない。
         assert!(!message.contains("値を入れてから"), "{message}");

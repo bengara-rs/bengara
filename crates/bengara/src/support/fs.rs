@@ -36,6 +36,11 @@ pub(crate) enum Access {
     ///
     /// 元のファイルの権限を引き継ぐときに使います。中身を書いている間は
     /// [`Access::Private`] と同じなので、途中の中身を他の利用者に読まれません。
+    ///
+    /// **これだけはディスクまで書き切ります（`fsync`）。** 使うのは `.env`
+    /// （`key:generate`）だけです。書き切らないと、電源が落ちたときに
+    /// 置き換えだけが残り、中身が空の `.env` になることがありました。
+    /// セッションやキャッシュはリクエストごとに書くので、遅くなる `fsync` はしません。
     Keep(std::fs::Permissions),
 }
 
@@ -52,20 +57,66 @@ pub(crate) fn write_atomic(
     access: Access,
 ) -> std::io::Result<()> {
     let written = (|| {
+        let durable = matches!(access, Access::Keep(_));
         match access {
             Access::Default => std::fs::write(temp, body)?,
             Access::Private => write_private(temp, body)?,
             Access::Keep(permissions) => {
                 write_private(temp, body)?;
+                // 中身をディスクまで書き切ってから置き換える。順が逆だと、
+                // 置き換えだけが先に残って空のファイルになることがある。
+                // 権限を付け直す前に行う（読み取りだけの権限だと開き直せない）。
+                sync_file(temp)?;
                 std::fs::set_permissions(temp, permissions)?;
             }
         }
-        rename_with_retry(temp, target)
+        rename_with_retry(temp, target)?;
+        if durable {
+            // 置き換えた（名前を付け替えた）ことも書き切る。置き換えは
+            // 済んでいるので、ここで失敗してもエラーにはせず知らせるだけにする。
+            if let Err(e) = sync_parent(target) {
+                tracing::warn!(
+                    "{} のディレクトリをディスクへ書き切れませんでした: {e}",
+                    target.display()
+                );
+            }
+        }
+        Ok(())
     })();
     if written.is_err() {
         remove_temp(temp);
     }
     written
+}
+
+/// ファイルの中身をディスクまで書き切る。
+///
+/// 書き込み用に開き直します。Windows の `FlushFileBuffers` は、読み取りだけで
+/// 開いたハンドルでは断られるためです（切り詰めはしません）。
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+/// 置き換えたファイルのあるディレクトリを書き切る（Unix だけ）。
+///
+/// `rename` はディレクトリの中身の書き換えなので、ディレクトリを `fsync`
+/// しないと、電源断の後に置き換え前へ戻ることがあります。
+/// Windows はディレクトリを `fsync` する手段が無いので、何もしません。
+#[cfg(unix)]
+fn sync_parent(target: &Path) -> std::io::Result<()> {
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_target: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// 置き換えられなかった一時ファイルを片付ける。
@@ -261,6 +312,47 @@ mod tests {
             permissions
         );
         assert_eq!(names(&dir), ["body"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 読み取りだけの権限でも書き切って置き換えられる() {
+        // `.env` を読み取りだけにしている環境。書き切る（`fsync`）ために
+        // 開き直すのは、権限を付け直す前でなければならない。
+        let dir = temp_dir("keep-readonly");
+        let target = dir.join("body");
+        std::fs::write(&target, "old").unwrap();
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_readonly(true);
+
+        write_atomic(
+            &dir.join("body.tmp"),
+            &target,
+            b"new",
+            Access::Keep(permissions.clone()),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(std::fs::metadata(&target).unwrap().permissions().readonly());
+        assert_eq!(names(&dir), ["body"]);
+
+        // 片付けのために書けるように戻す。
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&target, permissions).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 書き切りとディレクトリの書き切りは失敗しない() {
+        let dir = temp_dir("sync");
+        let file = dir.join("a");
+        std::fs::write(&file, "x").unwrap();
+        sync_file(&file).unwrap();
+        sync_parent(&file).unwrap();
+        // 親の無い相対パスでも落ちない（今のディレクトリを書き切る）。
+        sync_parent(Path::new("a")).unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
