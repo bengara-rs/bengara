@@ -18,16 +18,24 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use tokio::sync::{mpsc, watch};
 
-use super::{ConnectionId, SendError};
+use super::{ConnectionId, Message, SendError};
 
 /// 送信の列に積むもの。
+///
+/// 文字は `Arc` で持ちます。`Broadcast::publish` は同じ中身を全接続へ積むので、
+/// 接続ごとに写さずに 1 つを共有します（1 万本 × 10 KB でも 10 KB で済む）。
 #[derive(Debug)]
 pub(crate) enum Outgoing {
-    Text(String),
+    Text(Arc<String>),
     Binary(Vec<u8>),
 }
 
 impl Outgoing {
+    /// 文字を 1 つの宛先へ積む形にする（写さない）。
+    pub(crate) fn text(text: String) -> Self {
+        Outgoing::Text(Arc::new(text))
+    }
+
     /// 列の上限に数えるバイト数。
     pub(crate) fn len(&self) -> usize {
         match self {
@@ -97,14 +105,16 @@ impl Conn {
 
     /// 送信の列に積む。待たない。
     ///
-    /// 上限を超えたら、その場で 1008 の Close を頼んで `QueueFull` を返します。
+    /// 上限は**溜まった量**に掛けます。列が空なら、上限より大きい 1 通でも積みます
+    /// （大きい `publish` 1 回でチャンネルの全員を切らないため）。
+    /// 溜まっている上に積んで上限を超えたら、その場で 1008 の Close を頼んで `QueueFull` を返します。
     pub(crate) fn push(&self, item: Outgoing) -> Result<(), SendError> {
         if self.is_closed() {
             return Err(SendError::Closed);
         }
         let len = item.len();
         let before = self.queued.fetch_add(len, Ordering::AcqRel);
-        if before.saturating_add(len) > self.limit {
+        if before > 0 && before.saturating_add(len) > self.limit {
             self.queued.fetch_sub(len, Ordering::AcqRel);
             tracing::warn!(
                 "WebSocket {} の送信の列があふれたので、1008 で閉じます",
@@ -173,6 +183,100 @@ impl Conn {
     #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
         self.queued.load(Ordering::Acquire)
+    }
+}
+
+/// 受けたメッセージ 1 通に、中身のほかに足して数えるバイト数（列の入れ物の分）。
+/// 空のメッセージを大量に送られても、溜まりが増えて上限に届くようにする。
+const INBOUND_OVERHEAD: usize = 64;
+
+/// 受けたメッセージ（またはエラー）。
+type Inbound = crate::error::Result<Message>;
+
+/// 受けたメッセージをアプリの `recv` へ渡す口。I/O のタスクが持ちます。
+///
+/// 列に件数の上限はありません。代わりに、アプリがまだ読んでいないバイト数（`held`）に
+/// 上限を掛けます。I/O のタスクは待たずに積めるので、アプリが `recv` を呼ばない間も
+/// ソケットを読み続けられます（Ping に Pong を返す・相手の Close に気づく）。
+pub(crate) struct InboundSender {
+    tx: mpsc::UnboundedSender<Inbound>,
+    held: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+/// アプリの側の受け口。`WebSocket::recv` が読みます。
+pub(crate) struct InboundReceiver {
+    rx: mpsc::UnboundedReceiver<Inbound>,
+    held: Arc<AtomicUsize>,
+}
+
+/// 受けた分が上限を超えた。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InboundFull;
+
+/// 受け口を作る。`limit` はアプリが読んでいない分の上限（バイト）。
+pub(crate) fn inbound(limit: usize) -> (InboundSender, InboundReceiver) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let held = Arc::new(AtomicUsize::new(0));
+    (
+        InboundSender {
+            tx,
+            held: held.clone(),
+            limit,
+        },
+        InboundReceiver { rx, held },
+    )
+}
+
+/// 溜まりに数えるバイト数。
+fn inbound_cost(item: &Inbound) -> usize {
+    let len = match item {
+        Ok(Message::Text(text)) => text.len(),
+        Ok(Message::Binary(bytes)) => bytes.len(),
+        Err(_) => 0,
+    };
+    len.saturating_add(INBOUND_OVERHEAD)
+}
+
+impl InboundSender {
+    /// メッセージを積む。待ちません。
+    ///
+    /// 溜まっている上に積んで上限を超えるなら、積まずに `InboundFull` を返します。
+    /// 溜まりが空なら、上限より大きい 1 通でも積みます。
+    /// アプリが受け口を捨てていたら、黙って捨てます。
+    pub(crate) fn push(&self, message: Message) -> Result<(), InboundFull> {
+        let item = Ok(message);
+        let cost = inbound_cost(&item);
+        let before = self.held.fetch_add(cost, Ordering::AcqRel);
+        if before > 0 && before.saturating_add(cost) > self.limit {
+            self.held.fetch_sub(cost, Ordering::AcqRel);
+            return Err(InboundFull);
+        }
+        self.send(item, cost);
+        Ok(())
+    }
+
+    /// エラーを積む。上限は見ません（閉じる前の最後の 1 通なので）。
+    pub(crate) fn push_error(&self, error: crate::error::Error) {
+        let item = Err(error);
+        let cost = inbound_cost(&item);
+        self.held.fetch_add(cost, Ordering::AcqRel);
+        self.send(item, cost);
+    }
+
+    fn send(&self, item: Inbound, cost: usize) {
+        if self.tx.send(item).is_err() {
+            self.held.fetch_sub(cost, Ordering::AcqRel);
+        }
+    }
+}
+
+impl InboundReceiver {
+    /// 次の 1 通。送り口が捨てられ、残りも読み終えたら `None`。
+    pub(crate) async fn recv(&mut self) -> Option<Inbound> {
+        let item = self.rx.recv().await?;
+        self.held.fetch_sub(inbound_cost(&item), Ordering::AcqRel);
+        Some(item)
     }
 }
 
@@ -298,12 +402,18 @@ pub(crate) fn count(channel: &str) -> usize {
 
 /// チャンネルの全接続へ送る。送るのはロックを放してから。
 ///
+/// 中身は 1 回だけ写し、全接続で共有します（接続ごとに写さない）。
 /// 列がいっぱいの接続は、その接続だけが 1008 で閉じます（`Conn::push`）。
 /// ほかの接続への配信は止めません。返すのは積めた本数です。
 pub(crate) fn deliver(channel: &str, text: &str) -> usize {
-    members(channel)
+    let members = members(channel);
+    if members.is_empty() {
+        return 0;
+    }
+    let text = Arc::new(text.to_string());
+    members
         .into_iter()
-        .filter(|conn| conn.push(Outgoing::Text(text.to_string())).is_ok())
+        .filter(|conn| conn.push(Outgoing::Text(text.clone())).is_ok())
         .count()
 }
 
@@ -345,7 +455,7 @@ mod tests {
         join(a.id(), &channel);
 
         assert_eq!(deliver(&channel, "hello"), 1);
-        assert!(matches!(a_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t == "hello"));
+        assert!(matches!(a_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t.as_str() == "hello"));
         assert!(b_rx.out.try_recv().is_err(), "入っていない接続には届かない");
         assert_eq!(count(&channel), 1);
 
@@ -432,11 +542,11 @@ mod tests {
             Some((1008, "send queue full".to_string()))
         );
         assert_eq!(small.queued(), 5, "あふれた分は数えない");
-        assert!(matches!(big_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t == "12345"));
-        assert!(matches!(big_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t == "67890"));
+        assert!(matches!(big_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t.as_str() == "12345"));
+        assert!(matches!(big_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t.as_str() == "67890"));
         // 閉じた後は送れない。
         assert_eq!(
-            small.push(Outgoing::Text("x".into())),
+            small.push(Outgoing::text("x".into())),
             Err(SendError::Closed)
         );
         let _ = small_rx.out.try_recv();
@@ -453,6 +563,81 @@ mod tests {
         a.written(6);
         a.push(Outgoing::Binary(vec![0; 10])).unwrap();
         assert_eq!(a.queued(), 10);
+    }
+
+    #[test]
+    fn 列が空なら上限より大きい1通でも積み溜まると閉じる() {
+        let (a, mut rx) = Conn::new(10);
+        // 空の列には、上限（10）より大きい 1 通でも積める。
+        a.push(Outgoing::Binary(vec![0; 100])).unwrap();
+        assert_eq!(a.queued(), 100);
+        assert!(!a.is_closed());
+        // 溜まっている上に積むと、上限を超えるので閉じる。
+        assert_eq!(
+            a.push(Outgoing::Binary(vec![0; 1])),
+            Err(SendError::QueueFull)
+        );
+        assert!(a.is_closed());
+        assert_eq!(
+            rx.ctrl.try_recv().ok(),
+            Some((1008, "send queue full".to_string()))
+        );
+    }
+
+    #[test]
+    fn 大きい配信1回では誰も切れない() {
+        let channel = unique("big");
+        let (a, _a_rx) = Conn::new(8);
+        register(&a);
+        join(a.id(), &channel);
+        assert_eq!(deliver(&channel, &"x".repeat(100)), 1);
+        assert!(!a.is_closed());
+        unregister(a.id());
+    }
+
+    #[test]
+    fn 配信の中身は全接続で共有する() {
+        let channel = unique("shared");
+        let (a, mut a_rx) = Conn::new(1024);
+        let (b, mut b_rx) = Conn::new(1024);
+        register(&a);
+        register(&b);
+        join(a.id(), &channel);
+        join(b.id(), &channel);
+        assert_eq!(deliver(&channel, "same"), 2);
+        let (Ok(Outgoing::Text(x)), Ok(Outgoing::Text(y))) =
+            (a_rx.out.try_recv(), b_rx.out.try_recv())
+        else {
+            panic!("両方に届く");
+        };
+        assert!(Arc::ptr_eq(&x, &y), "写さずに同じものを指す");
+        assert_eq!(x.as_str(), "same");
+        unregister(a.id());
+        unregister(b.id());
+    }
+
+    #[tokio::test]
+    async fn 受けた分は読まれるまで数え上限を超えたら断る() {
+        let (tx, mut rx) = inbound(INBOUND_OVERHEAD * 2 + 10);
+        // 空なら、上限より大きい 1 通でも積める。
+        tx.push(Message::Binary(vec![0; 1000])).unwrap();
+        assert_eq!(tx.push(Message::Text("a".into())), Err(InboundFull));
+        assert_eq!(
+            rx.recv().await.unwrap().unwrap(),
+            Message::Binary(vec![0; 1000])
+        );
+        // 読んだ分は数から引く。
+        tx.push(Message::Text("b".into())).unwrap();
+        tx.push(Message::Text("c".into())).unwrap();
+        assert_eq!(tx.push(Message::Text("d".into())), Err(InboundFull));
+        // エラーは上限を見ずに積む。送り口を捨てたら、残りを読んでから None。
+        tx.push_error(crate::error::Error::msg("x"));
+        drop(tx);
+        assert_eq!(rx.recv().await.unwrap().unwrap(), Message::Text("b".into()));
+        assert_eq!(rx.recv().await.unwrap().unwrap(), Message::Text("c".into()));
+        assert!(rx.recv().await.unwrap().is_err());
+        assert!(rx.recv().await.is_none());
+        assert_eq!(rx.held.load(Ordering::Acquire), 0);
     }
 
     #[test]

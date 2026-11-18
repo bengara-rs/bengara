@@ -6,7 +6,7 @@
 ## 考え方
 
 判定（ポリシー）は、**`app/Policies/` に置いたただの関数**です。
-フレームワークが持つのは、真偽値から 403 を作る `authorize` だけです。
+フレームワークが持つのは、偽のときに 403 を返す `authorize` だけです。
 
 ```rust
 authorize(PostPolicy::update(&user, &post))?;
@@ -55,8 +55,6 @@ impl PostPolicy {
 
 ```rust
 // app/Http/Controllers/MyArticleController.rs
-use bengara::prelude::*;
-
 use crate::app::models::{Post, User};
 use crate::app::policies::PostPolicy;
 
@@ -81,12 +79,12 @@ pub async fn destroy(req: Request) -> Result<Response> {
 
 ### 呼ばないと効かない
 
-**ポリシーはただの関数です。呼び忘れても、コンパイルは通り、警告も出ません。**
+**ポリシーを呼び忘れても、コンパイルは通り、警告も出ません。**
 
 - 書いたポリシーと、呼んでいる場所を突き合わせます。
-- `view` のような「見てよいか」は特に忘れやすく、忘れると下書きが誰にでも見えます。
+- `view` のような「見てよいか」は特に忘れやすいです。忘れると、下書きが誰にでも見えます。
 - ルートを足したら、対になるテスト（他人なら 403）も足します。
-- 隠したいものには、403 ではなく 404 を返す形も考えます。403 だと「そこに何かある」と分かるためです。
+- 隠したいものには、403 でなく 404 を返す形も考えます。403 だと「そこに何かある」と分かるためです。
 
 ## 止めずに分岐する
 
@@ -126,16 +124,14 @@ async fn 他人の記事は直せない() {
 `User::register` と `Post::draft` は、アプリのモデルに書いた関数です。
 
 リクエストを送って確かめるなら、ログインしてから送ります（[testing.md](testing.md)）。
+`PUT` には `post_with_csrf` が無いので、トークンは自分で付けます。
 
 ```rust
-// ボブでログインする（Cookie が client に残ります）
 client
     .post_with_csrf("/api/login", "email=bob@example.com&password=password123", "/csrf-token")
     .await
     .assert_ok();
 
-// 他人の記事を直そうとすると 403。
-// POST 以外には `post_with_csrf` が無いので、トークンは自分で付けます。
 let token = client.csrf_token("/csrf-token").await;
 client
     .send("PUT", "/api/my/articles/1", b"title=x".to_vec(),
@@ -148,15 +144,15 @@ client
 **`VerifyCsrfToken` を掛けたルートでは、トークンを忘れると 419 になります。**
 403 のつもりが 419 になるときは、ここを疑います（[session.md](session.md)）。
 
-## Laravel との違い
+## Laravel の書き方との対応
 
-| Laravel                                                 | bengara                                        |
-|---------------------------------------------------------|------------------------------------------------|
-| `Gate::define('update-post', fn ($user, $post) => ...)` | 書かない。関数を直接定義する                   |
-| `Gate::allows('update-post', $post)`                    | `PostPolicy::update(&user, &post)`             |
-| `$this->authorize('update', $post)`                     | `authorize(PostPolicy::update(&user, &post))?` |
-| ポリシーの自動対応づけ                                  | 作らない。呼ぶ側で関数を指定する               |
-| `@can('update', $post)`                                 | 真偽値なので `if` で分ける                     |
+| Laravel                              | bengara                                        |
+|--------------------------------------|------------------------------------------------|
+| `Gate::allows('update-post', $post)` | `PostPolicy::update(&user, &post)`             |
+| `$this->authorize('update', $post)`  | `authorize(PostPolicy::update(&user, &post))?` |
+| `@can('update', $post)`              | 真偽値を `if` で分ける                         |
+
+`Gate::define` での登録や、ポリシーの自動の対応づけはありません。呼ぶ側で関数を指定します。
 
 ## 関連
 

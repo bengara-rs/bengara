@@ -12,7 +12,7 @@
 //! | `public` | `storage/app/public/` |
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::{Error, Result};
 
@@ -86,9 +86,50 @@ fn config() -> &'static StorageConfig {
 /// ファイルの読み書き。`Storage::disk("名前")` で置き場所を選べます。
 pub struct Storage {
     root: PathBuf,
+    /// `root` の実体のパス（リンクを解いたもの）。初めて要るときに求めて覚える。
+    ///
+    /// 同じ置き場所の `Storage` どうしで共有します（`real_root_cell`）。
+    /// 読み書きのたびに `root` を解き直さないためです。
+    real_root: Arc<OnceLock<PathBuf>>,
+}
+
+/// 置き場所の根ごとの「実体のパス」の覚え場所。
+///
+/// 設定の置き場所は起動後に変わらないので、最初に 1 回だけ表を作り、以後は読むだけです。
+/// 表に無い根（テストで手で作ったものなど）には、その場で新しい覚え場所を渡します。
+fn real_root_cell(root: &Path) -> Arc<OnceLock<PathBuf>> {
+    static TABLE: OnceLock<Vec<(PathBuf, Arc<OnceLock<PathBuf>>)>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            config()
+                .disks
+                .iter()
+                .map(|disk| (crate::paths::storage_path(&disk.root), Arc::default()))
+                .collect()
+        })
+        .iter()
+        .find(|(known, _)| known == root)
+        .map(|(_, cell)| Arc::clone(cell))
+        .unwrap_or_default()
 }
 
 impl Storage {
+    /// 根から作る。実体のパスの覚え場所は、同じ根のものを共有します。
+    fn at(root: PathBuf) -> Self {
+        let real_root = real_root_cell(&root);
+        Self { root, real_root }
+    }
+
+    /// 実体のパスで置き場所の中に収まっているかを確かめる道具を作る。
+    ///
+    /// 裏のスレッド（`spawn_blocking`）へ持ち込めるように、`self` から切り離します。
+    fn jail(&self) -> Jail {
+        Jail {
+            root: self.root.clone(),
+            real_root: Arc::clone(&self.real_root),
+        }
+    }
+
     /// 既定の置き場所。
     ///
     /// 既定の置き場所は**1回だけ組み立てて覚えます**。`Storage::put` のような
@@ -103,7 +144,7 @@ impl Storage {
                 .map(|disk| disk.root)
                 .map_err(|e| e.to_string())
         }) {
-            Ok(root) => Ok(Self { root: root.clone() }),
+            Ok(root) => Ok(Self::at(root.clone())),
             Err(message) => Err(Error::msg(message.clone())),
         }
     }
@@ -135,9 +176,7 @@ impl Storage {
                         .join(", ")
                 ))
             })?;
-        Ok(Self {
-            root: crate::paths::storage_path(&disk.root),
-        })
+        Ok(Self::at(crate::paths::storage_path(&disk.root)))
     }
 
     /// `public` の置き場所そのもの（`/storage/...` の配信に使う）。
@@ -215,7 +254,9 @@ impl Storage {
     pub async fn write(&self, path: &str, contents: Vec<u8>) -> Result<()> {
         let full = self.file_path(path)?;
         self.ensure_storage(&full)?;
+        let jail = self.jail();
         crate::support::blocking(move || {
+            jail.check(&full, true)?;
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -231,7 +272,9 @@ impl Storage {
     async fn append_line(&self, path: &str, contents: String) -> Result<()> {
         let full = self.file_path(path)?;
         self.ensure_storage(&full)?;
+        let jail = self.jail();
         crate::support::blocking(move || {
+            jail.check(&full, true)?;
             let exists = full.is_file();
             let mut bytes = Vec::with_capacity(contents.len() + 1);
             if exists {
@@ -254,7 +297,12 @@ impl Storage {
     pub async fn append_bytes(&self, path: &str, contents: Vec<u8>) -> Result<()> {
         let full = self.file_path(path)?;
         self.ensure_storage(&full)?;
-        crate::support::blocking(move || append_to(&full, &contents)).await?
+        let jail = self.jail();
+        crate::support::blocking(move || {
+            jail.check(&full, true)?;
+            append_to(&full, &contents)
+        })
+        .await?
     }
 
     /// 少しずつ届く本文（`req.body_stream()?`）を、そのままファイルに書く。
@@ -287,7 +335,9 @@ impl Storage {
 
         let opened = {
             let (full, temp) = (full.clone(), temp.clone());
+            let jail = self.jail();
             crate::support::blocking(move || -> Result<std::fs::File> {
+                jail.check(&full, true)?;
                 if let Some(parent) = full.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -393,29 +443,40 @@ impl Storage {
     /// バイト列として読む。
     pub async fn read_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
         let full = self.file_path(path)?;
-        crate::support::blocking(move || match std::fs::read(&full) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io(e)),
+        let jail = self.jail();
+        crate::support::blocking(move || {
+            jail.check(&full, true)?;
+            match std::fs::read(&full) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Error::Io(e)),
+            }
         })
         .await?
     }
 
     /// あるか。
     ///
-    /// `is_file()` 1 回だけなので、裏のスレッド（`spawn_blocking`）を経由しません。
+    /// 問い合わせが少ないので、裏のスレッド（`spawn_blocking`）を経由しません。
     /// 往復のほうが調べるより高く付きます。
     pub async fn has(&self, path: &str) -> Result<bool> {
-        Ok(self.file_path(path)?.is_file())
+        let full = self.file_path(path)?;
+        self.jail().check(&full, true)?;
+        Ok(full.is_file())
     }
 
     /// 消す。無くてもエラーにはしません。
     pub async fn remove(&self, path: &str) -> Result<()> {
         let full = self.file_path(path)?;
-        crate::support::blocking(move || match std::fs::remove_file(&full) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io(e)),
+        let jail = self.jail();
+        crate::support::blocking(move || {
+            // 消すのはリンクそのもので、先はたどらない。親のディレクトリだけ確かめる。
+            jail.check(&full, false)?;
+            match std::fs::remove_file(&full) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(Error::Io(e)),
+            }
         })
         .await?
     }
@@ -425,6 +486,7 @@ impl Storage {
     /// `metadata()` 1 回だけなので、`has` と同じく裏のスレッドを経由しません。
     pub async fn size(&self, path: &str) -> Result<Option<u64>> {
         let full = self.file_path(path)?;
+        self.jail().check(&full, true)?;
         match std::fs::metadata(&full) {
             Ok(meta) => Ok(Some(meta.len())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -446,7 +508,9 @@ impl Storage {
     pub async fn files(&self, prefix: &str) -> Result<Vec<String>> {
         let base = self.root.clone();
         let full = self.absolute(prefix)?;
+        let jail = self.jail();
         crate::support::blocking(move || {
+            jail.check(&full, true)?;
             let mut out = Vec::new();
             collect_files(&full, &base, &mut out);
             out.sort();
@@ -472,6 +536,10 @@ impl Storage {
     /// 公開ドキュメントは「絶対パスはエラー」と書いていたので、書いてある
     /// 約束のほうにそろえます。`/etc/passwd` を渡した人は、置き場所の中の
     /// `etc/passwd` が読まれるより、断られるほうが間違いに気づけます。
+    ///
+    /// ここで見るのは**文字列だけ**です。置き場所の中のリンク（シンボリックリンク・
+    /// ジャンクション）が外を指していないかは、読み書きの直前に [`Jail::check`] が
+    /// 実体のパスで確かめます。
     fn absolute(&self, path: &str) -> Result<PathBuf> {
         if path.starts_with(['/', '\\']) {
             return Err(Error::msg(format!(
@@ -496,6 +564,85 @@ impl Storage {
             }
         }
         Ok(self.root.join(trimmed.replace('\\', "/")))
+    }
+}
+
+/// 実体のパスで、置き場所の中に収まっているかを確かめる。
+///
+/// `absolute` の文字列の検査だけでは、置き場所の中に外を指すリンクがあると
+/// `read` や `write` がその先を読み書きしていました（`files` だけはリンクを飛ばしていた）。
+/// リンクを解いたパスが、リンクを解いた根の下にあるかを比べます。
+///
+/// - 根の実体のパスは初めて要るときに 1 回だけ求め、`Storage` どうしで共有します。
+/// - Windows の `canonicalize` は `\\?\C:\...` の形を返します。両方を同じ関数で
+///   解くので、比べる形はそろいます。
+/// - 調べてから開くまでの間に差し替えられる競合は防げません。置き場所の中に
+///   リンクを置ける人は、もともと中身を書き換えられる人だからです。
+struct Jail {
+    root: PathBuf,
+    real_root: Arc<OnceLock<PathBuf>>,
+}
+
+impl Jail {
+    /// `full` が実体でも置き場所の中にあれば `Ok`。
+    ///
+    /// `follow_last` が `false` なら、最後の要素のリンクはたどらず、親だけを確かめます
+    /// （`remove` はリンクそのものを消すため）。
+    ///
+    /// まだ無いファイルは、いちばん近くにある祖先で確かめます。何も無い（根も無い）
+    /// なら、これから作るのは普通のディレクトリなので通します。
+    /// 先の無いリンク（壊れたリンク）は、書くとリンクの先に作られるので断ります。
+    fn check(&self, full: &Path, follow_last: bool) -> Result<()> {
+        let mut probe = if follow_last {
+            full
+        } else {
+            match full.parent() {
+                Some(parent) => parent,
+                None => return Ok(()),
+            }
+        };
+        loop {
+            match std::fs::canonicalize(probe) {
+                Ok(real) => {
+                    return if real.starts_with(self.real_root()?) {
+                        Ok(())
+                    } else {
+                        Err(self.outside(full))
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if std::fs::symlink_metadata(probe).is_ok() {
+                        // 名前はあるのに先が無い。壊れたリンク。
+                        return Err(self.outside(full));
+                    }
+                    if probe == self.root {
+                        return Ok(());
+                    }
+                    match probe.parent() {
+                        Some(parent) if parent.starts_with(&self.root) => probe = parent,
+                        _ => return Ok(()),
+                    }
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+    }
+
+    /// 根の実体のパス。求められたら覚えます（失敗は覚えない）。
+    fn real_root(&self) -> Result<&PathBuf> {
+        if let Some(real) = self.real_root.get() {
+            return Ok(real);
+        }
+        let real = std::fs::canonicalize(&self.root)?;
+        Ok(self.real_root.get_or_init(|| real))
+    }
+
+    fn outside(&self, full: &Path) -> Error {
+        let shown = full.strip_prefix(&self.root).unwrap_or(full);
+        Error::msg(format!(
+            "`{}` は置き場所の外を指しています（リンクの先が置き場所の外です）",
+            shown.display()
+        ))
     }
 }
 
@@ -708,10 +855,9 @@ mod tests {
 
     /// テストごとに別のディレクトリを使う（並行して走るため）。
     fn disk(name: &str) -> Storage {
-        Storage {
-            root: std::env::temp_dir()
-                .join(format!("bengara-storage-{}-{name}", std::process::id())),
-        }
+        Storage::at(
+            std::env::temp_dir().join(format!("bengara-storage-{}-{name}", std::process::id())),
+        )
     }
 
     #[test]
@@ -761,9 +907,7 @@ mod tests {
     fn storageが無ければ作らない() {
         // `storage/` の下を指す置き場所。テストでは `storage/` が無い。
         let storage = crate::paths::storage_path("");
-        let disk = Storage {
-            root: crate::paths::storage_path("app"),
-        };
+        let disk = Storage::at(crate::paths::storage_path("app"));
         if storage.is_dir() {
             // 手元に `storage/` がある環境では確かめようがないので飛ばす。
             return;
@@ -1203,5 +1347,121 @@ mod tests {
         assert!(name.starts_with(".movie.mp4."), "{name}");
         assert!(name.ends_with(".part"), "{name}");
         assert_ne!(part_path(&full).unwrap(), part, "毎回違う名前");
+    }
+
+    // ---- 置き場所の中のリンク ----
+
+    /// 置き場所の中の `link` が、外のディレクトリを指しているときに確かめること。
+    ///
+    /// 外には `secret.txt` があり、リンク越しの読み書きはどれも断る。
+    async fn assert_link_is_refused(disk: &Storage, outside: &Path) {
+        let error = disk.read("link/secret.txt").await.unwrap_err().to_string();
+        assert!(error.contains("置き場所の外"), "{error}");
+        assert!(disk.read_bytes("link/secret.txt").await.is_err());
+        assert!(disk.write("link/secret.txt", b"x".to_vec()).await.is_err());
+        assert!(disk.write("link/new.txt", b"x".to_vec()).await.is_err());
+        assert!(disk
+            .append_line("link/secret.txt", "x".into())
+            .await
+            .is_err());
+        assert!(disk.append_bytes("link/secret.txt", vec![1]).await.is_err());
+        assert!(disk
+            .write_stream("link/new.txt", stream_of(b"x", 1024))
+            .await
+            .is_err());
+        assert!(disk.has("link/secret.txt").await.is_err());
+        assert!(disk.size("link/secret.txt").await.is_err());
+        assert!(disk.files("link").await.is_err());
+        assert!(disk.remove("link/secret.txt").await.is_err());
+
+        // 外の中身は何も変わっていない。
+        assert_eq!(
+            std::fs::read(outside.join("secret.txt")).unwrap(),
+            b"secret"
+        );
+        assert!(!outside.join("new.txt").exists());
+
+        // 中の普通のファイルは今までどおり読み書きできる。
+        disk.write("inside/a.txt", b"ok".to_vec()).await.unwrap();
+        assert_eq!(
+            disk.read("inside/a.txt").await.unwrap().as_deref(),
+            Some("ok")
+        );
+        assert_eq!(disk.files("").await.unwrap(), vec!["inside/a.txt"]);
+    }
+
+    /// 外を指すリンクの用意。置き場所と外を作り直して返す。
+    fn link_fixture(name: &str) -> (Storage, PathBuf) {
+        let disk = disk(name);
+        let outside = disk.root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&disk.root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&disk.root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        (disk, outside)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn 外を指すシンボリックリンクはたどらない() {
+        let (disk, outside) = link_fixture("symlink");
+        std::os::unix::fs::symlink(&outside, disk.root.join("link")).unwrap();
+        assert_link_is_refused(&disk, &outside).await;
+
+        // ファイルを指すリンクも同じ。消すのはリンクそのものなので通る。
+        std::os::unix::fs::symlink(outside.join("secret.txt"), disk.root.join("file-link"))
+            .unwrap();
+        assert!(disk.read("file-link").await.is_err());
+        disk.remove("file-link").await.unwrap();
+        assert!(outside.join("secret.txt").exists(), "リンクの先は消さない");
+
+        // 先の無いリンク。書くと外に作られるので断る。
+        std::os::unix::fs::symlink(outside.join("ghost.txt"), disk.root.join("ghost")).unwrap();
+        assert!(disk.write("ghost", b"x".to_vec()).await.is_err());
+        assert!(!outside.join("ghost.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn 根そのものがリンクでも中は読み書きできる() {
+        let (real, outside) = link_fixture("root-link-real");
+        let linked = Storage::at(real.root.with_extension("link"));
+        let _ = std::fs::remove_file(&linked.root);
+        std::os::unix::fs::symlink(&real.root, &linked.root).unwrap();
+
+        linked.write("a/b.txt", b"ok".to_vec()).await.unwrap();
+        assert_eq!(linked.read("a/b.txt").await.unwrap().as_deref(), Some("ok"));
+
+        let _ = std::fs::remove_file(&linked.root);
+        let _ = std::fs::remove_dir_all(&real.root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Windows はジャンクションで確かめる。シンボリックリンクと違って
+    /// 管理者の権限が要らない。作れない環境では飛ばす。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn 外を指すジャンクションはたどらない() {
+        let (disk, outside) = link_fixture("junction");
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(disk.root.join("link"))
+            .arg(&outside)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if made {
+            assert_link_is_refused(&disk, &outside).await;
+            // ジャンクションは `remove_dir` で外す（中身は消えない）。
+            let _ = std::fs::remove_dir(disk.root.join("link"));
+        }
+        let _ = std::fs::remove_dir_all(&disk.root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

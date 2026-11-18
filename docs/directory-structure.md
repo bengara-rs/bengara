@@ -1,7 +1,6 @@
 # ディレクトリ構成と自動検出
 
-どこに何を置くかの説明です。
-置いたファイルが見つからないときに何が出るかも書きます。
+どこに何を置くかの説明です。置いたファイルが動かないときの見方も書きます。
 
 `mod` を書き並べる必要はありません。ビルドのときにファイルを探して、自動で取り込みます。
 入口は次の 2 つで、どちらも `init` が作ります。
@@ -48,9 +47,7 @@ myapp/
 
 - `src/` はありません。入口はプロジェクト直下です。
 - `init` は `resources/views/` も作りますが、使いません（テンプレートの機能はありません）。
-- `config/` には、フレームワークの設定を差し替えるファイルを足せます。
-  たとえば `config/queue.rs`（ジョブごとの打ち切りの時間、[queue.md](queue.md)）です。
-  一覧は [configuration.md](configuration.md) にあります。
+- `config/` に足せるファイルは [configuration.md](configuration.md) にあります。
 
 ## 3 つの約束
 
@@ -66,9 +63,8 @@ use crate::app::http::controllers::HomeController;
 
 - `app/Models/User.rs` には `pub struct User`（`enum` なども可）を書きます。
 - 型を書き忘れると `unresolved import` のエラーになります。エラーの行の末尾に直し方が出ます。
-- 型を置かないファイルは、小文字で始まる名前にします。
-- 関数を置く場所（シーダーなど）では、型は要りません。
-- `config/` の大文字始まりのファイルは、設定として登録されません（[configuration.md](configuration.md)）。
+- 型を置かないファイルは、小文字で始めます。
+- 関数を置く場所（シーダー・ジョブ・コマンドなど）では、型は要りません。
 
 ## 名前の付き方
 
@@ -79,30 +75,27 @@ use crate::app::http::controllers::HomeController;
 | 小文字始まりのファイル | モジュール（`routes/web.rs` → `crate::routes::web`）                             |
 | 日付で始まるファイル   | 先頭に `m` が付く（`2026_…` → `m2026_…`）                                        |
 
-- 取り込むのは `app` `bootstrap` `config` `database` `routes` と、テストのときの `tests` です。
-- 大文字始まりのファイルは、モジュールとしても見えます（`crate::app::models::user`）。
+取り込むのは `app` `bootstrap` `config` `database` `routes` と、テストのときの `tests` です。
 
 ## 置き場所ごとに書くもの
 
-| 場所                    | 書くもの                                                                              | 自動で一覧になるか |
-|-------------------------|---------------------------------------------------------------------------------------|--------------------|
-| `database/migrations/`  | `pub fn up(schema: &mut Schema)` と `pub fn down(schema: &mut Schema)`                | なる               |
-| `database/seeders/`     | `pub async fn run() -> Result<()>`                                                    | なる               |
-| `app/Jobs/`             | `pub async fn handle(payload: String) -> Result<()>`                                  | なる               |
-| `app/Console/Commands/` | `pub const DESCRIPTION: &str` と `pub async fn handle(args: &[String]) -> Result<()>` | なる               |
-| `app/Listeners/`        | `pub async fn handle(payload: String) -> Result<()>`                                  | **ならない**       |
-| `database/factories/`   | ただの関数（決まりはない）                                                            | —                  |
-| `routes/console.rs`     | `pub fn schedule(s: &mut Schedule)`                                                   | —                  |
+| 場所                    | 書くもの                                                                              | 置けば動くか   |
+|-------------------------|---------------------------------------------------------------------------------------|----------------|
+| `database/migrations/`  | `pub fn up(schema: &mut Schema)` と `pub fn down(schema: &mut Schema)`                | 動く           |
+| `database/seeders/`     | `pub async fn run() -> Result<()>`                                                    | 動く           |
+| `app/Jobs/`             | `pub async fn handle(payload: String) -> Result<()>`                                  | 動く           |
+| `app/Console/Commands/` | `pub const DESCRIPTION: &str` と `pub async fn handle(args: &[String]) -> Result<()>` | 動く           |
+| `app/Listeners/`        | `pub async fn handle(payload: String) -> Result<()>`                                  | **登録が要る** |
+| `database/factories/`   | ただの関数（決まりはない）                                                            | —              |
+| `routes/console.rs`     | `pub fn schedule(s: &mut Schedule)`                                                   | —              |
 
-- 一覧になるものは、**置けば動きます。** 登録は要りません。並びは名前順です。
-- **聞く側（`app/Listeners/`）だけは自分で登録します。** `bootstrap/app.rs` の `with_events`
-  に書きます（[events.md](events.md)）。
+- 「動く」ものは、置くだけで一覧に入ります。並びは名前順です。
+- **聞く側（`app/Listeners/`）だけは、`bootstrap/app.rs` の `with_events` で登録します**（[events.md](events.md)）。
 - **マイグレーションのファイル名は日付から始めます**（`2026_10_05_000000_create_posts_table.rs`）。
-  日付で始まらないとビルドが止まります。
-- シーダー・ジョブ・コマンドは**大文字始まり**のファイルだけが一覧に入ります。小文字始まりは警告が出ます。
+- シーダー・ジョブ・コマンドは、**大文字始まり**のファイルだけが一覧に入ります。
 - コマンド名はファイル名から作ります（[console-commands.md](console-commands.md)）。
 
-### 下のディレクトリに分けて置く
+### 下のディレクトリに分ける
 
 マイグレーション・シーダー・ジョブ・コマンドは、下にディレクトリを作って分けられます。
 集めたものは 1 つの一覧になります。
@@ -115,21 +108,22 @@ app/Jobs/
 ```
 
 - **名前は置き場所の全体で重ねないでください。** 別のディレクトリでも、同じ名前だとビルドが止まります。
-- 置き場所のディレクトリ名は上の表のとおりに書きます。`app/JOBS/` はジョブの置き場所になりません。
+- 置き場所のディレクトリ名は、上の表のとおりに書きます（`app/JOBS/` はジョブの置き場所になりません）。
 
 ## 取り込まれないもの
 
-- 何も言わずに外すもの: `.` で始まる隠しファイル、`main.rs` / `lib.rs`、`.rs` 以外、`target/`。
-- 警告を出して外すもの: `mod.rs`、リンク（たどらない）、32 段より深いディレクトリ、控え（下）。
+| 扱い         | 対象                                                                  |
+|--------------|-----------------------------------------------------------------------|
+| 黙って外す   | `.` で始まる隠しファイル、`main.rs` / `lib.rs`、`.rs` 以外、`target/` |
+| 警告して外す | `mod.rs`、リンク、32 段より深いディレクトリ、控え（下）               |
+
+- 名前に `.` や空白が入ったものは**控え**（コピーして残したもの）と見て、取り込みません。
+  例は `User.old.rs`、`Controllers copy/`、`ja.old/` です。控えのディレクトリは中身ごと外します。
+- **`database/migrations/` 直下の控えだけは、ビルドが止まります**（`2026_..._v1.2.rs` など）。
+  外へ出すか、控えのディレクトリ（`old.bak/` など）に入れてください。
 - `.rs` のほかにビルドが読むのは、`resources/lang/` の言語ファイルと `public/` だけです。
 
-名前に `.` や空白が入ったものは**控え**と見て、取り込みません（`User.old.rs`、`Controllers copy/`、`ja.old/`）。
-控えのディレクトリは中身ごと外します。取り込みたいファイルは、名前を英数字と `_` だけにします。
-
-**`database/migrations/` 直下の控えだけは、ビルドが止まります**（`2026_..._v1.2.rs` など）。
-外へ出すか、控えのディレクトリ（`old.bak/` など）の中に入れてください。
-
-## `public/`
+## public/
 
 静的ファイルを置きます。
 
@@ -139,10 +133,9 @@ app/Jobs/
 | リリース | **全部を実行ファイルに埋め込む**（隠しファイルを除く） |
 
 - 1 つが 8 MiB、合計が 32 MiB を超えると、ビルドで警告が出ます。止まりはしません。
-- 32 段より深いディレクトリの中は配信しません。
 - ディレクトリへのリンク（`public/storage` など）は埋め込みません。警告が出ます。
 
-## `resources/lang/`
+## resources/lang/
 
 言語ファイルはビルドのときに読んで、実行ファイルに入れます。置き方は 2 つです。
 
@@ -155,27 +148,26 @@ app/Jobs/
 - **`<言語>/` より下のディレクトリは読みません**（警告が出ます）。
 - 書き方は [localization.md](localization.md) にあります。
 
-## `storage/`
+## storage/
 
 実行時の書き込み先です。中身はリポジトリに入れません（`storage/.gitignore` が全部を無視します）。
 
-| ディレクトリ                 | 置かれるもの                           |
-|------------------------------|----------------------------------------|
-| `storage/app`                | アプリが置くファイル                   |
-| `storage/app/public`         | `/storage/...` で配信する分            |
-| `storage/framework/cache`    | キャッシュ                             |
-| `storage/framework/schedule` | 定期処理の前回の時刻                   |
-| `storage/framework/serve`    | `cargo artisan serve` が使う（開発用） |
-| `storage/framework/sessions` | セッション                             |
-| `storage/logs`               | メールのログ（`mail.log`）             |
+| ディレクトリ                 | 置かれるもの                |
+|------------------------------|-----------------------------|
+| `storage/app`                | アプリが置くファイル        |
+| `storage/app/public`         | `/storage/...` で配信する分 |
+| `storage/framework/cache`    | キャッシュ                  |
+| `storage/framework/schedule` | 定期処理の前回の時刻        |
+| `storage/framework/sessions` | セッション                  |
+| `storage/logs`               | メールのログ（`mail.log`）  |
 
 - 手元では `cargo run -- init` が作ります。本番では `./myapp storage:init` を 1 回流します。
 - どちらも、作ったディレクトリを Unix では所有者だけ（0700）にします。すでにあるものには触りません。
 
 ## テストの置き場所
 
-テストは `tests/Feature/` か `tests/Unit/` に置きます。 **`tests/` の直下に `.rs` を置かないでください。**
-警告が出ます（[testing.md](testing.md)）。
+テストは `tests/Feature/` か `tests/Unit/` に置きます（[testing.md](testing.md)）。
+**`tests/` の直下に `.rs` を置かないでください。** 警告が出ます。
 
 ## 置いたのに動かないとき
 
@@ -199,20 +191,18 @@ app/Jobs/
 
 ### 警告だけのもの
 
-| 起きたこと                               | 例                                           |
-|------------------------------------------|----------------------------------------------|
-| 控え・`mod.rs`・リンク・深すぎる場所     | 上の「取り込まれないもの」                   |
-| 一覧に入らない小文字始まりのファイル     | `app/Jobs/sendWelcome.rs`                    |
-| `tests/` の直下の `.rs`                  | `tests/HomeTest.rs`                          |
-| フレームワークと同じ名前の自分のコマンド | `app/Console/Commands/List.rs`（呼ばれない） |
-| 読まない場所の言語ファイル               | `resources/lang/ja/admin/x.toml`             |
-| あるはずのディレクトリが無い             | `config/` が無い                             |
+ビルドは通ります。主なものは次のとおりです。
+
+- 控え・`mod.rs`・リンク・深すぎる場所（上の「取り込まれないもの」）
+- 一覧に入らない小文字始まりのファイル（`app/Jobs/sendWelcome.rs`）
+- `tests/` の直下の `.rs`、読まない場所の言語ファイル
+- フレームワークと同じ名前の自分のコマンド（`app/Console/Commands/List.rs`）
+- あるはずのディレクトリ（`config/` など）が無い
 
 ### 後からディレクトリを作ったとき
 
 **無かったディレクトリを後から作ったら、`build.rs` を保存し直してください**（`touch build.rs`）。
 作っただけでは、ビルドが見つけ直しません。
-対象は `app` `bootstrap` `config` `database` `routes` `tests` `public` `resources/lang` です。
 
 ### テストを足したとき
 

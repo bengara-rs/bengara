@@ -51,9 +51,9 @@ impl std::error::Error for SqlFailure {
 /// ログとデバッグ画面にも同じ文が出ます。利用者に見せる文は、
 /// `is_unique_violation()` で見分けて自分で書いてください。
 ///
-/// `commit` / `rollback` の失敗も、`sql` に `"commit"` / `"rollback"` を入れて
-/// ここを通します。どちらも SQL の文なので、出る文はそのまま読めます。
-/// 包まずに `Error::msg` にすると、`is_unique_violation()` が見る原因の連鎖が
+/// `begin` / `commit` / `rollback` の失敗も、`sql` にその名前を入れて
+/// ここを通します。どれも SQL の文なので、出る文はそのまま読めます。
+/// 包まずに `Error::msg` にすると、`source()` と `is_unique_violation()` がたどる原因の連鎖が
 /// 切れてしまいます（遅延制約は確定のときに当たります）。
 pub(crate) fn failed(sql: &str, error: sqlx::Error) -> Error {
     Error::other(SqlFailure {

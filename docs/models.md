@@ -28,31 +28,30 @@ pub struct Post {
 
 | 指定                        | 付ける所   | 意味                                                |
 |-----------------------------|------------|-----------------------------------------------------|
-| `#[model(table = "posts")]` | 構造体     | 表の名前。**必須**です（推測しません）              |
-| `#[model(primary)]`         | フィールド | 主キーにする。無ければ列名が `id` の項目が主キー    |
+| `#[model(table = "posts")]` | 構造体     | 表の名前。**必須**です                              |
+| `#[model(primary)]`         | フィールド | 主キーにする。無ければ `id` の項目が主キー          |
 | `#[model(column = "名前")]` | フィールド | 列名を変える。無ければフィールド名と同じ            |
 | `#[model(skip)]`            | フィールド | 表に無い項目にする。読むときは `Default` の値が入る |
 
-- 使える型は、整数（`i8`〜`i64`・`u8`〜`u64`・`isize`・`usize`）、`f32`・`f64`・`bool`・`String`・`Vec<u8>` です。ふだんは
-  `i64` と `String` を使います。
-- **NULL を許す列は `Option<...>` にしてください。** そうしないと、読むときにエラーです。
-- **主キーは自動採番の整数だけです。** `Option` にもできません。文字列の主キーは下の「文字列の主キー」を見てください。
+- 使える型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>` です。ふだんは `i64` と `String` を使います。
+- **NULL を許す列は `Option<...>` にします。** そうしないと、読むときにエラーです。
+- **主キーは自動採番の整数です。** `Option` にはできません。
 - `r#type` のようなフィールドは、`type` が列名になります。
 - 列名の一覧は `Post::COLUMNS` で取れます。
 
 ### コンパイルエラーになる書き方
 
-| 書き方                                                   | 理由                              |
-|----------------------------------------------------------|-----------------------------------|
-| `#[model(table = "...")]` が無い                         | 表の名前は推測しません            |
-| 表名・列名に使えない文字がある                           | 流すと必ず失敗します              |
-| 主キーが決まらない（`id` も `#[model(primary)]` も無い） | どの行を更新するか決まりません    |
-| `#[model(primary)]` が 2 つ以上                          | 主キーが決まりません              |
-| 主キーの型が整数でない                                   | 自動採番の整数だけに対応します    |
-| `skip` と `primary` を同じフィールドに付ける             | 表に無い項目は主キーになれません  |
-| 同じ列名が 2 回出る                                      | `insert` が失敗します             |
-| 主キー以外の列が無い                                     | `save()` で入れるものがありません |
-| タプル構造体・型引数・ライフタイムが付いている           | 対応していません                  |
+| 書き方                                                   | 理由                                 |
+|----------------------------------------------------------|--------------------------------------|
+| `#[model(table = "...")]` が無い                         | 表の名前は推測しない                 |
+| 表名・列名に使えない文字がある                           | 流すと必ず失敗する                   |
+| 主キーが決まらない（`id` も `#[model(primary)]` も無い） | どの行を更新するか決まらない         |
+| `#[model(primary)]` が 2 つ以上                          | 主キーが決まらない                   |
+| 主キーの型が整数でない                                   | 自動採番の整数だけに対応する         |
+| `skip` と `primary` を同じフィールドに付ける             | 表に無い項目は主キーになれない       |
+| 同じ列名が 2 回出る                                      | `insert` が失敗する                  |
+| 主キー以外の列が無い                                     | `save()` で入れるものが無い          |
+| タプル構造体・型引数・ライフタイムがある                 | 名前付きフィールドの構造体だけ使える |
 
 名前に使えるのは英数字（日本語も可）と `_` です。表名には `.`（`スキーマ.表`）も使えます。
 
@@ -72,42 +71,33 @@ let posts = Post::query()
     .await?;
 ```
 
-`find_or_fail` が見つけられないときは、ハンドラから `?` で返すだけで 404 の応答になります。
-
-```rust
-pub async fn show(req: Request) -> Result<Response> {
-    let id: i64 = req.param_as("post")?;
-    let post = Post::find_or_fail(id).await?;   // 無ければ 404
-    json(&bengara::serde_json::json!({ "title": post.title }))
-}
-```
+`find_or_fail` のエラーは、ハンドラから `?` で返すだけで 404 の応答になります。
 
 ### 条件と結果
 
-`Post::query()` は、条件の足し方が [database.md](database.md) と同じです。
-結果だけがモデルの型で返ります。
+`Post::query()` の条件の足し方は、[database.md](database.md) と同じです。
+結果がモデルの型で返ります。
 
-| 呼ぶもの                                | 返るもの               |
-|-----------------------------------------|------------------------|
-| `get()`                                 | `Vec<Post>`            |
-| `first()`                               | `Option<Post>`         |
-| `first_or_fail()`                       | `Post`（無ければ 404） |
-| `find(id)`                              | `Option<Post>`         |
-| `count()`                               | `i64`                  |
-| `exists()` / `doesnt_exist()`           | `bool`                 |
-| `sum` / `avg` / `min` / `max::<T>(col)` | `Option<T>`            |
-| `pluck::<T>(col)` / `value::<T>(col)`   | `Vec<T>` / `Option<T>` |
-| `update(&[...])` / `delete()`           | `u64`（件数）          |
-| `paginate(per_page, page)`              | `Paginator<Post>`      |
+| 呼ぶもの                                | 返るもの                                                         |
+|-----------------------------------------|------------------------------------------------------------------|
+| `get()`                                 | `Vec<Post>`                                                      |
+| `first()`                               | `Option<Post>`                                                   |
+| `first_or_fail()`                       | `Post`（無ければ 404）                                           |
+| `find(id)`                              | `Option<Post>`                                                   |
+| `count()`                               | `i64`                                                            |
+| `exists()` / `doesnt_exist()`           | `bool`                                                           |
+| `sum` / `avg` / `min` / `max::<T>(col)` | `Option<T>`                                                      |
+| `pluck::<T>(col)` / `value::<T>(col)`   | `Vec<T>` / `Option<T>`                                           |
+| `update(&[...])` / `delete()`           | `u64`（件数）                                                    |
+| `paginate(per_page, page)`              | `Paginator<Post>`（[database.md](database.md) の「ページ分け」） |
 
-- **`get()` や `first()` は全部の列を読みます。** `select` で列を絞ると、足りない列でエラーになります。
-- 一部の列だけ欲しいときは、`pluck` か、下の `query_builder()` を使います。
-- `to_sql()` で、組み立てた SQL を見られます。
+- **`get()` や `first()` は全部の列を読みます。** `select` で列を絞ると、足りない列でエラーです。
+- 一部の列だけ欲しいときは、`pluck` か下の `query_builder()` を使います。
 
 ### クエリビルダに降りる
 
-`join` や `increment` を使いたいときは、`query_builder()` を呼びます。
-降りるとモデルの型は外れ、`Row` が返ります。
+`join` や `increment` を使うときは、`query_builder()` を呼びます。
+降りると、結果はモデルでなく `Row` で返ります。
 
 ```rust
 let rows = Post::query()
@@ -136,47 +126,51 @@ post.delete().await?;                     // 返るのは件数
 - 主キーが `0` 以外なら、その行を更新します。
 - `Post::draft` は自分で用意する関数です（下の「書きやすくする」）。
 
-### 更新は全部の列を書き戻す
+### 変える列だけ書く（`save_only`）
 
-**`save()` は、構造体の値を全部書きます**（`created_at` だけは外します）。
+**`save()` は、構造体の値を全部書き戻します**（`created_at` を除く）。
 読んでから保存するまでに他の人が変えた列は、元に戻ってしまいます。
+変える列が決まっているなら、`save_only(&[列, ..])` を使います。
 
 ```rust
-// 駄目な書き方。題名だけ変えたいのに、読んだときの views も一緒に書き戻る。
 let mut post = Post::find_or_fail(id).await?;
 post.title = "新しい題名".to_string();
-post.save().await?;
+if post.save_only(&["title"]).await? == 0 {
+    // 読んだ後で行が消えた。
+    return Err(Error::http(404, "記事が見つかりません"));
+}
 ```
 
-変える列が決まっているなら、クエリビルダの `update` を使います。
-`updated_at` は自分で入れます。
+閲覧数のように `increment` で増やす列がある表では、必ずこの形にします。
 
-```rust
-// 良い書き方。触る列は title と updated_at だけ。
-DB::table("posts")
-    .where_("id", id)
-    .update(&[("title", "新しい題名".into()), ("updated_at", now().into())])
-    .await?;
-```
+| 項目               | `save()`                         | `save_only(&[..])`                  |
+|--------------------|----------------------------------|-------------------------------------|
+| 書く列             | 主キーと `created_at` 以外の全部 | 指定した列と `updated_at`（あれば） |
+| 新しい行           | 入れる                           | **エラー**（入れない）              |
+| 当てはまる行が無い | **エラー**                       | **`Ok(0)`**                         |
+| 返るもの           | `()`                             | 当てはまった行の数（`u64`）         |
 
-閲覧数のように `increment` で増やす列がある表では、必ずこの形にしてください。
+- 次のときはエラーです。SQL は流しません。
+    - 列を 1 つも指定していない
+    - モデルに無い列か、主キーの列を指定した
+    - まだ保存していない行（主キーが `0`）
+- 持ち主や状態でも絞りたいときは、クエリビルダの `update` を使います。`updated_at` は自分で入れます。
 
 ### `save()` がエラーになるとき
 
 | とき                               | 直し方                               |
 |------------------------------------|--------------------------------------|
-| 更新した行が **0 件**だった        | 行が消えていないか、主キーを確かめる |
+| 更新した行が 0 件だった            | 行が消えていないか、主キーを確かめる |
 | 採番された値を主キーに入れられない | 主キーの型を `i64` などにする        |
 | 採番された値が返らなかった         | 主キーが自動採番の列か確かめる       |
 
-- 下の 2 つは「行は入ったのに主キーが空」です。そのまま呼び直すと 2 行目が入るので、エラーにしています。
-- MySQL で自動採番の無い表に `save()` すると、3 つ目のエラーです。**行は入っています。**
+- 下の 2 つは「行は入ったのに主キーが空」です。呼び直すと 2 行目が入るので、エラーにしています。
 - 主キーに値を入れて `save()` すると、更新になります。主キーを自分で決める行は `DB::table(..).insert(..)` で入れます。
 - まだ保存していないモデルの `delete()` は、何もせずに 0 を返します。
 
 ### `created_at` と `updated_at`
 
-その列名のフィールドがあると、`save()` が `now()` の時刻（UTC の `YYYY-MM-DD HH:MM:SS`）を入れます。
+その列名のフィールドがあると、`save()` が `now()` の時刻を入れます。
 
 | とき     | `created_at` | `updated_at` |
 |----------|--------------|--------------|
@@ -184,12 +178,12 @@ DB::table("posts")
 | 更新     | 書き戻さない | 入る         |
 
 **`DB::table(...)` で直接入れた行には、時刻が入りません。**
-`timestamps()` の列は NULL を許すので、`String` のフィールドで読むとエラーになります。
-`now()` を自分で入れるか、フィールドを `Option<String>` にしてください。
+`timestamps()` の列は NULL を許すので、`String` のフィールドで読むとエラーです。
+`now()` を自分で入れるか、フィールドを `Option<String>` にします。
 
 ### 書きやすくする
 
-毎回フィールドを全部書くのは大変です。`impl` に関数を用意しておきます。
+毎回フィールドを全部書かずに済むよう、`impl` に関数を用意します。
 
 ```rust
 impl Post {
@@ -209,27 +203,19 @@ impl Post {
 
 ## 主キーに文字列を渡したとき
 
-パス引数は文字列で届きます。`Post::find("12")` のように、**整数に読める文字列は整数に直して**探します。
+パス引数は文字列で届きます。
+`Post::find("12")` のように、**整数に読める文字列は整数に直して**探します。
+整数に読めない値（`"abc"`）は、SQL エラーにせず「無い」とします。
 
-**整数に読めない値（`"abc"`）では探しません。** SQL エラーにせず「無い」とします。
-どのドライバでも 404 にそろえるためです。
-
-| 書き方                                   | `"abc"` のとき |
-|------------------------------------------|----------------|
-| `Post::find("abc")`                      | `None`         |
-| `Post::find_or_fail("abc")`              | 404            |
-| `req.model::<Post>("post")`              | 404            |
-| `req.auth().user::<User>()`              | `None`         |
-| `Post::query().where_("id", "abc")`      | 0 件           |
-| `where_op("id", "!=", "abc")`            | 全部当たる     |
-| `where_in("id", ...)` に混ざった `"abc"` | 一覧から外す   |
-
-- `find(None::<i64>)` も、問い合わせずに `None` です。
-- 直すのは主キーの列だけです。`like` でも直しません。
+- `Post::find("abc")` と `req.auth().user::<User>()` は `None` です。
+- `Post::find_or_fail("abc")` と `req.model::<Post>("post")` は 404 です。
+- `where_("id", "abc")` は 0 件、`where_op("id", "!=", "abc")` は全部当たります。
+- `where_in` に混ざった `"abc"` は、一覧から外します。
+- 直すのは主キーの列だけです。
 
 ## よく使う条件をまとめる
 
-Laravel のスコープに当たるものは、ただのメソッドです。
+Laravel のスコープに当たるものは、ただのメソッドで書きます。
 
 ```rust
 impl Post {
@@ -247,7 +233,7 @@ let posts = Post::published().limit(10).get().await?;
 
 ## リレーション
 
-リレーション（表と表のつながり）は、**メソッドで書きます。** `hasMany` のような宣言はありません。
+リレーション（表と表のつながり）も、メソッドで書きます。
 
 ```rust
 impl Post {
@@ -263,15 +249,11 @@ impl Comment {
         Post::query().where_("id", self.post_id)
     }
 }
-```
 
-```rust
 let comments = post.comments().get().await?;
 let owner = comment.post().first().await?;
-let recent = post.comments().where_op("created_at", ">", "2026-01-01").get().await?;
 ```
 
-Laravel の `$post->comments` のような、触っただけで読む仕組みはありません。
 問い合わせが流れるのは、`await` を書いた所だけです。
 
 ### まとめて読む
@@ -292,39 +274,29 @@ for post in &posts {
 }
 ```
 
-## ページ分け
-
-```rust
-let page = Post::published().paginate(15, req.page()).await?;
-json(&bengara::serde_json::json!({ "total": page.total, "last_page": page.last_page() }))
-```
-
-返るものは [database.md](database.md) の「ページ分け」と同じです。
-
 ## トランザクションの中で使う
 
 トランザクションの中では、`tx` を渡す形を使います。
 
-| ふだん               | トランザクションの中     |
-|----------------------|--------------------------|
-| `post.save()`        | `post.save_using(&tx)`   |
-| `post.delete()`      | `post.delete_using(&tx)` |
-| `post.fresh()`       | `post.fresh_using(&tx)`  |
-| `Post::query()`      | `Post::on(&tx)`          |
-| 組み立て済みのクエリ | `query.using(&tx)`       |
+| ふだん                  | トランザクションの中               |
+|-------------------------|------------------------------------|
+| `post.save()`           | `post.save_using(&tx)`             |
+| `post.save_only(&[..])` | `post.save_only_using(&tx, &[..])` |
+| `post.delete()`         | `post.delete_using(&tx)`           |
+| `post.fresh()`          | `post.fresh_using(&tx)`            |
+| `Post::query()`         | `Post::on(&tx)`                    |
+| 組み立て済みのクエリ    | `query.using(&tx)`                 |
 
 ```rust
 let tx = DB::begin().await?;
-
 let posts = Post::on(&tx).where_("status", "draft").get().await?;
 let mut post = Post::draft("やきそば");
 post.save_using(&tx).await?;
-
 tx.commit().await?;
 ```
 
-- **`save()` や `Post::find()` は、トランザクションの外で流れます。** 中で呼ぶと、巻き戻しても残ります。
-- メモリ上の SQLite は接続が 1 本です。中から `save()` を呼ぶと、待ち続けて時間切れのエラーになります。
+- **`save()` や `Post::find()` は、トランザクションの外で流れます。** 取り消しても残ります。
+- メモリ上の SQLite は接続が 1 本です。中から `save()` を呼ぶと、待ち続けて時間切れになります。
 
 ## 文字列の主キー
 
@@ -336,17 +308,14 @@ DB::table("sessions")
     .await?;
 ```
 
-`bengara::database::Model` を自分で実装すると、読む・更新・削除はモデルで書けます。
-新しく入れるのは `save()` ではできないので、上の `insert` を使います。
-
-**必ず `const INTEGER_KEY: bool = false;` を書いてください。**
-書かないと整数の主キーとして扱うので、`"a1"` のような主キーが見つかりません。
+- `bengara::database::Model` を自分で実装すると、読む・更新・削除はモデルで書けます。
+- **そのときは `const INTEGER_KEY: bool = false;` を必ず書きます。** 書かないと `"a1"` のような主キーが見つかりません。
 
 ## ソフトデリート
 
 ソフトデリートは、行を消す代わりに `deleted_at` に印を付ける方法です。
-`t.soft_deletes()` で列は作れますが、**モデルが自動で除く仕組みはありません。**
-`post.delete()` は行を消し、`Post::all()` は印の付いた行も返します。
+列は `t.soft_deletes()` で作れます。
+`post.delete()` は行を消し、`Post::all()` は印の付いた行も返すので、絞り込みは自分で書きます。
 
 ```rust
 impl Post {
@@ -383,8 +352,7 @@ pub async fn run() -> Result<()> {
 - `--class=PostSeeder` で 1 本だけ動かせます。
 - ほかのシーダーは、関数として呼びます（`crate::database::seeders::post_seeder::run().await?`）。
 
-ファクトリ（テスト用のデータを作る関数）は `database/factories/` に置きます。
-専用の仕組みはなく、ただの関数です。
+ファクトリ（テスト用のデータを作る関数）は `database/factories/` に、ただの関数として置きます。
 
 ```rust
 // database/factories/PostFactory.rs
@@ -399,7 +367,7 @@ pub fn make(i: i64) -> Post {
 
 ## 関連
 
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 - [database.md](database.md) — 接続とクエリビルダ
 - [migrations.md](migrations.md) — 表を作る

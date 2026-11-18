@@ -399,8 +399,11 @@ impl Session {
 }
 
 /// 期限切れのセッションを消す（`session:gc` から呼びます）。
+///
+/// 「切った」印を残す秒数は、置き場所が読むときと同じ（1 時間と
+/// `SESSION_LIFETIME` の長いほう）にそろえます。
 pub(crate) fn sweep_expired(dir: &std::path::Path) -> crate::error::Result<usize> {
-    store::sweep(dir)
+    store::sweep(dir, middleware::lifetime_secs_from_env())
 }
 
 /// CSRF のトークンを取り出す（無ければ作る）。

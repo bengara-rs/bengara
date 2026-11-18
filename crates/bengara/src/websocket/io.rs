@@ -8,28 +8,33 @@
 //! | アプリのタスクの終わり | 1000 で閉じる（パニックなら 1011 と `error!`） |
 //! | 閉じる要求（`close`・列あふれ・`Broadcast::disconnect`） | Close を送る |
 //! | 停止の合図 | 1001 で閉じる |
-//! | ソケットから読む | アプリの `recv` に渡す（列は 16 件。いっぱいなら読まない） |
-//! | 送信の列 | ソケットへ書く |
+//! | ソケットから読む | アプリの `recv` に渡す（待たずに積む。溜まりすぎたら 1008） |
+//! | 送信の列 | ソケットへ書く（1 通 30 秒まで） |
 //! | Ping の時計・無通信の時計 | Ping を送る・1000 で閉じる |
 //!
-//! アプリが `recv` を呼んでいない間も、Ping には Pong を返し、相手の Close にも応じます。
+//! 上から順に見ます。ただし読むのが 16 回続いたら、送信の列から 1 通書きます
+//! （受け取りが途切れなくても、送るほうが止まらないように）。
+//!
+//! アプリが `recv` を呼んでいない間もソケットは読み続けます。Ping には Pong を返し、
+//! 相手の Close にも応じます。読まれずに溜まった量が上限
+//! （受け取る 1 通の上限の 16 通分）を超えたら 1008 で閉じます。
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, Interval};
-use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, Utf8Bytes};
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
+use tokio_tungstenite::tungstenite::{Bytes, Error as WsError, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 
-use super::registry::{self, Conn, Outgoing, Receivers};
+use super::registry::{self, Conn, InboundSender, Outgoing, Receivers};
 use super::{Callback, Message, Pending, Seat, Settings, WebSocket, CLOSE_WAIT};
-use crate::error::{Error, Result};
+use crate::error::Error;
 
-/// 受けたメッセージをアプリの `recv` に渡す列の長さ。
-const INBOUND_QUEUE: usize = 16;
+/// 読むのが続いたとき、送信の列から 1 通書くまでの回数。
+const READ_BURST: u32 = 16;
 
 /// 読み込みの入れ物の大きさ。tungstenite の既定（128 KiB）は先に確保されるので、
 /// 1 万本つなぐと 1 GiB を超えます。足りなければ伸びるので小さくしておきます。
@@ -82,7 +87,7 @@ pub(super) async fn serve<S>(
     let (conn, receivers) = Conn::new(settings.send_queue_limit);
     let id = conn.id();
     registry::register(&conn);
-    let (inbound, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
+    let (inbound, inbound_rx) = registry::inbound(settings.inbound_limit());
     let started = std::time::Instant::now();
     tracing::debug!("WebSocket {id} がつながりました");
 
@@ -138,8 +143,8 @@ struct Io<S> {
     stream: WebSocketStream<S>,
     conn: std::sync::Arc<Conn>,
     receivers: Receivers,
-    /// アプリの `recv` へ渡す口。閉じるときに捨てる（`recv` が None を返す）。
-    inbound: Option<mpsc::Sender<Result<Message>>>,
+    /// アプリの `recv` へ渡す口。閉じるときに捨てる（`recv` は残りを返してから None）。
+    inbound: Option<InboundSender>,
     settings: Settings,
     shutdown: watch::Receiver<bool>,
     shutdown_seen: bool,
@@ -154,10 +159,7 @@ enum Step {
     App(std::result::Result<(), JoinError>),
     Close(u16, String),
     Shutdown,
-    Read(
-        Option<mpsc::OwnedPermit<Result<Message>>>,
-        Option<std::result::Result<WsMessage, WsError>>,
-    ),
+    Read(Option<Result<WsMessage, WsError>>),
     Write(Outgoing),
     Ping,
     Idle,
@@ -189,22 +191,30 @@ where
             interval
         });
         let mut idle_at = self.idle_deadline();
+        // 読むのが続いた回数。`READ_BURST` に届いたら、送信の列から 1 通書く。
+        let mut reads_in_row = 0u32;
 
         loop {
-            let step = {
-                let discard = self.closing.is_some();
-                let read = read_next(&mut self.stream, self.inbound.clone(), discard);
-                tokio::select! {
+            let discard = self.closing.is_some();
+            let step = if reads_in_row >= READ_BURST && !discard {
+                reads_in_row = 0;
+                self.receivers.out.try_recv().ok().map(Step::Write)
+            } else {
+                None
+            };
+            let step = match step {
+                Some(step) => step,
+                None => tokio::select! {
                     biased;
                     result = join(&mut app) => Step::App(result),
                     Some((code, reason)) = self.receivers.ctrl.recv() => Step::Close(code, reason),
                     _ = self.shutdown.wait_for(|stop| *stop), if !self.shutdown_seen => Step::Shutdown,
-                    (permit, frame) = read => Step::Read(permit, frame),
+                    frame = self.stream.next() => Step::Read(frame),
                     Some(item) = self.receivers.out.recv(), if !discard => Step::Write(item),
                     _ = tick(&mut ping), if !discard && ping.is_some() => Step::Ping,
                     _ = sleep_until(idle_at), if !discard && idle_at.is_some() => Step::Idle,
                     _ = sleep_until(self.closing), if discard => Step::CloseTimeout,
-                }
+                },
             };
 
             let flow = match step {
@@ -240,13 +250,15 @@ where
                     self.shutdown_seen = true;
                     self.start_close(1001, "server shutting down").await
                 }
-                Step::Read(permit, frame) => {
+                Step::Read(frame) => {
+                    reads_in_row += 1;
                     if matches!(frame, Some(Ok(_))) {
                         idle_at = self.idle_deadline();
                     }
-                    self.on_read(permit, frame).await
+                    self.on_read(frame).await
                 }
                 Step::Write(item) => {
+                    reads_in_row = 0;
                     let len = item.len();
                     let flow = self.write(outgoing_message(item)).await;
                     self.conn.written(len);
@@ -270,13 +282,26 @@ where
     }
 
     /// 1 通書く。相手が読まずに詰まっても、閉じる要求と停止の合図には応じる。
+    ///
+    /// 書き終わるまで `write_timeout`（30 秒）待ちます。過ぎたら Close を送らずに切ります
+    /// （相手が読まないので Close も届かない）。
     async fn write(&mut self, message: WsMessage) -> Flow {
+        let limit = self.settings.write_timeout;
         let interrupt = tokio::select! {
             biased;
-            result = self.stream.send(message) => {
+            result = tokio::time::timeout(limit, self.stream.send(message)) => {
                 return match result {
-                    Ok(()) => Flow::Continue,
-                    Err(_) => Flow::Break,
+                    Ok(Ok(())) => Flow::Continue,
+                    Ok(Err(_)) => Flow::Break,
+                    Err(_) => {
+                        tracing::warn!(
+                            "WebSocket {} への書き込みが {} 秒進まないので切ります",
+                            self.conn.id(),
+                            limit.as_secs_f32()
+                        );
+                        self.conn.mark_closed();
+                        Flow::Break
+                    }
                 };
             }
             Some((code, reason)) = self.receivers.ctrl.recv() => Interrupt::Close(code, reason),
@@ -330,23 +355,14 @@ where
     }
 
     /// 読んだものを扱う。
-    async fn on_read(
-        &mut self,
-        permit: Option<mpsc::OwnedPermit<Result<Message>>>,
-        frame: Option<std::result::Result<WsMessage, WsError>>,
-    ) -> Flow {
+    async fn on_read(&mut self, frame: Option<Result<WsMessage, WsError>>) -> Flow {
         match frame {
             Some(Ok(WsMessage::Text(text))) => {
-                if let Some(permit) = permit {
-                    permit.send(Ok(Message::Text(text.as_str().to_owned())));
-                }
-                Flow::Continue
+                self.hand_to_app(Message::Text(text.as_str().to_owned()))
+                    .await
             }
             Some(Ok(WsMessage::Binary(bytes))) => {
-                if let Some(permit) = permit {
-                    permit.send(Ok(Message::Binary(bytes.to_vec())));
-                }
-                Flow::Continue
+                self.hand_to_app(Message::Binary(bytes.to_vec())).await
             }
             Some(Ok(WsMessage::Ping(_))) => {
                 // tungstenite が Pong を積んでいる。アプリが読んでいなくても返す。
@@ -367,17 +383,39 @@ where
                 Flow::Break
             }
             Some(Ok(_)) => Flow::Continue,
-            Some(Err(error)) => self.on_error(permit, error).await,
+            Some(Err(error)) => self.on_error(error).await,
             None => Flow::Break,
         }
     }
 
+    /// 受けたメッセージをアプリの `recv` へ積む。待ちません。
+    ///
+    /// 閉じる途中なら捨てます。読まれずに溜まった量が上限を超えたら、
+    /// アプリに `Err` を 1 回渡して 1008 で閉じます（送信の列は送らない）。
+    async fn hand_to_app(&mut self, message: Message) -> Flow {
+        if self.closing.is_some() {
+            return Flow::Continue;
+        }
+        let Some(inbound) = &self.inbound else {
+            return Flow::Continue;
+        };
+        if inbound.push(message).is_ok() {
+            return Flow::Continue;
+        }
+        let limit = self.settings.inbound_limit();
+        tracing::warn!(
+            "WebSocket {} の受信がアプリに読まれずに溜まったので、1008 で閉じます",
+            self.conn.id()
+        );
+        inbound.push_error(Error::msg(format!(
+            "受け取ったメッセージが読まれずに溜まりすぎました（上限 {limit} バイト）"
+        )));
+        self.inbound = None;
+        self.start_close(1008, "receive queue full").await
+    }
+
     /// 読み込みのエラー。番号を決めて閉じ、アプリには `Err` を 1 回渡す。
-    async fn on_error(
-        &mut self,
-        permit: Option<mpsc::OwnedPermit<Result<Message>>>,
-        error: WsError,
-    ) -> Flow {
+    async fn on_error(&mut self, error: WsError) -> Flow {
         let (code, reason, message) = match &error {
             WsError::Capacity(_) => (
                 1009,
@@ -400,11 +438,10 @@ where
             // 切れた・読めない。もう送れないので、そのまま終わる。
             _ => return Flow::Break,
         };
-        if let Some(permit) = permit {
-            permit.send(Err(Error::msg(message)));
+        // 先に受けた分の後ろに積む。アプリにはこの後 None を返す。
+        if let Some(inbound) = self.inbound.take() {
+            inbound.push_error(Error::msg(message));
         }
-        // アプリにはこの後 None を返す。
-        self.inbound = None;
         match self.start_close(code, reason).await {
             Flow::Continue => Flow::Continue,
             Flow::Break => Flow::Break,
@@ -412,33 +449,34 @@ where
     }
 }
 
-/// アプリの `recv` の列に空きができてから、ソケットを 1 通読む。
-///
-/// 列がいっぱいの間は読みません（TCP の押し戻しで相手を待たせる）。
-/// 閉じる途中（`discard`）や、アプリが受け口を捨てたときは、読んで捨てます。
-async fn read_next<S>(
-    stream: &mut WebSocketStream<S>,
-    inbound: Option<mpsc::Sender<Result<Message>>>,
-    discard: bool,
-) -> (
-    Option<mpsc::OwnedPermit<Result<Message>>>,
-    Option<std::result::Result<WsMessage, WsError>>,
-)
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let permit = match inbound {
-        Some(inbound) if !discard => inbound.reserve_owned().await.ok(),
-        _ => None,
-    };
-    (permit, stream.next().await)
-}
-
-/// 送信の列のものを tungstenite の形にする。
+/// 送信の列のものを tungstenite の形にする。中身は写しません。
 fn outgoing_message(item: Outgoing) -> WsMessage {
     match item {
-        Outgoing::Text(text) => WsMessage::Text(text.into()),
+        Outgoing::Text(text) => WsMessage::Text(shared_text(text)),
         Outgoing::Binary(bytes) => WsMessage::Binary(bytes.into()),
+    }
+}
+
+/// 共有の文字を tungstenite の文字にする。
+///
+/// 宛先が 1 つ（`send_text`）なら、そのまま渡す。配信で共有しているなら、
+/// `Arc` を持たせた `Bytes` で包む（接続ごとに写さない）。
+fn shared_text(text: std::sync::Arc<String>) -> Utf8Bytes {
+    match std::sync::Arc::try_unwrap(text) {
+        Ok(owned) => owned.into(),
+        Err(shared) => {
+            // `String` なので必ず UTF-8。確かめは中身をなめるだけで、写さない。
+            Utf8Bytes::try_from(Bytes::from_owner(SharedText(shared))).unwrap_or_default()
+        }
+    }
+}
+
+/// `Bytes::from_owner` に渡すための包み。
+struct SharedText(std::sync::Arc<String>);
+
+impl AsRef<[u8]> for SharedText {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
     }
 }
 
@@ -596,6 +634,100 @@ mod tests {
         let _ = release.send(());
         assert_eq!(close_code_of(&mut client).await, Some(1000));
         finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn アプリが読まずにメッセージが溜まってもpingに応じ順に渡す() {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+        let (mut client, _state, task) = pair(|mut socket| async move {
+            let _ = wait.await;
+            let mut got = Vec::new();
+            while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                got.push(text);
+            }
+            let _ = got_tx.send(got);
+        })
+        .await;
+        // 以前の列の長さ（16 件）を超えて送ってから Ping を送る。
+        for i in 0..40 {
+            client.send(WsMessage::text(format!("m{i}"))).await.unwrap();
+        }
+        client.send(WsMessage::Ping(vec![7].into())).await.unwrap();
+        let pong = tokio::time::timeout(TEST_WAIT, client.next())
+            .await
+            .expect("アプリが読まなくても Pong が返る");
+        assert!(matches!(pong, Some(Ok(WsMessage::Pong(p))) if p.as_ref() == [7]));
+
+        // 相手の Close にも応じる。アプリは溜まった分を送った順に読める。
+        client.close(None).await.unwrap();
+        let _ = release.send(());
+        let got = tokio::time::timeout(TEST_WAIT, got_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let want: Vec<String> = (0..40).map(|i| format!("m{i}")).collect();
+        assert_eq!(got, want);
+        finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn 読まれずに溜まりすぎたら1008で閉じアプリにerrを渡す() {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        // 溜まりの上限は 16 × 16 = 256 バイト。1 通は 10 + 64 = 74 バイトに数えるので 4 通目であふれる。
+        let settings = Settings {
+            max_message_size: 16,
+            ..Settings::default()
+        };
+        let (mut client, _state, task) = pair_with(settings, 64 * 1024, |mut socket| async move {
+            let _ = wait.await;
+            let mut texts = Vec::new();
+            let mut errors = 0;
+            while let Some(item) = socket.recv().await {
+                match item {
+                    Ok(Message::Text(text)) => texts.push(text),
+                    Ok(Message::Binary(_)) => {}
+                    Err(_) => errors += 1,
+                }
+            }
+            let _ = seen_tx.send((texts, errors));
+        })
+        .await;
+        for i in 0..10 {
+            client
+                .send(WsMessage::text(format!("{i:0>10}")))
+                .await
+                .unwrap();
+        }
+        assert_eq!(close_code_of(&mut client).await, Some(1008));
+        let _ = release.send(());
+        let (texts, errors) = seen_rx.await.unwrap();
+        assert_eq!(texts.len(), 3, "あふれる前の分は読める: {texts:?}");
+        assert_eq!(texts[0], "0000000000");
+        assert_eq!(errors, 1, "Err が 1 回来て、その後は None");
+        finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn 書き込みが進まない相手は時間で切る() {
+        let settings = Settings {
+            write_timeout: Duration::from_millis(200),
+            send_queue_limit: 4 * 1024 * 1024,
+            ..Settings::default()
+        };
+        // duplex の入れ物を小さくして、相手が読まないと書けないようにする。
+        let (client, state, task) = pair_with(settings, 512, |mut socket| async move {
+            socket.send_text("x".repeat(256 * 1024)).unwrap();
+            while socket.recv().await.is_some() {}
+        })
+        .await;
+        // 相手（client）は読まない。Close も送れないので、そのまま切れる。
+        let started = std::time::Instant::now();
+        finished(task).await;
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(state.active(), 0, "席は返る");
+        drop(client);
     }
 
     #[tokio::test]

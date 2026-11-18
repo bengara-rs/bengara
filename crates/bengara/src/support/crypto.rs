@@ -26,66 +26,96 @@ const INIT: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-/// SHA-256 を計算する。
-pub(crate) fn sha256(input: &[u8]) -> Digest {
-    let mut h = INIT;
-
-    // 詰め物: 0x80 を1バイト、長さが 64 の倍数 - 8 になるまで 0、最後に元の長さ（ビット数）。
-    let mut message = Vec::with_capacity(input.len() + 72);
-    message.extend_from_slice(input);
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-
-    for block in message.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (slot, value) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *slot = slot.wrapping_add(value);
-        }
+/// SHA-256 の圧縮関数。1 ブロック（64 バイト＝16 語）で状態を進めます。
+///
+/// `sha256` と PBKDF2 の両方がここを通ります。PBKDF2 はブロックの中身が
+/// 決まっているので、バイト列に戻さずに語のまま渡します。
+fn compress(state: &mut [u32; 8], block: &[u32; 16]) {
+    let mut w = [0u32; 64];
+    w[..16].copy_from_slice(block);
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
     }
 
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *state;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *slot = slot.wrapping_add(value);
+    }
+}
+
+/// バイト列を語（ビッグエンディアン）に読む。`N` 語ぶん読みます。
+fn to_words<const N: usize>(bytes: &[u8]) -> [u32; N] {
+    let mut words = [0u32; N];
+    for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+        *word = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    words
+}
+
+/// 状態（8 語）を 32 バイトに書き出す。
+fn to_digest(state: &[u32; 8]) -> Digest {
     let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
+    for (i, word) in state.iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+/// 途中まで進めた状態から、残りの入力を足して仕上げる。
+///
+/// `done` は、状態を作るまでに通したバイト数です（64 の倍数）。
+/// 詰め物の最後に書く長さは、`done` と `input` を足した全体の長さです。
+/// `sha256` は `INIT` と 0 から始めます。
+fn sha256_from(mut state: [u32; 8], done: u64, input: &[u8]) -> Digest {
+    let mut chunks = input.chunks_exact(64);
+    for block in &mut chunks {
+        compress(&mut state, &to_words(block));
+    }
+
+    // 詰め物: 0x80 を1バイト、長さが 64 の倍数 - 8 になるまで 0、最後に全体の長さ（ビット数）。
+    // 残りは 63 バイト以下なので、詰め物を足しても 2 ブロックに収まります。
+    let rest = chunks.remainder();
+    let mut tail = [0u8; 128];
+    tail[..rest.len()].copy_from_slice(rest);
+    tail[rest.len()] = 0x80;
+    let tail_len = if rest.len() < 56 { 64 } else { 128 };
+    let bit_len = done.wrapping_add(input.len() as u64).wrapping_mul(8);
+    tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_be_bytes());
+    for block in tail[..tail_len].chunks_exact(64) {
+        compress(&mut state, &to_words(block));
+    }
+    to_digest(&state)
+}
+
+/// SHA-256 を計算する。
+pub(crate) fn sha256(input: &[u8]) -> Digest {
+    sha256_from(INIT, 0, input)
 }
 
 /// HMAC のブロックの長さ（RFC 2104）。
@@ -119,24 +149,36 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> Digest {
     sha256(&outer)
 }
 
-/// PBKDF2 の中だけで使う HMAC。鍵を 1 回だけ用意して使い回します。
+/// PBKDF2 の中だけで使う HMAC。鍵から作る部分を 1 回だけ計算して使い回します。
 ///
-/// `hmac_sha256` を繰り返し呼ぶと、**呼ぶたびに**鍵をそろえ直します（長い鍵なら
-/// `sha256` をやり直し）。12 万回ぶんだと、計算量がパスワードの長さに比例します。
-/// ここでは鍵から作る `ipad` / `opad` を持ち回り、そろえ直しを入口の 1 回にします。
+/// HMAC は `sha256(opad || sha256(ipad || メッセージ))` です。`ipad`（鍵 ^ 0x36）と
+/// `opad`（鍵 ^ 0x5c）はちょうど 1 ブロック（64 バイト）で、鍵が同じなら毎回同じです。
+/// そこで、**それぞれを圧縮したあとの状態**を入口で 1 回だけ作って持ちます。
 ///
-/// **確保が無くなるわけではありません。** 渡した先の `sha256` が毎回 `Vec` を
-/// 作ってメッセージを写します。確保なしの `sha256` を手で書いて測っても、
-/// 差は 1〜2 割（計測の揺れと同じ桁）だったので、そのままにしてあります。
+/// 2 回目以降のメッセージは 32 バイト（前回の結果）です。残りは
+/// 「32 バイト + 詰め物」の 1 ブロックだけなので、1 回の HMAC は
+/// **圧縮 2 回**で済みます（毎回 `sha256` に渡すと 4 回）。確保もしません。
 struct Pbkdf2Hmac {
-    /// 鍵 ^ 0x36。
-    ipad: [u8; HMAC_BLOCK],
-    /// 鍵 ^ 0x5c。
-    opad: [u8; HMAC_BLOCK],
+    /// `ipad` を圧縮したあとの状態。
+    inner: [u32; 8],
+    /// `opad` を圧縮したあとの状態。
+    outer: [u32; 8],
+}
+
+/// 「32 バイトのメッセージ + 詰め物」のブロック（16 語）を作る。
+///
+/// 前に 1 ブロック（`ipad` か `opad`）があるので、全体は 96 バイト＝768 ビットです。
+/// 詰め物は毎回同じなので、ここで決め打ちします。
+fn digest_block(message: &[u32; 8]) -> [u32; 16] {
+    let mut block = [0u32; 16];
+    block[..8].copy_from_slice(message);
+    block[8] = 0x8000_0000;
+    block[15] = ((HMAC_BLOCK + 32) * 8) as u32;
+    block
 }
 
 impl Pbkdf2Hmac {
-    /// 鍵をそろえて `ipad` / `opad` を作る。**ここだけで 1 回**です。
+    /// 鍵をそろえて、`ipad` / `opad` を圧縮した状態を作る。**ここだけで 1 回**です。
     fn new(key: &[u8]) -> Self {
         let k = hmac_block_key(key);
         let mut ipad = [0u8; HMAC_BLOCK];
@@ -145,33 +187,31 @@ impl Pbkdf2Hmac {
             *i = byte ^ 0x36;
             *o = byte ^ 0x5c;
         }
-        Self { ipad, opad }
+        let mut inner = INIT;
+        compress(&mut inner, &to_words(&ipad));
+        let mut outer = INIT;
+        compress(&mut outer, &to_words(&opad));
+        Self { inner, outer }
     }
 
     /// 長さの決まっていないメッセージに署名する。1 回目（`塩 || 1`）だけで使います。
-    fn sign(&self, message: &[u8]) -> Digest {
-        let mut inner = Vec::with_capacity(HMAC_BLOCK + message.len());
-        inner.extend_from_slice(&self.ipad);
-        inner.extend_from_slice(message);
-        self.finish(&sha256(&inner))
+    fn sign(&self, message: &[u8]) -> [u32; 8] {
+        let inner = sha256_from(self.inner, HMAC_BLOCK as u64, message);
+        self.finish(&to_words(&inner))
     }
 
-    /// 32 バイトのメッセージに署名する。2 回目以降はこちらだけです。
-    ///
-    /// メッセージの長さが決まっているので、積む先は固定長の配列です。
-    fn sign_digest(&self, message: &Digest) -> Digest {
-        let mut inner = [0u8; HMAC_BLOCK + 32];
-        inner[..HMAC_BLOCK].copy_from_slice(&self.ipad);
-        inner[HMAC_BLOCK..].copy_from_slice(message);
-        self.finish(&sha256(&inner))
+    /// 32 バイト（8 語）のメッセージに署名する。2 回目以降はこちらだけです。
+    fn sign_digest(&self, message: &[u32; 8]) -> [u32; 8] {
+        let mut inner = self.inner;
+        compress(&mut inner, &digest_block(message));
+        self.finish(&inner)
     }
 
-    /// 外側のハッシュ。`opad || 内側のハッシュ` を取ります。
-    fn finish(&self, inner: &Digest) -> Digest {
-        let mut outer = [0u8; HMAC_BLOCK + 32];
-        outer[..HMAC_BLOCK].copy_from_slice(&self.opad);
-        outer[HMAC_BLOCK..].copy_from_slice(inner);
-        sha256(&outer)
+    /// 外側のハッシュ。`opad || 内側のハッシュ` の残り 1 ブロックだけを圧縮します。
+    fn finish(&self, inner: &[u32; 8]) -> [u32; 8] {
+        let mut outer = self.outer;
+        compress(&mut outer, &digest_block(inner));
+        outer
     }
 }
 
@@ -188,7 +228,27 @@ impl Pbkdf2Hmac {
 /// 鍵のそろえ直し（64 バイトを超える鍵の `sha256`）は**入口で 1 回だけ**です。
 /// 繰り返しのたびにやり直すと、長いパスワードを送られただけで 1 件の照合が
 /// 何十秒もかかり、登録の有無まで時間差で漏れます。
+///
+/// # 1 回の繰り返しは圧縮 2 回です
+///
+/// 総当たりする側は、`ipad` / `opad` の状態を使い回す形で計算してきます。
+/// こちらが 1 回に 4 回ぶん圧縮していると、同じ時間をかけても強さは半分です。
+/// 詳しくは `Pbkdf2Hmac` を見てください。
 pub(crate) fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> Digest {
+    pbkdf2_sha256_spending(password, salt, iterations, iterations)
+}
+
+/// [`pbkdf2_sha256`] と同じ答えを、**`spend` 回ぶんの時間をかけて**返す。
+///
+/// `spend` が `iterations` より多ければ、足りない回数だけ同じ HMAC を空回しします。
+/// 答えには混ぜません。保存されている回数が少ない値の照合を、ほかの照合
+/// （空回しを含む）と同じ重さにするために使います。
+pub(crate) fn pbkdf2_sha256_spending(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    spend: u32,
+) -> Digest {
     let hmac = Pbkdf2Hmac::new(password);
 
     // ブロック番号は 1 つだけ（出力が 32 バイトのため）。
@@ -204,7 +264,13 @@ pub(crate) fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32) -> Di
             *slot ^= value;
         }
     }
-    out
+    // 足りない回数の空回し。結果は捨てるが、最適化で消されないよう目隠しする。
+    let mut waste = u;
+    for _ in iterations.max(1)..spend {
+        waste = std::hint::black_box(hmac.sign_digest(&waste));
+    }
+    std::hint::black_box(waste);
+    to_digest(&out)
 }
 
 /// バイト列を16進の小文字にする。
@@ -493,7 +559,7 @@ larger than block-size data. The key needs to be hashed before being used by the
             vec![0xaa; 131],
             vec![b'x'; 4096],
         ] {
-            for iterations in [1u32, 2, 5] {
+            for iterations in [1u32, 2, 3, 5, 64, 257] {
                 assert_eq!(
                     pbkdf2_sha256(&password, b"salt", iterations),
                     naive_pbkdf2(&password, b"salt", iterations),
@@ -503,12 +569,38 @@ larger than block-size data. The key needs to be hashed before being used by the
             }
         }
         // 塩の長さが変わっても同じ（1 回目だけ長さが決まっていない）。
-        for salt in [b"".to_vec(), b"s".to_vec(), vec![0x5a; 100]] {
+        // 「ipad の 64 バイト + 塩 + 4 バイト」の詰め物が 1 ブロック・2 ブロックに
+        // 分かれる境目（塩 51 / 52 バイト）と、塩だけで 1 ブロックを超える長さも見る。
+        for salt in [
+            b"".to_vec(),
+            b"s".to_vec(),
+            vec![0x5a; 51],
+            vec![0x5a; 52],
+            vec![0x5a; 60],
+            vec![0x5a; 100],
+        ] {
             assert_eq!(
                 pbkdf2_sha256(b"password", &salt, 3),
                 naive_pbkdf2(b"password", &salt, 3)
             );
         }
+    }
+
+    #[test]
+    fn 空回しを足しても答えは変わらない() {
+        let want = pbkdf2_sha256(b"password", b"salt", 4096);
+        for spend in [0u32, 1, 4096, 4097, 10_000] {
+            assert_eq!(
+                pbkdf2_sha256_spending(b"password", b"salt", 4096, spend),
+                want,
+                "{spend} 回ぶん"
+            );
+        }
+        assert_eq!(
+            pbkdf2_sha256_spending(b"x", b"y", 0, 5),
+            pbkdf2_sha256(b"x", b"y", 1),
+            "0 回は 1 回として扱う"
+        );
     }
 
     #[test]
@@ -537,18 +629,52 @@ mod bench {
     use super::*;
     use std::time::Instant;
 
-    /// 回数を決めるための計測。`cargo test -- --ignored --nocapture` で見る。
+    /// 1 回の繰り返しで圧縮を 4 回する形（直す前の形）。比べるためだけに置きます。
+    ///
+    /// `ipad || 前回の結果`（96 バイト）と `opad || 内側の結果` を毎回 `sha256` に渡します。
+    fn four_compressions(password: &[u8], salt: &[u8], iterations: u32) -> Digest {
+        let k = hmac_block_key(password);
+        let mut inner = [0u8; HMAC_BLOCK + 32];
+        let mut outer = [0u8; HMAC_BLOCK + 32];
+        for (i, byte) in k.iter().enumerate() {
+            inner[i] = byte ^ 0x36;
+            outer[i] = byte ^ 0x5c;
+        }
+        let mut block = salt.to_vec();
+        block.extend_from_slice(&1u32.to_be_bytes());
+        let mut u = hmac_sha256(password, &block);
+        let mut out = u;
+        for _ in 1..iterations.max(1) {
+            inner[HMAC_BLOCK..].copy_from_slice(&u);
+            outer[HMAC_BLOCK..].copy_from_slice(&sha256(&inner));
+            u = sha256(&outer);
+            for (slot, value) in out.iter_mut().zip(u.iter()) {
+                *slot ^= value;
+            }
+        }
+        out
+    }
+
+    /// 回数を決めるための計測。リリースビルドで見る。
+    ///
+    /// `cargo test --release -p bengara --lib pbkdf2の速さを測る -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn pbkdf2の速さを測る() {
-        for iterations in [10_000u32, 50_000, 120_000, 600_000] {
+        let password = b"correct horse battery staple";
+        let salt = b"0123456789abcdef";
+        assert_eq!(
+            pbkdf2_sha256(password, salt, 1000),
+            four_compressions(password, salt, 1000)
+        );
+        for iterations in [10_000u32, 50_000, 120_000, 240_000, 600_000] {
             let started = Instant::now();
-            let _ = pbkdf2_sha256(
-                b"correct horse battery staple",
-                b"0123456789abcdef",
-                iterations,
-            );
-            println!("{iterations:>7} 回: {:?}", started.elapsed());
+            std::hint::black_box(four_compressions(password, salt, iterations));
+            let before = started.elapsed();
+            let started = Instant::now();
+            std::hint::black_box(pbkdf2_sha256(password, salt, iterations));
+            let after = started.elapsed();
+            println!("{iterations:>7} 回: 圧縮 4 回の形 {before:?} / いまの形 {after:?}");
         }
     }
 }

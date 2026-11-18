@@ -4,7 +4,11 @@
 //! MySQL と PostgreSQL を足すときに触る場所が1つで済みます。
 
 /// 使うデータベース。
+///
+/// **`#[non_exhaustive]` です。** 後からドライバを足せるように、`match` には
+/// `_ =>` の腕を書いてください。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Driver {
     /// SQLite。
     Sqlite,

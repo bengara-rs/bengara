@@ -27,7 +27,7 @@ Mail::to("alice@example.com")
 | `send()`                 | 送る                       |
 
 - `text` と `html` は両方書けます。
-- 文面は `format!` で組み立てます。テンプレートの仕組みはありません。
+- 文面は `format!` で組み立てます。
 - 送る前の中身は `message()` で見られます。
 
 ### 断るもの
@@ -42,8 +42,7 @@ Mail::to("alice@example.com")
 
 - 改行を断るのは、ヘッダーに偽の行を混ぜられないようにするためです。本文の改行は通ります。
 - 空白だけの宛先・写しは飛ばします（`.cc("")` でも落ちません）。
-- **アドレスの形は確かめません。** 入力から受け取るなら、`email`
-  の検査規則を通してください（[validation.md](validation.md)）。
+- **アドレスの形は確かめません。** 入力から受け取るなら、`email` の検査規則を通してください（[validation.md](validation.md)）。
 
 ### キューから送る
 
@@ -68,19 +67,13 @@ Queue::push("SendWelcome", &Payload { user_id: user.id }).await?;
 
 - 大文字小文字と前後の空白は見ません。
 - `MAIL_MAILER` が無いか空なら、古い名前の `MAIL_DRIVER` を見ます。
-- **知らない名前は `log` にしません。** 送るときにエラーになります。打ち間違いのまま、送れたつもりにならないためです。
+- **知らない名前は、送るときにエラーになります。** 打ち間違いのまま、送れたつもりにならないためです。
 
 ```
 メールの送り先 `ses` は知りません（MAIL_MAILER / MAIL_DRIVER）。使えるのは log・array（memory）・smtp です
 ```
 
 ### 差出人
-
-```
-MAIL_MAILER=log
-MAIL_FROM=noreply@example.com
-MAIL_FROM_NAME=myapp
-```
 
 | 設定             | 既定                  | 意味             |
 |------------------|-----------------------|------------------|
@@ -99,8 +92,6 @@ pub fn config() -> MailConfig {
     MailConfig {
         from: env("MAIL_FROM", "noreply@example.com"),
         from_name: env("MAIL_FROM_NAME", "myapp"),
-        // 残りは既定のまま（送り先は MAIL_MAILER → MAIL_DRIVER の順に、
-        // SMTP は `.env` の MAIL_HOST などを見ます）。
         ..MailConfig::default()
     }
 }
@@ -137,7 +128,6 @@ async fn お知らせを送る() {
     let _lock = exclusive().await;      // Mail::sent() はプロセスで 1 つ
     Mail::clear_sent();
 
-    // 利用者がいないと、このジョブは何もせずに終わる。先に作る
     let mut user = User::register("アリス", "alice@example.com", "password123")
         .await
         .unwrap();
@@ -200,10 +190,11 @@ MAIL_FROM_NAME=myapp
 | `smtps`                        | 465          | ポートに関係なく、最初から暗号化する                  |
 | `none`（`null` と `false` も） | 25           | 暗号化しない                                          |
 
+- 大文字小文字は見ません。
 - `tls` と `MAIL_PORT=587` の組み合わせは `starttls` でつなぎます。Laravel の `.env` をそのまま使えます。
 - 行が無いときや空のときは `starttls` です。暗号化しないなら `none` と書きます。
-- 暗号化なしで `MAIL_USERNAME` を使うと、警告が出ます。パスワードが平文で流れるためです。
 - 知らない語は、警告を出して `starttls` にします。
+- 暗号化なしで `MAIL_USERNAME` を使うと、警告が出ます。パスワードが平文で流れるためです。
 
 ### 知っておくこと
 
@@ -238,8 +229,7 @@ bengara::mail::install_mailer(Box::new(MyMailer));
 - **効くのは 1 回目だけです。**
 - `send` は `async` ではありません。待つ処理をそのまま書けます。
 
-Laravel の通知（Notification）は作りません。`Mail` を直接使ってください。
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

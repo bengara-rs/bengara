@@ -13,20 +13,17 @@
 
 ### 1. 表を作る
 
-```rust
-// database/migrations/2026_10_05_000200_create_users_table.rs
-use bengara::prelude::*;
+`users` 表に、照合に使う列（`email` など）とパスワードの列（`password`）を作ります。
 
-pub fn up(schema: &mut Schema) {
-    schema.create("users", |t| {
-        t.id();
-        t.string("name");
-        t.string("email").unique();
-        t.string("password");
-        t.boolean("is_admin").default(false);
-        t.timestamps();
-    });
-}
+```rust
+schema.create("users", |t| {
+    t.id();
+    t.string("name");
+    t.string("email").unique();
+    t.string("password");
+    t.boolean("is_admin").default(false);
+    t.timestamps();
+});
 ```
 
 ### 2. モデル
@@ -35,16 +32,13 @@ pub fn up(schema: &mut Schema) {
 
 ```rust
 // app/Models/User.rs
-use bengara::prelude::*;
-
 #[derive(Model, Debug, Clone)]
 #[model(table = "users")]
 pub struct User {
     pub id: i64,
     pub name: String,
     pub email: String,
-    /// Hash::make_async が作った文字列。平文は入れません。
-    pub password: String,
+    pub password: String,   // Hash::make_async が作った文字列。平文は入れない
     pub is_admin: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -56,6 +50,9 @@ impl Authenticatable for User {
     }
 }
 ```
+
+パスワードの列が `password` でないときは、`auth_password_name()` も書いて列名を返します。
+ログインのついでにパスワードを作り直すとき、この列に書くためです（下の「ハッシュの回数」）。
 
 ### 3. 登録
 
@@ -83,11 +80,10 @@ user.password = Hash::make_async(password).await?;
 | `Hash::check_async(平文, 保存した値)`  | 合っているか                                     |
 | `Hash::make(平文)` / `Hash::check(..)` | 上の 2 つの同期版                                |
 | `Hash::make_with(平文, 回数)`          | 回数を決めて変える（同期）                       |
-| `Hash::needs_rehash(保存した値)`       | 設定の回数を上げたあと、作り直すべきか           |
+| `Hash::needs_rehash(保存した値)`       | 作り直すべきか（下の「ハッシュの回数」）         |
 
-- `async fn` の中では `make_async` / `check_async` を使います。
-  同期版はスレッドを約 0.2 秒止めるので、シーダやテストの準備など同期の関数の中でだけ使います。
-- `req.auth().attempt(...)` は、中で別のスレッドに回すのでそのまま呼べます。
+- **`async fn` の中では `make_async` / `check_async` を使います。** 同期版はスレッドを約 0.2 秒止めます。
+- 同期版は、シーダーやテストの準備など同期の関数の中でだけ使います。
 
 ### パスワードの検査に `max:1024` を必ず付ける
 
@@ -96,17 +92,12 @@ user.password = Hash::make_async(password).await?;
 ```
 
 平文の上限は 4096 バイトです。
+`check` は、上限を超える平文を計算せずに偽とします。
+ところが `make` は、上限を超えてもハッシュを作ってしまいます（ログにエラーが出ます）。
 
-| 関数    | 4096 バイトを超える平文を渡すと                   |
-|---------|---------------------------------------------------|
-| `check` | 計算せずに偽を返す                                |
-| `make`  | **そのままハッシュを作る**。ログに `error` が出る |
-
-**そのハッシュは `check` が必ず偽を返すので、その人は二度とログインできません。**
+**そのハッシュでは、その人は二度とログインできません。**
 登録・変更・再設定の 3 か所すべてに `max:1024` を付けます。
-
-- `max:1024` は文字数、上限の 4096 はバイト数です。UTF-8 は 1 文字が最大 4 バイトなので、1024 文字なら必ず収まります。
-- 上限は、とても長い入力で計算を引き延ばされないためにあります。
+1 文字は最大 4 バイトなので、1024 文字なら必ず 4096 バイトに収まります。
 
 ## ログインする
 
@@ -143,13 +134,12 @@ pub async fn login(req: Request) -> Result<Response> {
 | `user_or_fail::<U>()`                       | 同じ。いなければ 401                              |
 | `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする                        |
 
-- **ログインするとセッション ID を作り直し、CSRF トークンも変わります。**
-  ログイン後の画面で取り直します（[session.md](session.md)）。
-- **`user()` は呼ぶたびに DB を引きます。** 何度も使うときは変数に入れます。
-- **`check()` / `guest()` / `id()` と `auth` ミドルウェアは DB を引きません。** セッションだけを見ます。
-  利用者の行を消しても、セッションが残るあいだは通ります。**利用者を消したら `logout_user(id)` を呼びます。**
-- 利用者が見つからないときも、`attempt` は照合と同じだけ時間をかけます。応答の速さで登録の有無が分からないようにするためです。
-- `Auth::user()` のように、どこからでも読む形はありません。`req` から取ります。
+- **ログインすると、セッション ID と CSRF トークンが変わります。** ログイン後の画面で取り直します（[session.md](session.md)）。
+- `user()` は呼ぶたびに DB を引きます。何度も使うときは変数に入れます。
+- `check()` / `guest()` / `id()` と `auth` ミドルウェアは、セッションだけを見ます。
+- そのため、利用者の行を消してもセッションが残るあいだは通ります。**利用者を消したら `logout_user(id)` を呼びます。**
+- 利用者がいないときも、`attempt` は照合と同じだけ時間をかけます。応答の速さで登録の有無が分からないようにするためです。
+- ログイン中の人は `req.auth()` から取ります。
 
 ### ログインの回数を制限する
 
@@ -159,7 +149,7 @@ pub async fn login(req: Request) -> Result<Response> {
 Route::post("/api/login", AuthController::login).middleware("throttle");
 ```
 
-- ログインの口には `Throttle::per_minute(5).by_ip()` のように `by_ip()` を付けます。
+- ログインの口の制限は、`Throttle::per_minute(5).by_ip()` のように接続元で数えます。
 - ログイン中の人を止める `guest` も合わせて掛けます（下の節）。
 
 ## ログアウトする
@@ -182,14 +172,12 @@ user.save().await?;
 req.auth().logout_other_devices_async().await?;
 ```
 
-- **`async fn` の中では `_async` の付いた版を使います**（`logout_other_devices_async()` / `logout_all_devices_async()` /
-  `logout_user_async(id)`）。
-  同期版は置き場所を全部見るので、ほかのリクエストが止まります。`logout()` は同期のままで構いません。
+- **`async fn` の中では `_async` の付いた版を使います。** 同期版は置き場所を全部見るので、ほかのリクエストが止まります。
+    - `logout_other_devices_async()` / `logout_all_devices_async()` / `logout_user_async(id)`
+    - `logout()` は同期のままで構いません。
 - **パスワードを変えたら `logout_other_devices()` を呼びます。** 変えただけでは、盗まれたセッションが期限まで残ります。
 - `logout_other_devices()` を呼んだ本人は残ります。そのあと `regenerate()` しても残ります。
-  ただし、同じ時に別の所が `logout_user` などで全部切ると、本人も切られます。
 - `logout()` と `logout_all_devices()` は、セッションの Cookie も消します。
-- `logout()` で置き場所から消せなかったときは 500 を返します（[session.md](session.md)）。
 - ログインしていなければ、何もせず `0` を返します（`logout_user` を除く）。
 
 ## ログイン必須にする
@@ -209,13 +197,10 @@ Route::prefix("api/my/articles").middleware("auth").group(|| {
 | `Authenticate::new()`                 | 401                                    |
 | `Authenticate::redirect_to("/login")` | 302（JSON を求めるリクエストには 401） |
 
-ログイン中の人は、ハンドラで次のように取ります。
+ハンドラでは、ログイン中の人を次のように取ります。
 
 ```rust
-pub async fn me(req: Request) -> Result<Response> {
-    let user = req.auth().user_or_fail::<User>().await?;   // 401 か User
-    json(&json!({ "name": user.name }))
-}
+let user = req.auth().user_or_fail::<User>().await?;   // 401 か User
 ```
 
 ### ログイン後に元のページへ戻す
@@ -228,11 +213,11 @@ let back = req.session().intended().unwrap_or_else(|| "/".to_string());
 redirect().to(back)
 ```
 
-覚えるのは、次をすべて満たすときだけです。満たさなければ `None` です。
+覚えるのは、次をすべて満たすときだけです。
 
 - 302 で転送した（401 を返しただけなら覚えない）
-- メソッドが `GET` か `HEAD`（ログイン後は `GET` で戻るため）
-- 自分のサイトの中を指すパス（`/` で始まり、`//` で始まらず、`\` と制御文字を含まない）
+- メソッドが `GET` か `HEAD`
+- 自分のサイトの中を指すパス（`/` で始まり、`//` で始まらない）
 
 ## ログイン中の人を通さない（guest）
 
@@ -255,18 +240,16 @@ Route::post("/register", AuthController::register)
 | `RedirectIfAuthenticated::new()`                | 403                                    |
 | `RedirectIfAuthenticated::redirect_to("/home")` | 302（JSON を求めるリクエストには 403） |
 
-- ログインしていなければ、そのまま通します。
 - `prelude` には入っていません。`bengara::auth` から `use` します。
-- 回数の制限と組み合わせるときに要ります。`Throttle` はログイン中の人を ID で数えるので、
-  登録し直すたびに新しい枠ができてしまいます。`guest` で止めるか、`by_ip()` で数えます。
-- Laravel と違い、転送先を決めないと 403 です。行き先はアプリごとに違うためです。
+- 転送先を決めないと 403 です（Laravel と違います）。
+- `Throttle` はログイン中の人を ID で数えます。登録し直すたびに新しい枠ができるので、`guest` で止めるか `by_ip()` で数えます。
 
 ## パスワードの再設定
 
-**文面・送信・画面は自分で書きます。** bengara が作るのはトークン（一度だけ使える合い言葉）とリンクまでです。
-送るときは `Mail` を使います（[mail.md](mail.md)）。
+bengara が作るのは、トークン（一度だけ使える合い言葉）とリンクまでです。
+メールの文面・送信・画面は自分で書きます。送るときは `Mail` を使います（[mail.md](mail.md)）。
 
-トークンは `password_resets` 表に入れます。先に表を作ります。
+先にトークンを入れる `password_resets` 表を作ります。
 
 ```rust
 // database/migrations/..._create_password_resets_table.rs
@@ -304,22 +287,21 @@ req.auth().logout_user_async(user.key()).await?;
 | `verify(email, 鍵)`           | 照合だけする。入力欄を出してよいかの下調べ用                |
 | `consume(email)`              | トークンを消す。再設定をやめたときの片付け用                |
 | `sweep_expired()`             | 期限切れをまとめて消す                                      |
-| `lifetime_minutes()`          | トークンを使える時間（60 分で固定）                         |
+| `lifetime_minutes()`          | トークンを使える時間（60 分）                               |
 | `define(&mut Schema)`         | 表を作る定義                                                |
 
 **再設定の判定には、必ず `consume_if_valid` を使います。**
-`verify` のあとに `consume` を呼ぶ形だと、その間に別のリクエストが入って同じトークンを 2 回使えます。
+`verify` のあとに `consume` を呼ぶ形だと、その間に同じトークンを 2 回使われることがあります。
 
 - トークンは 1 つのアドレスに 1 本です。作り直すと前のものは使えません。
-- **同じアドレスへの再送は、`recently_created` で 60 秒止めます**（`PasswordReset::THROTTLE_SECONDS`）。
-  メールの送りつけを防ぐためです。`create` 自体は止めないので、呼ぶ側で確かめます。
-- 表に入るのはトークンのハッシュです。期限切れ・不一致・記録なしは、どれも同じ「偽」です。
+- `create` 自体は回数を止めません。再送の間隔は `recently_created` で確かめます（`PasswordReset::THROTTLE_SECONDS` = 60 秒）。
+- 期限切れ・不一致・記録なしは、どれも同じ「偽」です。
 - **知らないアドレスを頼まれたときも、同じ応答を返します。** 応答が違うと、登録の有無が分かります。
 - リンクは `GET` で開かれます。同じパスに `GET` のルートも用意します。
 
 ## 暗号化
 
-値を他人に読めない形にします。機能フラグ `encryption` が要ります。無いまま呼ぶとエラーです。
+値を他人に読めない形にします。機能フラグ `encryption` が要ります。
 
 ```toml
 bengara = { version = "0.1", features = ["sqlite", "encryption"] }
@@ -330,40 +312,52 @@ let hidden = encrypt("ひみつ")?;     // 毎回違う文字列になる
 let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 ```
 
-- 鍵のもとは `APP_KEY` です。セッションや署名付き URL とは別の鍵を作って使います（[configuration.md](configuration.md)）。
-- 改ざんを見抜くだけでよいなら `signed_url` を使います（[routing.md](routing.md)）。
+- 鍵のもとは `APP_KEY` です（[configuration.md](configuration.md)）。
+- 改ざんを見抜くだけでよいなら、`signed_url` を使います（[routing.md](routing.md)）。
 
 ## ハッシュの回数
 
-ふだんは読まなくて構いません。回数を変えるときに見てください。
-
-方式は PBKDF2-HMAC-SHA256 です。保存されるのは次の形の文字列です。
+方式は PBKDF2-HMAC-SHA256 です。
+同じ計算を何回もくり返して、総当たりにかかる時間を延ばします。
+保存されるのは次の形の文字列です。
 
 ```
-$pbkdf2-sha256$i=120000$<塩>$<ハッシュ>
+$pbkdf2-sha256$i=240000$<塩>$<ハッシュ>
 ```
-
-- 回数が文字列に入っているので、あとから回数を上げても古いパスワードを照合できます。
-- 1,000 万回を超える値は、照合せずに偽とします。
 
 回数は `config/hashing.rs` で変えます。
 
 ```rust
 // config/hashing.rs
-use bengara::prelude::*;
-
 pub fn config() -> HashConfig {
     HashConfig {
-        iterations: env("HASH_ITERATIONS", 120_000u32),
+        iterations: env("HASH_ITERATIONS", 240_000u32),
     }
 }
 ```
 
-- 既定は 120,000 回です。リリースビルドで 1 回約 0.23 秒、デバッグビルドでは約 3.6 秒かかります。
-- テストでは `#[bengara::test]` が 1,000 回に下げます。`.env` の値は見ません。
-- テストで変えたいときは、環境変数で渡します（`HASH_ITERATIONS=20000 cargo test`）。空の値は渡していない扱いです。
+| 項目           | 値                                                               |
+|----------------|------------------------------------------------------------------|
+| 既定           | 240,000 回（リリースビルドで約 0.2 秒、デバッグビルドで約 4 秒） |
+| テストのとき   | 1,000 回。`.env` は見ない（[testing.md](testing.md)）            |
+| 設定の上限     | 10,000,000 回。超えると上限で計算し、警告を出す                  |
+| 保存済みの上限 | 10,000,000 回を超える値は、照合せずに偽とする                    |
 
-**設定を上げても、保存済みのパスワードは古い回数のままです。** ログインできたついでに作り直します。
+- 回数は文字列に入っているので、回数を上げても古いパスワードを照合できます。
+- テストで回数を変えるときは、環境変数で渡します（`HASH_ITERATIONS=20000 cargo test`）。
+
+### 回数を上げたあと
+
+**保存済みのパスワードは、古い回数のままです。** `attempt` が、ログインのついでに作り直します。
+
+- 合ったパスワードの回数が設定より少なければ、その場で作り直して保存します（Laravel の `rehashOnLogin`）。
+- 書く列は `Authenticatable::auth_password_name()` です。既定は `password` です。
+- 作り直しに失敗しても、ログインは成功します。ログに警告が出ます。
+- 回数の違う値が混ざっていても、照合 1 回にかける時間はそろえます。
+
+`Hash::needs_rehash` は、回数が設定より少ないとき・10,000,000 回を超えるとき・形が読めないときに真です。
+
+`attempt` を使わずに自分で照合するときは、次のように書きます。
 
 ```rust
 if ok && Hash::needs_rehash(&user.password) {
@@ -372,7 +366,7 @@ if ok && Hash::needs_rehash(&user.password) {
 }
 ```
 
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

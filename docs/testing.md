@@ -8,7 +8,7 @@
 | `tests/Unit/`    | 関数を 1 つずつ確かめるテスト  |
 
 - `cargo test` で動きます。
-- `tests/` の直下には置きません。置くと、ビルド時に警告が出ます。
+- `tests/` の直下には置きません。置くと、ビルドのときに警告が出ます。
 
 ## まず書いてみる
 
@@ -26,10 +26,8 @@ async fn 無いページは404になる() {
 ```
 
 - `get` などの道具は `#[bengara::test]` が用意します。`use` は要りません。
-- テスト関数の名前は日本語で書けます。
-- `#[bengara::test]` を付けられるのは、**引数も戻り値も無い `async fn`** だけです。`-> Result<()>` などは書けないので、中で
-  `unwrap()` します。
-- アプリを組み立てる必要が無いユニットテストは、普通の `#[test]` で書きます。
+- `#[bengara::test]` を付けられるのは、**引数も戻り値も無い `async fn`** だけです。失敗は `unwrap()` で止めます。
+- アプリを使わないユニットテストは、普通の `#[test]` で書きます。
 
 ### データベースを使う
 
@@ -54,16 +52,11 @@ async fn 記事を保存して読み出せる() {
 シーダー（最初のデータ）も流すときは、札を `seed_database()` に渡します。
 
 ```rust
-#[bengara::test]
-async fn 一覧が見える() {
-    let db = refresh_database().await;
-    seed_database(&db).await;
-
-    get("/api/articles").await.assert_ok();
-}
+let db = refresh_database().await;
+seed_database(&db).await;
 ```
 
-`refresh_database()` がすることは次のとおりです。
+`refresh_database()` は次のことをします。
 
 - `.env` の `DB_TEST_DATABASE` につなぎます。**開発用の DB には触りません。**
 - 表を全部消してから、`database/migrations/` を流し直します。
@@ -77,7 +70,7 @@ async fn 一覧が見える() {
 ### ログインしてから送る
 
 `client` は **Cookie を覚えます。** ログインしたあと、続けて送れます。
-別の人として送るときは `client.fresh()` で作り直します。
+別の人として送るときは、`client.fresh()` で作り直します。
 
 ```rust
 #[bengara::test]
@@ -98,48 +91,36 @@ async fn ログインすると自分の情報が見える() {
         .await
         .assert_ok();
 
-    // Cookie が残っているので、続けて送れる
-    client.get("/api/me").await.assert_ok();
-
-    // 別の人として送ると 401
-    client.fresh().get("/api/me").await.assert_status(401);
+    client.get("/api/me").await.assert_ok();                    // Cookie が残っている
+    client.fresh().get("/api/me").await.assert_status(401);     // 別の人なら 401
 }
 ```
 
 - `User::register` はアプリの側の関数です（[authentication.md](authentication.md)）。
-- `post_with_csrf` の 3 つめは、トークンを返すルートです。`{"token": req.csrf_token()}` を返すルートを自分で用意します。
+- `post_with_csrf` の 3 つ目は、トークンを返すルートです。`{"token": req.csrf_token()}` を返すルートを自分で用意します。
 - CSRF（別のサイトからの成りすまし送信）を確かめないルートなら、`post` / `put` / `patch` / `delete` をそのまま使えます。
-
-```rust
-put("/api/articles/1", "title=x").await.assert_ok();
-delete("/api/articles/1").await.assert_ok();
-```
 
 ### ヘッダーを自分で付けて送る
 
 `send` を使います。CSRF のトークンは `csrf_token()` で取って、ヘッダーに付けます。
 
 ```rust
-#[bengara::test]
-async fn セッションに入れた値が次のリクエストで読める() {
-    let token = client.csrf_token("/csrf-token").await;
-    client
-        .send(
-            "POST",
-            "/remember",
-            b"value=yakisoba".to_vec(),
-            &[
-                ("content-type", "application/x-www-form-urlencoded"),
-                ("x-csrf-token", &token),
-            ],
-        )
-        .await
-        .assert_ok();
+let token = client.csrf_token("/csrf-token").await;
+client
+    .send(
+        "POST",
+        "/remember",
+        b"value=yakisoba".to_vec(),
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("x-csrf-token", &token),
+        ],
+    )
+    .await
+    .assert_ok();
 
-    // 同じ client なので、次のリクエストでも読める
-    let res = client.get("/recall").await.assert_ok();
-    assert_eq!(res.json()["remembered"], "yakisoba");
-}
+let res = client.get("/recall").await.assert_ok();
+assert_eq!(res.json()["remembered"], "yakisoba");
 ```
 
 ## 道具の一覧
@@ -159,21 +140,17 @@ async fn セッションに入れた値が次のリクエストで読める() {
 | `client.fresh()`                              | Cookie を捨てた、別の人としてのクライアント         |
 | `client.cookie(name)`                         | いま持っている Cookie の値                          |
 
-テストのクライアントは、本文の扱いもサーバーと同じ道を通ります（[requests-and-responses.md](requests-and-responses.md)）。
+```rust
+let res = client
+    .post_json("/api/posts", &bengara::serde_json::json!({ "title": "hi" }))
+    .await;
+res.assert_status(201);
+```
+
+本文はサーバーと同じ道を通ります（[requests-and-responses.md](requests-and-responses.md)）。
 
 - 本文が上限（`APP_MAX_BODY_BYTES` かルートの `.max_body`）を超えれば 413 です。
-  長さの申告（`Content-Length`）は付けませんが、読んだ合計で 413 になります。
-- `.stream_body()` のルートも、そのまま試せます。本文は 1 かたまりで届きます。
-
-```rust
-#[bengara::test]
-async fn JSONを受け取れる() {
-    let res = client
-        .post_json("/api/posts", &bengara::serde_json::json!({ "title": "hi" }))
-        .await;
-    res.assert_status(201);
-}
-```
+- `.stream_body()` のルートも試せます。本文は 1 かたまりで届きます。
 
 ### 確かめる
 
@@ -188,28 +165,27 @@ async fn JSONを受け取れる() {
 
 ```rust
 get("/").await
-.assert_ok()
-.assert_header("content-type", "text/html; charset=utf-8")
-.assert_see("myapp")
-.assert_dont_see("エラー");
+    .assert_ok()
+    .assert_header("content-type", "text/html; charset=utf-8")
+    .assert_dont_see("エラー");
 ```
 
 - `assert_*` はつなげて書けます。
 - 失敗すると、URI と本文の先頭（400 文字まで）を出します。
-- **`json()` は、本文が JSON でないとパニックします。** HTML のエラー画面が返ったことに気づけます。
+- **`json()` は、本文が JSON でないとパニックします。**
 
 ### `#[bengara::test]` が用意するもの
 
 - `.env` と `config/` を読みます（プロセスで 1 回）。
 - `bootstrap/app.rs` の `app()` でアプリを組み立てます（テスト 1 件ごと）。
 - メールの送り先を `array` にします。**本当には送りません。**
-- パスワードの変換の回数を 1,000 に下げます（本番の既定は 120,000）。変えるなら `HASH_ITERATIONS=20000 cargo test`
-  のように渡します。
+- パスワードの変換の回数を 1,000 に下げます（本番の既定は 240,000）。
+  変えるときは `HASH_ITERATIONS=20000 cargo test` のように渡します。
 - `APP_KEY` が無ければテスト用の鍵を、`APP_ENV` が無ければ `testing` を入れます。
 - ソケットは開きません。ポートの衝突を気にせず並べて走らせられます。
 - 回数の制限（throttle）は本番と同じく効きます。接続元は `127.0.0.1` として数えます。
 
-## テストどうしがぶつからないために
+## テストどうしがぶつからないように
 
 `tests/Feature/` のテストは、1 つのプロセスの中で並んで走ります。
 共有しているものを触るテストは、札を取って順番に走らせます。
@@ -224,53 +200,43 @@ get("/").await
 
 - 札は変数で受け取ります（`let _db = ...`）。受け取らないと、その場で手放されます。
 - 1 つのテストで同じ札を 2 回取ると、パニックします。
-- 両方要るときは `refresh_database()` → `exclusive()` の順です。逆だと止まります。
+- **両方要るときは `refresh_database()` → `exclusive()` の順です。** 逆だと止まります。
 
 ```rust
-#[bengara::test]
-async fn DBとメールの両方を使う() {
-    let _db = refresh_database().await;
-    let _lock = exclusive().await;
-    Mail::clear_sent();
-    // ...
-}
+let _db = refresh_database().await;
+let _lock = exclusive().await;
+Mail::clear_sent();
 ```
 
 ### キャッシュとファイルは自動で消えない
 
-**鍵とパスを、テストごとに変えてください。** 同じ名前だと、並んで走るテストが互いに踏みます。
+**鍵とパスは、テストごとに変えます。** 同じ名前だと、並んで走るテストが互いに踏みます。
 
 ```rust
-#[bengara::test]
-async fn 数を足し引きできる() {
-    Cache::forget("test.count").await.unwrap();      // 前の残りを消す
-    assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
-    Cache::forget("test.count").await.unwrap();      // 片付ける
-}
+Cache::forget("test.count").await.unwrap();      // 前の残りを消す
+assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
+Cache::forget("test.count").await.unwrap();      // 片付ける
 ```
 
-`.env` に `SESSION_DRIVER=memory` と `CACHE_DRIVER=memory` を書くと、テストがディスクにファイルを残しません。
+`.env` に `SESSION_DRIVER=memory` と `CACHE_DRIVER=memory` を書くと、ディスクにファイルが残りません。
 
 ## 周辺機能のテスト
 
-| 機能               | 確かめ方                                     | くわしい例                                |
-|--------------------|----------------------------------------------|-------------------------------------------|
-| メール             | `Mail::sent()` に溜まった中身を見る          | [mail.md](mail.md) の「テスト」           |
-| キュー             | 積まれた数を見る。中身は `handle` を直接呼ぶ | [queue.md](queue.md) の「テスト」         |
-| 定期処理           | `routes/console.rs` の関数を自分で呼ぶ       | 下の例                                    |
-| 配信               | `Broadcast::fake()` で記録して見る           | 下の例                                    |
-| WebSocket の受け口 | 切り替えのヘッダーを付けて送り、101 を見る   | [websocket.md](websocket.md) の「テスト」 |
+| 機能               | 確かめ方                                     | くわしい例                          |
+|--------------------|----------------------------------------------|-------------------------------------|
+| メール             | `Mail::sent()` に溜まった中身を見る          | [mail.md](mail.md) の「テスト」     |
+| キュー             | 積まれた数を見る。中身は `handle` を直接呼ぶ | [queue.md](queue.md) の「テスト」   |
+| 定期処理           | `routes/console.rs` の関数を自分で呼ぶ       | 下の例                              |
+| 配信               | `Broadcast::fake()` で記録して見る           | 下の例                              |
+| WebSocket の受け口 | 切り替えのヘッダーを付けて送り、101 を見る   | [websocket.md](websocket.md#テスト) |
 
 ```rust
-#[bengara::test]
-async fn 定期処理が登録されている() {
-    let mut schedule = Schedule::new();
-    crate::routes::console::schedule(&mut schedule);
+let mut schedule = Schedule::new();
+crate::routes::console::schedule(&mut schedule);
 
-    assert_eq!(schedule.len(), 3);
-    let names: Vec<&str> = schedule.tasks().iter().map(|t| t.name()).collect();
-    assert!(names.contains(&"記事数の集計"));
-}
+assert_eq!(schedule.len(), 3);
+let names: Vec<&str> = schedule.tasks().iter().map(|t| t.name()).collect();
+assert!(names.contains(&"記事数の集計"));
 ```
 
 ### 配信を確かめる
@@ -298,15 +264,14 @@ async fn 投稿すると配信される() {
 | `Broadcast::assert_published(名前, 含む文字)` | 含む中身が無ければパニック         |
 | `Broadcast::assert_nothing_published()`       | 何か記録があればパニック           |
 
-- **札を手放すと fake は終わり、記録も空になります。** 札を取らずに `fake()` を呼ばないでください。
+- 札を手放すと、fake は終わり、記録も空になります。
 - `Broadcast` は `prelude` に入っていません。`use` で取り込みます。
 
 ### WebSocket の受け口を確かめる
 
-`client.send` で切り替えのヘッダー（`upgrade`・`connection`・`sec-websocket-version`・`sec-websocket-key`）を付けて送ります。
-
-- 認証などを通れば、101 が返ります。**ソケットが無いので、`on_upgrade` のクロージャは動きません。**
-- 例は [websocket.md](websocket.md#テスト) にあります。
+`client.send` で、切り替えのヘッダー（`upgrade`・`connection`・`sec-websocket-version`・`sec-websocket-key`）を付けて送ります。
+認証などを通れば 101 が返ります。
+ソケットが無いので、`on_upgrade` の中身は動きません。
 
 ## 関連
 

@@ -12,8 +12,9 @@
 //! 値は必ずプレースホルダで渡します。SQL の文字列に埋め込みません。
 
 use super::grammar::{self, Driver};
+use super::transaction::Transaction;
 use super::value::{Affected, FromValue, IntoValue, Row, Value};
-use super::Source;
+use super::{Source, Target};
 use crate::error::{Error, Result};
 
 /// `and` でつなぐか `or` でつなぐか。
@@ -1761,6 +1762,14 @@ impl QueryBuilder {
     /// **ほかの表から外部キーで指されている表は、MySQL と PostgreSQL では
     /// 断られます**（指している側が空でも同じ）。SQLite は `delete` なので、
     /// 指している行が無ければ通ります。
+    ///
+    /// **MySQL の `truncate table` は、いまのトランザクションを暗黙に確定します。**
+    /// `tx.table(...).truncate()` の後で `rollback()` しても、それまでの書き込みと
+    /// 消した行は戻りません。巻き戻したいときは `delete()` を使ってください。
+    ///
+    /// SQLite は文を 3 本流すので、1つのトランザクションにまとめます。
+    /// トランザクションの外で呼んだら、ここで始めて確定します。
+    /// 中で呼んだら、そのトランザクションをそのまま使います。
     pub async fn truncate(&self) -> Result<()> {
         self.check()?;
         self.check_write("truncate")?;
@@ -1770,48 +1779,64 @@ impl QueryBuilder {
             ));
         }
         match self.driver {
-            // SQLite に truncate は無い。条件なしの delete と同じ。
-            // ただし delete だけでは `sqlite_sequence` が残り、採番が戻らない。
-            // MySQL / PostgreSQL の truncate は戻すので、文を分けてそろえる。
-            Driver::Sqlite => {
-                // `main.posts` のようにデータベース名が付いた表は、名前を分ける。
-                // `sqlite_sequence` の `name` は表の名前だけで、データベースごとに
-                // 別の `sqlite_sequence` がある。以前は `name = 'main.posts'` で探して
-                // 1件も当たらず、採番が戻らなかった。
-                let table = self.table.trim();
-                let (prefix, name) = match table.rsplit_once('.') {
-                    Some((schema, name)) => {
-                        (format!("{}.", grammar::quote(self.driver, schema)), name)
-                    }
-                    None => (String::new(), table),
-                };
-                // `sqlite_sequence` は autoincrement の表が1つも無いと存在しない。
-                // **有無を先に読んで確かめます。** 以前は消す文をそのまま流して
-                // 失敗を捨てていました。トランザクションの中では、1本失敗すると
-                // 以後が使えなくなるので、続く `delete` まで落ちていました。
-                let has_sequence = !self
-                    .fetch(
-                        &format!(
-                            "select 1 from {prefix}sqlite_master \
-                             where type = 'table' and name = 'sqlite_sequence'"
-                        ),
-                        &[],
-                    )
-                    .await?
-                    .is_empty();
-                // 先に行を消す。外部キーで断られたときに、採番だけ戻るのを避ける。
-                let sql = format!("delete from {}", grammar::quote(self.driver, &self.table));
-                self.run(&sql, &[]).await?;
-                if has_sequence {
-                    let reset = format!("delete from {prefix}sqlite_sequence where name = ?");
-                    self.run(&reset, &[Value::Text(name.to_string())]).await?;
+            Driver::Sqlite => match self.source.target().await? {
+                Target::Tx(_) => self.truncate_sqlite().await?,
+                // プールのままだと、確かめる・消す・採番を戻すの 3 本が
+                // 別々の接続に流れることがある。途中で失敗すると、行だけ消えて
+                // 採番が残る。1つのトランザクションにまとめる。
+                Target::Pool(found) => {
+                    let tx = Transaction::start(found).await?;
+                    self.clone()
+                        .with_source(tx.source())
+                        .truncate_sqlite()
+                        .await?;
+                    tx.commit().await?;
                 }
-            }
+            },
             // PostgreSQL は `restart identity` を付けて採番を戻す（`grammar::truncate`）。
             _ => {
                 let sql = grammar::truncate(self.driver, &self.table);
                 self.run(&sql, &[]).await?;
             }
+        }
+        Ok(())
+    }
+
+    /// SQLite の truncate の中身。投げ先はトランザクションにしてから呼ぶ。
+    ///
+    /// SQLite に truncate は無い。条件なしの delete と同じ。
+    /// ただし delete だけでは `sqlite_sequence` が残り、採番が戻らない。
+    /// MySQL / PostgreSQL の truncate は戻すので、文を分けてそろえる。
+    async fn truncate_sqlite(&self) -> Result<()> {
+        // `main.posts` のようにデータベース名が付いた表は、名前を分ける。
+        // `sqlite_sequence` の `name` は表の名前だけで、データベースごとに
+        // 別の `sqlite_sequence` がある。以前は `name = 'main.posts'` で探して
+        // 1件も当たらず、採番が戻らなかった。
+        let table = self.table.trim();
+        let (prefix, name) = match table.rsplit_once('.') {
+            Some((schema, name)) => (format!("{}.", grammar::quote(self.driver, schema)), name),
+            None => (String::new(), table),
+        };
+        // `sqlite_sequence` は autoincrement の表が1つも無いと存在しない。
+        // **有無を先に読んで確かめます。** 以前は消す文をそのまま流して
+        // 失敗を捨てていました。トランザクションの中では、1本失敗すると
+        // 以後が使えなくなるので、続く `delete` まで落ちていました。
+        let has_sequence = !self
+            .fetch(
+                &format!(
+                    "select 1 from {prefix}sqlite_master \
+                     where type = 'table' and name = 'sqlite_sequence'"
+                ),
+                &[],
+            )
+            .await?
+            .is_empty();
+        // 先に行を消す。外部キーで断られたときに、採番だけ戻るのを避ける。
+        let sql = format!("delete from {}", grammar::quote(self.driver, &self.table));
+        self.run(&sql, &[]).await?;
+        if has_sequence {
+            let reset = format!("delete from {prefix}sqlite_sequence where name = ?");
+            self.run(&reset, &[Value::Text(name.to_string())]).await?;
         }
         Ok(())
     }
@@ -3375,6 +3400,44 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn トランザクションの外のtruncateも採番が1から始まる() {
+        // プールから投げる経路。中で 1 つのトランザクションにまとめて確定する。
+        let _db = crate::testing::refresh_database().await;
+        super::super::DB::statement("drop table if exists truncate_pool_items", &[])
+            .await
+            .expect("消せる");
+        super::super::DB::statement(
+            "create table truncate_pool_items \
+             (id integer primary key autoincrement, title text)",
+            &[],
+        )
+        .await
+        .expect("表が作れる");
+        let items = super::super::DB::table("truncate_pool_items");
+        for title in ["1本目", "2本目"] {
+            items
+                .insert_get_id(&[("title", Value::Text(title.into()))])
+                .await
+                .expect("入る");
+        }
+
+        items.truncate().await.expect("空にできる");
+
+        assert_eq!(items.count().await.expect("数えられる"), 0);
+        let id = items
+            .insert_get_id(&[("title", Value::Text("やり直し".into()))])
+            .await
+            .expect("入る");
+        assert_eq!(id, 1, "truncate の後は 1 から");
+        // 確定しているので、別の問い合わせからも空になった後の 1 行だけが見える。
+        assert_eq!(items.count().await.expect("数えられる"), 1);
+        super::super::DB::statement("drop table truncate_pool_items", &[])
+            .await
+            .expect("消せる");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn データベース名付きの表でもtruncateの後は採番が1から始まる() {
         let tx = live().await;
         let posts = tx.table("main.posts");
@@ -3592,10 +3655,21 @@ mod tests {
         assert!(is_unique_violation(&error), "{error}");
 
         // 列が無いだけのエラーは偽。
-        let error = posts
+        //
+        // **別のトランザクションで試します。** 上の違反で `tx` はもう使えず、
+        // 同じ `tx` だと「使えません」のエラーで偽になるだけでした。
+        let fresh = live().await;
+        let error = fresh
+            .table("posts")
             .insert(&[("nope", Value::Int(1))])
             .await
             .expect_err("無い列は断られる");
+        let message = error.to_string();
+        assert!(message.contains("nope"), "列のエラーであること: {message}");
+        assert!(
+            !message.contains("このトランザクションは"),
+            "使えないトランザクションのエラーではないこと: {message}"
+        );
         assert!(!is_unique_violation(&error), "{error}");
 
         // 組み立てのエラー（接続より手前）も偽。

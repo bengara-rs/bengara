@@ -1,7 +1,6 @@
 # キャッシュ
 
-キャッシュは、計算やクエリの結果を取っておく仕組みです。
-次からは取っておいたほうを返すので、速くなります。
+計算やクエリの結果を取っておき、次から速く返す仕組みです。
 
 ## 出し入れ
 
@@ -18,7 +17,7 @@ Cache::forget("stats.posts").await?;
 Cache::flush().await?;                           // 全部捨てる
 ```
 
-値は文字列です。構造体は下の「構造体を入れる」を使います。
+値は文字列です。構造体は「[構造体を入れる](#構造体を入れる)」を使います。
 
 | メソッド          | 返るもの                 | 覚えること                         |
 |-------------------|--------------------------|------------------------------------|
@@ -28,19 +27,16 @@ Cache::flush().await?;                           // 全部捨てる
 | `has(鍵)`         | `Result<bool>`           | 期限切れは `false`                 |
 | `forget(鍵)`      | `Result<()>`             | 無くてもエラーにしない             |
 | `flush()`         | `Result<()>`             | 全部捨てる                         |
-| `prune()`         | `Result<Option<usize>>`  | 期限切れだけ消す（下の「掃除」）   |
+| `prune()`         | `Result<Option<usize>>`  | 期限切れだけ消す（[掃除](#掃除)）  |
 | `location()`      | `Option<String>`         | 置き場所の表示。`await` は要らない |
 
-- 壊れたファイルは「無い」として扱います。エラーにはなりません。
-- `file` の `get` と `has` は、期限切れのファイルを消しません。消すのは `cache:prune` です。
+壊れたファイルは「無い」として扱います。エラーにはなりません。
 
 ### 鍵の付け方
 
 **小文字の英数字と `. _ -` だけで付けてください**（`stats.posts`、`post.1`）。
-
-ほかの文字（大文字・`:`・日本語など）でも動きます。
-ただし、ファイル名がハッシュ（中身から作る英数字の列）になり、どの鍵のファイルか分からなくなります。
-150 バイトより長い鍵も同じです。
+ほかの文字や 150 バイトより長い鍵も動きます。
+ただしファイル名がハッシュ（中身から作る英数字の列）になり、どの鍵のファイルか見分けられません。
 
 ## 無ければ作る
 
@@ -67,11 +63,11 @@ Cache::decrement("visits", 1).await?;
 - 同時に呼ばれても、数は落ちません。
 - 値が数として読めないときはエラーです。
 - `i64` の上限・下限で止まります。あふれません。
-- **期限付きの鍵に使うと、期限が外れます。** Laravel は期限を保つので、ここは違います。
+- **期限付きの鍵に使うと、期限が外れます。** Laravel と違うところです。
 
 ## 構造体を入れる
 
-`serde::Serialize` が付いていれば、そのまま入れられます。
+`serde::Serialize` と `Deserialize` が付いていれば、そのまま入れられます。
 
 ```rust
 #[derive(bengara::serde::Serialize, bengara::serde::Deserialize)]
@@ -88,7 +84,7 @@ let stats: Option<Stats> = Cache::get_json("stats").await?;
 let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().await?) }).await?;
 ```
 
-構造体の形を変えて読めなくなった値は、`None` を返して消します。
+構造体の形を変えて読めなくなった値は、消して `None` を返します。
 
 ## 置き場所
 
@@ -100,9 +96,9 @@ let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().awai
 | `memory`（`array` も） | プロセスのメモリ。テストと手元の確認用 |
 
 - 知らない名前を書くと、警告を出して `file` にします。
-- **プロセスを 2 つ以上動かすときは `file` にして、全部が同じ `storage/` を見るようにします。** `memory` はプロセスをまたげません。
-- `file` は `storage/` を自分では作りません。無いと書き込みでエラーになるので、`storage:init`
-  で作ってください（[deployment.md](deployment.md)）。
+- **プロセスを 2 つ以上動かすときは `file` にします。** 全部が同じ `storage/` を見るようにしてください。
+- `file` は `storage/` が無いと書き込みでエラーになります。`storage:init` で作ってください（[deployment.md](deployment.md)）。
+- `storage/` の中のキャッシュのディレクトリは自分で作ります。作るときは所有者だけが読める権限にします。
 
 `config/cache.rs` を置くと、そちらを使います。無くても動きます。
 
@@ -126,17 +122,10 @@ cargo artisan cache:prune     # 期限切れだけ
 cargo artisan cache:clear     # 全部
 ```
 
-**`cache:prune` は、cron などから 1 日 1 回ほど呼んでください。** 呼ばないとファイルが増えていきます。
+**`cache:prune` は cron などから 1 日 1 回ほど呼んでください。** 呼ばないとファイルが増えていきます。
 
 コードからは `Cache::prune()` を呼びます。
-`file` は消した件数を返します。`memory` は自分で掃除するので `None` を返します。
-
-```rust
-match Cache::prune().await? {
-    Some(n) => println!("{n} 件消しました"),
-    None => println!("この置き場所は件数を返しません"),
-}
-```
+`file` は消した件数を返し、`memory` は `None` を返します（自分で掃除するため）。
 
 ## テスト
 
@@ -147,11 +136,8 @@ match Cache::prune().await? {
 #[bengara::test]
 async fn 数を足し引きできる() {
     Cache::forget("test.count").await.unwrap();
-
     assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
     assert_eq!(Cache::increment("test.count", 2).await.unwrap(), 3);
-    assert_eq!(Cache::decrement("test.count", 1).await.unwrap(), 2);
-
     Cache::forget("test.count").await.unwrap();
 }
 ```
@@ -159,13 +145,12 @@ async fn 数を足し引きできる() {
 ## 置き場所を自分で作る
 
 `CacheStore` を実装して、`bootstrap/app.rs` で入れ替えます。
+**効くのは 1 回目だけです。** キャッシュを最初に使う前に呼んでください。
 
 ```rust
 // bootstrap/app.rs の中で
 bengara::cache::install_store(std::sync::Arc::new(MyStore::new()));
 ```
-
-**効くのは 1 回目だけです。** キャッシュを最初に使う前に呼んでください。
 
 必ず書くのは次の 4 つです。`async` ではないので、待つ処理をそのまま書けます。
 
@@ -192,7 +177,7 @@ impl CacheStore for MyStore {
 | `location`  | `None`                             | 置き場所を見せたいとき                 |
 | `blocking`  | `true`（裏のスレッドで呼ぶ）       | メモリだけで済むとき（`false` にする） |
 
-置き場所は `file` と `memory` だけです。まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

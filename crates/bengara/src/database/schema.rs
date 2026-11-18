@@ -384,7 +384,12 @@ impl Blueprint {
     /// `create table` がどのドライバでも失敗します。以前は検査せず、
     /// migrate を流したところで SQL エラーになっていました。
     ///
-    /// 最初の指定だけを残し、後の指定は組み立てから外します。
+    /// 2 つ以上あるときはエラーとして返します。流す前に止まります。
+    ///
+    /// 組み立てから外すのは、2 つ目以降の列の `.primary()` と表の `primary(&[..])`
+    /// だけです。**`id()` / `increments()` は外しません。** 列そのものなので、
+    /// 外すと列ごと消えます。2 つ目の `id()` が残った SQL は流せませんが、
+    /// 上のエラーで流す前に止まるので、そのままにしています。
     fn check_single_primary(&mut self, errors: &mut Vec<String>) {
         let mut sources: Vec<String> = Vec::new();
         for column in &mut self.columns {
@@ -510,13 +515,10 @@ impl Blueprint {
             );
         } else {
             for foreign in &self.foreigns {
+                // 制約の名前は `foreign_sql` が付けます。作るときと同じ名前です。
                 statements.push(format!(
-                    "alter table {} add constraint {} {}",
+                    "alter table {} add {}",
                     grammar::quote(driver, &self.table),
-                    grammar::quote(
-                        driver,
-                        &self.constraint_name(std::slice::from_ref(&foreign.column), "foreign")
-                    ),
                     self.foreign_sql(foreign)
                 ));
             }
@@ -690,12 +692,21 @@ impl Blueprint {
         sql
     }
 
+    /// 外部キーの定義。**制約の名前（`{表}_{列}_foreign`）を必ず付けます。**
+    ///
+    /// 以前は表を作るときだけ名前を付けず、データベースに決めさせていました。
+    /// 後から足したとき（`alter table`）と名前が食い違い、名前で落とせませんでした。
+    /// 長すぎる名前・重なる名前にハッシュを付けるのも、索引と同じです。
     fn foreign_sql(&self, foreign: &ForeignKey) -> String {
         let driver = self.driver;
         // `.on(表名)` の無い外部キーは、ここへ来る前に
         // collect_errors() が外しています。
         let mut sql = format!(
-            "foreign key ({}) references {} ({})",
+            "constraint {} foreign key ({}) references {} ({})",
+            grammar::quote(
+                driver,
+                &self.constraint_name(std::slice::from_ref(&foreign.column), "foreign")
+            ),
             grammar::quote(driver, &foreign.column),
             grammar::quote(driver, &foreign.on),
             grammar::quote(driver, &foreign.references)
@@ -1475,8 +1486,70 @@ mod tests {
             t.foreign_id("post_id");
             t.foreign("post_id").on("posts").cascade_on_delete();
         });
-        assert!(schema.to_sql()[0]
-            .contains("foreign key (\"post_id\") references \"posts\" (\"id\") on delete cascade"));
+        assert!(schema.to_sql()[0].contains(
+            "constraint \"comments_post_id_foreign\" foreign key (\"post_id\") \
+             references \"posts\" (\"id\") on delete cascade"
+        ));
+    }
+
+    #[test]
+    fn 外部キーの名前は作るときと足すときで同じ() {
+        // 以前は作るときだけ名前を付けず、データベースが決めていた。
+        for driver in [Driver::Sqlite, Driver::MySql, Driver::Postgres] {
+            let q = |name: &str| grammar::quote(driver, name);
+            let expected = format!(
+                "constraint {} foreign key ({}) references {} ({})",
+                q("comments_post_id_foreign"),
+                q("post_id"),
+                q("posts"),
+                q("id")
+            );
+
+            let mut create = Schema::new(driver);
+            create.create("comments", |t| {
+                t.id();
+                t.foreign_id("post_id");
+                t.foreign("post_id").on("posts");
+            });
+            let sql = create.to_sql();
+            assert!(sql[0].contains(&expected), "{driver}: {}", sql[0]);
+
+            if driver == Driver::Sqlite {
+                // SQLite は後から外部キーを足せない（出さない）。
+                continue;
+            }
+            let mut alter = Schema::new(driver);
+            alter.table("comments", |t| {
+                t.foreign("post_id").on("posts");
+            });
+            let sql = alter.to_sql();
+            assert_eq!(
+                sql.last().map(String::as_str),
+                Some(format!("alter table {} add {expected}", q("comments")).as_str()),
+                "{driver}: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 長い外部キーの名前は作るときもハッシュを付ける() {
+        let table = "t".repeat(40);
+        let column = "c".repeat(40);
+        let mut schema = sqlite();
+        schema.create(&table, |t| {
+            t.id();
+            t.foreign_id(&column);
+            t.foreign(&column).on("posts");
+        });
+        let sql = schema.to_sql();
+        let expected =
+            constraint_name_for(&table, std::slice::from_ref(&column), "foreign", |_| false);
+        assert!(expected.len() <= MAX_NAME_LEN, "{expected}");
+        assert!(
+            sql[0].contains(&format!("constraint \"{expected}\" foreign key")),
+            "{}",
+            sql[0]
+        );
     }
 
     #[test]
@@ -1677,6 +1750,41 @@ mod tests {
             assert_eq!(sql.matches("primary key").count(), 1, "{sql}");
             tx.statement(&sql, &[]).await.expect("流せる");
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 名前付きの外部キーはsqliteで流せて効く() {
+        use super::super::{ConnectionConfig, Transaction};
+
+        let backend = super::super::sqlite::connect(&ConnectionConfig::sqlite("test", ":memory:"))
+            .await
+            .expect("メモリ上の SQLite につながる");
+        let mut schema = sqlite();
+        schema.create("posts", |t| {
+            t.id();
+        });
+        schema.create("comments", |t| {
+            t.id();
+            t.foreign_id("post_id");
+            t.foreign("post_id").on("posts").cascade_on_delete();
+        });
+        assert!(schema.take_errors().is_empty());
+        let tx = Transaction::start(backend).await.expect("始められる");
+        for sql in schema.into_statements() {
+            tx.statement(&sql, &[]).await.expect("流せる");
+        }
+        tx.statement("insert into posts (id) values (1)", &[])
+            .await
+            .expect("入る");
+        tx.statement("insert into comments (post_id) values (1)", &[])
+            .await
+            .expect("入る");
+        // `on delete cascade` が効いている（制約として読まれている）。
+        tx.statement("delete from posts", &[])
+            .await
+            .expect("消せる");
+        assert_eq!(tx.table("comments").count().await.expect("数えられる"), 0);
     }
 
     #[test]

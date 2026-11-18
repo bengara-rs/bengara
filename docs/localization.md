@@ -2,7 +2,8 @@
 
 画面に出す文字を、言語ごとに分けて持つ仕組みです。
 
-文字は `resources/lang/` の TOML ファイルに書きます。 **ビルド時に読み込んで、実行ファイルに入れます。** 文字を変えたら、ビルドし直します。
+文字は `resources/lang/` の TOML ファイルに書きます。
+**ビルド時に読み込んで、実行ファイルに入れます。** 文字を変えたら、ビルドし直します。
 
 ## 使う
 
@@ -14,24 +15,19 @@ __with("messages.greeting", &[("name", "アリス")]);   // こんにちは、�
 ```
 
 - 鍵は `節.鍵` の形です。`__` は Laravel と同じ名前です。
-- **鍵が無いときは、鍵の文字がそのまま返ります。** 落ちないので、画面を見ればどの鍵が抜けているか分かります。
-
-```rust
-__("messages.ない鍵");   // => "messages.ない鍵"
-```
+- **鍵が無いときは、鍵の文字がそのまま返ります**（`"messages.ない鍵"`）。落ちないので、画面を見れば抜けている鍵が分かります。
 
 探す順番は次のとおりです。
 
 1. いまの言語（`Lang::current()`）
 2. `APP_FALLBACK_LOCALE` の言語
-3. 鍵そのもの（警告をログに出す。同じ鍵の警告は続けては出さない）
+3. 鍵そのもの（ログに警告。同じ鍵の警告は続けては出さない）
 
 ### 差し替え
 
 文の中の `:名前` を、渡した値に差し替えます。
 
 ```toml
-greeting = "こんにちは、:name さん"
 count = ":total 件のうち :done 件が終わりました"
 ```
 
@@ -59,16 +55,6 @@ __with("messages.count", &[("total", "10"), ("done", "3")]);
 [messages]
 welcome = "ようこそ"
 greeting = "こんにちは、:name さん"
-
-[posts]
-created = "記事を作りました"
-```
-
-```toml
-# resources/lang/en.toml
-[messages]
-welcome = "Welcome"
-greeting = "Hello, :name"
 ```
 
 2 つめが Laravel と同じ置き方です。ファイル名が鍵の頭に付きます。
@@ -78,20 +64,13 @@ greeting = "Hello, :name"
 welcome = "ようこそ"
 ```
 
-次のものは読みません。
+次のものは読みません。控えは `resources/lang/` の外に置いてください。
 
 - `<言語>/` より下のディレクトリ（`ja/admin/menu.toml`）。警告が出ます。
 - 名前に `.` か空白が入った控え（`ja.old/`、`ja copy.toml`）。警告が出ます。
 - `.` で始まるもの（`.git/`）。
 
-控えは `resources/lang/` の外に置いてください。
-
 ## 言語を切り替える
-
-```
-APP_LOCALE=ja
-APP_FALLBACK_LOCALE=ja
-```
 
 | 設定                  | 既定 | 役割                           |
 |-----------------------|------|--------------------------------|
@@ -119,20 +98,12 @@ pub async fn show(req: Request) -> Result<Response> {
 **`Lang::set` をリクエストの中で呼ばないでください。** 同時に来た別のリクエストの言語も変わります。
 テストで呼ぶときは `exclusive()` の札を取ります（[testing.md](testing.md)）。
 
-いまの状態は次の 3 つで分かります。
+いまの状態は次の 3 つで分かります。`cargo artisan lang:list` でも見られます。
 
 ```rust
 Lang::current();        // "ja"
 Lang::available();      // ["en", "ja"]
 Lang::has("fr");        // false
-```
-
-`cargo artisan lang:list` でも見られます。
-
-```
-いまの言語: ja
-  en
-  ja
 ```
 
 ## 書ける TOML
@@ -170,10 +141,10 @@ TOML の全部は読みません。読めるのは次の形だけです。
 
 ## 知っておくこと
 
-- 言語ファイルは TOML だけです。JSON は読みません。
+- 言語ファイルは TOML だけです。
 - 入力の検査（`validate`）の文は、`[validation]` の節を書いても変わりません（[validation.md](validation.md)）。
 
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

@@ -37,8 +37,8 @@
 | `storage:init` | `storage/` の下の書き込み先を作る              | [deployment.md](deployment.md)               |
 | `session:gc`   | 期限切れのセッションのファイルを消す           | [session.md](session.md)                     |
 
-本体を引数なしで動かすと `serve` です（`./myapp`）。
-`--host` か `--port` から始めたときも `serve` です（`./myapp --port 8001`）。
+- 本体を引数なしで動かすと `serve` です（`./myapp`）。`--host` か `--port` から始めたときも同じです。
+- `key:generate` と `storage:init` は `bootstrap/app.rs` を呼びません。ルートの組み立てで落ちるアプリでも動きます。
 
 ### データベース
 
@@ -70,13 +70,10 @@
 | `schedule:list` | 定期処理の一覧                 | [scheduling.md](scheduling.md)     |
 | `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
--
-
-データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
-
+- データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
 - `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます（[console-commands.md](console-commands.md)）。
 - 無い名前を打つと、エラーと一覧を出して終了コード 1 で終わります。
-- コードを生成する `make:*` コマンドはありません。ファイルは手で作ります。
+- ファイルを生成する `make:*` コマンドはありません。ファイルは手で作ります。
 
 ## コマンドに付けられる指定
 
@@ -109,8 +106,7 @@ $ cargo artisan cache:clear --tries=9
 | `--retry-after=90`  | 90        | 処理中のまま残ったジョブを取り直すまでの秒数（1 以上）     |
 | `--once`            | —         | 1 件だけ処理して終わる                                     |
 
-- ジョブごとの打ち切りの時間は `config/queue.rs` で決めます。載っているジョブは `--timeout` より優先します。
-- 打ち切りの時間が `--retry-after` より長いジョブは、予約を延ばします。二重には動きません（[queue.md](queue.md)）。
+ジョブごとの打ち切りの時間は `config/queue.rs` で決めます。載っているジョブは `--timeout` より優先します（[queue.md](queue.md)）。
 
 ### データベース
 
@@ -137,16 +133,14 @@ $ cargo artisan cache:clear --tries=9
 - `--class=` は、`db:seed` 以外では `--seed` と一緒に使います。
 - **シーダーは既定の接続にだけ流せます。** `db:seed` と `--seed` に別の `--database=` を付けるとエラーです。
 - `migrate` と `db:seed` の `--force` は、付けても付けなくても同じ動きです。
-- `migrate:status` と `migrate:unlock` は、記録の表や札の表が無くても**作りません。**
 
-## 本番で `--force` が要るコマンド
+## 本番で --force が要るコマンド
 
 `APP_ENV=production` のとき、**中身が消える次の 5 つ**は `--force` が無いと止まります。
 
 `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
-**表を変えるコマンドは同時に流せません。** 2
-つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
+**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
 
 ## serve の動き
 
@@ -158,30 +152,32 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 ホストとポートの既定は、`.env` の `APP_HOST`（`127.0.0.1`）と `APP_PORT`（`8000`）です。
 
 1. アプリをビルドする。
-2. できた実行ファイルを `storage/framework/serve/` に写して起動する。
+2. できた実行ファイルを `target/debug/bengara-serve/` に写して起動する。
 3. ファイルの変更を見張る。
 4. 変更があれば、ビルドし直して起動し直す。
 
-同じプロジェクトで `serve` を 2 つ動かしても、写した実行ファイルはぶつかりません。
-前回までの写しは、起動のときに片付けます。
+- 写すのは、動いている実行ファイルを上書きせずに済ませるためです。`storage/` は使いません。
+- `CARGO_TARGET_DIR` を変えていれば、写す先もそちらになります。
+- 同じプロジェクトで `serve` を 2 つ動かしても、ぶつかりません。
 
 ### 見張るもの
 
 **見張るのは、ビルドに影響するファイルだけです。**
 
 - `app/` `bootstrap/` `config/` `database/` `routes/` `resources/` の下の `.rs`
-- `resources/lang/<言語>.toml` と `resources/lang/<言語>/*.toml`
+- `resources/lang/` の言語ファイル（`.toml`）
 - `.env` `Cargo.toml` `Cargo.lock` `build.rs` `main.rs` `artisan.rs` `.cargo/config.toml` `rust-toolchain.toml`
 
-- `public/` は見張りません。直せばすぐ反映されます（デバッグビルドはディスクから読むため）。
-- `tests/` は見張りません。テストは `cargo test` で走らせます。
-- `storage/` `target/` `node_modules/` `.git/`、隠しファイル、データベースのファイルも見張りません。
+| 見張らないもの                                                       | 理由・代わり                                               |
+|----------------------------------------------------------------------|------------------------------------------------------------|
+| `public/`                                                            | デバッグビルドはディスクから読むので、直せばすぐ反映される |
+| `tests/`                                                             | テストは `cargo test` で走らせる                           |
+| `storage/` `target/` `node_modules/` `.git/`、データベースのファイル | ビルドに関係ない                                           |
 
 - 0.4 秒ごとに確かめます。保存が続いている間は待って、1 回のビルドにまとめます。
 - 比べるのは**ファイルの数**と**いちばん新しい更新時刻**です。
   どちらも変わらない書き換えは見落とします。そのときはファイルを 1 つ保存し直してください。
-- ビルドが自分で書き換えた `Cargo.lock` では作り直しません。
-  ビルドの最中に `cargo update` をしたときは、ファイルを 1 つ保存し直してください。
+- ビルドの最中に `cargo update` をしたときも、ファイルを 1 つ保存し直してください。
 
 ### 失敗したとき
 
@@ -191,7 +187,7 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 | 本体が自分で終わった         | その旨を出し、次の変更でもう一度起動する       |
 | 初回のビルドや起動に失敗した | `serve` は止まらない。直せばもう一度試す       |
 
-本体が自分で終わるのは、ポートが使われているときや、`serve` に知らない指定を付けたときです。
+本体が自分で終わるのは、ポートが使われているときなどです。
 画面に「本体が異常終了しました（終了コード 1）」と出ます。
 
 ### 止め方
@@ -199,9 +195,8 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 Ctrl+C で止めます。
 
 - **`serve` は本体をすぐに止めます。** 処理中のリクエストは待ちません。
-- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめるときは、`cargo run -- serve`
-  で動かします（[deployment.md](deployment.md#止める)）。
-- `serve` を強制終了したとき（`kill -9`、タスクマネージャ）だけは、本体が残ります。手で止めてください。
+- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめるときは、`cargo run -- serve` で動かします（[deployment.md](deployment.md#止める)）。
+- `serve` を強制終了したとき（`kill -9`、タスクマネージャ）は、本体が残ります。手で止めてください。
 
 ## 関連
 

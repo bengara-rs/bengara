@@ -36,6 +36,14 @@ impl Default for SessionConfig {
     }
 }
 
+/// `SESSION_LIFETIME`（分、既定 120）を秒にする。60 秒より短くはしません。
+///
+/// `from_env` と `session:gc`（「切った」印を残す秒数を決める）が使います。
+pub(crate) fn lifetime_secs_from_env() -> u64 {
+    let minutes: u64 = crate::env("SESSION_LIFETIME", 120u64);
+    minutes.saturating_mul(60).max(60)
+}
+
 impl SessionConfig {
     /// 実際に使う設定にそろえる。
     ///
@@ -167,9 +175,8 @@ impl StartSession {
     /// 知らない `SESSION_DRIVER`（`redis` や書き間違い）は、**警告を出してから**
     /// `file` にします。
     pub fn from_env() -> Self {
-        let minutes: u64 = crate::env("SESSION_LIFETIME", 120u64);
         let config = SessionConfig {
-            lifetime_secs: minutes.saturating_mul(60).max(60),
+            lifetime_secs: lifetime_secs_from_env(),
             ..SessionConfig::default()
         };
         let driver: String = crate::env("SESSION_DRIVER", "file");

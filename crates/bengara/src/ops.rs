@@ -20,9 +20,6 @@ pub(crate) const STORAGE_DIRECTORIES: &[&str] = &[
     "framework",
     "framework/cache",
     "framework/schedule",
-    // `cargo artisan serve` が本体の実行ファイルをコピーする場所。
-    // ここに入るのはアプリの実行ファイルそのものなので、`restrict` を通す。
-    "framework/serve",
     "framework/sessions",
     "logs",
 ];
@@ -160,8 +157,8 @@ mod tests {
         assert!(STORAGE_DIRECTORIES.contains(&"framework/cache"));
         assert!(STORAGE_DIRECTORIES.contains(&"framework/schedule"));
         assert!(STORAGE_DIRECTORIES.contains(&"framework/sessions"));
-        // `cargo artisan serve` のコピー置き場。入れないと 0700 に絞られない。
-        assert!(STORAGE_DIRECTORIES.contains(&"framework/serve"));
+        // `cargo artisan serve` のコピーはビルドの成果物の隣に置く（`storage/` には置かない）。
+        assert!(!STORAGE_DIRECTORIES.contains(&"framework/serve"));
         assert!(STORAGE_DIRECTORIES.contains(&"logs"));
     }
 }

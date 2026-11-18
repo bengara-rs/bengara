@@ -1,13 +1,7 @@
 # bengara ドキュメント
 
 bengara を使う人のための資料です。読むページをここで探してください。
-フレームワークの紹介は [../README.md](../README.md) にあります。
-
-初めてなら、次の順に読んでください。
-
-1. [getting-started.md](getting-started.md)
-2. [directory-structure.md](directory-structure.md)
-3. [routing.md](routing.md)
+初めてなら、表の上から 3 つ（動かす → 置き場所 → URL）を順に読んでください。
 
 ## やりたいこと → 読むページ
 
@@ -15,8 +9,8 @@ bengara を使う人のための資料です。読むページをここで探し
 |-------------------------|--------------------------------------------------------|
 | まず動かす              | [getting-started.md](getting-started.md)               |
 | どこに何を置くか知る    | [directory-structure.md](directory-structure.md)       |
-| コマンドを知る          | [artisan.md](artisan.md)                               |
 | URL を足す              | [routing.md](routing.md)                               |
+| コマンドを知る          | [artisan.md](artisan.md)                               |
 | 入力を読む・応答を返す  | [requests-and-responses.md](requests-and-responses.md) |
 | リクエストの前後に挟む  | [middleware.md](middleware.md)                         |
 | 入力を確かめる          | [validation.md](validation.md)                         |

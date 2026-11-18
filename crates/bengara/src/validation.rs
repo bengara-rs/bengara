@@ -458,9 +458,7 @@ fn check(
             }
         }
         Rule::Url => {
-            if !(value.starts_with("http://") || value.starts_with("https://"))
-                || value.len() < http_prefix_len(value) + 1
-            {
+            if !looks_like_url(value) {
                 errors.add(
                     field,
                     format!("{field} は http:// か https:// で始まる URL を入力してください。"),
@@ -651,12 +649,52 @@ fn trim_num(n: f64) -> String {
     }
 }
 
-fn http_prefix_len(value: &str) -> usize {
-    if value.starts_with("https://") {
-        8
-    } else {
-        7
+/// `http://` か `https://` で始まる URL らしい形か。
+///
+/// 完全な URL の解析はしません。次のものだけを断ります。
+///
+/// - スキームが `http` / `https` でない（大文字小文字は見ない）
+/// - 空白・制御文字、URL にそのまま書けない記号（`< > " { } | \ ^` と `` ` ``）を含む
+/// - スキームの直後にホストが無い（`https://`・`https:///evil`・`https://:80`・`https://user@`）
+/// - ポートが数字でない（`https://a:b`）
+fn looks_like_url(value: &str) -> bool {
+    let rest = ["https://", "http://"].iter().find_map(|scheme| {
+        value
+            .get(..scheme.len())
+            .filter(|head| head.eq_ignore_ascii_case(scheme))
+            .map(|_| &value[scheme.len()..])
+    });
+    let Some(rest) = rest else {
+        return false;
+    };
+    if rest.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+    }) {
+        return false;
     }
+    // ホストとポート（`/` `?` `#` の手前まで）。利用者名（`user@`）は外す。
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    if host_port.starts_with('[') {
+        // IPv6（`[::1]:8080`）。`]` で閉じていて、中が空でないこと。
+        return match host_port.find(']') {
+            Some(end) if end > 1 => {
+                let after = &host_port[end + 1..];
+                after.is_empty()
+                    || after
+                        .strip_prefix(':')
+                        .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit()))
+            }
+            _ => false,
+        };
+    }
+    let (host, port) = match host_port.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (host_port, None),
+    };
+    !host.is_empty() && port.is_none_or(|port| port.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// メールアドレスらしい形か。
@@ -950,6 +988,38 @@ mod tests {
         assert!(errors_of(&input(&[("u", "https://example.com")]), &[("u", "url")]).is_empty());
         assert!(!errors_of(&input(&[("u", "example.com")]), &[("u", "url")]).is_empty());
         assert!(!errors_of(&input(&[("u", "https://")]), &[("u", "url")]).is_empty());
+    }
+
+    #[test]
+    fn urlはホストの無いものと書けない文字を断る() {
+        for ok in [
+            "http://example.com",
+            "HTTPS://Example.com/a?b=c#d",
+            "https://localhost:8000/x",
+            "https://user:pass@example.com",
+            "http://[::1]:8080/",
+            "https://例え.jp/パス",
+        ] {
+            assert!(looks_like_url(ok), "{ok} は通すはず");
+        }
+        for ng in [
+            "https://a b",
+            "https:///evil",
+            "https://<x>",
+            "https://a\tb",
+            "https://a\nb",
+            "https://?q",
+            "https://#x",
+            "https://:80",
+            "https://user@",
+            "https://a:b",
+            "https://[]",
+            "https://[::1",
+            "ftp://example.com",
+            "https:/example.com",
+        ] {
+            assert!(!looks_like_url(ng), "{ng:?} は弾くはず");
+        }
     }
 
     #[test]

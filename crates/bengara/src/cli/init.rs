@@ -366,29 +366,39 @@ fn write_secret_if_missing(
         report.kept.push(relative.to_string());
         return Ok(());
     }
-    write_file(&path, contents)?;
-    restrict_file(&path)?;
+    write_secret_file(&path, contents)?;
     report.created.push(relative.to_string());
     Ok(())
 }
 
-/// 所有者だけが読み書きできるようにする（Unix のみ）。
+/// 所有者だけが読み書きできるファイルとして、新しく作って書く（Unix では 0600）。
 ///
 /// `std::fs::write` だけでは umask まかせ（ふつう 0644）で、共用ホストでは
 /// 同じマシンの他のアカウントから `APP_KEY` が読めます。`storage/` は 0700 に
 /// 絞ってあるので、秘密を持つファイルのほうが緩いのは不釣り合いです。
 ///
-/// Windows では何もしません。既定の継承に任せます（`ops::restrict` と同じ方針）。
-#[cfg(unix)]
-fn restrict_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| Error::msg(format!("{} の権限を絞れません: {e}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn restrict_file(_path: &Path) -> Result<()> {
-    Ok(())
+/// **作る時点で 0600 にします。** 書いてから絞っていたころは、絞るまでの短い間
+/// 0644 で読めました。`create_new` なので、確かめてから作るまでの間に
+/// 誰かが同じ名前を置いても上書きしません（エラーになります）。
+///
+/// Windows では権限を変えません。既定の継承に任せます（`ops::restrict` と同じ方針）。
+fn write_secret_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::msg(format!("{} を作れません: {e}", parent.display())))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .map_err(|e| Error::msg(format!("{} を書けません: {e}", path.display())))
 }
 
 fn write_file(path: &PathBuf, contents: &str) -> Result<()> {

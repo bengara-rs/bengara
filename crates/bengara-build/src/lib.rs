@@ -665,14 +665,10 @@ impl Generator {
                 continue;
             }
             if skip_file(stem) {
-                // `mod.rs` は Rust の癖で意味を持つ名前なので取り込みません。
+                // `mod.rs`・`main.rs`・`lib.rs` は Rust の癖で意味を持つ名前なので取り込みません。
                 // 黙って無視すると、置いた人には何も伝わらないので知らせます。
-                if stem == "mod" {
-                    warn(&format!(
-                        "{} は取り込みません。bengara はファイル名をそのままモジュール名にするので、\
-                         mod.rs は要りません",
-                        path.display()
-                    ));
+                if let Some(message) = skipped_file_warning(stem, &path) {
+                    warn(&message);
                 }
                 continue;
             }
@@ -1264,6 +1260,26 @@ fn skip_file(stem: &str) -> bool {
     stem.starts_with('.') || stem == "mod" || stem == "main" || stem == "lib"
 }
 
+/// `skip_file` で外したファイルのうち、知らせるものの文言。隠しファイルは黙って外す（`None`）。
+///
+/// 走査するディレクトリ（`app/` など）の中のものだけがここに来ます。プロジェクト直下の
+/// `main.rs`（入口）は走査の外なので、警告は出ません。
+fn skipped_file_warning(stem: &str, path: &Path) -> Option<String> {
+    match stem {
+        "mod" => Some(format!(
+            "{} は取り込みません。bengara はファイル名をそのままモジュール名にするので、\
+             mod.rs は要りません",
+            path.display()
+        )),
+        "main" | "lib" => Some(format!(
+            "{} は取り込みません。{stem}.rs は Rust でクレートの入口を表す名前なので、\
+             モジュールにしません。別の名前にしてください",
+            path.display()
+        )),
+        _ => None,
+    }
+}
+
 /// 黙って取り込まないディレクトリ。
 ///
 /// 控えのディレクトリ（`old.bak/`・`Controllers copy/`）は、ここではなく
@@ -1809,6 +1825,42 @@ mod tests {
         assert_eq!(dir_name(Path::new("a/old.bak")), Some("old.bak"));
         // 名前として使うときは `old_bak` になる（控えとして外す前の形）。
         assert_eq!(to_module_name("old.bak").unwrap(), "old_bak");
+    }
+
+    #[test]
+    fn 入口の名前のファイルは取り込まずに知らせる() {
+        // 以前は `mod.rs` だけ警告し、`main.rs` と `lib.rs` は黙って外していた。
+        for stem in ["mod", "main", "lib"] {
+            let path = Path::new("app").join("Http").join(format!("{stem}.rs"));
+            let message = skipped_file_warning(stem, &path).expect(stem);
+            assert!(message.contains(&format!("{stem}.rs")), "{message}");
+            assert!(message.contains("取り込みません"), "{message}");
+        }
+        // 隠しファイルは黙って外す。
+        assert_eq!(
+            skipped_file_warning(".hidden", Path::new("app/.hidden.rs")),
+            None
+        );
+        assert_eq!(skipped_file_warning("User", Path::new("app/User.rs")), None);
+    }
+
+    #[test]
+    fn 入口の名前のファイルはモジュールにしない() {
+        let root = temp_root("entry-names");
+        touch(&root.join("app/Http/main.rs"), "pub fn x() {}\n");
+        touch(&root.join("app/Http/lib.rs"), "pub fn y() {}\n");
+        touch(&root.join("app/Http/Home.rs"), "pub struct Home;\n");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let code = generator.finish();
+        assert!(code.contains("Home.rs"), "{code}");
+        assert!(!code.contains("main.rs"), "{code}");
+        assert!(!code.contains("lib.rs"), "{code}");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

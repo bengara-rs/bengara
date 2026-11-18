@@ -15,6 +15,8 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use axum::body::Bytes;
+
 use crate::error::{Error, Result};
 
 /// 受け取る本文の上限の既定（2 MiB）。`APP_MAX_BODY_BYTES` で変えられます。
@@ -56,31 +58,47 @@ impl PendingBody {
 
     /// 手元にある本文（テスト用のクライアント）。
     pub(crate) fn memory(bytes: Vec<u8>) -> Self {
-        Self(Source::Memory(Some(bytes)))
+        Self(Source::Memory(std::collections::VecDeque::from([
+            Bytes::from(bytes),
+        ])))
+    }
+
+    /// 手元にある本文を、いくつかのかたまりに分けて届ける（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn memory_chunks(chunks: Vec<Vec<u8>>) -> Self {
+        Self(Source::Memory(
+            chunks.into_iter().map(Bytes::from).collect(),
+        ))
     }
 }
 
 /// 本文の出どころ。
 enum Source {
     Incoming(axum::body::Body),
-    /// 1 回で全部を返し、次からは終わり（`None`）を返します。
-    Memory(Option<Vec<u8>>),
+    /// 積んだかたまりを順に返し、尽きたら終わり（`None`）を返します。
+    Memory(std::collections::VecDeque<Bytes>),
 }
 
 impl Source {
     /// 次のかたまり。終わりなら `None`。読めなければ `Some(Err(()))`。
     ///
     /// 中身の無いかたまりと、データでないもの（trailer）は飛ばします。
-    async fn next(&mut self) -> Option<std::result::Result<Vec<u8>, ()>> {
+    /// 届いた形（`Bytes`）のまま返し、ここでは写しません。
+    async fn next(&mut self) -> Option<std::result::Result<Bytes, ()>> {
         match self {
-            Self::Memory(bytes) => bytes.take().filter(|b| !b.is_empty()).map(Ok),
+            Self::Memory(chunks) => loop {
+                let chunk = chunks.pop_front()?;
+                if !chunk.is_empty() {
+                    return Some(Ok(chunk));
+                }
+            },
             Self::Incoming(body) => loop {
                 use axum::body::HttpBody;
                 let frame = std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await?;
                 match frame {
                     Ok(frame) => match frame.into_data() {
                         Ok(data) if data.is_empty() => continue,
-                        Ok(data) => return Some(Ok(data.to_vec())),
+                        Ok(data) => return Some(Ok(data)),
                         Err(_trailers) => continue,
                     },
                     Err(_) => return Some(Err(())),
@@ -116,18 +134,36 @@ pub(crate) async fn read_all(
 ) -> Result<Vec<u8>> {
     let mut source = body.0;
     let reading = async move {
-        // 申告を信じすぎない。確保するのは上限と 64 KiB の小さいほうまで。
-        let hint = declared.unwrap_or(0).min(limit).min(64 * 1024);
-        let mut buffer = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
+        // かたまりが 1 つで終わる本文（小さなフォームや JSON のほとんど）は、
+        // つなぐ先を作らずにそのかたまりを返す。2 つ目が来たときに初めてつなぐ。
+        let mut first: Option<Bytes> = None;
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
         while let Some(chunk) = source.next().await {
             let chunk = chunk.map_err(|()| unreadable())?;
-            let total = (buffer.len() as u64).saturating_add(chunk.len() as u64);
+            total = total.saturating_add(chunk.len() as u64);
             if total > limit {
                 return Err(too_large());
             }
+            // `next` は空のかたまりを返さないので、`buffer` が空ならまだ 1 つ目。
+            if first.is_none() && buffer.is_empty() {
+                first = Some(chunk);
+                continue;
+            }
+            if let Some(head) = first.take() {
+                // 申告を信じすぎない。確保するのは上限と 64 KiB の小さいほうまで。
+                let hint = declared.unwrap_or(0).min(limit).min(64 * 1024);
+                let hint = usize::try_from(hint).unwrap_or(0);
+                buffer.reserve(hint.max(head.len() + chunk.len()));
+                buffer.extend_from_slice(&head);
+            }
             buffer.extend_from_slice(&chunk);
         }
-        Ok(buffer)
+        Ok(match first {
+            // 自分だけが持つ `Vec` 由来の `Bytes` なら、写さずに `Vec` へ戻ります。
+            Some(only) => Vec::from(only),
+            None => buffer,
+        })
     };
     match tokio::time::timeout(BODY_READ_TIMEOUT, reading).await {
         Ok(result) => result,
@@ -206,7 +242,7 @@ impl BodyStream {
                     return Err(self.fail(too_large()));
                 }
                 self.received = total;
-                Ok(Some(chunk))
+                Ok(Some(Vec::from(chunk)))
             }
         }
     }
@@ -279,6 +315,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), 413);
+    }
+
+    #[tokio::test]
+    async fn いくつかのかたまりをつないで読む() {
+        let chunks = || vec![b"ab".to_vec(), Vec::new(), b"cd".to_vec(), b"e".to_vec()];
+        let body = read_all(PendingBody::memory_chunks(chunks()), 5, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(body, b"abcde");
+        // 上限は合計で数える。最後のかたまりで超えたら 413。
+        let error = read_all(PendingBody::memory_chunks(chunks()), 4, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), 413);
+        // 申告が実際より小さくても、全部読む。
+        let body = read_all(PendingBody::memory_chunks(chunks()), 100, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(body, b"abcde");
+
+        // 少しずつ読む口でも、空のかたまりは飛ばす。
+        let mut stream = BodyStream::new(PendingBody::memory_chunks(chunks()), 5);
+        assert_eq!(stream.chunk().await.unwrap().as_deref(), Some(&b"ab"[..]));
+        assert_eq!(stream.chunk().await.unwrap().as_deref(), Some(&b"cd"[..]));
+        assert_eq!(stream.chunk().await.unwrap().as_deref(), Some(&b"e"[..]));
+        assert_eq!(stream.chunk().await.unwrap(), None);
+        assert_eq!(stream.received(), 5);
     }
 
     #[tokio::test]

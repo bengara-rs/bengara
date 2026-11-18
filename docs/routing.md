@@ -25,7 +25,7 @@ pub fn app() -> Application {
 }
 ```
 
-- `r.web(関数)` でルートの関数を取り込みます。
+- `r.web(関数)` でルートを取り込みます。
 - `r.health(パス)` は生存確認のルートを足します。`{"status":"ok","name":"アプリ名"}` を返します。
 - **`Route::*` は `r.web(...)` に渡した関数の中でだけ効きます。** 外で呼ぶと、エラーログを出して無視します。
 
@@ -39,7 +39,7 @@ Route::patch("/posts/{post}", PostController::patch);
 Route::delete("/posts/{post}", PostController::destroy);
 ```
 
-- 書けるのはこの 5 つです。メソッドごとに 1 行ずつ書きます。
+- 書けるのはこの 5 つです。
 - `GET` のルートは `HEAD` にも答えます（本文は空）。
 
 ハンドラの形は 2 つです。
@@ -66,7 +66,8 @@ pub async fn show(req: Request) -> Result<Response> {
 }
 ```
 
-読み方の決まりは [requests-and-responses.md](requests-and-responses.md) にあります。
+読み方は [requests-and-responses.md](requests-and-responses.md) にあります。
+日本語のパスも書けます（`/記事-{id}` は `/記事-12` に当たります）。
 
 ### 書けない形
 
@@ -80,9 +81,8 @@ pub async fn show(req: Request) -> Result<Response> {
 | `/posts/{}`                      | 名前が空。`{` `}` が対になっていないときも |
 | `/posts/{id}` と `/posts/{post}` | 名前だけ違うパスは同じパスとみなす         |
 
-- 拡張子で分けたいときは、`/posts/{id}` で受けてハンドラで値の末尾を見ます。
-- `{` そのものをパスに書く方法はありません。
-- 日本語のパスも書けます（`/記事-{id}` は `/記事-12` に当たります）。
+- 拡張子で分けたいときは、`/posts/{id}` で受けて、ハンドラで値の末尾を見ます。
+- `{` そのものをパスに書くことはできません。
 
 ## 名前と URL
 
@@ -106,20 +106,13 @@ Route::get("/posts/{post}", PostController::show).name("posts.show");
 
 ### 引数の扱い
 
-- パスに使わなかった引数は、クエリとして後ろに付きます。
-  `route_with("posts.index", &[("page", "2")])` は `/posts?page=2` です。
-- 値は符号化（`%xx` の形に変換）します。残るのは英数字と `-` `_` `.` `~` だけです。
-- `/` も `%2F` になります。`{*path}` の引数だけは `/` を残します。
-
-| 書いたもの                                     | できる URL     |
-|------------------------------------------------|----------------|
-| `route_with("posts.show", &[("post", "a b")])` | `/posts/a%20b` |
-| `route_with("posts.show", &[("post", "a/b")])` | `/posts/a%2Fb` |
-| `route_with("files.show", &[("path", "a/b")])` | `/files/a/b`   |
+- パスに使わなかった引数は、クエリとして後ろに付きます（`/posts?page=2`）。
+- 値は `%xx` の形に符号化します。残るのは英数字と `-` `_` `.` `~` だけです。
+- `/` も `%2F` になります（`/posts/a%2Fb`）。`{*path}` の引数だけは `/` を残します。
 
 ## 署名付き URL
 
-改ざんすると通らなくなるリンクです。
+書き換えると通らなくなるリンクです。
 「退会する」のように、**ログインしていない人に渡すリンク**で使います。
 
 ```rust
@@ -138,28 +131,21 @@ pub async fn unsubscribe(req: Request) -> Result<Response> {
 
 - **`APP_KEY` が要ります（64 文字以上）。** くわしくは [configuration.md](configuration.md) にあります。
 - **署名が合わなくても自動では止まりません。** 何を返すかは自分で決めます。
-- クエリの並び順が変わっても通ります。末尾に `/` が付いても通ります。
+- クエリの並び順が変わっても、末尾に `/` が付いても通ります。
 - `signature` と `expires` は仕組みが使う名前です。引数には使えません。
 - `signature` が 2 つ以上付いたリンクは通りません。
 
 ### 渡せるパス
 
-| 渡したもの                                 | 結果                       |
-|--------------------------------------------|----------------------------|
-| `/unsubscribe`                             | 使える                     |
-| `unsubscribe`（`/` なし）                  | 頭に `/` を足して使う      |
-| 空文字                                     | `/` として使う             |
-| `https://example.com/x` のような完全な URL | エラー                     |
-| `//` で始まるもの                          | エラー                     |
-| 空白・`?`・`#`・日本語を含むもの           | エラー。先に符号化して渡す |
+渡すのはパスだけです。確かめる側が `APP_URL` と届いたパスから URL を組み直すためです。
 
-- 完全な URL を断るのは、確かめる側が `APP_URL` と届いたパスから URL を組み直すためです。
-  完全な URL で作った署名は必ず合いません。
-- 符号化したパス（`/hello/%E3%81%82`）は通ります。
+- `unsubscribe` のように `/` が無ければ頭に足します。空文字は `/` です。
+- 完全な URL（`https://...`）と `//` で始まるものはエラーです。
+- 空白・`?`・`#`・日本語を含むパスはエラーです。先に符号化して渡します（`/hello/%E3%81%82` は通ります）。
 
 ## ミドルウェアを付ける
 
-ミドルウェア（前後に挟む処理）を名前で付けます。
+ミドルウェア（前後に挟む処理）を名前で付けます。名前の登録は [middleware.md](middleware.md) にあります。
 
 ```rust
 Route::get("/admin", AdminController::index)
@@ -167,11 +153,9 @@ Route::get("/admin", AdminController::index)
     .name("admin.index");
 ```
 
-名前の登録は [middleware.md](middleware.md) にあります。
-
 ## 本文の受け取り方を決める
 
-`.name()` や `.middleware()` と同じように、ルートの後ろに続けて書きます。
+ルートの後ろに続けて書きます。
 
 ```rust
 Route::post("/imports", ImportController::store).max_body(16 * 1024 * 1024);
@@ -188,12 +172,10 @@ Route::post("/uploads/{name}", UploadController::store)
 | `.stream_body()`    | 本文を読まずにハンドラへ渡す。ハンドラは `req.body_stream()?` で少しずつ読む |
 
 - 上限を超えると 413 を返します。
-- `.max_body(0)` は「本文を受け付けない」です。空でない本文はすべて 413 になります。
-  `.env` の `APP_MAX_BODY_BYTES=0` は書き間違いと見て既定に戻しますが、ルートの `0` は書いたとおりに効きます。
+- `.max_body(0)` は「本文を受け付けない」です。空でない本文はすべて 413 です。
 - `.stream_body()` の無いルートは、30 秒で読み終える必要があります（過ぎると 408）。
-  何 MB もある本文は `.stream_body()` と組み合わせます。
-- **ルートごとにだけ付けられます。** グループ（`Route::prefix(..)`）には付けられません。
-- くわしい動きは [requests-and-responses.md](requests-and-responses.md) の「本文の上限」と「本文を少しずつ読む」にあります。
+- **ルートごとにだけ付けられます。** グループには付けられません。
+- くわしくは [requests-and-responses.md](requests-and-responses.md) の「本文の上限」と「本文を少しずつ読む」にあります。
 
 ## グループ
 
@@ -215,9 +197,9 @@ Route::prefix("admin")
 | ルート名の頭 | `Route::name("admin.")`      | 外側から順につなぐ。**点は自分で書く** |
 | ミドルウェア | `Route::middleware("admin")` | 外側が先、内側が後                     |
 
-- 3 つは好きな順で、1 つだけでも使えます。
+- 3 つは好きな順で書けます。1 つだけでも使えます。
 - 入れ子にできます。外側の設定は内側へ引き継がれます。
-- `prefix("/admin/")` の前後の `/` は落ちます。`prefix("")` は何も足しません。
+- `prefix("/admin/")` の前後の `/` は落ちます。
 - `Route::name("admin")` と点を忘れると、名前は `adminindex` になります。
 
 ## 起動時に止まる場合
@@ -244,7 +226,7 @@ Route::prefix("admin")
 
 照合の前に、届いたパスを 2 つだけそろえます。転送（リダイレクト）はしません。
 
-- 末尾の `/` を落とす。`/posts` と `/posts/` は同じルートに当たります。
+- 末尾の `/` を落とす。`/posts` と `/posts/` は同じルートに当たる。
 - `%xx` の 16 進を大文字にする（`%e3` → `%E3`）。
 
 ## 一覧を見る
@@ -253,15 +235,9 @@ Route::prefix("admin")
 cargo artisan route:list
 ```
 
-```
-METHOD  URI                   NAME               MIDDLEWARE
-GET     /                     home
-GET     /team/members/{name}  team.members.show  admin
-```
+METHOD・URI・NAME・MIDDLEWARE の列が出ます。ミドルウェアを付けたルートが無ければ、MIDDLEWARE の列は出ません。
 
-ミドルウェアを付けたルートが無ければ、MIDDLEWARE の列は出ません。
-
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{watch, Notify};
 
 use crate::error::{Error, Result};
 use crate::http::{Request, Response};
@@ -65,6 +65,13 @@ const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// 相手の Close を待つ長さ（`close` と、bengara が閉じるとき）。
 pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
+/// 1 通の書き込みを待つ長さ。相手が読まずに TCP の窓が 0 のままなら、これで切る。
+/// 要求の本文を読む上限（`BODY_READ_TIMEOUT`）と同じ 30 秒です。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 受信の溜まりの上限を、受け取る 1 通の上限の何通分にするか。
+const INBOUND_MESSAGES: usize = 16;
 
 /// 停止のとき、接続が閉じるのを待つ長さの上限。
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -134,6 +141,16 @@ pub(crate) struct Settings {
     pub(crate) send_queue_limit: usize,
     pub(crate) ping_interval: Option<Duration>,
     pub(crate) idle_timeout: Option<Duration>,
+    /// 1 通の書き込みを待つ長さの上限。利用者は変えられない（テストで縮める）。
+    pub(crate) write_timeout: Duration,
+}
+
+impl Settings {
+    /// アプリがまだ `recv` で読んでいない受信の量の上限（バイト）。
+    /// 受け取る 1 通の上限の 16 通分です（既定 64 KiB × 16 = 1 MiB）。
+    pub(crate) fn inbound_limit(&self) -> usize {
+        self.max_message_size.saturating_mul(INBOUND_MESSAGES)
+    }
 }
 
 impl Default for Settings {
@@ -143,6 +160,7 @@ impl Default for Settings {
             send_queue_limit: DEFAULT_SEND_QUEUE_LIMIT,
             ping_interval: None,
             idle_timeout: None,
+            write_timeout: WRITE_TIMEOUT,
         }
     }
 }
@@ -657,7 +675,7 @@ pub(crate) fn after_response(response: Response, wants_json: bool) -> Response {
 /// 閉じたら、入っていたチャンネルからは自動で外れます。
 pub struct WebSocket {
     conn: Arc<Conn>,
-    inbound: mpsc::Receiver<Result<Message>>,
+    inbound: registry::InboundReceiver,
 }
 
 impl std::fmt::Debug for WebSocket {
@@ -669,7 +687,7 @@ impl std::fmt::Debug for WebSocket {
 }
 
 impl WebSocket {
-    pub(crate) fn new(conn: Arc<Conn>, inbound: mpsc::Receiver<Result<Message>>) -> Self {
+    pub(crate) fn new(conn: Arc<Conn>, inbound: registry::InboundReceiver) -> Self {
         Self { conn, inbound }
     }
 
@@ -689,7 +707,7 @@ impl WebSocket {
 
     /// 文字を送る。待ちません（送信の列に積むだけ）。
     pub fn send_text(&self, text: impl Into<String>) -> Result<(), SendError> {
-        self.conn.push(Outgoing::Text(text.into()))
+        self.conn.push(Outgoing::text(text.into()))
     }
 
     /// バイト列を送る。待ちません。
@@ -757,7 +775,7 @@ impl std::fmt::Debug for WebSocketSender {
 impl WebSocketSender {
     /// 文字を送る。待ちません。
     pub fn send_text(&self, text: impl Into<String>) -> Result<(), SendError> {
-        self.conn.push(Outgoing::Text(text.into()))
+        self.conn.push(Outgoing::text(text.into()))
     }
 
     /// バイト列を送る。待ちません。
@@ -934,11 +952,11 @@ mod tests {
     #[tokio::test]
     async fn 送り口は閉じた後に送れない() {
         let (conn, mut rx) = Conn::new(1024);
-        let socket = WebSocket::new(conn.clone(), mpsc::channel(1).1);
+        let socket = WebSocket::new(conn.clone(), registry::inbound(1).1);
         let sender = socket.sender();
         socket.send_text("a").unwrap();
         sender.send_binary(vec![1, 2]).unwrap();
-        assert!(matches!(rx.out.try_recv(), Ok(Outgoing::Text(t)) if t == "a"));
+        assert!(matches!(rx.out.try_recv(), Ok(Outgoing::Text(t)) if t.as_str() == "a"));
         assert!(matches!(rx.out.try_recv(), Ok(Outgoing::Binary(b)) if b == vec![1, 2]));
         assert!(!sender.is_closed());
         sender.close(4000, "bye");

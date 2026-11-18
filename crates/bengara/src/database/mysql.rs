@@ -95,11 +95,7 @@ impl Backend for MySqlBackend {
 
     fn begin(&self) -> DbFuture<'_, Box<dyn RawTx>> {
         Box::pin(async move {
-            let tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| Error::msg(format!("トランザクションを始められません: {e}")))?;
+            let tx = self.pool.begin().await.map_err(|e| failed("begin", e))?;
             Ok(Box::new(MySqlTx { tx }) as Box<dyn RawTx>)
         })
     }

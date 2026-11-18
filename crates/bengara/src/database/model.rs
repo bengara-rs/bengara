@@ -157,13 +157,11 @@ pub trait Model: Sized + Send + Sync + 'static {
     /// post.save().await?;                       // ← views が戻る
     ///
     /// // 動く列がある表では、変える列だけを指定する。
-    /// DB::table("posts")
-    ///     .where_("id", id)
-    ///     .update(&[("title", "新しい題名".into())])
-    ///     .await?;
+    /// post.save_only(&["title"]).await?;        // ← title と updated_at だけ
     /// ```
     ///
-    /// 変えたい項目を数えられるなら、クエリビルダの `update` を使ってください。
+    /// 変えたい項目を数えられるなら、[`save_only`](Model::save_only) か
+    /// クエリビルダの `update` を使ってください。
     /// どの列が「他の人も動かす列」かは枠組みから分からないので、ここでは
     /// 何が変わったかを追いません。
     ///
@@ -193,6 +191,56 @@ pub trait Model: Sized + Send + Sync + 'static {
         tx: &Transaction,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         save_to(self, tx.source())
+    }
+
+    /// 指定した列だけを書き戻す。返るのは当てはまった行の数です。
+    ///
+    /// ```ignore
+    /// let mut post = Post::find_or_fail(id).await?;
+    /// post.title = "新しい題名".into();
+    /// if post.save_only(&["title"]).await? == 0 {
+    ///     // 読んだ後で行が消えた。
+    ///     return Err(Error::http(404, "見つかりません"));
+    /// }
+    /// ```
+    ///
+    /// 他の人も動かす列（閲覧数など）がある表で、`save()` の代わりに使います。
+    /// 書くのは指定した列と `updated_at` だけなので、ほかの列は巻き戻りません。
+    ///
+    /// | 項目               | `save()`                         | `save_only(&[..])`                  |
+    /// |--------------------|----------------------------------|-------------------------------------|
+    /// | 書く列             | 主キーと `created_at` 以外の全部 | 指定した列と `updated_at`（あれば） |
+    /// | 新しい行           | 足す                             | **エラー**（足しません）            |
+    /// | 当てはまる行が無い | **エラー**                       | **`Ok(0)`**（エラーにしません）     |
+    /// | 返るもの           | `()`                             | 当てはまった行の数（`u64`）         |
+    ///
+    /// - **`updated_at` は自動で足します。** その列がモデルにあれば、今の時刻にして
+    ///   一緒に書きます（`save()` と同じ [`Model::touch_timestamps`]）。
+    /// - 行が無いときを `Ok(0)` にするのは、呼ぶ側で 404 などに分けられるようにするためです。
+    /// - 次のときはエラーです。何も書きません。
+    ///   - 列を1つも指定していない
+    ///   - モデルに無い列（`COLUMNS` に無い名前）を指定した
+    ///   - 主キーの列を指定した
+    ///   - まだ保存していない行（[`Model::is_new`] が真）
+    ///
+    /// **既定の接続を使います。** トランザクションの中で書くときは
+    /// [`save_only_using(&tx, ..)`](Model::save_only_using) を使ってください。
+    fn save_only(
+        &mut self,
+        columns: &[&str],
+    ) -> impl std::future::Future<Output = Result<u64>> + Send {
+        save_only_to(self, columns, Source::Default)
+    }
+
+    /// トランザクションの中で、指定した列だけを書き戻す。
+    ///
+    /// 決まりは [`save_only`](Model::save_only) と同じです。
+    fn save_only_using(
+        &mut self,
+        tx: &Transaction,
+        columns: &[&str],
+    ) -> impl std::future::Future<Output = Result<u64>> + Send {
+        save_only_to(self, columns, tx.source())
     }
 
     /// 消す。返るのは消した件数です。
@@ -290,6 +338,67 @@ async fn save_to<T: Model>(model: &mut T, source: Source) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `save_only()` と `save_only_using()` の中身。投げ先だけが違います。
+///
+/// 列の検査は、時刻を入れる前・問い合わせる前に済ませます。
+/// 断るときに構造体を書き換えないためです。
+async fn save_only_to<T: Model>(model: &mut T, columns: &[&str], source: Source) -> Result<u64> {
+    if model.is_new() {
+        return Err(Error::msg(format!(
+            "{} の save_only() は保存済みの行にだけ使えます。\
+             新しい行は save() で入れてください",
+            T::TABLE
+        )));
+    }
+    if columns.is_empty() {
+        return Err(Error::msg(format!(
+            "{} の save_only() に書く列を1つ以上指定してください",
+            T::TABLE
+        )));
+    }
+    for column in columns {
+        if *column == T::PRIMARY_KEY {
+            return Err(Error::msg(format!(
+                "{}.{} は主キーなので save_only() では書けません",
+                T::TABLE,
+                column
+            )));
+        }
+        if !T::COLUMNS.contains(column) {
+            return Err(Error::msg(format!(
+                "{} に `{column}` という列はありません（ある列: {}）",
+                T::TABLE,
+                T::COLUMNS.join(", ")
+            )));
+        }
+    }
+    // `COLUMNS` にあって `attributes()` に無い列（手で実装したモデルの食い違い）。
+    // 黙って書かずに済ませると、変えたつもりの値が残りません。
+    let known = model.attributes();
+    if let Some(column) = columns
+        .iter()
+        .find(|c| !known.iter().any(|(name, _)| name == *c))
+    {
+        return Err(Error::msg(format!(
+            "{}.{column} は attributes() に無いので書けません",
+            T::TABLE
+        )));
+    }
+    let query = QueryBuilder::new(source, T::TABLE);
+    // 探しても無いと分かっている主キーは、問い合わせずに「行が無い」（0 件）にする。
+    let Some(key) = lookup_key::<T>(model.key(), query.driver()) else {
+        query.check()?;
+        return Ok(0);
+    };
+    model.touch_timestamps(false);
+    let updating: Vec<(&'static str, Value)> = model
+        .attributes()
+        .into_iter()
+        .filter(|(name, _)| columns.contains(name) || *name == "updated_at")
+        .collect();
+    query.where_(T::PRIMARY_KEY, key).update(&updating).await
 }
 
 /// 更新のつもりで `save()` して、当てはまる行が無かったときのエラー。
@@ -1803,5 +1912,203 @@ mod tests {
         tiny.save_using(&tx).await.expect("保存できる");
         assert_eq!(tiny.id, 7);
         assert!(!tiny.is_new());
+    }
+
+    /// 閲覧数と `updated_at` を持つモデル。`save_only` を試します。
+    ///
+    /// `touch_timestamps` は `#[derive(Model)]` と同じく `updated_at` を入れます。
+    struct Counted {
+        id: i64,
+        title: String,
+        views: i64,
+        updated_at: String,
+    }
+
+    impl Model for Counted {
+        const TABLE: &'static str = "counted";
+        const PRIMARY_KEY: &'static str = "id";
+        const COLUMNS: &'static [&'static str] = &["id", "title", "views", "updated_at"];
+
+        fn from_row(row: &Row) -> Result<Self> {
+            Ok(Self {
+                id: row.get("id")?,
+                title: row.get("title")?,
+                views: row.get("views")?,
+                updated_at: row.get("updated_at")?,
+            })
+        }
+
+        fn attributes(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("title", Value::Text(self.title.clone())),
+                ("views", Value::Int(self.views)),
+                ("updated_at", Value::Text(self.updated_at.clone())),
+            ]
+        }
+
+        fn key(&self) -> Value {
+            Value::Int(self.id)
+        }
+
+        fn set_key(&mut self, value: Value) {
+            self.id = i64::from_value(&value).unwrap_or(0);
+        }
+
+        fn touch_timestamps(&mut self, _creating: bool) {
+            self.updated_at = "touched".into();
+        }
+    }
+
+    /// `counted` の表を持つメモリ上の SQLite で、トランザクションを始める。
+    #[cfg(feature = "sqlite")]
+    async fn counted_table() -> Transaction {
+        use super::super::{ConnectionConfig, Schema};
+
+        let backend = super::super::sqlite::connect(&ConnectionConfig::sqlite("test", ":memory:"))
+            .await
+            .expect("メモリ上の SQLite につながる");
+        let mut schema = Schema::new(Driver::Sqlite);
+        schema.create("counted", |t| {
+            t.id();
+            t.string("title");
+            t.integer("views").default(0);
+            t.string("updated_at").default("");
+        });
+        for sql in schema.into_statements() {
+            backend.execute(&sql, &[]).await.expect("表が作れる");
+        }
+        Transaction::start(backend).await.expect("始められる")
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn save_onlyは指定した列とupdated_atだけを書く() {
+        let tx = counted_table().await;
+        tx.table("counted")
+            .insert(&[("title", Value::Text("やきそば".into()))])
+            .await
+            .expect("入る");
+        let mut post = Counted::on(&tx)
+            .find(1)
+            .await
+            .expect("読める")
+            .expect("ある");
+
+        // 読んだ後で、他の人が閲覧数を増やした。
+        tx.table("counted")
+            .where_("id", 1)
+            .increment("views", 5)
+            .await
+            .expect("増える");
+
+        post.title = "たこやき".into();
+        let affected = post.save_only_using(&tx, &["title"]).await.expect("書ける");
+        assert_eq!(affected, 1);
+        assert_eq!(
+            post.updated_at, "touched",
+            "構造体の updated_at も今の時刻になる"
+        );
+
+        let saved = Counted::on(&tx)
+            .find(1)
+            .await
+            .expect("読める")
+            .expect("ある");
+        assert_eq!(saved.title, "たこやき");
+        assert_eq!(saved.views, 5, "閲覧数は巻き戻らない");
+        assert_eq!(saved.updated_at, "touched", "updated_at は自動で足す");
+
+        // 比べるために save() も試す。読んだときの閲覧数（0）で書き戻す。
+        post.save_using(&tx).await.expect("書ける");
+        let clobbered = Counted::on(&tx)
+            .find(1)
+            .await
+            .expect("読める")
+            .expect("ある");
+        assert_eq!(clobbered.views, 0, "save() は全列を書き戻す");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn save_onlyは行が無ければ0を返す() {
+        let tx = counted_table().await;
+        let mut gone = Counted {
+            id: 42,
+            title: "消えた行".into(),
+            views: 0,
+            updated_at: String::new(),
+        };
+        let affected = gone
+            .save_only_using(&tx, &["title"])
+            .await
+            .expect("エラーにはしない");
+        assert_eq!(affected, 0);
+        // トランザクションは使い続けられる（失敗扱いにしていない）。
+        assert_eq!(tx.table("counted").count().await.expect("数えられる"), 0);
+    }
+
+    #[tokio::test]
+    async fn save_onlyは列の間違いを問い合わせる前に断る() {
+        let (found, tx) = spy().await;
+        let mut post = Counted {
+            id: 1,
+            title: "x".into(),
+            views: 0,
+            updated_at: "before".into(),
+        };
+
+        let message = post
+            .save_only_using(&tx, &["nope"])
+            .await
+            .expect_err("無い列は断る")
+            .to_string();
+        assert!(message.contains("nope"), "{message}");
+
+        let message = post
+            .save_only_using(&tx, &["id"])
+            .await
+            .expect_err("主キーは断る")
+            .to_string();
+        assert!(message.contains("主キー"), "{message}");
+
+        let message = post
+            .save_only_using(&tx, &[])
+            .await
+            .expect_err("空は断る")
+            .to_string();
+        assert!(message.contains("1つ以上"), "{message}");
+
+        let mut fresh = Counted {
+            id: 0,
+            title: "x".into(),
+            views: 0,
+            updated_at: String::new(),
+        };
+        let message = fresh
+            .save_only_using(&tx, &["title"])
+            .await
+            .expect_err("新しい行は断る")
+            .to_string();
+        assert!(message.contains("save()"), "{message}");
+
+        assert_eq!(post.updated_at, "before", "断るときは構造体を書き換えない");
+        assert!(joined(&found.tx).is_empty(), "何も流さない");
+    }
+
+    #[tokio::test]
+    async fn save_onlyの文は指定した列と主キーの条件だけ() {
+        let (found, tx) = spy().await;
+        let mut post = Counted {
+            id: 3,
+            title: "x".into(),
+            views: 9,
+            updated_at: String::new(),
+        };
+        post.save_only_using(&tx, &["title"]).await.expect("書ける");
+        let sent = joined(&found.tx);
+        assert_eq!(
+            sent,
+            "update \"counted\" set \"title\" = ?, \"updated_at\" = ? where \"id\" = ?"
+        );
     }
 }

@@ -221,9 +221,31 @@ impl FileCache {
         if !storage.is_dir() {
             return Err(Error::msg(crate::paths::missing_storage_message(&storage)));
         }
-        std::fs::create_dir_all(&self.dir)?;
-        Ok(())
+        create_dir_restricted(&self.dir)
     }
+}
+
+/// ディレクトリを作り、作ったものは所有者だけに絞る（Unix では 0700）。
+///
+/// `storage:init` と定期処理の `ensure_state_dir` と同じ絞り方です。`storage:init` を
+/// 通さずに動いたとき、キャッシュの中身が既定の権限（ほかの利用者も読める）で
+/// 置かれないようにします。途中のディレクトリ（`framework/` など）も、無くて作った
+/// ものは絞ります。前からあったものには触りません。
+fn create_dir_restricted(dir: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut probe = dir;
+    while !probe.is_dir() {
+        missing.push(probe.to_path_buf());
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => break,
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    for path in missing.iter().rev() {
+        crate::ops::restrict(path)?;
+    }
+    Ok(())
 }
 
 impl CacheStore for FileCache {
@@ -708,6 +730,25 @@ mod tests {
         assert_eq!(store.get("b").unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 置き場所を作るときは所有者だけに絞る() {
+        let base = temp_dir("restricted");
+        let dir = base.join("framework").join("cache");
+        create_dir_restricted(&dir).unwrap();
+        assert!(dir.is_dir());
+        // 2 回目は何もしない。
+        create_dir_restricted(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [base.join("framework"), dir.clone()] {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "{}", path.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

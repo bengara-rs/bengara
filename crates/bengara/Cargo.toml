@@ -41,7 +41,9 @@ postgres = [
     "tls",
 ]
 # ドライバ共通の土台。単体では指定しません。
-database = ["sqlx"]
+# 依存は `dep:` で書きます。書かないと `sqlx` という名前のフラグが外から選べてしまい、
+# `features = ["sqlx"]` がドライバ無しで通ります（encryption と mail も同じ）。
+database = ["dep:sqlx"]
 # ネットワーク越しの接続を暗号化する。mysql と postgres が内側で付けます。
 # 単体では指定しません。rustls と webpki-roots を使うので、OS の証明書置き場に
 # 依存しません（ビルドには C コンパイラが要ります）。
@@ -50,12 +52,12 @@ tls = ["sqlx/tls-rustls-ring-webpki"]
 # 暗号化（encrypt / decrypt）。既定では入りません。
 # 署名（SHA-256 / HMAC）は自前なのでフラグは要りませんが、
 # 暗号は実績のあるクレートに任せます（判断 30）。
-encryption = ["chacha20poly1305"]
+encryption = ["dep:chacha20poly1305"]
 
 # SMTP でメールを送る。既定では入りません。
 # フラグが無いときも mail モジュールはコンパイルされ、MAIL_MAILER=smtp に
 # したときだけ「features に "mail" を足してください」というエラーになります。
-mail = ["lettre"]
+mail = ["dep:lettre"]
 
 # WebSocket（`req.websocket()` で切り替える受け口）。既定では入りません。
 # フラグが無いときも websocket / broadcast モジュールはコンパイルされ、

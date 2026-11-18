@@ -651,7 +651,7 @@ mod tests {
         let mut out = Vec::new();
         while let Ok(item) = rx.out.try_recv() {
             if let Outgoing::Text(text) = item {
-                out.push(text);
+                out.push(text.to_string());
             }
         }
         out

@@ -37,7 +37,7 @@ pub fn url(path: &str) -> String {
     if path.is_empty() {
         return base.to_string();
     }
-    if path.starts_with("http://") || path.starts_with("https://") {
+    if is_absolute_http(path) {
         return path.to_string();
     }
     // 先頭の `/` は**1本だけ**落とす。何本でも落としていたころは、`//x` が `/x` と
@@ -46,6 +46,17 @@ pub fn url(path: &str) -> String {
     // まとめないので、こちらも畳まない形にそろえます。
     let path = path.strip_prefix('/').unwrap_or(path);
     format!("{base}/{path}")
+}
+
+/// `http://` か `https://` で始まるか。スキームは大文字小文字を区別しない（RFC 3986）。
+///
+/// `HTTPS://example.com` の頭に `APP_URL` を足してしまわないようにするためです。
+fn is_absolute_http(path: &str) -> bool {
+    let starts = |scheme: &str| {
+        path.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    };
+    starts("http://") || starts("https://")
 }
 
 /// 名前付きルートの絶対 URL。
@@ -297,6 +308,17 @@ mod tests {
     #[test]
     fn 日本語も逃がす() {
         assert_eq!(encode("あ"), "%E3%81%82");
+    }
+
+    #[test]
+    fn 絶対urlのスキームは大文字でもよい() {
+        assert!(is_absolute_http("https://example.com"));
+        assert!(is_absolute_http("HTTPS://example.com"));
+        assert!(is_absolute_http("Http://example.com"));
+        assert!(!is_absolute_http("/posts"));
+        assert!(!is_absolute_http("httpsx"));
+        assert!(!is_absolute_http("あいうえおかきく"));
+        assert_eq!(url("HTTPS://example.com/x"), "HTTPS://example.com/x");
     }
 
     #[test]

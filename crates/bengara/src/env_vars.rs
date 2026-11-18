@@ -82,6 +82,11 @@ impl_from_env_parse!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, us
 
 /// `.env` を読んで、まだ設定されていない環境変数だけを設定する。
 ///
+/// **空の環境変数は「設定されていない」と見なします。** 前後の空白を落として空に
+/// なるものも含みます。`env()` が空を未設定として扱うのと同じ規則です。
+/// docker-compose の `APP_KEY=${APP_KEY}` は、ホスト側で未設定だと空の変数を
+/// 作ります。これで `.env` の値が黙って隠れないようにするためです。
+///
 /// 戻り値は読み込んだファイルのパスと、読めなかった行の警告です。
 ///
 /// **警告をその場では出しません。** `.env` の `APP_DEBUG` を見てからログの購読を
@@ -97,7 +102,7 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let (pairs, warnings) = parse_dotenv(text);
     for (key, value) in pairs {
-        if std::env::var_os(&key).is_none() {
+        if is_unset(std::env::var_os(&key).as_deref()) {
             // SAFETY: 起動直後、スレッドを作る前に1回だけ呼ぶ。
             // edition 2021 では set_var は安全な関数なので unsafe は余る。
             #[allow(unused_unsafe)]
@@ -107,6 +112,16 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
         }
     }
     (Some(path), warnings)
+}
+
+/// 実際の環境変数が「未設定」かどうか。無いか、空白だけなら未設定。
+///
+/// UTF-8 でない値は中身があるものとして扱います（上書きしない）。
+fn is_unset(value: Option<&std::ffi::OsStr>) -> bool {
+    match value {
+        None => true,
+        Some(raw) => raw.to_str().is_some_and(|text| text.trim().is_empty()),
+    }
 }
 
 /// 行の先頭の `export` を外す。
@@ -419,6 +434,16 @@ mod tests {
         assert_eq!(dotenv_value("\"\""), "");
         assert_eq!(dotenv_value(" # 後で"), "");
         assert_eq!(dotenv_value("abc # コメント"), "abc");
+    }
+
+    #[test]
+    fn 空の環境変数は未設定と見なして埋める() {
+        use std::ffi::OsStr;
+        assert!(is_unset(None));
+        assert!(is_unset(Some(OsStr::new(""))));
+        assert!(is_unset(Some(OsStr::new("  \t"))));
+        assert!(!is_unset(Some(OsStr::new("base64:abc"))));
+        assert!(!is_unset(Some(OsStr::new(" x "))));
     }
 
     #[test]

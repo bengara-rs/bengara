@@ -57,6 +57,25 @@ pub(crate) const AUTH_AT_KEY: &str = "bengara_auth_at";
 pub trait Authenticatable: Model {
     /// 保存してあるパスワード（`Hash::make` が作った文字列）。
     fn password_hash(&self) -> &str;
+
+    /// パスワードを入れている列の名前。Laravel の `getAuthPasswordName` に当たります。
+    ///
+    /// `attempt` がログインのついでにパスワードを作り直すとき、この列に書きます。
+    /// 既定は `"password"` です。列の名前が違うときだけ書き換えてください。
+    ///
+    /// ```ignore
+    /// impl Authenticatable for User {
+    ///     fn password_hash(&self) -> &str {
+    ///         &self.password_digest
+    ///     }
+    ///     fn auth_password_name() -> &'static str {
+    ///         "password_digest"
+    ///     }
+    /// }
+    /// ```
+    fn auth_password_name() -> &'static str {
+        "password"
+    }
 }
 
 /// ログインの状態を扱う。`req.auth()` が返します。
@@ -293,6 +312,11 @@ impl<'a> Auth<'a> {
     /// - 合わなければ `false` を返します。**エラーにはしません**（理由を外に出さないため）。
     /// - 利用者がいない場合も、**照合と同じだけ時間をかけます**（登録の有無が漏れないため）。
     /// - 照合は裏のスレッドで行うので、ほかのリクエストを待たせません。
+    /// - 合ったとき、保存されている値の回数が設定より少なければ
+    ///   （[`Hash::needs_rehash`]）、**その場で作り直して保存します**
+    ///   （Laravel の `rehashOnLogin`）。書く列は
+    ///   [`Authenticatable::auth_password_name`] です。
+    ///   作り直しに失敗しても、ログインは成功させます（警告をログに出します）。
     pub async fn attempt<U: Authenticatable>(
         &self,
         column: &str,
@@ -300,6 +324,7 @@ impl<'a> Auth<'a> {
         password: &str,
     ) -> Result<bool> {
         let found = U::query().where_(column, value).first().await?;
+        let plain = password;
         let password = password.to_string();
 
         let Some(user) = found else {
@@ -317,6 +342,11 @@ impl<'a> Auth<'a> {
         let stored = user.password_hash().to_string();
         let ok = blocking(move || Hash::check(&password, &stored)).await?;
         if ok {
+            if Hash::needs_rehash(user.password_hash()) {
+                if let Err(e) = rehash_password(&user, plain).await {
+                    tracing::warn!("ログインのついでにパスワードを作り直せませんでした: {e}");
+                }
+            }
             self.login(&user)?;
         }
         Ok(ok)
@@ -334,6 +364,26 @@ impl<'a> Auth<'a> {
         let password = password.to_string();
         blocking(move || Hash::check(&password, &stored)).await
     }
+}
+
+/// パスワードをいまの設定で作り直し、主キーで引いた行に書く。
+///
+/// 書くのは [`Authenticatable::auth_password_name`] の列だけです。`save()` を使わないのは、
+/// 呼ぶ側が持っている構造体（読んだあとに変わっているかもしれない）を丸ごと
+/// 書き戻さないためです。
+async fn rehash_password<U: Authenticatable>(user: &U, password: &str) -> Result<()> {
+    let hashed = Hash::make_async(password).await?;
+    let affected = U::query()
+        .where_(U::PRIMARY_KEY, user.key())
+        .update(&[(
+            U::auth_password_name(),
+            crate::database::Value::Text(hashed),
+        )])
+        .await?;
+    if affected == 0 {
+        return Err(Error::msg("当てはまる行がありませんでした"));
+    }
+    Ok(())
 }
 
 /// 同じ利用者のセッションのうち `keep_id` 以外を切り、
@@ -511,6 +561,172 @@ mod tests {
     impl Authenticatable for Member {
         fn password_hash(&self) -> &str {
             &self.password
+        }
+    }
+
+    #[test]
+    fn パスワードの列の名前は既定でpassword() {
+        assert_eq!(Member::auth_password_name(), "password");
+    }
+
+    /// ログインのついでの作り直しを、メモリ上の SQLite で確かめる。
+    #[cfg(feature = "sqlite")]
+    mod rehash_on_login {
+        use super::*;
+        use crate::database::{Value, DB};
+
+        /// パスワードの列が `secret` の利用者。列の名前を書き換える形を試す。
+        struct Login {
+            id: i64,
+            secret: String,
+        }
+
+        impl Model for Login {
+            const TABLE: &'static str = "logins";
+            const PRIMARY_KEY: &'static str = "id";
+            const COLUMNS: &'static [&'static str] = &["id", "email", "secret"];
+
+            fn from_row(row: &crate::database::Row) -> Result<Self> {
+                Ok(Self {
+                    id: row.get("id")?,
+                    secret: row.get("secret")?,
+                })
+            }
+
+            fn attributes(&self) -> Vec<(&'static str, Value)> {
+                vec![("secret", Value::Text(self.secret.clone()))]
+            }
+
+            fn key(&self) -> Value {
+                Value::Int(self.id)
+            }
+
+            fn set_key(&mut self, _value: Value) {}
+        }
+
+        impl Authenticatable for Login {
+            fn password_hash(&self) -> &str {
+                &self.secret
+            }
+            fn auth_password_name() -> &'static str {
+                "secret"
+            }
+        }
+
+        /// 同じ表で、書く列の名前を間違えた利用者。作り直しが必ず失敗する。
+        struct BrokenLogin(Login);
+
+        impl Model for BrokenLogin {
+            const TABLE: &'static str = "logins";
+            const PRIMARY_KEY: &'static str = "id";
+            const COLUMNS: &'static [&'static str] = &["id", "email", "secret"];
+
+            fn from_row(row: &crate::database::Row) -> Result<Self> {
+                Login::from_row(row).map(Self)
+            }
+
+            fn attributes(&self) -> Vec<(&'static str, Value)> {
+                self.0.attributes()
+            }
+
+            fn key(&self) -> Value {
+                self.0.key()
+            }
+
+            fn set_key(&mut self, _value: Value) {}
+        }
+
+        impl Authenticatable for BrokenLogin {
+            fn password_hash(&self) -> &str {
+                &self.0.secret
+            }
+            fn auth_password_name() -> &'static str {
+                "no_such_column"
+            }
+        }
+
+        async fn setup(secret: &str) -> crate::testing::DatabaseGuard {
+            let guard = crate::testing::refresh_database().await;
+            DB::statement(
+                "CREATE TABLE logins (id INTEGER PRIMARY KEY, email TEXT NOT NULL, secret TEXT NOT NULL)",
+                &[],
+            )
+            .await
+            .expect("表が作れる");
+            DB::statement(
+                "INSERT INTO logins (email, secret) VALUES (?, ?)",
+                &[
+                    Value::Text("a@example.com".to_string()),
+                    Value::Text(secret.to_string()),
+                ],
+            )
+            .await
+            .expect("行が入る");
+            guard
+        }
+
+        async fn stored_secret() -> String {
+            DB::table("logins")
+                .where_("email", "a@example.com")
+                .value::<String>("secret")
+                .await
+                .unwrap()
+                .expect("行がある")
+        }
+
+        #[tokio::test]
+        async fn 回数が古ければログインのついでに作り直す() {
+            install_test_iterations();
+            let old = Hash::make_with("ひみつ", 1);
+            let _db = setup(&old).await;
+            assert!(Hash::needs_rehash(&old), "回数 1 は作り直す対象");
+
+            // 合わないときは作り直さない。
+            let session = Session::empty();
+            let auth = Auth::new(Some(&session));
+            assert!(!auth
+                .attempt::<Login>("email", "a@example.com", "ちがう")
+                .await
+                .unwrap());
+            assert_eq!(stored_secret().await, old, "外れたら書かない");
+
+            // 合えば作り直して `secret` 列に書く。ログインもする。
+            assert!(auth
+                .attempt::<Login>("email", "a@example.com", "ひみつ")
+                .await
+                .unwrap());
+            assert!(auth.check());
+            let new = stored_secret().await;
+            assert_ne!(new, old, "作り直した");
+            assert!(!Hash::needs_rehash(&new), "いまの設定の回数になった");
+            assert!(Hash::check("ひみつ", &new), "作り直した値でも照合できる");
+
+            // もう一度ログインしても、作り直す必要はないので変わらない。
+            let session = Session::empty();
+            let auth = Auth::new(Some(&session));
+            assert!(auth
+                .attempt::<Login>("email", "a@example.com", "ひみつ")
+                .await
+                .unwrap());
+            assert_eq!(stored_secret().await, new, "要らなければ書かない");
+        }
+
+        #[tokio::test]
+        async fn 作り直しに失敗してもログインは成功する() {
+            install_test_iterations();
+            let old = Hash::make_with("ひみつ", 1);
+            let _db = setup(&old).await;
+
+            let session = Session::empty();
+            let auth = Auth::new(Some(&session));
+            assert!(
+                auth.attempt::<BrokenLogin>("email", "a@example.com", "ひみつ")
+                    .await
+                    .unwrap(),
+                "書けない列でもログインは通す"
+            );
+            assert!(auth.check());
+            assert_eq!(stored_secret().await, old, "書けなかったので元のまま");
         }
     }
 

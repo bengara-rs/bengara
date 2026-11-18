@@ -93,7 +93,22 @@ struct Bucket {
 
 impl Throttle {
     /// 回数と期間を決めて作る。
+    ///
+    /// # Panics
+    ///
+    /// `max` が 0 か、`window` が 0 のときはパニックします。回数 0 は全員を
+    /// 429 にし、期間 0 は数えないのと同じで、どちらも書き間違いだからです。
+    /// ミドルウェアの別名の重複と同じく、起動時の設定の誤りとして止めます
+    /// （`from_spec` は同じ値を `Err` で断ります）。
     pub fn new(max: u32, window: Duration) -> Self {
+        assert!(
+            max > 0,
+            "Throttle の回数は 1 以上にしてください（0 だと全リクエストが 429 になります）"
+        );
+        assert!(
+            !window.is_zero(),
+            "Throttle の期間は 0 より長くしてください"
+        );
         Self {
             max,
             window,
@@ -531,6 +546,24 @@ mod tests {
         assert_eq!(throttle.hit("a", now), Ok(1));
         assert_eq!(throttle.hit("a", now), Ok(0));
         assert!(throttle.hit("a", now).is_err(), "4回目は断る");
+    }
+
+    #[test]
+    #[should_panic(expected = "Throttle の回数は 1 以上")]
+    fn 回数0は作る時点で止める() {
+        let _ = Throttle::per_minute(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Throttle の期間は 0 より長く")]
+    fn 期間0は作る時点で止める() {
+        let _ = Throttle::new(1, Duration::ZERO);
+    }
+
+    #[test]
+    fn from_specは0をエラーで返す() {
+        assert!(Throttle::from_spec("0,1").is_err());
+        assert!(Throttle::from_spec("1,0").is_err());
     }
 
     #[test]

@@ -77,14 +77,14 @@ pub async fn store(req: Request) -> Result<Response> {
 | 値         | `in:a,b,c`、`starts_with:x`、`ends_with:x`         |
 | 項目どうし | `confirmed`、`same:other`、`different:other`       |
 
-| 規則         | 通るもの                                                           |
-|--------------|--------------------------------------------------------------------|
-| `boolean`    | `1` `0` `true` `false` `on` `off` `yes` `no`                       |
-| `numeric`    | 数として読める値。`inf` `NaN` `1e400` は通さない                   |
-| `email`      | `@` が 1 つあり、後ろに `.` がある。空白を含まない                 |
-| `url`        | `http://` か `https://` で始まる                                   |
-| `alpha` など | 「文字」かどうかを見る。**ひらがな・漢字も通る**（Laravel と同じ） |
-| `confirmed`  | `password` に付けると、`password_confirmation` と同じかを見る      |
+| 規則         | 通るもの                                                                  |
+|--------------|---------------------------------------------------------------------------|
+| `boolean`    | `1` `0` `true` `false` `on` `off` `yes` `no`                              |
+| `numeric`    | 数として読める値。`inf` `NaN` `1e400` は通さない                          |
+| `email`      | `@` が 1 つあり、後ろに `.` がある。空白を含まない                        |
+| `url`        | `http://` か `https://` で始まり、直後にホストがある。空白を含まない      |
+| `alpha` など | 「文字」かどうかを見る。**ひらがな・漢字も通る**（Laravel と同じ）        |
+| `confirmed`  | `項目名_confirmation` と同じか（`password` なら `password_confirmation`） |
 
 英数字だけに限りたいときは、自分で確かめます。
 
@@ -99,7 +99,7 @@ pub async fn store(req: Request) -> Result<Response> {
 | `("title", "max:50")`             | `title=9999999` | **通る**（7 文字）   |
 
 - 文字数はバイト数ではありません。`あいう` は 3 文字です。
-- 数として読めない値には、大きさの規則は何も言いません。理由は「整数で入力してください」の 1 件だけです。
+- 数として読めない値には、大きさの規則は何も言いません。理由は「整数で入力してください」などの 1 件だけです。
 
 ### 空文字も検査する
 
@@ -164,7 +164,14 @@ if !errors.is_empty() {
 }
 ```
 
-ほかに `has(field)` `get(field)` `first()` `all()` と、`len()`（項目の数）・`total()`（理由の総数）があります。
+| メソッド     | 返すもの               |
+|--------------|------------------------|
+| `has(field)` | その項目に理由があるか |
+| `get(field)` | その項目の理由の一覧   |
+| `first()`    | 最初の理由             |
+| `all()`      | 全部                   |
+| `len()`      | 項目の数               |
+| `total()`    | 理由の総数             |
 
 ## 規則の書き間違いは 500 になる
 
@@ -189,7 +196,7 @@ if !errors.is_empty() {
 ```
 password  passwd  pwd  pass  passphrase  secret  token  key  apikey
 credential  credentials  cvv  cvc  csc  card  ssn  otp  totp  pin
-code  seed  mnemonic  recovery  backup  answer  signature
+code  seed  mnemonic  recovery  backup  answer  signature  ticket
 ```
 
 - 名前を `_` `-` `.` `[` `]` 空白と、小文字から大文字へ変わる所で語に切ります。
@@ -204,7 +211,7 @@ code  seed  mnemonic  recovery  backup  answer  signature
 
 `zip_code` も覚えないので、落ちたフォームを出し直すと郵便番号の欄は空に戻ります。
 
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

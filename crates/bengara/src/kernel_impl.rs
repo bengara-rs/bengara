@@ -39,6 +39,18 @@ enum AppCommand {
     Custom,
 }
 
+impl AppCommand {
+    /// アプリ（`bootstrap/app.rs`）を組み立ててから動かすか。
+    ///
+    /// `key:generate` と `storage:init` だけは組み立てません。使うのは `.env` と
+    /// 置き場所（`paths`）だけで、ルートもイベントも見ないためです。
+    /// 組み立ての中のパニック（ルートの重複、知らないミドルウェアの別名など）で、
+    /// 新しい環境の準備に要るこの 2 つまで止まらないようにします。
+    fn builds_application(self) -> bool {
+        !matches!(self, Self::KeyGenerate | Self::StorageInit)
+    }
+}
+
 /// 打たれた名前が指すもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -291,12 +303,17 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
         Target::App(kind) => kind,
     };
 
+    // 組み立てずに動かすもの（[`AppCommand::builds_application`]）。
+    if !kind.builds_application() {
+        return run_without_application(kind, command, rest);
+    }
+
     // アプリの組み立て（`bootstrap/app.rs`）は、ここで**1回だけ**行う。
     //
     // 組み立てのときにイベントの聞く側（`Event::listen`）が固定されるので、
     // 飛ばすと `queue:work` や自作コマンドの中の `Event::dispatch` が
     // 何も呼ばずに終わります（決定記録）。`serve` と `route:list` のほかにも
-    // 要るので、[`AppCommand`] の全部で組み立てます。
+    // 要るので、上の 2 つを除く [`AppCommand`] の全部で組み立てます。
     let app = build(factory);
 
     match kind {
@@ -311,14 +328,12 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
             print_routes(&app);
             Ok(())
         }
-        AppCommand::KeyGenerate => generate_key(rest),
+        AppCommand::KeyGenerate | AppCommand::StorageInit => {
+            run_without_application(kind, command, rest)
+        }
         AppCommand::SessionGc => {
             crate::commands::no_flags(command, rest)?;
             sweep_sessions()
-        }
-        AppCommand::StorageInit => {
-            crate::commands::no_flags(command, rest)?;
-            crate::ops::storage_init()
         }
         AppCommand::About => {
             crate::commands::no_flags(command, rest)?;
@@ -332,6 +347,22 @@ fn dispatch(args: &[String], hooks: Hooks, factory: fn() -> Application) -> Resu
         // 周辺のコマンド（cache:clear / queue:work / schedule:run など）。
         AppCommand::Extra => crate::commands::run(command, rest, hooks),
         AppCommand::Custom => crate::commands::run_custom(command, rest, hooks),
+    }
+}
+
+/// 置き場所は要るが、アプリの組み立ては要らないコマンドを動かす。
+///
+/// 使うのは `.env` と置き場所（`paths`）だけです（[`AppCommand::builds_application`]）。
+fn run_without_application(kind: AppCommand, command: &str, rest: &[String]) -> Result<()> {
+    match kind {
+        AppCommand::KeyGenerate => generate_key(rest),
+        AppCommand::StorageInit => {
+            crate::commands::no_flags(command, rest)?;
+            crate::ops::storage_init()
+        }
+        other => Err(crate::Error::msg(format!(
+            "`{command}` はアプリを組み立ててから動かすコマンドです（{other:?}）"
+        ))),
     }
 }
 
@@ -362,15 +393,17 @@ fn shadowed_message(name: &str) -> String {
 ///
 /// 組み立てると、ルート・ミドルウェア・**イベントの聞く側**が固定されます。
 /// `Event::dispatch` はどのコマンドからでも呼べることになっているので、
-/// 置き場所が要らないコマンド（`init` / `--version` / `--help` など）を除いて
-/// すべて真にします。置き場所の要否（[`needs_base`]）と同じにするのは、
-/// 置き場所が無ければ `bootstrap/app.rs` も読めないためです。
+/// 次のものを除いてすべて真にします。
+///
+/// - 置き場所が要らないコマンド（`init` / `--version` / `--help` など）
+/// - `key:generate` と `storage:init`（[`AppCommand::builds_application`]）
+/// - 知らない名前（ヘルプを出して終わる）
 ///
 /// 振り分けそのものは型（[`Standalone`] と [`AppCommand`]）で分かれています。
 /// この関数は、その対応をテストで名前から確かめるためのものです。
 #[cfg(test)]
-fn needs_application(command: &str) -> bool {
-    !matches!(resolve(command, &[]), Target::Standalone(_))
+fn needs_application(command: &str, custom: &[Command]) -> bool {
+    matches!(resolve(command, custom), Target::App(kind) if kind.builds_application())
 }
 
 /// `bootstrap/app.rs` を呼んでアプリを固定する。
@@ -994,9 +1027,10 @@ mod tests {
             "migrate",
             "db:seed",
             "cache:clear",
-            "app:my-command",
+            "session:gc",
+            "about",
         ] {
-            assert!(needs_application(command), "{command}");
+            assert!(needs_application(command, &[]), "{command}");
         }
         // 置き場所が要らないコマンドは組み立てない。
         for command in [
@@ -1009,16 +1043,52 @@ mod tests {
             "help",
             "list",
         ] {
-            assert!(!needs_application(command), "{command}");
+            assert!(!needs_application(command, &[]), "{command}");
+        }
+    }
+
+    #[test]
+    fn 自作コマンドは組み立ててから動かす() {
+        // `bengara-build` が生成できる名前（`app/Console/Commands/MyCommand.rs` → `my-command`）。
+        // 以前のテストは `app:my-command` を使っていたが、これは生成できない名前で、
+        // 表に無いので「知らない名前」に落ち、自作コマンドの道を通っていなかった。
+        let commands = [custom("my-command")];
+        assert_eq!(
+            resolve("my-command", &commands),
+            Target::App(AppCommand::Custom)
+        );
+        assert!(needs_application("my-command", &commands));
+        assert!(needs_base("my-command"));
+        // 登録していなければ知らない名前。組み立てずにヘルプを出して終わる。
+        assert_eq!(resolve("my-command", &[]), Target::Unknown);
+        assert!(!needs_application("my-command", &[]));
+    }
+
+    #[test]
+    fn 準備のコマンドはアプリを組み立てない() {
+        // `bootstrap/app.rs` の組み立てがパニックしても（ルートの重複など）、
+        // 新しい環境の準備に要るこの 2 つは動く。置き場所は要る。
+        for command in ["key:generate", "storage:init"] {
+            assert!(matches!(resolve(command, &[]), Target::App(_)), "{command}");
+            assert!(!needs_application(command, &[]), "{command}");
+            assert!(needs_base(command), "{command}");
         }
     }
 
     #[test]
     fn 置き場所の要否と組み立ての要否はそろえる() {
         // 表にある名前の全部で、2 つの要否が一致する。
+        // 例外は、置き場所だけが要る準備のコマンド（`key:generate` と `storage:init`）。
         for builtin in BUILTINS {
             for command in builtin.names {
-                assert_eq!(needs_base(command), needs_application(command), "{command}");
+                if matches!(builtin.target, Target::App(kind) if !kind.builds_application()) {
+                    continue;
+                }
+                assert_eq!(
+                    needs_base(command),
+                    needs_application(command, &[]),
+                    "{command}"
+                );
             }
         }
         // 置き場所が要らないのは、この 8 つだけ。

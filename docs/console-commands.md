@@ -30,14 +30,10 @@ pub async fn handle(args: &[String]) -> Result<()> {
 ## 動かす
 
 ```sh
-cargo artisan greet アリス
+cargo artisan greet アリス     # 開発
+./myapp greet アリス           # 本番
 ```
 
-```
-こんにちは、アリス さん
-```
-
-本番では実行ファイルを直接動かします（`./myapp greet アリス`）。
 `cargo artisan list` の末尾に、説明つきで並びます。
 
 ```
@@ -76,10 +72,6 @@ cargo artisan greet アリス
 
 置くと、ビルドのときと、コマンドを動かすたびに警告が出ます。
 
-```
-WARN 自作コマンド `list` は呼ばれません。フレームワークに同じ名前のコマンドがあります（app/Console/Commands/ のファイル名を変えてください）
-```
-
 ## 引数
 
 `args` には、コマンド名より後ろがそのまま入ります。**解析はされません。** 自分で読みます。
@@ -100,7 +92,7 @@ pub async fn handle(args: &[String]) -> Result<()> {
 }
 ```
 
-知らない指定も自分で断ってください。フレームワークのコマンドの指定の確かめ（[artisan.md](artisan.md)）は掛かりません。
+知らない指定も自分で断ってください。フレームワークのコマンドのような指定の確かめは掛かりません。
 
 ## 中でできること
 
@@ -123,14 +115,12 @@ pub async fn handle(_args: &[String]) -> Result<()> {
 }
 ```
 
-- 決まった時刻に動かす処理は、[scheduling.md](scheduling.md) の定期処理に書きます。
-- ファイルを作るコマンド（`make:command`）はありません。手で作ります。
 - 画面への出力は `println!` を使います。
+- 決まった時刻に動かす処理は、[scheduling.md](scheduling.md) の定期処理に書きます。
 
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 
 - [artisan.md](artisan.md) — もとからあるコマンド
-- [scheduling.md](scheduling.md) — 定期処理
 - [directory-structure.md](directory-structure.md) — ファイルの自動検出の決まり

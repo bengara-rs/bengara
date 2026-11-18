@@ -26,7 +26,7 @@ pub async fn handle(payload: String) -> Result<()> {
 ```
 
 **聞く側は、知らせた場所でそのまま動きます。** ここで待つと、画面の応答が遅くなります。
-メールや外部への通信のような時間のかかることは、聞く側からキューに積みます。
+メールや外部への通信は、聞く側からキューに積みます。
 
 ## 登録する
 
@@ -37,22 +37,15 @@ pub fn app() -> Application {
     Application::configure()
         .with_events(|e| {
             e.listen("user.registered", crate::app::listeners::notify_admin::handle)
+                .listen("user.registered", crate::app::listeners::send_slack::handle)
+                .listen("post.published", crate::app::listeners::clear_cache::handle)
         })
         .with_routing(|r| r.web(crate::routes::web::routes))
         .create()
 }
 ```
 
-`listen` は続けて書けます。1 つの名前に、聞く側をいくつでも付けられます。
-
-```rust
-.with_events(|e| {
-    e.listen("user.registered", crate::app::listeners::notify_admin::handle)
-        .listen("user.registered", crate::app::listeners::send_slack::handle)
-        .listen("post.published", crate::app::listeners::clear_cache::handle)
-})
-```
-
+- `listen` は続けて書けます。1 つの名前に、聞く側をいくつでも付けられます。
 - 起動したあとは増やせません。
 - 登録した中身は `e.count(名前)`・`e.names()`・`e.is_empty()` で見られます。
 
@@ -121,11 +114,8 @@ pub const USER_REGISTERED: &str = "user.registered";
 pub struct Payload {
     pub user_id: i64,
 }
-```
 
-聞く側では自分で読みます。
-
-```rust
+// 聞く側では自分で読む
 let payload: Payload = bengara::serde_json::from_str(&payload)?;
 ```
 
@@ -136,9 +126,8 @@ let payload: Payload = bengara::serde_json::from_str(&payload)?;
 登録の表はプロセスに 1 つで、アプリを組み立てるたびに置き換わります。
 テストは並んで走るので、ほかのテストの登録で動くことがあります。
 
-**`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()`
-の札を取ってください**（[testing.md](testing.md)）。
-`bootstrap/app.rs` の登録のまま使うテストには、札は要りません。
+- **`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()` の札を取ってください**（[testing.md](testing.md)）。
+- `bootstrap/app.rs` の登録のまま使うテストには、札は要りません。
 
 ```rust
 #[bengara::test]
@@ -151,10 +140,9 @@ async fn 聞く側がいなければ何も起きない() {
 ## 知っておくこと
 
 - イベントはクラスでなく、名前（文字列）と中身（構造体）で書きます。
-- モデルの保存で自動的に知らせる仕組みはありません。`Event::dispatch` を自分で呼びます。
 - 呼ぶたびに登録の表を読むので、1 リクエストで何千回も知らせる使い方には向きません。
 
-まだ無い機能は [backlog.md](backlog.md) にまとめています。
+まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

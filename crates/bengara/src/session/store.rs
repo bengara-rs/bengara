@@ -130,31 +130,51 @@ pub trait SessionStore: Send + Sync + 'static {
     ///
     /// `mark_revoked` で `except` にした ID には `None` を返します。
     ///
-    /// **古い印は返さないでください**（組み込みの置き場所は 1 時間）。
-    /// 印が要るのは、切った瞬間に処理中だったリクエストだけです。いつまでも
-    /// 返すと、ずっと後のリクエストまで「切られた」と判定されます。
+    /// **古い印は返さないでください**（組み込みの置き場所は、1 時間とセッションの
+    /// 期限の長いほう）。印が要るのは、切った瞬間に処理中だったリクエストだけです。
+    /// いつまでも返すと、ずっと後のリクエストまで「切られた」と判定されます。
+    /// 短すぎると、長く走るリクエスト（`.stream_body()` の受け取りなど）が
+    /// 印の切れたあとに保存して、切ったセッションを生き返らせます。
     fn revoked_at(&self, user_id: &str, session_id: &str) -> Option<i64> {
         let _ = (user_id, session_id);
         None
     }
 }
 
-/// 「切った」印が効く秒数。
+/// 「切った」印が効く秒数の下限。
 ///
-/// 印が要るのは、切った瞬間に処理中だったリクエストだけです。
-/// リクエストが 1 時間を超えて走ることはないので、それより古い印は
+/// 実際に効く秒数は [`revoked_mark_secs`] で、セッションの期限が長ければそちらに合わせます。
+const REVOKED_MARK_MIN_SECS: u64 = 3600;
+
+/// 「切った」印が効く秒数。**1 時間とセッションの期限の長いほう**です。
+///
+/// 印が要るのは、切った瞬間に処理中だったリクエストだけです。それより古い印は
 /// **読むときに無視します**（[`mark_is_fresh`]）。ファイルそのものは掃除が消します。
-///
 /// 読むときに見ないと、掃除が走るまで（`MemoryStore` では次に誰かを切るまで）
 /// 印が効き続けます。
-const REVOKED_MARK_SECS: u64 = 3600;
+///
+/// 1 時間で固定していたころは、「1 時間を超えるリクエストは無い」と決めていました。
+/// ところが `.stream_body()` の受け取りには全体の時間の上限がありません。
+/// 切られたセッションで 1 時間を超えて受け取り続けたリクエストは、印が切れたあとに
+/// 保存して、セッションを生き返らせられました。期限まで延ばせば、そのあいだは塞げます。
+///
+/// **期限より長く走るリクエストは、まだ塞げません。** 印の古さを「いま」から
+/// 数えているためです。
+fn revoked_mark_secs(lifetime_secs: u64) -> u64 {
+    REVOKED_MARK_MIN_SECS.max(lifetime_secs)
+}
 
-/// 「切った」印がまだ効くか。`at` は印の時刻（UNIX ミリ秒）です。
+/// 「切った」印がまだ効くか。`at` は印の時刻（UNIX ミリ秒）、`mark_secs` は
+/// [`revoked_mark_secs`] の値です。
 ///
 /// 時計が戻って印のほうが未来になったときは、効くほうに倒します。
-fn mark_is_fresh(at: i64) -> bool {
-    let limit = i64::try_from(REVOKED_MARK_SECS * 1000).unwrap_or(i64::MAX);
-    crate::support::time::now_millis().saturating_sub(at) <= limit
+fn mark_is_fresh(at: i64, mark_secs: u64) -> bool {
+    crate::support::time::now_millis().saturating_sub(at) <= mark_millis(mark_secs)
+}
+
+/// 秒をミリ秒にする。あふれたら `i64::MAX`。
+fn mark_millis(mark_secs: u64) -> i64 {
+    i64::try_from(mark_secs.saturating_mul(1000)).unwrap_or(i64::MAX)
 }
 
 /// 中身に入っているログインの時刻より後に、その利用者が切られているか。
@@ -383,10 +403,11 @@ impl FileStore {
             return;
         }
         let dir = self.dir.clone();
+        let mark_secs = revoked_mark_secs(self.lifetime_secs);
         let spawned = std::thread::Builder::new()
             .name("bengara-session-sweep".to_string())
             .spawn(move || {
-                if let Err(e) = sweep_limited(&dir, Some(SWEEP_MAX_ENTRIES)) {
+                if let Err(e) = sweep_limited(&dir, Some(SWEEP_MAX_ENTRIES), mark_secs) {
                     tracing::warn!("セッションの掃除に失敗しました: {e}");
                 }
                 SWEEPING.store(false, Ordering::Release);
@@ -469,10 +490,11 @@ impl SessionStore for FileStore {
     fn write(&self, id: &str, data: &Data) -> Result<()> {
         let path = self.path_of(id)?;
         self.ensure_dir()?;
-        let stored = Stored {
+        // 中身は借りるだけで写さない（`StoredRef`）。
+        let stored = StoredRef {
             // `SESSION_LIFETIME` に巨大な値を入れてもあふれない。
             expires_at: now_seconds_u64().saturating_add(self.lifetime_secs),
-            data: data.clone(),
+            data,
         };
         let body = serde_json::to_string(&stored)?;
 
@@ -575,7 +597,7 @@ impl SessionStore for FileStore {
             return None;
         }
         // 古い印は無視する。ファイルは掃除が消すまで残るので、ここで見ます。
-        mark_is_fresh(at).then_some(at)
+        mark_is_fresh(at, revoked_mark_secs(self.lifetime_secs)).then_some(at)
     }
 }
 
@@ -737,10 +759,9 @@ impl SessionStore for MemoryStore {
 
     fn mark_revoked(&self, user_id: &str, except: Option<&str>) {
         let mut revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
-        // 古い印はここで落とす（1 時間より前のものは誰にも効かない）。
+        // 古い印はここで落とす（効く秒数より前のものは誰にも効かない）。
         let now = crate::support::time::now_millis();
-        let cutoff =
-            now.saturating_sub(i64::try_from(REVOKED_MARK_SECS * 1000).unwrap_or(i64::MAX));
+        let cutoff = now.saturating_sub(mark_millis(revoked_mark_secs(self.lifetime_secs)));
         revoked.retain(|_, (at, _)| *at >= cutoff);
         revoked.insert(user_id.to_string(), (now, except.map(str::to_string)));
     }
@@ -753,7 +774,7 @@ impl SessionStore for MemoryStore {
         }
         // 古い印は無視する（`FileStore` と同じ扱い）。`mark_revoked` が落とすのは
         // 次に誰かを切ったときなので、それまで残っている印をここで見ます。
-        mark_is_fresh(*at).then_some(*at)
+        mark_is_fresh(*at, revoked_mark_secs(self.lifetime_secs)).then_some(*at)
     }
 }
 
@@ -776,18 +797,29 @@ impl MemoryStore {
     }
 }
 
-/// ファイルに書く形。
+/// ファイルに書く形。読むときはこちらです（テストは書くときにも使います）。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Stored {
     expires_at: u64,
     data: Data,
 }
 
+/// ファイルに書く形（書くとき）。[`Stored`] と同じ形で、中身は借りるだけです。
+///
+/// 書くたびに中身を `clone` して `Stored` を組み立てていたころは、
+/// 保存 1 回で中身を 2 回写していました（`snapshot_for_save` と、ここ）。
+#[derive(serde::Serialize)]
+struct StoredRef<'a> {
+    expires_at: u64,
+    data: &'a Data,
+}
+
 /// 期限切れのセッションを消す（`session:gc` から呼びます）。**全部見ます。**
 ///
-/// 合わせて、5 分より古い書きかけの一時ファイルと、1 時間より古い「切った」印も消します。
-pub(crate) fn sweep(dir: &Path) -> Result<usize> {
-    sweep_limited(dir, None)
+/// 合わせて、5 分より古い書きかけの一時ファイルと、効く秒数（[`revoked_mark_secs`]。
+/// 1 時間とセッションの期限 `lifetime_secs` の長いほう）より古い「切った」印も消します。
+pub(crate) fn sweep(dir: &Path, lifetime_secs: u64) -> Result<usize> {
+    sweep_limited(dir, None, revoked_mark_secs(lifetime_secs))
 }
 
 /// 期限切れのセッションを消す。消した**期限切れセッションの数**を返す。
@@ -799,7 +831,9 @@ pub(crate) fn sweep(dir: &Path) -> Result<usize> {
 /// 返す数には**一時ファイルを数えません。** 数えると `session:gc` の
 /// 「N 件消しました」が期限切れセッションの数と合わなくなります。
 /// 一時ファイルの数はログに出します。
-fn sweep_limited(dir: &Path, max: Option<usize>) -> Result<usize> {
+///
+/// `mark_secs` は「切った」印を残す秒数（[`revoked_mark_secs`] の値）です。
+fn sweep_limited(dir: &Path, max: Option<usize>, mark_secs: u64) -> Result<usize> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -830,7 +864,7 @@ fn sweep_limited(dir: &Path, max: Option<usize>) -> Result<usize> {
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         if name == REVOKED_DIR {
-            sweep_revoked_marks(&path);
+            sweep_revoked_marks(&path, mark_secs);
             continue;
         }
         if !path.is_file() {
@@ -883,10 +917,12 @@ fn random_index(len: usize) -> usize {
 
 /// 「切った」印の置き場所を掃除する。
 ///
-/// 1 時間より古い印を消します。書きかけの一時ファイル（`<名前>.<乱数>.tmp`）は、
+/// `mark_secs`（[`revoked_mark_secs`]）より古い印を消します。読むときと同じ秒数です。
+/// 短くすると、まだ効くはずの印を消してしまいます。
+/// 書きかけの一時ファイル（`<名前>.<乱数>.tmp`）は、
 /// `sweep_limited` の本体と同じく**5 分より古いものだけ**消します。
 /// 新しいものを消すと `mark_revoked` の `rename` が失敗します。
-fn sweep_revoked_marks(dir: &Path) {
+fn sweep_revoked_marks(dir: &Path, mark_secs: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -898,7 +934,7 @@ fn sweep_revoked_marks(dir: &Path) {
         let stale_after = if entry.file_name().to_string_lossy().ends_with(".tmp") {
             TEMP_STALE_SECS
         } else {
-            REVOKED_MARK_SECS
+            mark_secs
         };
         if crate::support::lock::is_stale(&path, stale_after) {
             let _ = std::fs::remove_file(&path);
@@ -1019,7 +1055,7 @@ mod tests {
             .write("new", &data(&[("a", "1")]))
             .unwrap();
 
-        let removed = sweep(&dir).unwrap();
+        let removed = sweep(&dir, 60).unwrap();
         assert_eq!(removed, 1);
         assert!(!dir.join("old").exists());
         assert!(dir.join("new").exists());
@@ -1031,7 +1067,7 @@ mod tests {
     fn 無い場所を掃除しても落ちない() {
         let dir = std::env::temp_dir().join("bengara-session-test-missing");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(sweep(&dir).unwrap(), 0);
+        assert_eq!(sweep(&dir, 60).unwrap(), 0);
     }
 
     /// 認証 ID だけを入れた中身を作る。
@@ -1176,7 +1212,7 @@ mod tests {
         let temp = dir.join("abc.0123456789abcdef.tmp");
         std::fs::write(&temp, "{\"expires_at\":").unwrap();
 
-        let removed = sweep(&dir).unwrap();
+        let removed = sweep(&dir, 60).unwrap();
         assert_eq!(removed, 1, "期限切れの本体だけ消す");
         assert!(!dir.join("old").exists());
         assert!(
@@ -1409,7 +1445,7 @@ mod tests {
         store.destroy_for_user("7").unwrap();
         std::fs::write(dir.join("aaa.deadbeef.tmp"), "{").unwrap();
 
-        assert_eq!(sweep(&dir).unwrap(), 0);
+        assert_eq!(sweep(&dir, 60).unwrap(), 0);
         assert!(dir.join(REVOKED_DIR).is_dir(), "印の置き場所は残る");
         assert!(store.revoked_at("7", "zzz").is_some(), "新しい印は消えない");
         assert!(
@@ -1434,7 +1470,7 @@ mod tests {
 
         // 返す数は**期限切れセッションの数**だけ。一時ファイルは数えない
         // （`session:gc` の「N 件消しました」を合わせるため）。
-        assert_eq!(sweep(&dir).unwrap(), 0);
+        assert_eq!(sweep(&dir, 60).unwrap(), 0);
         assert!(!temp.exists(), "古い一時ファイルは消す");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1497,9 +1533,13 @@ mod tests {
             std::fs::write(dir.join(format!("id{i}")), &body).unwrap();
         }
 
-        assert_eq!(sweep_limited(&dir, Some(2)).unwrap(), 2, "2 件で打ち切る");
         assert_eq!(
-            sweep_limited(&dir, None).unwrap(),
+            sweep_limited(&dir, Some(2), REVOKED_MARK_MIN_SECS).unwrap(),
+            2,
+            "2 件で打ち切る"
+        );
+        assert_eq!(
+            sweep_limited(&dir, None, REVOKED_MARK_MIN_SECS).unwrap(),
             3,
             "上限なしなら残りも消える"
         );
@@ -1517,11 +1557,14 @@ mod tests {
         // 読むときに古さを見ていなかったころは、掃除が走るまで
         // （メモリでは次に誰かを切るまで）印が効き続けた。
         let now_ms = crate::support::time::now_millis();
-        let old = now_ms - i64::try_from(REVOKED_MARK_SECS * 1000).unwrap() - 1_000;
-        assert!(!mark_is_fresh(old), "1 時間より古い");
-        assert!(mark_is_fresh(now_ms), "いま付けた印は効く");
+        let old = now_ms - mark_millis(REVOKED_MARK_MIN_SECS) - 1_000;
+        assert!(!mark_is_fresh(old, REVOKED_MARK_MIN_SECS), "1 時間より古い");
         assert!(
-            mark_is_fresh(now_ms + 5_000),
+            mark_is_fresh(now_ms, REVOKED_MARK_MIN_SECS),
+            "いま付けた印は効く"
+        );
+        assert!(
+            mark_is_fresh(now_ms + 5_000, REVOKED_MARK_MIN_SECS),
             "時計が戻っても効くほうに倒す"
         );
 
@@ -1545,6 +1588,65 @@ mod tests {
         assert!(store.revoked_at("7", "aaa").is_none(), "古い印は無視する");
         store.mark_revoked("7", None);
         assert!(store.revoked_at("7", "aaa").is_some(), "新しい印は効く");
+    }
+
+    #[test]
+    fn 印はセッションの期限まで効く() {
+        // 1 時間で固定していたころは、期限が 2 時間（既定）のセッションでも
+        // 1 時間で印が切れた。`.stream_body()` で 1 時間を超えて受け取り続けた
+        // リクエストが、切られたセッションを保存して生き返らせられた。
+        assert_eq!(
+            revoked_mark_secs(60),
+            REVOKED_MARK_MIN_SECS,
+            "下限は 1 時間"
+        );
+        assert_eq!(revoked_mark_secs(7200), 7200, "期限が長ければ期限まで");
+        assert_eq!(revoked_mark_secs(u64::MAX), u64::MAX);
+        assert_eq!(mark_millis(u64::MAX), i64::MAX, "あふれない");
+
+        // 90 分前の印。1 時間は過ぎているが、期限 2 時間のうちは効く。
+        let now_ms = crate::support::time::now_millis();
+        let at = now_ms - 90 * 60 * 1000;
+
+        // ファイル。
+        let dir = temp_dir("revoke-lifetime");
+        let long = FileStore::new(&dir, 7200);
+        std::fs::create_dir_all(dir.join(REVOKED_DIR)).unwrap();
+        std::fs::write(long.revoked_path_of("7"), format!("{at}\n")).unwrap();
+        assert_eq!(long.revoked_at("7", "aaa"), Some(at), "期限 2 時間なら効く");
+        let short = FileStore::new(&dir, 60);
+        assert!(
+            short.revoked_at("7", "aaa").is_none(),
+            "期限が短ければ 1 時間で切れる"
+        );
+
+        // 掃除も同じ秒数で見る。期限 2 時間なら 90 分前の印を消さない。
+        let mark = long.revoked_path_of("7");
+        let file = std::fs::File::options().write(true).open(&mark).unwrap();
+        file.set_modified(SystemTime::now() - std::time::Duration::from_secs(90 * 60))
+            .unwrap();
+        drop(file);
+        sweep(&dir, 7200).unwrap();
+        assert!(mark.exists(), "期限 2 時間なら残す");
+        sweep(&dir, 60).unwrap();
+        assert!(!mark.exists(), "期限が短ければ 1 時間で消す");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // メモリ。
+        let store = MemoryStore::new(7200);
+        store
+            .revoked
+            .lock()
+            .unwrap()
+            .insert("7".to_string(), (at, None));
+        assert_eq!(
+            store.revoked_at("7", "aaa"),
+            Some(at),
+            "期限 2 時間なら効く"
+        );
+        // 別の利用者を切っても、まだ効く印は落とさない。
+        store.mark_revoked("8", None);
+        assert_eq!(store.revoked_at("7", "aaa"), Some(at), "落とさない");
     }
 
     #[test]
@@ -1832,7 +1934,7 @@ mod tests {
         // 1 回に 1 件しか見なくても、始める位置が毎回変わるので、いずれ当たる。
         // 外れ続ける確率は (9/10)^500 で、事実上 0。
         for _ in 0..500 {
-            sweep_limited(&dir, Some(1)).unwrap();
+            sweep_limited(&dir, Some(1), REVOKED_MARK_MIN_SECS).unwrap();
             if !expired.exists() {
                 break;
             }
