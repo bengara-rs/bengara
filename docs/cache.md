@@ -94,14 +94,15 @@ let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().awai
 
 `.env` の `CACHE_DRIVER` で選びます。
 
-| `CACHE_DRIVER`         | 置き場所                                   |
-|------------------------|--------------------------------------------|
-| `file`（既定）         | `storage/framework/cache/`                 |
-| `memory`（`array` も） | プロセスのメモリ。テストと手元の確認用     |
+| `CACHE_DRIVER`         | 置き場所                               |
+|------------------------|----------------------------------------|
+| `file`（既定）         | `storage/framework/cache/`             |
+| `memory`（`array` も） | プロセスのメモリ。テストと手元の確認用 |
 
 - 知らない名前を書くと、警告を出して `file` にします。
 - **プロセスを 2 つ以上動かすときは `file` にして、全部が同じ `storage/` を見るようにします。** `memory` はプロセスをまたげません。
-- `file` は `storage/` を自分では作りません。無いと書き込みでエラーになるので、`storage:init` で作ってください（[deployment.md](deployment.md)）。
+- `file` は `storage/` を自分では作りません。無いと書き込みでエラーになるので、`storage:init`
+  で作ってください（[deployment.md](deployment.md)）。
 
 `config/cache.rs` を置くと、そちらを使います。無くても動きます。
 

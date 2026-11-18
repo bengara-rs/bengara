@@ -19,14 +19,14 @@ let there = Storage::exists("notes/memo.txt").await?;
 Storage::delete("notes/memo.txt").await?;
 ```
 
-| メソッド                         | 返るもの                  | 覚えること               |
-|----------------------------------|---------------------------|--------------------------|
-| `put(パス, 文字)`                | `Result<()>`              | 途中のディレクトリも作る |
-| `put_bytes(パス, Vec<u8>)`       | `Result<()>`              | 同上                     |
-| `get(パス)`                      | `Result<Option<String>>`  | 無ければ `None`          |
-| `get_bytes(パス)`                | `Result<Option<Vec<u8>>>` | 無ければ `None`          |
-| `exists(パス)` / `missing(パス)` | `Result<bool>`            |                          |
-| `delete(パス)`                   | `Result<()>`              | 無くてもエラーにしない   |
+| メソッド                         | 返るもの                  | 覚えること                         |
+|----------------------------------|---------------------------|------------------------------------|
+| `put(パス, 文字)`                | `Result<()>`              | 途中のディレクトリも作る           |
+| `put_bytes(パス, Vec<u8>)`       | `Result<()>`              | 同上                               |
+| `get(パス)`                      | `Result<Option<String>>`  | 無ければ `None`                    |
+| `get_bytes(パス)`                | `Result<Option<Vec<u8>>>` | 無ければ `None`                    |
+| `exists(パス)` / `missing(パス)` | `Result<bool>`            |                                    |
+| `delete(パス)`                   | `Result<()>`              | 無くてもエラーにしない             |
 | `append(パス, 文字)`             | `Result<()>`              | 末尾に書き足す（下の「書き足す」） |
 
 - 書く途中で落ちると、途中までのファイルが残ります（Laravel と同じ）。
@@ -54,18 +54,18 @@ let files: Vec<String> = disk.files("").await?;     // 下まで全部
 let real: PathBuf = disk.path("logo.png")?;         // 実際の場所
 ```
 
-| メソッド               | 返るもの                  | 既定のディスクでの名前 |
-|------------------------|---------------------------|------------------------|
-| `write(パス, Vec<u8>)` | `Result<()>`              | `put_bytes`            |
-| `read(パス)`           | `Result<Option<String>>`  | `get`                  |
-| `read_bytes(パス)`     | `Result<Option<Vec<u8>>>` | `get_bytes`            |
-| `has(パス)`            | `Result<bool>`            | `exists`               |
-| `remove(パス)`         | `Result<()>`              | `delete`               |
-| `size(パス)`           | `Result<Option<u64>>`     | –                      |
-| `files(頭のパス)`      | `Result<Vec<String>>`     | –                      |
-| `path(パス)`           | `Result<PathBuf>`         | –                      |
-| `append_bytes(パス, Vec<u8>)` | `Result<()>`       | –（`append` は改行を挟む別物） |
-| `write_stream(パス, BodyStream)` | `Result<u64>`   | –                      |
+| メソッド                         | 返るもの                  | 既定のディスクでの名前         |
+|----------------------------------|---------------------------|--------------------------------|
+| `write(パス, Vec<u8>)`           | `Result<()>`              | `put_bytes`                    |
+| `read(パス)`                     | `Result<Option<String>>`  | `get`                          |
+| `read_bytes(パス)`               | `Result<Option<Vec<u8>>>` | `get_bytes`                    |
+| `has(パス)`                      | `Result<bool>`            | `exists`                       |
+| `remove(パス)`                   | `Result<()>`              | `delete`                       |
+| `size(パス)`                     | `Result<Option<u64>>`     | –                              |
+| `files(頭のパス)`                | `Result<Vec<String>>`     | –                              |
+| `path(パス)`                     | `Result<PathBuf>`         | –                              |
+| `append_bytes(パス, Vec<u8>)`    | `Result<()>`              | –（`append` は改行を挟む別物） |
+| `write_stream(パス, BodyStream)` | `Result<u64>`             | –                              |
 
 - **設定に無い名前を `Storage::disk` に渡すと、パニックします。** 書き間違いにすぐ気づけるようにするためです。
 - 既定のディスクそのものは `Storage::default_disk()?` で取れます。`size` や `files` を使うときに呼びます。
@@ -116,10 +116,10 @@ Storage::append("logs/notes.txt", "2 行目").await?;   // 中身は "1 行目\n
 Storage::disk("local").append_bytes("chunks/a.bin", bytes).await?;
 ```
 
-| メソッド                              | 動き                                                   |
-|---------------------------------------|--------------------------------------------------------|
-| `Storage::append(パス, 文字)`         | ファイルがあれば、間に改行（`\n`）を挟んで足す。無ければ作る（挟まない） |
-| `disk.append_bytes(パス, Vec<u8>)`    | 何も挟まずに末尾へ足す。無ければ作る                   |
+| メソッド                           | 動き                                                                     |
+|------------------------------------|--------------------------------------------------------------------------|
+| `Storage::append(パス, 文字)`      | ファイルがあれば、間に改行（`\n`）を挟んで足す。無ければ作る（挟まない） |
+| `disk.append_bytes(パス, Vec<u8>)` | 何も挟まずに末尾へ足す。無ければ作る                                     |
 
 - `Storage::append` は Laravel の `Storage::append` と同じ決まりです。
 - Laravel の改行は OS ごとに違います。bengara は**どの OS でも `\n`** です。
@@ -172,15 +172,15 @@ pub async fn upload(req: Request) -> Result<Response> {
 **置き場所の外には出られません。** 利用者が決めたパスを、そのまま渡して構いません。
 次のものはエラーになります。
 
-| 断るもの                    | 例                                |
-|-----------------------------|-----------------------------------|
-| `..` を含む                 | `../../.env`                      |
-| 絶対パス（先頭が `/` `\`）  | `/etc/passwd`                     |
-| `:` を含む                  | `C:\Windows`                      |
-| Windows の装置の名前        | `nul`、`con`、`com1`、`nul.txt`   |
-| 末尾が空白か `.` のパス要素 | `note.txt `、`notes./a.txt`       |
-| `< > " \| ? *`・制御文字    | `notes/a?b.txt`                   |
-| `~` の直後が数字            | `avatars/alicep~1.jpg`            |
+| 断るもの                    | 例                              |
+|-----------------------------|---------------------------------|
+| `..` を含む                 | `../../.env`                    |
+| 絶対パス（先頭が `/` `\`）  | `/etc/passwd`                   |
+| `:` を含む                  | `C:\Windows`                    |
+| Windows の装置の名前        | `nul`、`con`、`com1`、`nul.txt` |
+| 末尾が空白か `.` のパス要素 | `note.txt `、`notes./a.txt`     |
+| `< > " \| ? *`・制御文字    | `notes/a?b.txt`                 |
+| `~` の直後が数字            | `avatars/alicep~1.jpg`          |
 
 - **どの OS でもエラーにします。** 開発機で通ったコードが、本番で失敗しないようにするためです。
 - 装置の名前は `CON` `PRN` `AUX` `NUL` `COM0`〜`COM9` `LPT0`〜`LPT9` などです。大文字小文字は見ません。拡張子を付けても断ります。

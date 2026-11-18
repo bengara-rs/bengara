@@ -16,12 +16,12 @@ cargo add bengara --features sqlite
 
 `--features` は使うものに合わせて選びます。データベースを使わないなら付けません。
 
-| 使うもの            | 機能フラグ |
-|---------------------|------------|
-| SQLite              | `sqlite`   |
-| MySQL / MariaDB     | `mysql`    |
-| PostgreSQL          | `postgres` |
-| SMTP でのメール送信 | `mail`     |
+| 使うもの            | 機能フラグ  |
+|---------------------|-------------|
+| SQLite              | `sqlite`    |
+| MySQL / MariaDB     | `mysql`     |
+| PostgreSQL          | `postgres`  |
+| SMTP でのメール送信 | `mail`      |
 | WebSocket           | `websocket` |
 
 フラグの一覧は [configuration.md](configuration.md#機能フラグ) にあります。
@@ -43,17 +43,16 @@ fn main() { bengara::run() }
 cargo run -- init
 ```
 
-Laravel と同じ構成のディレクトリとファイルができます。
-**何度実行しても壊れません。** 足りないものだけを作ります。
+Laravel と同じ構成のディレクトリとファイルができます。 **何度実行しても壊れません。** 足りないものだけを作ります。
 
-| すること                        | 中身                                                         |
-|---------------------------------|--------------------------------------------------------------|
-| ディレクトリとファイルを作る    | 構成は [directory-structure.md](directory-structure.md)      |
-| 直下に `main.rs` を置く         | 中身は `bengara::app!();` の 1 行                            |
-| `src/main.rs` を消す            | `src/` が空になれば `src/` も消す                            |
-| `.env` と `.env.example` を作る | `.env` は Unix では所有者だけが読める（0600）                |
-| `storage/` を作る               | Unix では所有者だけが使える（0700）                          |
-| `Cargo.toml` に足りない行を足す | 下の一覧。すでにある行には触らない                           |
+| すること                        | 中身                                                    |
+|---------------------------------|---------------------------------------------------------|
+| ディレクトリとファイルを作る    | 構成は [directory-structure.md](directory-structure.md) |
+| 直下に `main.rs` を置く         | 中身は `bengara::app!();` の 1 行                       |
+| `src/main.rs` を消す            | `src/` が空になれば `src/` も消す                       |
+| `.env` と `.env.example` を作る | `.env` は Unix では所有者だけが読める（0600）           |
+| `storage/` を作る               | Unix では所有者だけが使える（0700）                     |
+| `Cargo.toml` に足りない行を足す | 下の一覧。すでにある行には触らない                      |
 
 `Cargo.toml` に足すのは次の行です。
 
@@ -68,13 +67,13 @@ Laravel と同じ構成のディレクトリとファイルができます。
 
 ### すでにあるファイルの扱い
 
-| ファイル             | すること                                                           |
-|----------------------|--------------------------------------------------------------------|
-| `.gitignore`         | 足りない行を足す（`/.env`・`/.idea`・`/.vscode` など）             |
-| `.cargo/config.toml` | `artisan` の別名が無ければ足す                                     |
+| ファイル             | すること                                                                  |
+|----------------------|---------------------------------------------------------------------------|
+| `.gitignore`         | 足りない行を足す（`/.env`・`/.idea`・`/.vscode` など）                    |
+| `.cargo/config.toml` | `artisan` の別名が無ければ足す                                            |
 | `build.rs`           | **書き換えない。** 足りない 1 行（`bengara_build::discover()`）を案内する |
-| `main.rs`            | `cargo new` の雛形か手順 2 の 1 行なら置き換える。ほかは案内だけ   |
-| それ以外             | 触らない                                                           |
+| `main.rs`            | `cargo new` の雛形か手順 2 の 1 行なら置き換える。ほかは案内だけ          |
+| それ以外             | 触らない                                                                  |
 
 - `.cargo/config.toml` で `alias.b = ...` や `alias = { ... }` の書き方をしているときは、
   書き換えずに足す行を案内します。
@@ -151,8 +150,8 @@ cargo update idna_adapter --precise 1.2.0
 
 ### `cargo artisan` が「そんなコマンドはない」と言われる
 
-`cargo artisan` は Cargo の別名です。`init` が次のファイルを作ります。
-**このファイルを `.gitignore` に入れないでください。**
+`cargo artisan` は Cargo の別名です。`init` が次のファイルを作ります。 **このファイルを `.gitignore`
+に入れないでください。**
 
 ```toml
 # .cargo/config.toml

@@ -22,12 +22,12 @@ pub fn config() -> AppConfig {
 }
 ```
 
-| 決まり                                 | 守らないと                   |
-|----------------------------------------|------------------------------|
-| `config/` の**直下**に置く             | 設定として登録されない       |
-| ファイル名を**小文字**で始める         | 設定として登録されない       |
-| `pub fn config() -> 何かの型` を書く   | ビルドが通らない             |
-| 1 つの型は 1 つのファイルからだけ返す  | どちらか 1 つしか残らない    |
+| 決まり                                | 守らないと                |
+|---------------------------------------|---------------------------|
+| `config/` の**直下**に置く            | 設定として登録されない    |
+| ファイル名を**小文字**で始める        | 設定として登録されない    |
+| `pub fn config() -> 何かの型` を書く  | ビルドが通らない          |
+| 1 つの型は 1 つのファイルからだけ返す | どちらか 1 つしか残らない |
 
 ### 読み出す
 
@@ -71,16 +71,16 @@ let shop = config::<crate::config::shop::ShopConfig>();
 次の型を返すファイルを置くと、フレームワークはその値を使います。
 置かなければ、下の「環境変数の一覧」のとおりに読みます。ファイル名は自由です。
 
-| 返す型           | 何の設定か             | 詳しくは                               | `init` が作るか |
-|------------------|------------------------|----------------------------------------|-----------------|
-| `AppConfig`      | 基本設定               | このページ                             | 作る            |
-| `DatabaseConfig` | データベースの接続     | [database.md](database.md)             | 作る            |
-| `CacheConfig`    | キャッシュの置き場所   | [cache.md](cache.md)                   | 作らない        |
-| `MailConfig`     | メールの送り先         | [mail.md](mail.md)                     | 作らない        |
-| `StorageConfig`  | ファイルの置き場所     | [storage.md](storage.md)               | 作らない        |
-| `HashConfig`     | パスワードの変換の回数 | [authentication.md](authentication.md) | 作らない        |
-| `BroadcastConfig` | 配信の送り方          | [websocket.md](websocket.md)           | 作らない        |
-| `QueueConfig`    | ジョブごとの打ち切りの時間 | [queue.md](queue.md)               | 作らない        |
+| 返す型            | 何の設定か                 | 詳しくは                               | `init` が作るか |
+|-------------------|----------------------------|----------------------------------------|-----------------|
+| `AppConfig`       | 基本設定                   | このページ                             | 作る            |
+| `DatabaseConfig`  | データベースの接続         | [database.md](database.md)             | 作る            |
+| `CacheConfig`     | キャッシュの置き場所       | [cache.md](cache.md)                   | 作らない        |
+| `MailConfig`      | メールの送り先             | [mail.md](mail.md)                     | 作らない        |
+| `StorageConfig`   | ファイルの置き場所         | [storage.md](storage.md)               | 作らない        |
+| `HashConfig`      | パスワードの変換の回数     | [authentication.md](authentication.md) | 作らない        |
+| `BroadcastConfig` | 配信の送り方               | [websocket.md](websocket.md)           | 作らない        |
+| `QueueConfig`     | ジョブごとの打ち切りの時間 | [queue.md](queue.md)                   | 作らない        |
 
 - `QueueConfig` は `bengara::queue::QueueConfig` です（`config/queue.rs` に置くのが Laravel の形）。
   環境変数からは読みません。置かなければ、どのジョブも `queue:work --timeout` で打ち切ります。
@@ -114,11 +114,11 @@ let dir: std::path::PathBuf = env("CACHE_DIR", "storage/cache");
 読める型は `String`・`std::path::PathBuf`・`bool`・整数・小数（`f32` `f64`）です。
 `bool` は `true` `1` `yes` `on` が真、`false` `0` `no` `off` `null` `none` が偽です。
 
-| 環境変数の値                  | `env()` が返すもの     |
-|-------------------------------|------------------------|
-| 無い・空・空白だけ            | 既定値                 |
-| 型に合わない（`APP_PORT=abc`）| 既定値。警告が出る     |
-| 前後に空白がある（`A=" x "`） | `x`（空白は落とす）    |
+| 環境変数の値                   | `env()` が返すもの  |
+|--------------------------------|---------------------|
+| 無い・空・空白だけ             | 既定値              |
+| 型に合わない（`APP_PORT=abc`） | 既定値。警告が出る  |
+| 前後に空白がある（`A=" x "`）  | `x`（空白は落とす） |
 
 **`.env` では値を空にできません。** 空にしたいときは、既定値を空にします（`env("MAIL_FROM_NAME", "")`）。
 
@@ -132,16 +132,16 @@ APP_ENV=local
 DB_PASSWORD="p#ss"
 ```
 
-| 決まり          | 内容                                                                       |
-|-----------------|----------------------------------------------------------------------------|
-| 優先            | 本物の環境変数が勝つ。`.env` は設定されていないものだけを埋める            |
-| 同じ名前が 2 回 | **先に出てくるほう**が勝つ                                                 |
-| コメント        | `#` から行末まで。前に空白は要らない（`APP_PORT=8000#dev` は `8000`）      |
-| `#` を含む値    | **必ず引用符で囲む。** 囲まないと `#` より前までが値になる。警告も出ない   |
-| `"..."`         | `\n` `\r` `\t` `\\` `\"` `\'` を解釈する。ほかの `\` はそのまま残る        |
-| `'...'`         | すべてそのままの文字                                                       |
-| 行頭の `export` | 無視する                                                                   |
-| 先頭の BOM      | 外して読む（メモ帳で保存しても読める）                                     |
+| 決まり          | 内容                                                                     |
+|-----------------|--------------------------------------------------------------------------|
+| 優先            | 本物の環境変数が勝つ。`.env` は設定されていないものだけを埋める          |
+| 同じ名前が 2 回 | **先に出てくるほう**が勝つ                                               |
+| コメント        | `#` から行末まで。前に空白は要らない（`APP_PORT=8000#dev` は `8000`）    |
+| `#` を含む値    | **必ず引用符で囲む。** 囲まないと `#` より前までが値になる。警告も出ない |
+| `"..."`         | `\n` `\r` `\t` `\\` `\"` `\'` を解釈する。ほかの `\` はそのまま残る      |
+| `'...'`         | すべてそのままの文字                                                     |
+| 行頭の `export` | 無視する                                                                 |
+| 先頭の BOM      | 外して読む（メモ帳で保存しても読める）                                   |
 
 Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C:\data\app.sqlite"`）。
 
@@ -157,14 +157,14 @@ Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C
 
 ### アプリ
 
-| 名前        | 既定                    | 何に効くか                                 | 設定ファイル |
-|-------------|-------------------------|--------------------------------------------|--------------|
-| `APP_NAME`  | `init` 時のパッケージ名 | アプリ名                                   | `AppConfig`  |
-| `APP_ENV`   | `production`            | 環境名                                     | `AppConfig`  |
-| `APP_DEBUG` | `false`                 | エラーページの詳細表示と、ログの細かさ     | `AppConfig`  |
-| `APP_URL`   | `http://localhost:8000` | `url()` が作る URL の頭                    | `AppConfig`  |
-| `APP_KEY`   | （空）                  | 署名と暗号化の鍵（[APP_KEY](#app_key)）    | `AppConfig`  |
-| `RUST_LOG`  | （なし）                | ログの細かさ（[ログ](#ログ)）              | —            |
+| 名前        | 既定                    | 何に効くか                              | 設定ファイル |
+|-------------|-------------------------|-----------------------------------------|--------------|
+| `APP_NAME`  | `init` 時のパッケージ名 | アプリ名                                | `AppConfig`  |
+| `APP_ENV`   | `production`            | 環境名                                  | `AppConfig`  |
+| `APP_DEBUG` | `false`                 | エラーページの詳細表示と、ログの細かさ  | `AppConfig`  |
+| `APP_URL`   | `http://localhost:8000` | `url()` が作る URL の頭                 | `AppConfig`  |
+| `APP_KEY`   | （空）                  | 署名と暗号化の鍵（[APP_KEY](#app_key)） | `AppConfig`  |
+| `RUST_LOG`  | （なし）                | ログの細かさ（[ログ](#ログ)）           | —            |
 
 `APP_ENV=production` で変わるのは 2 つです。
 
@@ -173,13 +173,13 @@ Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C
 
 ### 待ち受けと停止
 
-| 名前                   | 既定        | 何に効くか                                                          |
-|------------------------|-------------|---------------------------------------------------------------------|
-| `APP_HOST`             | `127.0.0.1` | 待ち受けるホスト                                                    |
-| `APP_PORT`             | `8000`      | 待ち受けるポート                                                    |
-| `APP_SHUTDOWN_TIMEOUT` | `30`        | 止めるときに待つ上限の秒数。**`0` は無制限**（[deployment.md](deployment.md#止める)） |
+| 名前                   | 既定        | 何に効くか                                                                                                                   |
+|------------------------|-------------|------------------------------------------------------------------------------------------------------------------------------|
+| `APP_HOST`             | `127.0.0.1` | 待ち受けるホスト                                                                                                             |
+| `APP_PORT`             | `8000`      | 待ち受けるポート                                                                                                             |
+| `APP_SHUTDOWN_TIMEOUT` | `30`        | 止めるときに待つ上限の秒数。**`0` は無制限**（[deployment.md](deployment.md#止める)）                                        |
 | `APP_MAX_BODY_BYTES`   | `2097152`   | 受け取る本文の上限のバイト数（2 MiB）。ルートの `.max_body` が優先（[requests-and-responses.md](requests-and-responses.md)） |
-| `TRUSTED_PROXIES`      | （空）      | 信頼する前段のアドレス（[TRUSTED_PROXIES](#trusted_proxies)）       |
+| `TRUSTED_PROXIES`      | （空）      | 信頼する前段のアドレス（[TRUSTED_PROXIES](#trusted_proxies)）                                                                |
 
 どれもフレームワークが直接読みます。
 
@@ -215,17 +215,17 @@ Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C
 
 ### データベース
 
-| 名前                 | 既定                                        | 何に効くか                                           |
-|----------------------|---------------------------------------------|------------------------------------------------------|
-| `DB_CONNECTION`      | `sqlite`                                    | 使う接続（`sqlite` / `mysql` / `mariadb` / `pgsql`） |
-| `DB_DATABASE`        | SQLite は `database/database.sqlite`、ほかは `bengara` | SQLite はファイル、ほかはデータベース名   |
-| `DB_HOST`            | `127.0.0.1`                                 | つなぎ先                                             |
-| `DB_PORT`            | 3306（MySQL）/ 5432（PostgreSQL）           | ポート。空と `0` は左の値                            |
-| `DB_USERNAME`        | `root`（MySQL）/ `postgres`（PostgreSQL）   | 利用者名。空は左の値                                 |
-| `DB_PASSWORD`        | （空）                                      | パスワード                                           |
-| `DB_URL`             | （空）                                      | 接続文字列。上の 4 つより優先                        |
-| `DB_MAX_CONNECTIONS` | `5`                                         | 同時に張る接続の数の上限（全部の接続に同じ値）       |
-| `DB_TEST_DATABASE`   | SQLite は `:memory:`                        | テストで使うデータベース                             |
+| 名前                 | 既定                                                   | 何に効くか                                           |
+|----------------------|--------------------------------------------------------|------------------------------------------------------|
+| `DB_CONNECTION`      | `sqlite`                                               | 使う接続（`sqlite` / `mysql` / `mariadb` / `pgsql`） |
+| `DB_DATABASE`        | SQLite は `database/database.sqlite`、ほかは `bengara` | SQLite はファイル、ほかはデータベース名              |
+| `DB_HOST`            | `127.0.0.1`                                            | つなぎ先                                             |
+| `DB_PORT`            | 3306（MySQL）/ 5432（PostgreSQL）                      | ポート。空と `0` は左の値                            |
+| `DB_USERNAME`        | `root`（MySQL）/ `postgres`（PostgreSQL）              | 利用者名。空は左の値                                 |
+| `DB_PASSWORD`        | （空）                                                 | パスワード                                           |
+| `DB_URL`             | （空）                                                 | 接続文字列。上の 4 つより優先                        |
+| `DB_MAX_CONNECTIONS` | `5`                                                    | 同時に張る接続の数の上限（全部の接続に同じ値）       |
+| `DB_TEST_DATABASE`   | SQLite は `:memory:`                                   | テストで使うデータベース                             |
 
 - `DB_TEST_DATABASE` 以外は、`init` が作る `config/database.rs` が読みます。
 - `DB_HOST` から `DB_PASSWORD` までは、MySQL と PostgreSQL のときだけ使います。
@@ -235,35 +235,35 @@ Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C
 
 ### キャッシュ・メール・言語
 
-| 名前                  | 既定                     | 何に効くか                                         | 設定ファイル  |
-|-----------------------|--------------------------|----------------------------------------------------|---------------|
-| `CACHE_DRIVER`        | `file`                   | キャッシュの置き場所（`file` / `memory`）          | `CacheConfig` |
-| `MAIL_MAILER`         | （空なら `MAIL_DRIVER`） | メールの送り先（`log` / `array` / `smtp`）         | `MailConfig`  |
-| `MAIL_DRIVER`         | `log`                    | 古い名前。`MAIL_MAILER` が空のときだけ見る         | `MailConfig`  |
-| `MAIL_FROM`           | `noreply@example.com`    | 差出人                                             | `MailConfig`  |
-| `MAIL_FROM_NAME`      | `bengara`                | 差出人の名前（`init` の `.env` はパッケージ名）    | `MailConfig`  |
-| `MAIL_HOST`           | `127.0.0.1`              | SMTP サーバー                                      | `MailConfig`  |
-| `MAIL_PORT`           | 暗号化で決まる           | `tls` は 465、`starttls` は 587、`none` は 25      | `MailConfig`  |
-| `MAIL_ENCRYPTION`     | `starttls`（空も同じ）   | `tls` / `starttls` / `none`                        | `MailConfig`  |
-| `MAIL_USERNAME`       | （空）                   | SMTP の利用者名。空なら認証しない                  | `MailConfig`  |
-| `MAIL_PASSWORD`       | （空）                   | SMTP のパスワード                                  | `MailConfig`  |
-| `MAIL_EHLO_NAME`      | （空）                   | SMTP で名乗る名前。空なら `[127.0.0.1]`            | `MailConfig`  |
-| `MAIL_TIMEOUT`        | `10`                     | 返事を待つ上限の秒数                               | `MailConfig`  |
-| `APP_LOCALE`          | `ja`                     | 画面の言語                                         | —             |
-| `APP_FALLBACK_LOCALE` | `ja`                     | 鍵が無いときに見る言語                             | —             |
+| 名前                  | 既定                     | 何に効くか                                      | 設定ファイル  |
+|-----------------------|--------------------------|-------------------------------------------------|---------------|
+| `CACHE_DRIVER`        | `file`                   | キャッシュの置き場所（`file` / `memory`）       | `CacheConfig` |
+| `MAIL_MAILER`         | （空なら `MAIL_DRIVER`） | メールの送り先（`log` / `array` / `smtp`）      | `MailConfig`  |
+| `MAIL_DRIVER`         | `log`                    | 古い名前。`MAIL_MAILER` が空のときだけ見る      | `MailConfig`  |
+| `MAIL_FROM`           | `noreply@example.com`    | 差出人                                          | `MailConfig`  |
+| `MAIL_FROM_NAME`      | `bengara`                | 差出人の名前（`init` の `.env` はパッケージ名） | `MailConfig`  |
+| `MAIL_HOST`           | `127.0.0.1`              | SMTP サーバー                                   | `MailConfig`  |
+| `MAIL_PORT`           | 暗号化で決まる           | `tls` は 465、`starttls` は 587、`none` は 25   | `MailConfig`  |
+| `MAIL_ENCRYPTION`     | `starttls`（空も同じ）   | `tls` / `starttls` / `none`                     | `MailConfig`  |
+| `MAIL_USERNAME`       | （空）                   | SMTP の利用者名。空なら認証しない               | `MailConfig`  |
+| `MAIL_PASSWORD`       | （空）                   | SMTP のパスワード                               | `MailConfig`  |
+| `MAIL_EHLO_NAME`      | （空）                   | SMTP で名乗る名前。空なら `[127.0.0.1]`         | `MailConfig`  |
+| `MAIL_TIMEOUT`        | `10`                     | 返事を待つ上限の秒数                            | `MailConfig`  |
+| `APP_LOCALE`          | `ja`                     | 画面の言語                                      | —             |
+| `APP_FALLBACK_LOCALE` | `ja`                     | 鍵が無いときに見る言語                          | —             |
 
 - `MAIL_HOST` から下の `MAIL_` は、送り先が `smtp` のときだけ使います。知らない `MAIL_MAILER` は送るときにエラーです。
 - くわしくは [cache.md](cache.md) / [mail.md](mail.md) / [localization.md](localization.md) にあります。
 
 ### WebSocket と配信
 
-| 名前                          | 既定                            | 何に効くか                                          | 設定ファイル      |
-|-------------------------------|---------------------------------|-----------------------------------------------------|-------------------|
-| `BROADCAST_CONNECTION`        | （空なら `BROADCAST_DRIVER`）   | 配信の送り方（`memory` / `database`）               | `BroadcastConfig` |
-| `BROADCAST_DRIVER`            | `memory`                        | 古い名前。`BROADCAST_CONNECTION` が空のときだけ見る | `BroadcastConfig` |
-| `BROADCAST_POLL_MS`           | `250`                           | `database` のとき、表を読む間隔（ミリ秒。下限 10）  | `BroadcastConfig` |
-| `BROADCAST_RETENTION_SECONDS` | `60`                            | `database` のとき、行を残す秒数（下限 5）           | `BroadcastConfig` |
-| `WEBSOCKET_MAX_CONNECTIONS`   | `10000`                         | 1 プロセスの同時接続の上限。`0` は既定と同じ        | —                 |
+| 名前                          | 既定                          | 何に効くか                                          | 設定ファイル      |
+|-------------------------------|-------------------------------|-----------------------------------------------------|-------------------|
+| `BROADCAST_CONNECTION`        | （空なら `BROADCAST_DRIVER`） | 配信の送り方（`memory` / `database`）               | `BroadcastConfig` |
+| `BROADCAST_DRIVER`            | `memory`                      | 古い名前。`BROADCAST_CONNECTION` が空のときだけ見る | `BroadcastConfig` |
+| `BROADCAST_POLL_MS`           | `250`                         | `database` のとき、表を読む間隔（ミリ秒。下限 10）  | `BroadcastConfig` |
+| `BROADCAST_RETENTION_SECONDS` | `60`                          | `database` のとき、行を残す秒数（下限 5）           | `BroadcastConfig` |
+| `WEBSOCKET_MAX_CONNECTIONS`   | `10000`                       | 1 プロセスの同時接続の上限。`0` は既定と同じ        | —                 |
 
 - `array` は `memory` と同じです。知らない送り方は、送るときにエラーです。
 - `BroadcastConfig` は `prelude` に入っていません。`bengara::broadcast::BroadcastConfig` から取り込みます。
@@ -292,11 +292,11 @@ cargo artisan key:generate
 TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 ```
 
-| 書き方       | 動き                                                       | 採るアドレス                               |
-|--------------|------------------------------------------------------------|--------------------------------------------|
-| 空（既定）   | 転送元のヘッダーを見ない                                   | つないできた相手                           |
-| アドレスの列 | カンマ区切り。載っている相手から来たヘッダーだけを見る     | **右端から見て、一覧に無い最初のアドレス** |
-| `*`          | すべての相手を信頼する                                     | 左端                                       |
+| 書き方       | 動き                                                   | 採るアドレス                               |
+|--------------|--------------------------------------------------------|--------------------------------------------|
+| 空（既定）   | 転送元のヘッダーを見ない                               | つないできた相手                           |
+| アドレスの列 | カンマ区切り。載っている相手から来たヘッダーだけを見る | **右端から見て、一覧に無い最初のアドレス** |
+| `*`          | すべての相手を信頼する                                 | 左端                                       |
 
 - 見るヘッダーは `X-Forwarded-For` と `X-Real-IP` です。
 - **範囲の書き方（`10.0.0.0/8`）は使えません。** アドレスを 1 つずつ並べます。読めない値は警告を出して無視します。
@@ -340,8 +340,8 @@ bengara = { version = "0.1", features = ["sqlite", "mail"] }
 | `encryption` | 入っていない   | `encrypt` / `decrypt`（[authentication.md](authentication.md)） |
 | `log-filter` | **入っている** | `RUST_LOG=myapp=debug` のような絞り込み                         |
 
-- `init` で作ったプロジェクトには `features = ["sqlite"]` が入ります。
-  **別のデータベースを使うなら書き換えてください。** 使わないなら消してかまいません。
+- `init` で作ったプロジェクトには `features = ["sqlite"]` が入ります。 **別のデータベースを使うなら書き換えてください。**
+  使わないなら消してかまいません。
 - **キューとマイグレーションにも、データベースのフラグが要ります。**
 - 認証・キャッシュ・ファイル・多言語・イベント・定期処理は、フラグなしで使えます。
 - メールは、送り先が `log` と `array` ならフラグなしで使えます。
@@ -358,12 +358,12 @@ bengara = { version = "0.1", default-features = false, features = ["sqlite"] }
 
 ## パスを作る関数
 
-| 関数                | 返すもの                                      |
-|---------------------|-----------------------------------------------|
-| `base_path()`       | 基準ディレクトリ                              |
-| `app_path(rel)`     | 基準ディレクトリからの相対パスを、絶対パスに  |
-| `public_path(rel)`  | `public/` の下のパス                          |
-| `storage_path(rel)` | `storage/` の下のパス                         |
+| 関数                | 返すもの                                     |
+|---------------------|----------------------------------------------|
+| `base_path()`       | 基準ディレクトリ                             |
+| `app_path(rel)`     | 基準ディレクトリからの相対パスを、絶対パスに |
+| `public_path(rel)`  | `public/` の下のパス                         |
+| `storage_path(rel)` | `storage/` の下のパス                        |
 
 **`app_path()` は Laravel と意味が違います。** Laravel は `app/` を指しますが、bengara は基準ディレクトリを指します。
 

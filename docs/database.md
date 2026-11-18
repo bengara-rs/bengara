@@ -108,7 +108,8 @@ let maybe = row.try_get::<i64>("views");      // 読めなければ None
 ```
 
 - 読める型は、整数（`i8`〜`i64`・`u8`〜`u64`・`isize`・`usize`）、`f32`・`f64`・`bool`・`String`・`Vec<u8>`・`Value`（生の値）です。
-- **NULL がありうる列は `Option<T>` で読みます。** `T` のままだと NULL の行でエラーです。`pluck::<Option<String>>("body")` も同じです。
+- **NULL がありうる列は `Option<T>` で読みます。** `T` のままだと NULL の行でエラーです。`pluck::<Option<String>>("body")`
+  も同じです。
 - 型に収まらない値はエラーです。小数を整数で読むと、`2.0` は `2` になり、`2.5` はエラーです。
 - 主キーが `id` でない表は、`find` の代わりに `where_(列, 値).first()` を使います。
 - **同じ名前の列が 2 つあると、左の列を採ります。** `join` したら `select` で取る列を決めてください。
@@ -116,21 +117,21 @@ let maybe = row.try_get::<i64>("views");      // 読めなければ None
 
 ### 条件を足す
 
-| 書き方                                                 | 意味                           |
-|--------------------------------------------------------|--------------------------------|
-| `where_("status", "published")`                        | 等しい                         |
-| `where_op("views", ">", 100)`                          | 演算子を指定する               |
-| `or_where(...)` / `or_where_op(...)`                   | `or` でつなぐ                  |
-| `where_in("id", &[1, 2, 3])` / `where_not_in`          | 一覧のどれか                   |
-| `or_where_in(...)`                                     | `or` でつないで、一覧のどれか  |
-| `where_null("body")` / `where_not_null`                | NULL かどうか                  |
-| `where_between("views", 0, 100)` / `where_not_between` | 範囲（両端を含む）             |
-| `where_like("title", "%そば%")`                        | 形に当てはまる                 |
-| `where_column("updated_at", ">", "created_at")`        | 列と列を比べる                 |
-| `where_raw("length(title) > ?", &[3.into()])`          | SQL を直接書く                 |
+| 書き方                                                 | 意味                            |
+|--------------------------------------------------------|---------------------------------|
+| `where_("status", "published")`                        | 等しい                          |
+| `where_op("views", ">", 100)`                          | 演算子を指定する                |
+| `or_where(...)` / `or_where_op(...)`                   | `or` でつなぐ                   |
+| `where_in("id", &[1, 2, 3])` / `where_not_in`          | 一覧のどれか                    |
+| `or_where_in(...)`                                     | `or` でつないで、一覧のどれか   |
+| `where_null("body")` / `where_not_null`                | NULL かどうか                   |
+| `where_between("views", 0, 100)` / `where_not_between` | 範囲（両端を含む）              |
+| `where_like("title", "%そば%")`                        | 形に当てはまる                  |
+| `where_column("updated_at", ">", "created_at")`        | 列と列を比べる                  |
+| `where_raw("length(title) > ?", &[3.into()])`          | SQL を直接書く                  |
 | `or_where_raw(...)`                                    | `or` でつないで、SQL を直接書く |
-| `where_group(\|q\| q.where_("a", 1).or_where("b", 2))` | 括弧でくくる                   |
-| `or_where_group(...)`                                  | `or` でつないで、括弧でくくる  |
+| `where_group(\|q\| q.where_("a", 1).or_where("b", 2))` | 括弧でくくる                    |
+| `or_where_group(...)`                                  | `or` でつないで、括弧でくくる   |
 
 `where` は Rust の予約語なので `where_` です。
 Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` と書きます。
@@ -277,13 +278,13 @@ json(&page)   // data / total / per_page / current_page が出ます
 
 `req.page()` は `?page=` を読みます（無ければ 1）。
 
-| 名前                                           | 意味                                     |
-|------------------------------------------------|------------------------------------------|
-| `data` / `total` / `per_page` / `current_page` | 中身と件数                               |
-| `last_page()`                                  | 最後のページ番号（0 件でも 1）           |
-| `has_more_pages()`                             | 次があるか                               |
-| `from()` / `to()`                              | 全体の何件目から何件目か。空なら `None`  |
-| `len()` / `is_empty()`                         | このページの件数 / 空か                  |
+| 名前                                           | 意味                                    |
+|------------------------------------------------|-----------------------------------------|
+| `data` / `total` / `per_page` / `current_page` | 中身と件数                              |
+| `last_page()`                                  | 最後のページ番号（0 件でも 1）          |
+| `has_more_pages()`                             | 次があるか                              |
+| `from()` / `to()`                              | 全体の何件目から何件目か。空なら `None` |
+| `len()` / `is_empty()`                         | このページの件数 / 空か                 |
 
 - 件数と中身で 2 回問い合わせます。0 件なら中身は問い合わせません。
 - `per_page` と `page` の 0 は 1 として扱います。
@@ -314,9 +315,9 @@ let rows = DB::select("select * from posts where views > ?", &[100.into()]).awai
 let affected = DB::statement("update posts set views = views + 1", &[]).await?;
 ```
 
-| 書き方                      | 返るもの                                                         |
-|-----------------------------|------------------------------------------------------------------|
-| `DB::select(sql, &[値])`    | `Vec<Row>`                                                       |
+| 書き方                      | 返るもの                                                           |
+|-----------------------------|--------------------------------------------------------------------|
+| `DB::select(sql, &[値])`    | `Vec<Row>`                                                         |
 | `DB::statement(sql, &[値])` | `Affected`（`rows` は変わった行の数、`last_insert_id` は採番の値） |
 
 - 値の置き場所は、どのドライバでも `?` です。PostgreSQL では bengara が `$1` `$2` に直します。
@@ -373,15 +374,15 @@ pub fn config() -> DatabaseConfig {
 }
 ```
 
-| 指定                 | 既定                | 意味                                            |
-|----------------------|---------------------|-------------------------------------------------|
-| `host(s)`            | `127.0.0.1`         | つなぎ先。空の文字列は無視                      |
-| `port(n)`            | 3306 / 5432         | ポート。0 は無視                                |
-| `username(s)`        | `root` / `postgres` | 利用者名。空の文字列は無視                      |
-| `password(s)`        | 空                  | パスワード。空なら渡さない                      |
-| `max_connections(n)` | 5                   | 同時に張る接続の数。メモリ上の SQLite は 1      |
-| `foreign_keys(b)`    | 真                  | SQLite で外部キーを効かせるか                   |
-| `url(s)`             | 空                  | 接続文字列。書くと、ほかの値より優先            |
+| 指定                 | 既定                | 意味                                       |
+|----------------------|---------------------|--------------------------------------------|
+| `host(s)`            | `127.0.0.1`         | つなぎ先。空の文字列は無視                 |
+| `port(n)`            | 3306 / 5432         | ポート。0 は無視                           |
+| `username(s)`        | `root` / `postgres` | 利用者名。空の文字列は無視                 |
+| `password(s)`        | 空                  | パスワード。空なら渡さない                 |
+| `max_connections(n)` | 5                   | 同時に張る接続の数。メモリ上の SQLite は 1 |
+| `foreign_keys(b)`    | 真                  | SQLite で外部キーを効かせるか              |
+| `url(s)`             | 空                  | 接続文字列。書くと、ほかの値より優先       |
 
 接続文字列の形は次のとおりです。
 パスワードに `@` `#` `/` `?` があるときは、`%40` のような形（パーセントエンコード）に直します。
@@ -420,21 +421,21 @@ MySQL につなげません（接続 `mysql`: 127.0.0.1:3306 / myapp）: 原因
 
 引用符・値の置き場所・列の型名は bengara が書き分けます。それでも残る違いは次のとおりです。
 
-| こと                         | SQLite                       | MySQL                        | PostgreSQL                         |
-|------------------------------|------------------------------|------------------------------|------------------------------------|
-| 真偽の列の生の値             | `Int`                        | `Bool`                       | `Bool`                             |
-| `decimal` の生の値           | `Float`                      | `Text`                       | `Text`                             |
-| `decimal` に文字列を書き戻す | 通る                         | 通る                         | **断られる**。`f64` で読んで書く   |
-| 整数の列を文字列と比べる     | 通る                         | 通る                         | **SQL エラー**。整数で渡す         |
-| 型の決まらない所の `None`    | 通る                         | 通る                         | エラー。`cast(? as text)` と書く   |
-| `truncate()` で流す文        | `delete` と採番の巻き戻し    | `truncate table`             | `truncate table … restart identity` |
-| `truncate()` の巻き戻し      | できる                       | **トランザクションを確定する** | できる                           |
-| 外部キーで指される表の `truncate()` | 指す側が空ならできる  | エラー（指す側が空でも）     | エラー（指す側が空でも）           |
-| 1 つの文に渡せる値の数       | 32,766                       | 65,535                       | 65,535                             |
-| `Affected` の `last_insert_id` | `insert` で入る            | `insert` で入る              | 常に `None`                        |
-| 外部キー                     | `foreign_keys(false)` で切れる | 常に効く                   | 常に効く                           |
-| 使える演算子                 | —                            | `<=>`                        | `ilike` / `not ilike`              |
-| 読めない型                   | —                            | —                            | `uuid` / `money` / `inet` / 配列 / 範囲 / `interval` など |
+| こと                                | SQLite                         | MySQL                          | PostgreSQL                                                |
+|-------------------------------------|--------------------------------|--------------------------------|-----------------------------------------------------------|
+| 真偽の列の生の値                    | `Int`                          | `Bool`                         | `Bool`                                                    |
+| `decimal` の生の値                  | `Float`                        | `Text`                         | `Text`                                                    |
+| `decimal` に文字列を書き戻す        | 通る                           | 通る                           | **断られる**。`f64` で読んで書く                          |
+| 整数の列を文字列と比べる            | 通る                           | 通る                           | **SQL エラー**。整数で渡す                                |
+| 型の決まらない所の `None`           | 通る                           | 通る                           | エラー。`cast(? as text)` と書く                          |
+| `truncate()` で流す文               | `delete` と採番の巻き戻し      | `truncate table`               | `truncate table … restart identity`                       |
+| `truncate()` の巻き戻し             | できる                         | **トランザクションを確定する** | できる                                                    |
+| 外部キーで指される表の `truncate()` | 指す側が空ならできる           | エラー（指す側が空でも）       | エラー（指す側が空でも）                                  |
+| 1 つの文に渡せる値の数              | 32,766                         | 65,535                         | 65,535                                                    |
+| `Affected` の `last_insert_id`      | `insert` で入る                | `insert` で入る                | 常に `None`                                               |
+| 外部キー                            | `foreign_keys(false)` で切れる | 常に効く                       | 常に効く                                                  |
+| 使える演算子                        | —                              | `<=>`                          | `ilike` / `not ilike`                                     |
+| 読めない型                          | —                              | —                              | `uuid` / `money` / `inet` / 配列 / 範囲 / `interval` など |
 
 - 値の数の上限を超えると、投げる前にエラーにします。`insert_many` は「行 × 列」で数えます。
 - `truncate()` できない表は `delete()` で空にします（採番は戻りません）。
@@ -451,7 +452,8 @@ MySQL につなげません（接続 `mysql`: 127.0.0.1:3306 / myapp）: 原因
 - PostgreSQL の `timestamptz` は UTC に直します。
 - 文字列の `decimal` は末尾の 0 を落とします（`12.50` は `12.5`）。
 - MariaDB の `json` 列は `Bytes` です。`row.get::<String>()` なら文字列で読めます。
-- MySQL の `unsigned` で `i64` に収まらない値は `Text` です。`year` と `bit` は `Int`、`enum` と `set` は `Text`、空間の型は `Bytes` です。
+- MySQL の `unsigned` で `i64` に収まらない値は `Text` です。`year` と `bit` は `Int`、`enum` と `set` は `Text`、空間の型は
+  `Bytes` です。
 
 ### 自動採番の番号
 
@@ -459,7 +461,8 @@ MySQL につなげません（接続 `mysql`: 127.0.0.1:3306 / myapp）: 原因
 主キーの名前が `id` でないときは、`insert_get_id_as(値, 主キーの名前)` を使います。
 
 - 自動採番の無い表には `insert()` を使ってください。
-- 自動採番の無い表に `insert_get_id` を使うと、SQLite は rowid（別の番号）を返します。MySQL はエラーですが、**行は入っています。**
+- 自動採番の無い表に `insert_get_id` を使うと、SQLite は rowid（別の番号）を返します。MySQL はエラーですが、
+  **行は入っています。**
 - PostgreSQL で自分で `insert` を書くときは、`returning` を付けて `DB::select` で受け取ります。
 
 ## 名前の検査と、式が書ける所
@@ -479,10 +482,10 @@ MySQL につなげません（接続 `mysql`: 127.0.0.1:3306 / myapp）: 原因
 
 ### 使える演算子
 
-| 使う所                                   | 演算子                                                                      |
-|------------------------------------------|-----------------------------------------------------------------------------|
+| 使う所                                   | 演算子                                                                              |
+|------------------------------------------|-------------------------------------------------------------------------------------|
 | `where_op` / `or_where_op` / `having_op` | `=` `!=` `<>` `<` `<=` `>` `>=` `like` `not like` `ilike` `not ilike` `is` `is not` |
-| `where_column` / `join` / `left_join`    | `=` `!=` `<>` `<` `<=` `>` `>=` `<=>` `like` `not like` `ilike` `not ilike` |
+| `where_column` / `join` / `left_join`    | `=` `!=` `<>` `<` `<=` `>` `>=` `<=>` `like` `not like` `ilike` `not ilike`         |
 
 - 大文字と小文字は区別しません。
 - `in` と `between` は渡せません。`where_in` / `where_between` を使います。

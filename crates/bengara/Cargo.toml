@@ -93,10 +93,10 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = [
 # bengara は `Mailer::send` を `spawn_blocking` の中で呼ぶので、
 # tokio 向けの送り口（tokio1-rustls-tls）は要りません。依存も少なくなります。
 lettre = { version = "0.11", default-features = false, features = [
-    "builder",        # 文面の組み立て
+    "builder", # 文面の組み立て
     "smtp-transport", # SMTP
-    "rustls-tls",     # TLS は rustls + webpki-roots（OS の証明書置き場に依存しない）
-    "pool",           # つなぎっぱなしにして TLS の握り直しを減らす
+    "rustls-tls", # TLS は rustls + webpki-roots（OS の証明書置き場に依存しない）
+    "pool", # つなぎっぱなしにして TLS の握り直しを減らす
 ], optional = true }
 # WebSocket。フレームの処理（マスク・断片・制御フレーム・Close の手順）だけを使います。
 # TLS は前段のプロキシが終端するので入れません。圧縮も使いません。

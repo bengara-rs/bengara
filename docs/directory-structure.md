@@ -54,11 +54,11 @@ myapp/
 
 ## 3 つの約束
 
-| 約束                                                            | 守らないと                   |
-|-----------------------------------------------------------------|------------------------------|
-| ほかのファイルは `crate::` から参照する                         | `super::` では解決できない   |
-| 大文字始まりのファイルに、同じ名前の型を 1 つ書く               | **ビルドが通らない**         |
-| `config/` 直下の**小文字**のファイルに `pub fn config()` を書く | **ビルドが通らない**         |
+| 約束                                                            | 守らないと                 |
+|-----------------------------------------------------------------|----------------------------|
+| ほかのファイルは `crate::` から参照する                         | `super::` では解決できない |
+| 大文字始まりのファイルに、同じ名前の型を 1 つ書く               | **ビルドが通らない**       |
+| `config/` 直下の**小文字**のファイルに `pub fn config()` を書く | **ビルドが通らない**       |
 
 ```rust
 use crate::app::http::controllers::HomeController;
@@ -72,12 +72,12 @@ use crate::app::http::controllers::HomeController;
 
 ## 名前の付き方
 
-| 置いたもの                       | Rust での名前                                                     |
-|----------------------------------|-------------------------------------------------------------------|
-| ディレクトリ                     | 小文字と `_` に直す（`app/Http/Controllers/` → `crate::app::http::controllers`） |
-| 大文字始まりのファイル           | 型として使える（`app/Models/User.rs` → `crate::app::models::User`） |
-| 小文字始まりのファイル           | モジュール（`routes/web.rs` → `crate::routes::web`）              |
-| 日付で始まるファイル             | 先頭に `m` が付く（`2026_…` → `m2026_…`）                         |
+| 置いたもの             | Rust での名前                                                                    |
+|------------------------|----------------------------------------------------------------------------------|
+| ディレクトリ           | 小文字と `_` に直す（`app/Http/Controllers/` → `crate::app::http::controllers`） |
+| 大文字始まりのファイル | 型として使える（`app/Models/User.rs` → `crate::app::models::User`）              |
+| 小文字始まりのファイル | モジュール（`routes/web.rs` → `crate::routes::web`）                             |
+| 日付で始まるファイル   | 先頭に `m` が付く（`2026_…` → `m2026_…`）                                        |
 
 - 取り込むのは `app` `bootstrap` `config` `database` `routes` と、テストのときの `tests` です。
 - 大文字始まりのファイルは、モジュールとしても見えます（`crate::app::models::user`）。
@@ -95,7 +95,8 @@ use crate::app::http::controllers::HomeController;
 | `routes/console.rs`     | `pub fn schedule(s: &mut Schedule)`                                                   | —                  |
 
 - 一覧になるものは、**置けば動きます。** 登録は要りません。並びは名前順です。
-- **聞く側（`app/Listeners/`）だけは自分で登録します。** `bootstrap/app.rs` の `with_events` に書きます（[events.md](events.md)）。
+- **聞く側（`app/Listeners/`）だけは自分で登録します。** `bootstrap/app.rs` の `with_events`
+  に書きます（[events.md](events.md)）。
 - **マイグレーションのファイル名は日付から始めます**（`2026_10_05_000000_create_posts_table.rs`）。
   日付で始まらないとビルドが止まります。
 - シーダー・ジョブ・コマンドは**大文字始まり**のファイルだけが一覧に入ります。小文字始まりは警告が出ます。
@@ -132,9 +133,9 @@ app/Jobs/
 
 静的ファイルを置きます。
 
-| ビルド   | 読み方                                               |
-|----------|------------------------------------------------------|
-| デバッグ | ディスクから読む。直せばすぐ反映される               |
+| ビルド   | 読み方                                                 |
+|----------|--------------------------------------------------------|
+| デバッグ | ディスクから読む。直せばすぐ反映される                 |
 | リリース | **全部を実行ファイルに埋め込む**（隠しファイルを除く） |
 
 - 1 つが 8 MiB、合計が 32 MiB を超えると、ビルドで警告が出ます。止まりはしません。
@@ -158,23 +159,23 @@ app/Jobs/
 
 実行時の書き込み先です。中身はリポジトリに入れません（`storage/.gitignore` が全部を無視します）。
 
-| ディレクトリ                 | 置かれるもの                               |
-|------------------------------|--------------------------------------------|
-| `storage/app`                | アプリが置くファイル                       |
-| `storage/app/public`         | `/storage/...` で配信する分                |
-| `storage/framework/cache`    | キャッシュ                                 |
-| `storage/framework/schedule` | 定期処理の前回の時刻                       |
-| `storage/framework/serve`    | `cargo artisan serve` が使う（開発用）     |
-| `storage/framework/sessions` | セッション                                 |
-| `storage/logs`               | メールのログ（`mail.log`）                 |
+| ディレクトリ                 | 置かれるもの                           |
+|------------------------------|----------------------------------------|
+| `storage/app`                | アプリが置くファイル                   |
+| `storage/app/public`         | `/storage/...` で配信する分            |
+| `storage/framework/cache`    | キャッシュ                             |
+| `storage/framework/schedule` | 定期処理の前回の時刻                   |
+| `storage/framework/serve`    | `cargo artisan serve` が使う（開発用） |
+| `storage/framework/sessions` | セッション                             |
+| `storage/logs`               | メールのログ（`mail.log`）             |
 
 - 手元では `cargo run -- init` が作ります。本番では `./myapp storage:init` を 1 回流します。
 - どちらも、作ったディレクトリを Unix では所有者だけ（0700）にします。すでにあるものには触りません。
 
 ## テストの置き場所
 
-テストは `tests/Feature/` か `tests/Unit/` に置きます。
-**`tests/` の直下に `.rs` を置かないでください。** 警告が出ます（[testing.md](testing.md)）。
+テストは `tests/Feature/` か `tests/Unit/` に置きます。 **`tests/` の直下に `.rs` を置かないでください。**
+警告が出ます（[testing.md](testing.md)）。
 
 ## 置いたのに動かないとき
 

@@ -31,18 +31,18 @@ bengara を使う人のための資料です。読むページをここで探し
 
 ## 周辺の機能
 
-| ページ                                     | 内容                                 |
-|--------------------------------------------|--------------------------------------|
-| [cache.md](cache.md)                       | 結果を取っておく                     |
-| [storage.md](storage.md)                   | ファイルの置き場所                   |
-| [queue.md](queue.md)                       | キューとジョブ（データベースが必要） |
-| [scheduling.md](scheduling.md)             | 定期処理                             |
-| [events.md](events.md)                     | イベントと、聞く側                   |
-| [mail.md](mail.md)                         | メール（`log` / `array` / SMTP）     |
-| [websocket.md](websocket.md)               | WebSocket と配信（`Broadcast`）      |
+| ページ                                     | 内容                                      |
+|--------------------------------------------|-------------------------------------------|
+| [cache.md](cache.md)                       | 結果を取っておく                          |
+| [storage.md](storage.md)                   | ファイルの置き場所                        |
+| [queue.md](queue.md)                       | キューとジョブ（データベースが必要）      |
+| [scheduling.md](scheduling.md)             | 定期処理                                  |
+| [events.md](events.md)                     | イベントと、聞く側                        |
+| [mail.md](mail.md)                         | メール（`log` / `array` / SMTP）          |
+| [websocket.md](websocket.md)               | WebSocket と配信（`Broadcast`）           |
 | [processes.md](processes.md)               | 外部コマンドの起動（`Process`）と重い処理 |
-| [localization.md](localization.md)         | 多言語                               |
-| [console-commands.md](console-commands.md) | 自分のコマンド                       |
+| [localization.md](localization.md)         | 多言語                                    |
+| [console-commands.md](console-commands.md) | 自分のコマンド                            |
 
 ## 知っておく
 

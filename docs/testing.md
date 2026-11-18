@@ -27,7 +27,8 @@ async fn 無いページは404になる() {
 
 - `get` などの道具は `#[bengara::test]` が用意します。`use` は要りません。
 - テスト関数の名前は日本語で書けます。
-- `#[bengara::test]` を付けられるのは、**引数も戻り値も無い `async fn`** だけです。`-> Result<()>` などは書けないので、中で `unwrap()` します。
+- `#[bengara::test]` を付けられるのは、**引数も戻り値も無い `async fn`** だけです。`-> Result<()>` などは書けないので、中で
+  `unwrap()` します。
 - アプリを組み立てる必要が無いユニットテストは、普通の `#[test]` で書きます。
 
 ### データベースを使う
@@ -145,18 +146,18 @@ async fn セッションに入れた値が次のリクエストで読める() {
 
 ### 送る
 
-| 名前                                   | すること                                         |
-|----------------------------------------|--------------------------------------------------|
-| `get(uri)`                             | GET で送る（`get("/search?q=1")` も書ける）      |
-| `post` / `put` / `patch(uri, body)`    | 本文をフォームの形で送る                         |
-| `delete(uri)`                          | DELETE で送る                                    |
-| `client`                               | テスト用のクライアント。上の関数も持っている     |
-| `client.post_json(uri, &値)`           | JSON で POST する                                |
-| `client.post_with_csrf(uri, body, token_uri)` | トークンを取ってから POST する            |
-| `client.csrf_token(token_uri)`         | トークンを取り出す。応答に `token` が無いとパニック |
-| `client.send(method, uri, body, headers)` | メソッドとヘッダーを自分で決めて送る          |
-| `client.fresh()`                       | Cookie を捨てた、別の人としてのクライアント      |
-| `client.cookie(name)`                  | いま持っている Cookie の値                       |
+| 名前                                          | すること                                            |
+|-----------------------------------------------|-----------------------------------------------------|
+| `get(uri)`                                    | GET で送る（`get("/search?q=1")` も書ける）         |
+| `post` / `put` / `patch(uri, body)`           | 本文をフォームの形で送る                            |
+| `delete(uri)`                                 | DELETE で送る                                       |
+| `client`                                      | テスト用のクライアント。上の関数も持っている        |
+| `client.post_json(uri, &値)`                  | JSON で POST する                                   |
+| `client.post_with_csrf(uri, body, token_uri)` | トークンを取ってから POST する                      |
+| `client.csrf_token(token_uri)`                | トークンを取り出す。応答に `token` が無いとパニック |
+| `client.send(method, uri, body, headers)`     | メソッドとヘッダーを自分で決めて送る                |
+| `client.fresh()`                              | Cookie を捨てた、別の人としてのクライアント         |
+| `client.cookie(name)`                         | いま持っている Cookie の値                          |
 
 テストのクライアントは、本文の扱いもサーバーと同じ道を通ります（[requests-and-responses.md](requests-and-responses.md)）。
 
@@ -187,10 +188,10 @@ async fn JSONを受け取れる() {
 
 ```rust
 get("/").await
-    .assert_ok()
-    .assert_header("content-type", "text/html; charset=utf-8")
-    .assert_see("myapp")
-    .assert_dont_see("エラー");
+.assert_ok()
+.assert_header("content-type", "text/html; charset=utf-8")
+.assert_see("myapp")
+.assert_dont_see("エラー");
 ```
 
 - `assert_*` はつなげて書けます。
@@ -202,7 +203,8 @@ get("/").await
 - `.env` と `config/` を読みます（プロセスで 1 回）。
 - `bootstrap/app.rs` の `app()` でアプリを組み立てます（テスト 1 件ごと）。
 - メールの送り先を `array` にします。**本当には送りません。**
-- パスワードの変換の回数を 1,000 に下げます（本番の既定は 120,000）。変えるなら `HASH_ITERATIONS=20000 cargo test` のように渡します。
+- パスワードの変換の回数を 1,000 に下げます（本番の既定は 120,000）。変えるなら `HASH_ITERATIONS=20000 cargo test`
+  のように渡します。
 - `APP_KEY` が無ければテスト用の鍵を、`APP_ENV` が無ければ `testing` を入れます。
 - ソケットは開きません。ポートの衝突を気にせず並べて走らせられます。
 - 回数の制限（throttle）は本番と同じく効きます。接続元は `127.0.0.1` として数えます。
@@ -212,13 +214,13 @@ get("/").await
 `tests/Feature/` のテストは、1 つのプロセスの中で並んで走ります。
 共有しているものを触るテストは、札を取って順番に走らせます。
 
-| 触るもの                                                 | 取る札               |
-|----------------------------------------------------------|----------------------|
-| データベース                                             | `refresh_database()` |
-| 溜まったメール（`Mail::sent()` / `Mail::clear_sent()`）  | `exclusive()`        |
-| いまの言語を変える（`Lang::set`）                        | `exclusive()`        |
-| イベントの登録を変えたアプリで `Event::dispatch` を呼ぶ  | `exclusive()`        |
-| 配信の記録（`Broadcast::fake()` / `published()`）        | `exclusive()`        |
+| 触るもの                                                | 取る札               |
+|---------------------------------------------------------|----------------------|
+| データベース                                            | `refresh_database()` |
+| 溜まったメール（`Mail::sent()` / `Mail::clear_sent()`） | `exclusive()`        |
+| いまの言語を変える（`Lang::set`）                       | `exclusive()`        |
+| イベントの登録を変えたアプリで `Event::dispatch` を呼ぶ | `exclusive()`        |
+| 配信の記録（`Broadcast::fake()` / `published()`）       | `exclusive()`        |
 
 - 札は変数で受け取ります（`let _db = ...`）。受け取らないと、その場で手放されます。
 - 1 つのテストで同じ札を 2 回取ると、パニックします。
@@ -251,13 +253,13 @@ async fn 数を足し引きできる() {
 
 ## 周辺機能のテスト
 
-| 機能     | 確かめ方                                     | くわしい例                        |
-|----------|----------------------------------------------|-----------------------------------|
-| メール   | `Mail::sent()` に溜まった中身を見る          | [mail.md](mail.md) の「テスト」   |
-| キュー   | 積まれた数を見る。中身は `handle` を直接呼ぶ | [queue.md](queue.md) の「テスト」 |
-| 定期処理 | `routes/console.rs` の関数を自分で呼ぶ       | 下の例                            |
-| 配信     | `Broadcast::fake()` で記録して見る           | 下の例                            |
-| WebSocket の受け口 | 切り替えのヘッダーを付けて送り、101 を見る | [websocket.md](websocket.md) の「テスト」 |
+| 機能               | 確かめ方                                     | くわしい例                                |
+|--------------------|----------------------------------------------|-------------------------------------------|
+| メール             | `Mail::sent()` に溜まった中身を見る          | [mail.md](mail.md) の「テスト」           |
+| キュー             | 積まれた数を見る。中身は `handle` を直接呼ぶ | [queue.md](queue.md) の「テスト」         |
+| 定期処理           | `routes/console.rs` の関数を自分で呼ぶ       | 下の例                                    |
+| 配信               | `Broadcast::fake()` で記録して見る           | 下の例                                    |
+| WebSocket の受け口 | 切り替えのヘッダーを付けて送り、101 を見る   | [websocket.md](websocket.md) の「テスト」 |
 
 ```rust
 #[bengara::test]

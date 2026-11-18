@@ -28,14 +28,14 @@
 
 ### 本体
 
-| コマンド       | 動き                                           | 詳しくは                             |
-|----------------|------------------------------------------------|--------------------------------------|
-| `serve`        | HTTP サーバーを起動する（見張りはしない）      | [deployment.md](deployment.md)       |
-| `route:list`   | ルートの表（METHOD / URI / NAME / MIDDLEWARE） | [routing.md](routing.md)             |
+| コマンド       | 動き                                           | 詳しくは                                     |
+|----------------|------------------------------------------------|----------------------------------------------|
+| `serve`        | HTTP サーバーを起動する（見張りはしない）      | [deployment.md](deployment.md)               |
+| `route:list`   | ルートの表（METHOD / URI / NAME / MIDDLEWARE） | [routing.md](routing.md)                     |
 | `key:generate` | `APP_KEY` を作って `.env` に書く               | [configuration.md](configuration.md#app_key) |
-| `about`        | いまの設定と置き場所を出す                     | [deployment.md](deployment.md)       |
-| `storage:init` | `storage/` の下の書き込み先を作る              | [deployment.md](deployment.md)       |
-| `session:gc`   | 期限切れのセッションのファイルを消す           | [session.md](session.md)             |
+| `about`        | いまの設定と置き場所を出す                     | [deployment.md](deployment.md)               |
+| `storage:init` | `storage/` の下の書き込み先を作る              | [deployment.md](deployment.md)               |
+| `session:gc`   | 期限切れのセッションのファイルを消す           | [session.md](session.md)                     |
 
 本体を引数なしで動かすと `serve` です（`./myapp`）。
 `--host` か `--port` から始めたときも `serve` です（`./myapp --port 8001`）。
@@ -70,7 +70,8 @@
 | `schedule:list` | 定期処理の一覧                 | [scheduling.md](scheduling.md)     |
 | `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
-- データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
+-
+データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
 - `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます（[console-commands.md](console-commands.md)）。
 - 無い名前を打つと、エラーと一覧を出して終了コード 1 で終わります。
 - コードを生成する `make:*` コマンドはありません。ファイルは手で作ります。
@@ -87,24 +88,24 @@ $ cargo artisan cache:clear --tries=9
 
 ### 本体と周辺機能
 
-| コマンド       | 使える指定                                                     |
-|----------------|----------------------------------------------------------------|
+| コマンド       | 使える指定                                                      |
+|----------------|-----------------------------------------------------------------|
 | `serve`        | `--host <ホスト>` / `--port <ポート>`（`--port=8080` の形も可） |
-| `key:generate` | `--force`（すでにある鍵を作り直す）                            |
-| `queue:work`   | 下の表                                                         |
-| `queue:retry`  | `--id=1`（1 件だけ戻す）                                       |
-| 上記以外       | **受け付けない。** 余分な引数も断る                            |
+| `key:generate` | `--force`（すでにある鍵を作り直す）                             |
+| `queue:work`   | 下の表                                                          |
+| `queue:retry`  | `--id=1`（1 件だけ戻す）                                        |
+| 上記以外       | **受け付けない。** 余分な引数も断る                             |
 
 `init` / `list` / `--version` だけは、余分な引数を無視します。
 
-| `queue:work` の指定 | 既定      | 意味                                                  |
-|---------------------|-----------|-------------------------------------------------------|
-| `--queue=名前`      | `default` | 処理するキュー                                        |
-| `--tries=3`         | 3         | 諦めるまでに試す回数（1 以上）                        |
-| `--sleep=1`         | 1         | ジョブが無いときに待つ秒数                            |
+| `queue:work` の指定 | 既定      | 意味                                                       |
+|---------------------|-----------|------------------------------------------------------------|
+| `--queue=名前`      | `default` | 処理するキュー                                             |
+| `--tries=3`         | 3         | 諦めるまでに試す回数（1 以上）                             |
+| `--sleep=1`         | 1         | ジョブが無いときに待つ秒数                                 |
 | `--timeout=60`      | 60        | 1 件のジョブを待つ上限の秒数。`0` は無制限（起動時に警告） |
-| `--retry-after=90`  | 90        | 処理中のまま残ったジョブを取り直すまでの秒数（1 以上） |
-| `--once`            | —         | 1 件だけ処理して終わる                                |
+| `--retry-after=90`  | 90        | 処理中のまま残ったジョブを取り直すまでの秒数（1 以上）     |
+| `--once`            | —         | 1 件だけ処理して終わる                                     |
 
 - ジョブごとの打ち切りの時間は `config/queue.rs` で決めます。載っているジョブは `--timeout` より優先します。
 - 打ち切りの時間が `--retry-after` より長いジョブは、予約を延ばします。二重には動きません（[queue.md](queue.md)）。
@@ -142,7 +143,8 @@ $ cargo artisan cache:clear --tries=9
 
 `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
-**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
+**表を変えるコマンドは同時に流せません。** 2
+つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
 
 ## serve の動き
 
@@ -181,11 +183,11 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 
 ### 失敗したとき
 
-| 起きたこと                   | 動き                                             |
-|------------------------------|--------------------------------------------------|
-| ビルドに失敗した             | エラーを出し、**前の版をそのまま動かし続ける**   |
-| 本体が自分で終わった         | その旨を出し、次の変更でもう一度起動する         |
-| 初回のビルドや起動に失敗した | `serve` は止まらない。直せばもう一度試す         |
+| 起きたこと                   | 動き                                           |
+|------------------------------|------------------------------------------------|
+| ビルドに失敗した             | エラーを出し、**前の版をそのまま動かし続ける** |
+| 本体が自分で終わった         | その旨を出し、次の変更でもう一度起動する       |
+| 初回のビルドや起動に失敗した | `serve` は止まらない。直せばもう一度試す       |
 
 本体が自分で終わるのは、ポートが使われているときや、`serve` に知らない指定を付けたときです。
 画面に「本体が異常終了しました（終了コード 1）」と出ます。
@@ -195,7 +197,8 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 Ctrl+C で止めます。
 
 - **`serve` は本体をすぐに止めます。** 処理中のリクエストは待ちません。
-- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめるときは、`cargo run -- serve` で動かします（[deployment.md](deployment.md#止める)）。
+- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめるときは、`cargo run -- serve`
+  で動かします（[deployment.md](deployment.md#止める)）。
 - `serve` を強制終了したとき（`kill -9`、タスクマネージャ）だけは、本体が残ります。手で止めてください。
 
 ## 関連
