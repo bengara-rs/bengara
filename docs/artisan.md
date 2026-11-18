@@ -71,7 +71,9 @@
 | `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
 -
+
 データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
+
 - `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます（[console-commands.md](console-commands.md)）。
 - 無い名前を打つと、エラーと一覧を出して終了コード 1 で終わります。
 - コードを生成する `make:*` コマンドはありません。ファイルは手で作ります。
