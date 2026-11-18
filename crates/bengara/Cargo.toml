@@ -73,7 +73,9 @@ serde_json = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
+    "io-util", # 外部コマンドの標準入力へ書く（`Process::input`）
     "net",
+    "process", # 外部コマンドの起動と待ち合わせ（`Process`）。打ち切ると止められる
     "signal",
     "sync", # 停止の合図を伝える watch チャネル
     "time", # 停止の上限時間

@@ -158,6 +158,12 @@ async fn セッションに入れた値が次のリクエストで読める() {
 | `client.fresh()`                       | Cookie を捨てた、別の人としてのクライアント      |
 | `client.cookie(name)`                  | いま持っている Cookie の値                       |
 
+テストのクライアントは、本文の扱いもサーバーと同じ道を通ります（[requests-and-responses.md](requests-and-responses.md)）。
+
+- 本文が上限（`APP_MAX_BODY_BYTES` かルートの `.max_body`）を超えれば 413 です。
+  長さの申告（`Content-Length`）は付けませんが、読んだ合計で 413 になります。
+- `.stream_body()` のルートも、そのまま試せます。本文は 1 かたまりで届きます。
+
 ```rust
 #[bengara::test]
 async fn JSONを受け取れる() {

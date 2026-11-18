@@ -21,6 +21,10 @@ pub(crate) struct RouteDef {
     pub(crate) handler: Arc<dyn ErasedHandler>,
     /// 起動時に組み立てた並び。`create()` で入ります。
     pub(crate) stack: Option<Arc<[Arc<dyn Middleware>]>>,
+    /// 受け取る本文の上限（`.max_body(n)`）。`None` なら `APP_MAX_BODY_BYTES`。
+    pub(crate) max_body: Option<u64>,
+    /// 本文を読まずにハンドラへ渡すか（`.stream_body()`）。
+    pub(crate) stream_body: bool,
 }
 
 thread_local! {
@@ -93,6 +97,8 @@ macro_rules! route_method {
                 middleware: group.middleware,
                 handler: Arc::new(Erased::new(handler)),
                 stack: None,
+                max_body: None,
+                stream_body: false,
             })
         }
     };
@@ -162,6 +168,44 @@ impl Registered {
     /// 何回でも呼べます。書いた順に通ります。
     pub fn middleware(self, name: &str) -> Self {
         self.edit(|def| def.middleware.push(name.to_string()))
+    }
+
+    /// このルートで受け取る本文の上限（バイト）を決める。
+    ///
+    /// 決めなければ `APP_MAX_BODY_BYTES`（既定 2 MiB）です。超えると 413 を返します。
+    /// 長さの申告（`Content-Length`）が上限を超えていれば、読まずに 413 にします。
+    ///
+    /// ```ignore
+    /// Route::post("/imports", ImportController::store).max_body(16 * 1024 * 1024);
+    /// ```
+    ///
+    /// **全部読むルートでは、30 秒で読み終える必要があります**（過ぎると 408）。
+    /// 何 MB もある本文は [`stream_body`](Self::stream_body) と組み合わせてください。
+    ///
+    /// `0` は「本文を受け付けない」です（空でない本文はすべて 413）。
+    /// `APP_MAX_BODY_BYTES` の `0` は書き間違いと見て既定に戻しますが、ルートに書いた
+    /// `0` はそのルートだけの意図した指定として扱います。
+    pub fn max_body(self, bytes: u64) -> Self {
+        self.edit(|def| def.max_body = Some(bytes))
+    }
+
+    /// 本文を読まずにハンドラへ渡す。ハンドラは `req.body_stream()?` で少しずつ読みます。
+    ///
+    /// ```ignore
+    /// Route::post("/uploads", UploadController::store)
+    ///     .middleware("auth")
+    ///     .stream_body()
+    ///     .max_body(512 * 1024 * 1024);
+    /// ```
+    ///
+    /// - 上限（[`max_body`](Self::max_body)）は、読んだ合計に効きます。
+    /// - 時間の上限は「次のかたまりが 30 秒届かない」です。全体の時間は数えません。
+    /// - ミドルウェアは**本文を読む前に**通ります。ログインしていない相手の大きな
+    ///   送信を、受け取らずに断れます。
+    /// - `req.body()`・`req.input()`・`req.validate()` から本文は見えません（クエリだけ）。
+    ///   CSRF のトークンも本文の `_token` は読めないので、`X-CSRF-TOKEN` ヘッダーで送ってください。
+    pub fn stream_body(self) -> Self {
+        self.edit(|def| def.stream_body = true)
     }
 
     fn edit(self, change: impl FnOnce(&mut RouteDef)) -> Self {

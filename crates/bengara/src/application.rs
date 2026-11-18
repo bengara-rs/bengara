@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::config_registry::app_config;
 use crate::error::Error;
+use crate::http::body::BodyPolicy;
 use crate::http::handler::{Erased, ErasedHandler};
 use crate::http::middleware::{Middleware, Middlewares, Next};
 use crate::http::response::{error_response, RenderOptions};
@@ -38,6 +39,8 @@ struct Inner {
     /// その実体。`storage/` を作る前に起動したときは `None` になります。
     storage_public_canonical: Option<Arc<Path>>,
     debug: bool,
+    /// 受け取る本文の上限の既定（`APP_MAX_BODY_BYTES`）。ルートの `.max_body(n)` が優先します。
+    max_body: u64,
     exceptions: Option<Arc<Exceptions>>,
     /// ルートに当たらなかったときの最内側（静的ファイル → 404）。
     ///
@@ -126,28 +129,16 @@ impl Application {
 
         // 共通ミドルウェアは、ルートに当たらなかったときも通します（Laravel と同じ）。
         // そのため、ここでは並びを1本だけ回し、分岐は最内側のハンドラに寄せます。
-        let inner = self.innermost(&mut req, &options);
+        let (inner, policy) = self.innermost(&mut req, &options);
         let target = log.then(|| crate::server::log_target(&req));
-        let future = Next::new(self.inner.global.clone(), inner, options.clone()).run(req);
 
-        // ミドルウェアとハンドラのパニックを1リクエストに閉じ込める。
-        // 並びの一番外で包むので、共通ミドルウェアの中で起きたものも 500 になります。
-        //
-        // この形は意図したものです（決定記録 #008）。`catch_unwind` に替えると
-        // `UnwindSafe` の扱いが広く波及するので、ここは変えません。
-        //
-        // **制限**: クライアントが切断すると、axum 側の処理は落ちますが、ここで
-        // 切り出したタスクは走り続けます。そのタスクは停止処理の追跡から外れるので、
-        // 終了を待ってもらえません（停止の上限時間まで走り、そこで打ち切られます）。
-        let response = match tokio::spawn(future).await {
-            // `Next::run` は必ず `Ok` を返します（エラーはその中でレスポンスに変わります）。
-            // ここの `Err` には来ませんが、型を合わせるために同じ関数を通します。
-            Ok(result) => crate::http::response::render(result, options),
-            Err(join_error) => {
-                let error = Error::msg(panic_message(join_error, options.debug));
-                tracing::error!("ハンドラがパニックしました: {error}");
-                error_response(&error, options)
-            }
+        // 本文はルートが決まってから受け取る。上限と読み方（全部・少しずつ）がルートごとだからです。
+        // 受け取れなかったとき（413・400・408）は、ミドルウェアもハンドラも通さずに返します。
+        // `with_exceptions` と `APP_DEBUG` も使いません（中身の無いエラーなので、見せ方を変える理由が無い）。
+        // 後ろの HEAD の扱いと本文を持てない状態の扱いは、ほかの応答と同じく通します。
+        let response = match req.receive_body(policy).await {
+            Err(error) => error_response(&error, RenderOptions::new(false, options.wants_json)),
+            Ok(()) => self.run_stack(inner, req, options).await,
         };
 
         let response = if is_head {
@@ -184,12 +175,55 @@ impl Application {
         )
     }
 
-    /// 最内側のハンドラを決める（ルート本体・405・静的ファイル・404）。
+    /// 共通の並び → ルートの並び → ハンドラを回して、応答にする。
+    async fn run_stack(
+        &self,
+        inner: Arc<dyn ErasedHandler>,
+        req: Request,
+        options: RenderOptions,
+    ) -> Response {
+        let future = Next::new(self.inner.global.clone(), inner, options.clone()).run(req);
+
+        // ミドルウェアとハンドラのパニックを1リクエストに閉じ込める。
+        // 並びの一番外で包むので、共通ミドルウェアの中で起きたものも 500 になります。
+        //
+        // この形は意図したものです（決定記録 #008）。`catch_unwind` に替えると
+        // `UnwindSafe` の扱いが広く波及するので、ここは変えません。
+        //
+        // **制限**: クライアントが切断すると、axum 側の処理は落ちますが、ここで
+        // 切り出したタスクは走り続けます。そのタスクは停止処理の追跡から外れるので、
+        // 終了を待ってもらえません（停止の上限時間まで走り、そこで打ち切られます）。
+        match tokio::spawn(future).await {
+            // `Next::run` は必ず `Ok` を返します（エラーはその中でレスポンスに変わります）。
+            // ここの `Err` には来ませんが、型を合わせるために同じ関数を通します。
+            Ok(result) => crate::http::response::render(result, options),
+            Err(join_error) => {
+                let error = Error::msg(panic_message(join_error, options.debug));
+                tracing::error!("ハンドラがパニックしました: {error}");
+                error_response(&error, options)
+            }
+        }
+    }
+
+    /// 最内側のハンドラと、本文の受け取り方を決める（ルート本体・405・静的ファイル・404）。
     ///
     /// パス引数・ルート名・登録パスは、ミドルウェアからも見えるように**ここで**載せます。
-    fn innermost(&self, req: &mut Request, options: &RenderOptions) -> Arc<dyn ErasedHandler> {
-        match self.inner.routes.find(req.method(), req.path()) {
+    /// ルートに当たらなかったときの本文は、既定の上限で全部読みます。
+    fn innermost(
+        &self,
+        req: &mut Request,
+        options: &RenderOptions,
+    ) -> (Arc<dyn ErasedHandler>, BodyPolicy) {
+        let default_policy = BodyPolicy {
+            limit: self.inner.max_body,
+            stream: false,
+        };
+        let handler = match self.inner.routes.find(req.method(), req.path()) {
             Matched::Found { def, path, params } => {
+                let policy = BodyPolicy {
+                    limit: def.max_body.unwrap_or(self.inner.max_body),
+                    stream: def.stream_body,
+                };
                 let name = def.name.clone();
                 req.set_params(params);
                 req.set_route_name(name);
@@ -201,17 +235,18 @@ impl Application {
                 // ルートごとの並びが無ければ、ハンドラをそのまま返す。
                 // 包み直すと `Arc` を1つ作って捨てるだけなので、何もしない。
                 let Some(stack) = def.stack.clone() else {
-                    return def.handler.clone();
+                    return (def.handler.clone(), policy);
                 };
 
                 let handler = def.handler.clone();
                 let options = options.clone();
-                Arc::new(Erased::new(move |req: Request| {
+                let wrapped: Arc<dyn ErasedHandler> = Arc::new(Erased::new(move |req: Request| {
                     // ルートごとの並びは、共通の並びの内側で回す。
                     // `Fn` なので捕まえたものは動かせない。どれも `Arc` のクローンで済む。
                     let next = Next::new(stack.clone(), handler.clone(), options.clone());
                     async move { next.run(req).await }
-                }))
+                }));
+                return (wrapped, policy);
             }
             Matched::MethodNotAllowed { mut allowed } => {
                 // HEAD は GET で受けると決めているので、GET があれば HEAD も並べる。
@@ -247,7 +282,8 @@ impl Application {
             }
             // 起動時に作ったものをそのまま返す。描画の指定はリクエストから作り直せる。
             Matched::NotFound => self.inner.not_found.clone(),
-        }
+        };
+        (handler, default_policy)
     }
 
     /// 描画の指定（`APP_DEBUG` と、JSON で返すか）をリクエストから作る。
@@ -534,6 +570,7 @@ impl ApplicationBuilder {
                     storage_public_dir,
                     storage_public_canonical,
                     debug: app_config().debug,
+                    max_body: crate::http::body::max_body_from_env(),
                     exceptions,
                     not_found,
                 }
@@ -922,5 +959,165 @@ mod tests {
             assert_eq!(response.header("content-type"), None, "{method}");
             assert_eq!(response.header("content-length"), None, "{method}");
         }
+    }
+
+    // ---- 本文の受け取り（上限・少しずつ読む） ----
+
+    /// まだ読んでいない本文を載せた POST（サーバーとテストのクライアントと同じ形）。
+    fn post_body(path: &str, body: &[u8]) -> Request {
+        Request::new("POST", path)
+            .with_pending_body(crate::http::body::PendingBody::memory(body.to_vec()))
+    }
+
+    /// 受け取った本文の長さを返す。
+    async fn body_length(req: Request) -> AppResult<Response> {
+        Ok(Response::text(req.body().len().to_string()))
+    }
+
+    /// 本文を少しずつ読み、合計と `body()` の長さを返す。
+    async fn streamed_length(req: Request) -> AppResult<Response> {
+        let buffered = req.body().len();
+        let mut body = req.body_stream()?;
+        let mut total = 0;
+        while let Some(chunk) = body.chunk().await? {
+            total += chunk.len();
+        }
+        Ok(Response::text(format!("{total}/{buffered}")))
+    }
+
+    fn body_app() -> Application {
+        Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::post("/small", body_length).max_body(4);
+                    Route::post("/default", body_length);
+                    Route::post("/stream", streamed_length)
+                        .stream_body()
+                        .max_body(8);
+                    Route::post("/twice", |req: Request| async move {
+                        req.body_stream()?;
+                        req.body_stream()?;
+                        Ok(Response::text("届かない"))
+                    })
+                    .stream_body();
+                })
+            })
+            .create()
+    }
+
+    #[tokio::test]
+    async fn ルートの上限ちょうどは通り_超えたら413() {
+        let app = body_app();
+        let ok = app.handle(post_body("/small", b"1234")).await;
+        assert_eq!(ok.status(), 200);
+        assert_eq!(ok.body_text(), "4");
+
+        let over = app.handle(post_body("/small", b"12345")).await;
+        assert_eq!(over.status(), 413);
+    }
+
+    #[tokio::test]
+    async fn 上限を決めないルートは既定の上限() {
+        let app = body_app();
+        let ok = app.handle(post_body("/default", &[b'a'; 1024])).await;
+        assert_eq!(ok.body_text(), "1024");
+
+        let limit = usize::try_from(crate::http::body::DEFAULT_MAX_BODY_BYTES).unwrap();
+        let over = app
+            .handle(post_body("/default", &vec![b'a'; limit + 1]))
+            .await;
+        assert_eq!(over.status(), 413);
+    }
+
+    #[tokio::test]
+    async fn 申告が上限を超えていれば読まずに413() {
+        // 中身は 1 バイトでも、申告が上限を超えていれば断る。
+        let req = post_body("/small", b"1")
+            .with_headers(vec![("content-length".to_string(), "100".to_string())]);
+        assert_eq!(body_app().handle(req).await.status(), 413);
+    }
+
+    #[tokio::test]
+    async fn 本文のエラーはjsonを欲しがる相手にjsonで返す() {
+        let req = post_body("/small", b"12345")
+            .with_headers(vec![("accept".to_string(), "application/json".to_string())]);
+        let response = body_app().handle(req).await;
+        assert_eq!(response.status(), 413);
+        assert_eq!(response.header("content-type"), Some("application/json"));
+    }
+
+    #[tokio::test]
+    async fn headで本文のエラーになっても本文は返さない() {
+        // 申告が上限を超えた HEAD。413 でも、HEAD なので本文は付けない（長さは残す）。
+        let req = Request::new("HEAD", "/small")
+            .with_pending_body(crate::http::body::PendingBody::memory(Vec::new()))
+            .with_headers(vec![("content-length".to_string(), "100".to_string())]);
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::get("/small", body_length).max_body(4);
+                })
+            })
+            .create();
+        let response = app.handle(req).await;
+        assert_eq!(response.status(), 413);
+        assert!(response.body().is_empty(), "HEAD に本文は付けない");
+        assert!(response.header("content-length").is_some());
+    }
+
+    #[tokio::test]
+    async fn stream_bodyのルートは少しずつ読めて_bodyは空() {
+        let response = body_app().handle(post_body("/stream", b"12345678")).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body_text(), "8/0");
+    }
+
+    #[tokio::test]
+    async fn 少しずつ読んでも上限を超えたら413() {
+        let response = body_app().handle(post_body("/stream", b"123456789")).await;
+        assert_eq!(response.status(), 413);
+    }
+
+    #[tokio::test]
+    async fn stream_bodyの無いルートでbody_streamを呼ぶと500() {
+        async fn wrong(req: Request) -> AppResult<Response> {
+            req.body_stream()?;
+            Ok(Response::text("届かない"))
+        }
+        let app = Application::configure()
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::post("/wrong", wrong);
+                })
+            })
+            .create();
+        assert_eq!(app.handle(post_body("/wrong", b"x")).await.status(), 500);
+    }
+
+    #[tokio::test]
+    async fn body_streamは1回しか取り出せない() {
+        assert_eq!(
+            body_app().handle(post_body("/twice", b"x")).await.status(),
+            500
+        );
+    }
+
+    #[tokio::test]
+    async fn 本文を受け取る前にミドルウェアは通らない_受け取った後に通る() {
+        // 413 はミドルウェアを通さない（共通のヘッダーが付かない）。
+        let app = Application::configure()
+            .with_middleware(|m| m.append(powered_by))
+            .with_routing(|r| {
+                r.web(|| {
+                    Route::post("/small", body_length).max_body(4);
+                })
+            })
+            .create();
+        let over = app.handle(post_body("/small", b"12345")).await;
+        assert_eq!(over.status(), 413);
+        assert_eq!(over.header("x-powered-by"), None);
+
+        let ok = app.handle(post_body("/small", b"1234")).await;
+        assert_eq!(ok.header("x-powered-by"), Some("bengara"));
     }
 }

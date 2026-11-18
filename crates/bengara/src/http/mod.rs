@@ -1,5 +1,6 @@
 //! HTTP の入口。リクエスト、レスポンス、ルーティング。
 
+pub(crate) mod body;
 pub(crate) mod cookie;
 pub(crate) mod handler;
 pub(crate) mod middleware;
@@ -11,6 +12,7 @@ pub(crate) mod statics;
 pub(crate) mod throttle;
 pub(crate) mod url;
 
+pub use body::BodyStream;
 pub use cookie::{Cookie, SameSite};
 pub use handler::{BoxFuture, Handler};
 pub use middleware::{Middleware, Middlewares, Next};

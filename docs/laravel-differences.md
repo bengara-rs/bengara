@@ -81,6 +81,8 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | `redirect('/login')`           | `redirect().to("/login")`                                         |
 | `abort(403)`                   | `return abort(403);`                                              |
 | 例外を投げる                   | `Err` を返す。状態コードを持つエラーならそのコードになる          |
+| 本文の上限は PHP の `post_max_size` | `.env` の `APP_MAX_BODY_BYTES`（既定 2 MiB）と、ルートの `.max_body(バイト)` |
+| 本文を全部受け取ってから動く   | 同じ。ただし `.stream_body()` のルートは `req.body_stream()?` で少しずつ読む |
 
 くわしくは [requests-and-responses.md](requests-and-responses.md) にあります。
 
@@ -222,9 +224,14 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | `Cache::tags([...])`                      | ありません。鍵に頭を付ける                                               |
 | `Storage::disk('s3')`                     | `storage/` の下だけ                                                      |
 | `Storage::url()` / `storage:link`         | ありません。`/storage/` ＋ パスの URL を自分で組み立てる（直接配信される） |
+| `Storage::append('a.log', '行')`          | 同じ名前。挟む改行は**どの OS でも `\n`**                               |
+| （改行を挟まずに書き足す）                | `Storage::disk(名前).append_bytes(..)`                                   |
+| `Storage::writeStream(..)`                | `Storage::disk(名前).write_stream(パス, req.body_stream()?)`。**最後まで受け取れたときだけ**置き換わる |
 | `SendWelcome::dispatch()`                 | `app/Jobs/SendWelcome.rs` の関数 ＋ `Queue::push("SendWelcome", &payload)` |
 | `->onQueue()` / `->delay()`               | `Queue::push_on` / `Queue::later` / `Queue::later_on`                    |
 | `retry_after` を設定ファイルに書く        | `queue:work --retry-after=`（既定 90 秒）                                |
+| ジョブの `public $timeout = 120;`         | `config/queue.rs` の `QueueConfig::default().timeout("ジョブ名", 120)`。無ければ `--timeout` |
+| `retry_after` を一番長いジョブより長くする | **要りません。** 打ち切りの時間が長いジョブは、予約を延ばす             |
 | 時間切れでワーカーごと落とす              | **そのジョブだけ失敗にする。** ワーカーは次へ進む                        |
 | Redis のキュー・キャッシュ                | ありません。キューはデータベース、キャッシュはファイル                   |
 | `->everyMinute()` / `->cron('0 3 * * 1')` | `Every::Minute` などの列挙。cron の式は読まない                          |
@@ -234,6 +241,8 @@ bengara は Laravel の構成と書き味に寄せていますが、同じでは
 | 知らない `MAIL_MAILER` は例外             | 送るときにエラー（`log` には落とさない）                                 |
 | `MAIL_ENCRYPTION=null`                    | `none` か `null`。**空にすると `starttls`**                              |
 | `Notification`                            | 作りません。`Mail` を使う                                                |
+| `Process::run('ls -la')`                  | `Process::run(["ls", "-la"]).await?`。**シェルを通さない**（[processes.md](processes.md)） |
+| `Process::timeout(120)->run(..)`（既定 60 秒） | 同じ（既定 60 秒）。打ち切ると**子プロセスを止める**。待つ側がやめたときも同じ |
 | `__('messages.welcome')`                  | 同じ（`__`）。`:name` の差し替えは `__with`                              |
 | `App::setLocale()`                        | `Lang::set`（プロセス全体）。リクエストごとなら `Lang::with`             |
 | 言語ファイルは PHP の配列                 | `resources/lang/<言語>.toml`。**ビルド時に読む**                         |
@@ -294,6 +303,6 @@ PHP の言語や実行の形に結びついた機能は作りません。
 ## その他
 
 - `GET` のルートは `HEAD` にも応答します。
-- 本文の上限は 2 MiB です。超えると 413 を返します。
+- 本文の上限は既定 2 MiB です。`APP_MAX_BODY_BYTES` とルートの `.max_body(..)` で変えられます。超えると 413 を返します。
 - ハンドラがパニックしても 500 を返すだけです。プロセスは落ちません。
 - `APP_DEBUG=true` のときだけ、エラーページに詳細が出ます。

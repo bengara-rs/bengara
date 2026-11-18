@@ -40,6 +40,7 @@ bengara を使う人のための資料です。読むページをここで探し
 | [events.md](events.md)                     | イベントと、聞く側                   |
 | [mail.md](mail.md)                         | メール（`log` / `array` / SMTP）     |
 | [websocket.md](websocket.md)               | WebSocket と配信（`Broadcast`）      |
+| [processes.md](processes.md)               | 外部コマンドの起動（`Process`）と重い処理 |
 | [localization.md](localization.md)         | 多言語                               |
 | [console-commands.md](console-commands.md) | 自分のコマンド                       |
 

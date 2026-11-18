@@ -12,17 +12,6 @@ use crate::application::Application;
 use crate::error::{Error, Result};
 use crate::http::{Request, Response};
 
-/// 受け取る本文の上限（2 MiB）。超えると 413 を返します。
-const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-
-/// 本文を読み終えるまでに掛けてよい時間。過ぎると 408 を返します。
-///
-/// 2 MiB をこの時間で送れない相手は、回線が細いのではなく、わざと遅く送って
-/// 接続を握り続けている可能性のほうが高いです。
-/// 接続そのものの待ち時間（ヘッダーが来るまで・idle）と同時接続数の上限は
-/// 持ちません。前段のプロキシで掛けてください（`docs/deployment.md`）。
-const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// 上限で打ち切った後、裏のスレッドが終わるのを待つ時間。
 ///
 /// 打ち切った時点で走っている `spawn_blocking`（静的ファイル・セッション・
@@ -219,8 +208,8 @@ async fn dispatch(
     #[cfg(not(feature = "websocket"))]
     let _ = sockets;
 
-    // アプリへ渡す前に返すときも、相手が JSON を欲しがっているなら JSON で返す。
-    // 判定に使うヘッダーはこの時点で手元にあるので、先に求めておく。
+    // 101 を直すとき（`websocket::after_response`）も、相手が JSON を欲しがっているなら
+    // JSON で返す。判定に使うヘッダーはこの時点で手元にあるので、先に求めておく。
     let wants_json = crate::application::wants_json_with(|name| {
         parts
             .headers
@@ -228,34 +217,8 @@ async fn dispatch(
             .and_then(|value| value.to_str().ok())
     });
 
-    // 先に長さの申告を見る。上限を超えていると分かっているときだけ 413 にする。
-    if too_large(declared_length(&parts.headers)) {
-        return early_error(Error::http(413, "本文が大きすぎます"), wants_json);
-    }
-
-    // 本文を読むのに掛けてよい時間に上限を置く。送りを遅らせるだけで接続とタスクを
-    // 握り続けられないようにするため。間に合わなければ 408 で切る。
-    let read = tokio::time::timeout(
-        BODY_READ_TIMEOUT,
-        axum::body::to_bytes(body, MAX_BODY_BYTES),
-    )
-    .await;
-    let bytes = match read {
-        Ok(Ok(bytes)) => bytes.to_vec(),
-        Ok(Err(_)) => {
-            // ここに来るのは、途中で接続が切れた・chunked が壊れていた・
-            // 長さの申告が無いまま上限を超えた、のどれかです。
-            // 「大きすぎる」と分かっているのは申告を見た上の分岐だけなので、ここは 400。
-            return early_error(Error::http(400, "本文を読み取れませんでした"), wants_json);
-        }
-        Err(_elapsed) => {
-            return early_error(
-                Error::http(408, "本文の受け取りに時間がかかりすぎました"),
-                wants_json,
-            );
-        }
-    };
-
+    // 本文はここでは読まない。上限と読み方（全部・少しずつ）はルートごとに決まるので、
+    // 照合した後に `Request::receive_body` が受け取ります（`http/body.rs`）。
     let headers = parts
         .headers
         .iter()
@@ -273,7 +236,7 @@ async fn dispatch(
     let req = Request::new(parts.method.as_str(), parts.uri.path())
         .with_query(parts.uri.query().unwrap_or_default())
         .with_headers(headers)
-        .with_body(bytes)
+        .with_pending_body(crate::http::body::PendingBody::incoming(body))
         .with_remote_addr(peer);
     #[cfg(feature = "websocket")]
     let req = match handoff {
@@ -450,33 +413,6 @@ fn is_sensitive_name(name: &str) -> bool {
         return true;
     }
     name.contains('%') && crate::http::request::is_sensitive(&crate::http::percent::decode(name))
-}
-
-/// `Content-Length` の申告を読む。無い・読めないときは `None`。
-fn declared_length(headers: &axum::http::HeaderMap) -> Option<usize> {
-    headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<usize>().ok())
-}
-
-/// 申告された長さが上限を超えているか。
-///
-/// 申告が無ければ、読んでみるまで分かりません。読んで失敗したときは
-/// 「大きすぎる」と決めつけず 400 にします（接続が切れただけのこともあります）。
-fn too_large(declared: Option<usize>) -> bool {
-    declared.is_some_and(|length| length > MAX_BODY_BYTES)
-}
-
-/// アプリに渡す前に返すエラー。
-///
-/// 設定（`APP_DEBUG`）はまだ読めないので詳細は出しませんが、
-/// **JSON で返すかどうかはヘッダーから分かる**ので、そこは尊重します。
-fn early_error(error: Error, wants_json: bool) -> axum::response::Response {
-    into_axum(crate::http::response::error_response(
-        &error,
-        crate::http::response::RenderOptions::new(false, wants_json),
-    ))
 }
 
 /// `bengara` のレスポンスを axum の形に変える。
@@ -729,33 +665,6 @@ mod tests {
         assert_eq!(
             axum_response.headers().get_all("set-cookie").iter().count(),
             2
-        );
-    }
-
-    #[test]
-    fn 本文の長さの申告を読む() {
-        let mut headers = axum::http::HeaderMap::new();
-        assert_eq!(declared_length(&headers), None);
-        headers.insert(
-            axum::http::header::CONTENT_LENGTH,
-            "123".parse().expect("ヘッダーの値"),
-        );
-        assert_eq!(declared_length(&headers), Some(123));
-        headers.insert(
-            axum::http::header::CONTENT_LENGTH,
-            "abc".parse().expect("ヘッダーの値"),
-        );
-        assert_eq!(declared_length(&headers), None, "読めなければ分からない");
-    }
-
-    #[test]
-    fn 上限を超える申告だけ413にする() {
-        assert!(too_large(Some(MAX_BODY_BYTES + 1)));
-        assert!(!too_large(Some(MAX_BODY_BYTES)));
-        assert!(!too_large(Some(0)));
-        assert!(
-            !too_large(None),
-            "申告が無ければ、読んで失敗しても 413 にはしない"
         );
     }
 
@@ -1051,6 +960,156 @@ mod tests {
     fn ログはwebsocketのチケットも伏せる() {
         let req = Request::new("GET", "/gateway").with_query("ticket=abc&v=1");
         assert_eq!(log_target(&req), "/gateway?ticket=***&v=1");
+    }
+
+    /// 実際に `127.0.0.1:0` で待ち受けて、本文を手で組んだ HTTP/1.1 で送る。
+    ///
+    /// テストのクライアントはメモリの本文を 1 かたまりで渡すので、hyper の本文
+    /// （chunked・何回かに分けて届く・長さの申告）を通る道はここで確かめます。
+    mod body {
+        use super::*;
+        use crate::http::Route;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn length(req: Request) -> Result<Response> {
+            Ok(Response::text(req.body().len().to_string()))
+        }
+
+        /// 少しずつ読み、合計のバイト数とかたまりの数を返す。
+        async fn streamed(req: Request) -> Result<Response> {
+            let mut body = req.body_stream()?;
+            let (mut total, mut chunks) = (0, 0);
+            while let Some(chunk) = body.chunk().await? {
+                total += chunk.len();
+                chunks += 1;
+            }
+            Ok(Response::text(format!("{total} {chunks}")))
+        }
+
+        async fn start() -> SocketAddr {
+            let app = Application::configure()
+                .with_routing(|r| {
+                    r.web(|| {
+                        Route::post("/buffered", length).max_body(10);
+                        Route::post("/stream", streamed).stream_body().max_body(10);
+                    })
+                })
+                .create();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let service = router(app, crate::websocket::ServerState::new(10));
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, service).await;
+            });
+            addr
+        }
+
+        /// ヘッダーを送り、本文を `pieces` ごとに少し間を空けて送り、応答を全部読む。
+        ///
+        /// 書くのと読むのは**同時に**進めます。サーバーは途中で 413 を返して閉じることが
+        /// あり、書き終えてから読むと、閉じた相手に書いた時点で接続がリセットされ
+        /// （Windows）、届いていた応答まで読めなくなるためです。ブラウザも同じく
+        /// 送りながら応答を読みます。途中で断られると書き込みは失敗するので、そのエラーは見ません。
+        async fn send(addr: SocketAddr, head: &str, pieces: &[&[u8]]) -> (u16, String) {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut reader, mut writer) = stream.into_split();
+            let mut outgoing = vec![head.as_bytes().to_vec()];
+            outgoing.extend(pieces.iter().map(|piece| piece.to_vec()));
+            let writing = tokio::spawn(async move {
+                for piece in outgoing {
+                    if writer.write_all(&piece).await.is_err() {
+                        return;
+                    }
+                    let _ = writer.flush().await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+                // 書き終えても閉じない（`connection: close` なのでサーバーが閉じる）。
+                std::future::pending::<()>().await;
+            });
+            let mut raw = Vec::new();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(10), reader.read_to_end(&mut raw)).await;
+            writing.abort();
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let status = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(0);
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            (status, body)
+        }
+
+        fn chunked(path: &str) -> String {
+            format!(
+                "POST {path} HTTP/1.1\r\nhost: localhost\r\ntransfer-encoding: chunked\r\n\
+                 connection: close\r\n\r\n"
+            )
+        }
+
+        #[tokio::test]
+        async fn 分けて届いた本文を少しずつ読める() {
+            let addr = start().await;
+            let (status, body) = send(
+                addr,
+                &chunked("/stream"),
+                &[
+                    b"3\r\nabc\r\n",
+                    b"3\r\ndef\r\n",
+                    b"3\r\nghi\r\n",
+                    b"0\r\n\r\n",
+                ],
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let (total, chunks) = body.split_once(' ').expect("合計とかたまりの数");
+            assert_eq!(total, "9");
+            assert!(chunks.parse::<u32>().unwrap() >= 1, "{body}");
+        }
+
+        #[tokio::test]
+        async fn 少しずつ読んだ合計が上限を超えたら413() {
+            let addr = start().await;
+            let (status, _) = send(
+                addr,
+                &chunked("/stream"),
+                &[b"6\r\nabcdef\r\n", b"6\r\nghijkl\r\n", b"0\r\n\r\n"],
+            )
+            .await;
+            assert_eq!(status, 413);
+        }
+
+        #[tokio::test]
+        async fn 申告の無い本文が上限を超えたら413() {
+            // 以前は読み取りの失敗と見分けられず 400 にしていた。
+            let addr = start().await;
+            let (status, _) = send(
+                addr,
+                &chunked("/buffered"),
+                &[b"6\r\nabcdef\r\n", b"6\r\nghijkl\r\n", b"0\r\n\r\n"],
+            )
+            .await;
+            assert_eq!(status, 413);
+        }
+
+        #[tokio::test]
+        async fn 申告が上限を超えていれば読まずに413() {
+            let addr = start().await;
+            let head = "POST /buffered HTTP/1.1\r\nhost: localhost\r\ncontent-length: 1000\r\n\
+                        connection: close\r\n\r\n";
+            let (status, _) = send(addr, head, &[]).await;
+            assert_eq!(status, 413);
+        }
+
+        #[tokio::test]
+        async fn 上限までの本文は全部読める() {
+            let addr = start().await;
+            let head = "POST /buffered HTTP/1.1\r\nhost: localhost\r\ncontent-length: 10\r\n\
+                        connection: close\r\n\r\n";
+            let (status, body) = send(addr, head, &[b"12345", b"67890"]).await;
+            assert_eq!(status, 200);
+            assert_eq!(body, "10");
+        }
     }
 
     /// 実際に `127.0.0.1:0` で待ち受けて、tokio-tungstenite のクライアントで話す。

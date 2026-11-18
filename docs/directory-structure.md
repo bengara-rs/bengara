@@ -48,6 +48,9 @@ myapp/
 
 - `src/` はありません。入口はプロジェクト直下です。
 - `init` は `resources/views/` も作りますが、使いません（テンプレートの機能はありません）。
+- `config/` には、フレームワークの設定を差し替えるファイルを足せます。
+  たとえば `config/queue.rs`（ジョブごとの打ち切りの時間、[queue.md](queue.md)）です。
+  一覧は [configuration.md](configuration.md) にあります。
 
 ## 3 つの約束
 

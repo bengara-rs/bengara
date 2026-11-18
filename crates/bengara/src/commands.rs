@@ -89,6 +89,10 @@ async fn execute(name: &str, options: &Options, hooks: Hooks) -> Result<()> {
                 once: options.once,
                 retry_after: options.retry_after,
                 timeout: options.timeout,
+                // ジョブごとの打ち切り（`config/queue.rs`）。置いていなければ空。
+                timeouts: crate::try_config::<crate::queue::QueueConfig>()
+                    .map(|config| config.timeouts.clone())
+                    .unwrap_or_default(),
             };
             crate::queue::work((hooks.jobs)(), &worker, stop).await?;
         }

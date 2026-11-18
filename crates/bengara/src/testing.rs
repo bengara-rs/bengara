@@ -187,10 +187,13 @@ impl TestClient {
 
         // 接続元のアドレスを入れておく。入れないと `req.ip()` が空になり、
         // 回数の制限（`Throttle`）が鍵を作れずに素通りしてしまう。
+        //
+        // 本文は「まだ読んでいないもの」として渡す。サーバーと同じく照合の後に
+        // 受け取るので、本文の上限（413）と `.stream_body()` のルートもテストで確かめられる。
         let req = Request::new(method, path)
             .with_query(query)
             .with_headers(headers)
-            .with_body(body)
+            .with_pending_body(crate::http::body::PendingBody::memory(body))
             .with_remote_addr(TEST_REMOTE_ADDR);
         let response = self.app.handle(req).await;
         self.remember_cookies(&response);

@@ -39,12 +39,13 @@ pub mod lang;
 pub mod mail;
 pub(crate) mod ops;
 mod paths;
+pub mod process;
 pub mod queue;
 pub mod schedule;
 mod server;
 pub mod session;
 mod storage;
-mod support;
+pub mod support;
 pub mod validation;
 pub mod websocket;
 
@@ -67,14 +68,14 @@ pub use error::{Error, Result};
 pub use events::{Event, Events, Listener, ListenerFuture};
 pub use http::{
     abort, abort_with, escape_html, has_valid_signature, html, json, redirect, route, route_url,
-    route_url_with, route_with, signed_url, temporary_signed_url, text, url, BoxFuture, Cookie,
-    Handler, Middleware, Middlewares, Next, Redirect, Registered, Request, Response, Route,
+    route_url_with, route_with, signed_url, temporary_signed_url, text, url, BodyStream, BoxFuture,
+    Cookie, Handler, Middleware, Middlewares, Next, Redirect, Registered, Request, Response, Route,
     RouteGroup, SameSite, Throttle,
 };
 pub use lang::{__with, Lang, LangTable, __};
 pub use mail::{Mail, MailConfig, Mailer, Message};
 pub use paths::{app_path, base_path, public_path, storage_path};
-pub use queue::{Job, JobFuture, Queue};
+pub use queue::{Job, JobFuture, Queue, QueueConfig};
 pub use schedule::{Every, Schedule, Task};
 pub use storage::{DiskConfig, Storage, StorageConfig};
 

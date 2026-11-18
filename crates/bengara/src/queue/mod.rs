@@ -52,6 +52,41 @@ pub struct Job {
     pub handle: fn(String) -> JobFuture,
 }
 
+/// キューの設定。`config/queue.rs` が返します。Laravel の `config/queue.php` に当たります。
+///
+/// ファイル名は自由です。見分けるのは名前ではなく、`config()` が返す型です。
+///
+/// ```ignore
+/// use bengara::queue::QueueConfig;
+///
+/// pub fn config() -> QueueConfig {
+///     QueueConfig::default()
+///         .timeout("TranscodeVideo", 30 * 60) // 30 分
+///         .timeout("SendWelcome", 30)
+/// }
+/// ```
+///
+/// 置かなければ、どのジョブも `queue:work --timeout`（既定 60 秒）で打ち切ります。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueConfig {
+    /// ジョブごとの打ち切りの時間（秒）。ジョブの名前（`app/Jobs/` のファイル名）と秒の組です。
+    ///
+    /// Laravel のジョブの `$timeout` に当たります。決めたジョブは `--timeout` より
+    /// こちらを使います。`0` は打ち切りません（`--timeout 0` と同じ）。
+    ///
+    /// 打ち切りの時間が `--retry-after` より長いジョブは、**予約もその分だけ延ばします。**
+    /// 動いている途中に別のワーカーが取り直して、二重に動くことはありません。
+    pub timeouts: Vec<(String, u64)>,
+}
+
+impl QueueConfig {
+    /// ジョブの打ち切りの時間（秒）を決める。
+    pub fn timeout(mut self, job: impl Into<String>, secs: u64) -> Self {
+        self.timeouts.push((job.into(), secs));
+        self
+    }
+}
+
 impl std::fmt::Debug for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Job").field("name", &self.name).finish()

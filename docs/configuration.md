@@ -80,6 +80,10 @@ let shop = config::<crate::config::shop::ShopConfig>();
 | `StorageConfig`  | ファイルの置き場所     | [storage.md](storage.md)               | 作らない        |
 | `HashConfig`     | パスワードの変換の回数 | [authentication.md](authentication.md) | 作らない        |
 | `BroadcastConfig` | 配信の送り方          | [websocket.md](websocket.md)           | 作らない        |
+| `QueueConfig`    | ジョブごとの打ち切りの時間 | [queue.md](queue.md)               | 作らない        |
+
+- `QueueConfig` は `bengara::queue::QueueConfig` です（`config/queue.rs` に置くのが Laravel の形）。
+  環境変数からは読みません。置かなければ、どのジョブも `queue:work --timeout` で打ち切ります。
 
 ### いまの環境を調べる
 
@@ -174,9 +178,13 @@ Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C
 | `APP_HOST`             | `127.0.0.1` | 待ち受けるホスト                                                    |
 | `APP_PORT`             | `8000`      | 待ち受けるポート                                                    |
 | `APP_SHUTDOWN_TIMEOUT` | `30`        | 止めるときに待つ上限の秒数。**`0` は無制限**（[deployment.md](deployment.md#止める)） |
+| `APP_MAX_BODY_BYTES`   | `2097152`   | 受け取る本文の上限のバイト数（2 MiB）。ルートの `.max_body` が優先（[requests-and-responses.md](requests-and-responses.md)） |
 | `TRUSTED_PROXIES`      | （空）      | 信頼する前段のアドレス（[TRUSTED_PROXIES](#trusted_proxies)）       |
 
 どれもフレームワークが直接読みます。
+
+- `APP_MAX_BODY_BYTES` は起動時に 1 回だけ読みます。実行中は変わりません。
+- `APP_MAX_BODY_BYTES` が `0` や数として読めない値なら、警告を出して既定の 2097152 にします。
 
 ### 置き場所
 

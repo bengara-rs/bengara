@@ -169,6 +169,32 @@ Route::get("/admin", AdminController::index)
 
 名前の登録は [middleware.md](middleware.md) にあります。
 
+## 本文の受け取り方を決める
+
+`.name()` や `.middleware()` と同じように、ルートの後ろに続けて書きます。
+
+```rust
+Route::post("/imports", ImportController::store).max_body(16 * 1024 * 1024);
+
+Route::post("/uploads/{name}", UploadController::store)
+    .middleware("auth")
+    .stream_body()
+    .max_body(512 * 1024 * 1024);
+```
+
+| メソッド           | すること                                                         |
+|--------------------|------------------------------------------------------------------|
+| `.max_body(バイト)` | このルートで受け取る本文の上限。無ければ `APP_MAX_BODY_BYTES`（既定 2 MiB） |
+| `.stream_body()`   | 本文を読まずにハンドラへ渡す。ハンドラは `req.body_stream()?` で少しずつ読む |
+
+- 上限を超えると 413 を返します。
+- `.max_body(0)` は「本文を受け付けない」です。空でない本文はすべて 413 になります。
+  `.env` の `APP_MAX_BODY_BYTES=0` は書き間違いと見て既定に戻しますが、ルートの `0` は書いたとおりに効きます。
+- `.stream_body()` の無いルートは、30 秒で読み終える必要があります（過ぎると 408）。
+  何 MB もある本文は `.stream_body()` と組み合わせます。
+- **ルートごとにだけ付けられます。** グループ（`Route::prefix(..)`）には付けられません。
+- くわしい動きは [requests-and-responses.md](requests-and-responses.md) の「本文の上限」と「本文を少しずつ読む」にあります。
+
 ## グループ
 
 同じ設定をまとめて付けます。

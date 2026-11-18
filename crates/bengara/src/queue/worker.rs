@@ -6,7 +6,10 @@
 //! - 停止の合図（Ctrl+C）を受けたら、**いま処理中のジョブを終えてから**止まります。
 //! - ワーカーが強制終了しても、`retry_after` 秒たてば別のワーカーが取り直します
 //!   （Laravel の `retry_after` と同じ考え方）。
-//! - 1 本のジョブは `timeout` 秒で打ち切ります（[`run_one`]）。
+//! - 1 本のジョブは `timeout` 秒で打ち切ります（[`run_one`]）。ジョブごとの値は
+//!   `config/queue.rs`（[`QueueConfig`](super::QueueConfig)）で決められます。
+//! - 打ち切りの時間が `retry_after` より長いジョブは、予約もその分だけ延ばします
+//!   （[`reserved_until`]）。動いている途中に取り直されて二重に動くことはありません。
 //! - DB の一時的なエラーでは、すぐには終わりません。短い待ちを挟んで
 //!   数回やり直します（[`RESERVE_RETRIES`]、[`RECORD_RETRIES`]）。
 
@@ -33,14 +36,17 @@ pub(crate) struct Options {
     pub once: bool,
     /// 処理中のまま放置されたジョブを取り直すまでの秒数。
     ///
-    /// **1 本のジョブにかかる最長の時間より長くしてください。** 短いと、
-    /// まだ動いているジョブを別のワーカーが二重に処理します。
+    /// 打ち切りの時間（`timeout`）がこれより長いジョブは、予約をその分だけ
+    /// 延ばします（[`reserved_until`]）。打ち切らない（`0`）ジョブだけは延ばせないので、
+    /// この秒数を過ぎると、まだ動いていても別のワーカーが取り直します。
     pub retry_after: i64,
     /// 1 本のジョブを待つ上限（秒）。**0 は無制限です。**
     ///
     /// 超えたらジョブのタスクを打ち切って、失敗として扱います。
-    /// **`retry_after` より短くしてください**（[`timeout_warning`]）。
+    /// `timeouts` に載っているジョブは、そちらを使います。
     pub timeout: u64,
+    /// ジョブごとの打ち切りの時間（秒）。`config/queue.rs` の [`QueueConfig`](super::QueueConfig) から来ます。
+    pub timeouts: Vec<(String, u64)>,
 }
 
 impl Default for Options {
@@ -52,8 +58,72 @@ impl Default for Options {
             once: false,
             retry_after: DEFAULT_RETRY_AFTER,
             timeout: DEFAULT_TIMEOUT,
+            timeouts: Vec::new(),
         }
     }
+}
+
+impl Options {
+    /// そのジョブを待つ上限（秒）と、どこで決めたか。
+    ///
+    /// `config/queue.rs` に載っていればそれ（最初の 1 つ）、無ければ `--timeout` です。
+    fn timeout_for(&self, job: &str) -> (u64, TimeoutSource) {
+        match self.timeouts.iter().find(|(name, _)| name == job) {
+            Some((_, secs)) => (*secs, TimeoutSource::Config),
+            None => (self.timeout, TimeoutSource::Flag),
+        }
+    }
+}
+
+/// 打ち切りの時間をどこで決めたか。打ち切ったときの説明文に入れます。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutSource {
+    /// `queue:work --timeout`（既定 60 秒）。
+    Flag,
+    /// `config/queue.rs` の `QueueConfig::timeout`。
+    Config,
+}
+
+impl TimeoutSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flag => "--timeout",
+            Self::Config => "config/queue.rs",
+        }
+    }
+}
+
+/// 打ち切りの時間が `retry_after` に足りないときに、予約へ足す余裕（秒）。
+///
+/// 打ち切った後の後始末（[`ABORT_GRACE`] と結果の記録）の時間です。
+/// 予約が切れるのは「打ち切りの時間 + これ」と `retry_after` の遅いほうです。
+const RECLAIM_MARGIN_SECS: i64 = 30;
+
+/// 予約の目印（`reserved_at`）に書く時刻。
+///
+/// 取り直しの判定は `reserved_at <= now - retry_after` です（[`reclaim_cutoff`]）。
+/// 打ち切りの時間が `retry_after` より長いジョブにいまの時刻を書くと、動いている
+/// 途中で取り直されて二重に動きます。そこで、その分だけ**先の時刻**を書きます。
+/// 判定の式は変えないので、どのワーカーも同じ表で同じように見分けられます。
+///
+/// | 打ち切りの時間 | 書く時刻 | 取り直されるのは |
+/// |---|---|---|
+/// | `retry_after - 30` 秒以下 | いま | `retry_after` 秒後 |
+/// | それより長い | いま + (打ち切り + 30 - `retry_after`) | 打ち切り + 30 秒後 |
+/// | 0（打ち切らない） | いま | `retry_after` 秒後（延ばせない） |
+///
+/// 時刻は `9999-12-31 23:59:59` で止めます（文字の比較が逆転しないように）。
+pub(crate) fn reserved_until(now: i64, retry_after: i64, timeout_secs: u64) -> String {
+    let timeout = i64::try_from(timeout_secs).unwrap_or(i64::MAX);
+    let extra = if timeout == 0 {
+        0
+    } else {
+        timeout
+            .saturating_add(RECLAIM_MARGIN_SECS)
+            .saturating_sub(retry_after.max(1))
+            .max(0)
+    };
+    super::available_at(now, extra.unsigned_abs())
 }
 
 /// 予約を取り直すまでの既定の秒数。Laravel の `retry_after` に当たります。
@@ -67,28 +137,55 @@ fn job_timeout(secs: u64) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
-/// `--timeout` が `--retry-after` 以上のときの警告文。問題が無ければ `None`。
+/// 打ち切りの時間（`--timeout` と `config/queue.rs`）を確かめ、気になるものを警告文にする。
 ///
-/// 打ち切る前に `retry_after` が来ると、**まだ動いているジョブ**を別のワーカーが
-/// 取り直して二重に動かします。Laravel が「`--timeout` は `retry_after` より
-/// 数秒短く」と言うのと同じ理由です。断らずに警告にとどめます。ワーカーが
-/// 1 つだけなら実害が無く、起動を止めるほどではないためです。
+/// どれも起動は止めません。ワーカーを止めるほどの誤りではないためです。
 ///
-/// 無制限（0）は警告しません。利用者が選んだ値で、比べる相手がありません。
-fn timeout_warning(options: &Options) -> Option<String> {
+/// | 見るもの | 警告する理由 |
+/// |---|---|
+/// | `--timeout 0`（打ち切らない） | 予約を延ばせないので、`--retry-after` を過ぎると二重に動く |
+/// | 設定の `app/Jobs/` に無い名前 | 書き間違いだと、そのジョブは `--timeout` のまま動く |
+/// | 設定の同じ名前が 2 回 | 使うのは最初の 1 つだけ |
+/// | 設定の `0`（打ち切らない） | `--timeout 0` と同じ |
+///
+/// `--timeout` と `--retry-after` の大小は、もう警告しません。打ち切りの時間が
+/// 長いジョブは予約を延ばすので（[`reserved_until`]）、二重には動きません。
+fn timeout_warnings(options: &Options, jobs: &[Job]) -> Vec<String> {
+    let mut warnings = Vec::new();
     if options.timeout == 0 {
-        return None;
+        warnings.push(format!(
+            "警告: --timeout 0 は打ち切りません。予約を延ばせないので、\
+             --retry-after（{} 秒）を過ぎても動いているジョブは、\
+             別のワーカーが取り直して二重に動きます",
+            options.retry_after
+        ));
     }
-    let timeout = i64::try_from(options.timeout).unwrap_or(i64::MAX);
-    if timeout < options.retry_after {
-        return None;
+    for (index, (name, secs)) in options.timeouts.iter().enumerate() {
+        if options.timeouts[..index]
+            .iter()
+            .any(|(earlier, _)| earlier == name)
+        {
+            warnings.push(format!(
+                "警告: config/queue.rs に `{name}` の打ち切りが 2 回あります。最初の 1 つを使います"
+            ));
+            continue;
+        }
+        if !jobs.iter().any(|job| job.name == name) {
+            warnings.push(format!(
+                "警告: config/queue.rs の `{name}` というジョブは app/Jobs/ にありません\
+                 （名前はファイル名です。書き間違いなら、そのジョブは --timeout で打ち切られます）"
+            ));
+        }
+        if *secs == 0 {
+            warnings.push(format!(
+                "警告: config/queue.rs の `{name}` は打ち切りません（0）。\
+                 予約を延ばせないので、--retry-after（{} 秒）を過ぎても動いていると、\
+                 別のワーカーが同じジョブを取り直して二重に動きます",
+                options.retry_after
+            ));
+        }
     }
-    Some(format!(
-        "警告: --timeout（{} 秒）が --retry-after（{} 秒）以上です。\
-         ジョブを打ち切る前に別のワーカーが同じジョブを取り直し、二重に動きます。\
-         --timeout を --retry-after より数秒短くしてください",
-        options.timeout, options.retry_after
-    ))
+    warnings
 }
 
 /// 失敗の回数から次に試すまでの待ち時間（秒）を決める。
@@ -221,7 +318,10 @@ enum Reservation {
 /// 回収され続けました。`failed_jobs` に入らないので `queue:failed` にも出ず、
 /// 取り出しは `order_by("id") limit 1` なので、そのジョブ 1 件でキュー全体が
 /// 止まりました。
-async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservation> {
+///
+/// 予約の目印に書く時刻は、ジョブの打ち切りの時間で決めます（[`reserved_until`]）。
+async fn reserve(options: &Options) -> Result<Reservation> {
+    let (queue, retry_after, tries) = (options.queue.as_str(), options.retry_after, options.tries);
     let now_secs = time::now_seconds();
     let now = time::format_timestamp(now_secs);
     let cutoff = reclaim_cutoff(now_secs, retry_after);
@@ -260,7 +360,10 @@ async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservatio
         return Ok(Reservation::Lost);
     }
 
-    let affected = claim_row(queue, id, done, &now, &cutoff, attempts).await?;
+    let job: String = row.get("job")?;
+    let (timeout_secs, _) = options.timeout_for(&job);
+    let marker = reserved_until(now_secs, retry_after, timeout_secs);
+    let affected = claim_row(queue, id, done, &now, &cutoff, attempts, &marker).await?;
 
     if affected == 0 {
         // ほかのワーカーが先に取った。待たずに取り直す。
@@ -269,17 +372,17 @@ async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservatio
 
     if was_stale {
         tracing::warn!(
-            "ジョブ #{id} は {retry_after} 秒以上処理中のままだったので取り直します（{attempts} 回目）"
+            "ジョブ #{id} は予約の期限を過ぎても処理中のままだったので取り直します（{attempts} 回目）"
         );
     }
 
     Ok(Reservation::Taken(Reserved {
         id,
-        job: row.get("job")?,
+        job,
         payload: row.get("payload")?,
         attempts,
         queue: row.get("queue")?,
-        reserved_at: now,
+        reserved_at: marker,
     }))
 }
 
@@ -297,6 +400,9 @@ async fn reserve(queue: &str, retry_after: i64, tries: u32) -> Result<Reservatio
 /// 待たずに取り直します。
 /// `seen_attempts` は**列から読んだ値そのまま**です。丸めた値を渡すと、
 /// 条件と実値がずれて永久に 0 件になります。
+///
+/// `marker` は予約の目印に書く時刻です（[`reserved_until`]）。打ち切りの時間が
+/// 長いジョブでは、いまより先の時刻になります。
 async fn claim_row(
     queue: &str,
     id: i64,
@@ -304,11 +410,12 @@ async fn claim_row(
     now: &str,
     cutoff: &str,
     attempts: i64,
+    marker: &str,
 ) -> Result<u64> {
     reservable(DB::table(TABLE).where_("id", id), queue, now, cutoff)
         .where_("attempts", seen_attempts)
         .update(&[
-            ("reserved_at", Value::Text(now.to_string())),
+            ("reserved_at", Value::Text(marker.to_string())),
             ("attempts", Value::Int(attempts)),
         ])
         .await
@@ -428,11 +535,12 @@ fn unknown_job_message(name: &str) -> String {
     format!("`{name}` というジョブはありません（app/Jobs/ を確かめてください）")
 }
 
-/// 打ち切ったときの説明文。
-fn timed_out_message(limit: Duration) -> String {
+/// 打ち切ったときの説明文。どこで決めた時間かも入れます。
+fn timed_out_message(limit: Duration, source: TimeoutSource) -> String {
     format!(
-        "{} 秒で終わらなかったので打ち切りました（--timeout）",
-        limit.as_secs()
+        "{} 秒で終わらなかったので打ち切りました（{}）",
+        limit.as_secs(),
+        source.label()
     )
 }
 
@@ -494,8 +602,9 @@ async fn run_one(
     jobs: &[Job],
     reserved: &Reserved,
     timeout: Option<Duration>,
+    source: TimeoutSource,
 ) -> std::result::Result<(), Failure> {
-    run_one_with(jobs, reserved, timeout, ABORT_GRACE).await
+    run_one_with(jobs, reserved, timeout, source, ABORT_GRACE).await
 }
 
 /// [`run_one`] の中身。様子を見る時間を引数で受け取ります（テストで短くするため）。
@@ -503,6 +612,7 @@ async fn run_one_with(
     jobs: &[Job],
     reserved: &Reserved,
     timeout: Option<Duration>,
+    source: TimeoutSource,
     grace: Duration,
 ) -> std::result::Result<(), Failure> {
     let Some(job) = jobs.iter().find(|j| j.name == reserved.job) else {
@@ -523,7 +633,7 @@ async fn run_one_with(
                 // 止まらないものの終わりは**待ちません**（待つとワーカーごと固まる）。
                 let stopped = tokio::time::timeout(grace, &mut task).await.is_ok();
                 return Err(Failure {
-                    message: timed_out_message(limit),
+                    message: timed_out_message(limit, source),
                     stuck: !stopped,
                 });
             }
@@ -646,10 +756,9 @@ async fn run_with(
         "キュー `{}` のジョブを処理します（Ctrl+C で終了）",
         options.queue
     );
-    if let Some(warning) = timeout_warning(options) {
+    for warning in timeout_warnings(options, jobs) {
         eprintln!("{warning}");
     }
-    let timeout = job_timeout(options.timeout);
 
     let mut processed = 0u64;
     // 続けて競り合いに負けた回数。取れたら 0 に戻します。
@@ -662,7 +771,7 @@ async fn run_with(
             return Ok(());
         }
 
-        let reservation = match reserve(&options.queue, options.retry_after, options.tries).await {
+        let reservation = match reserve(options).await {
             Ok(reservation) => {
                 reserve_failures = 0;
                 reservation
@@ -724,8 +833,12 @@ async fn run_with(
             continue;
         }
 
+        // 打ち切りの時間はジョブごと（`config/queue.rs`、無ければ `--timeout`）。
+        // 予約の目印も同じ値で延ばしてある（`reserve`）。
+        let (timeout_secs, source) = options.timeout_for(&reserved.job);
+        let timeout = job_timeout(timeout_secs);
         let started = std::time::Instant::now();
-        match run_one(jobs, &reserved, timeout).await {
+        match run_one(jobs, &reserved, timeout, source).await {
             Ok(()) => {
                 let finished = with_retries("成功", &stop, retry_unit, || finish(&reserved)).await;
                 if let Err(error) = finished {
@@ -876,30 +989,97 @@ mod tests {
         assert_eq!(options.sleep, 1);
         assert!(!options.once);
         assert_eq!(options.retry_after, 90);
-        // Laravel の `--timeout` と同じ 60 秒。`retry_after` より短い。
+        // Laravel の `--timeout` と同じ 60 秒。
         assert_eq!(options.timeout, 60);
-        assert!(timeout_warning(&options).is_none());
+        assert!(options.timeouts.is_empty());
+        assert!(timeout_warnings(&options, &[]).is_empty());
+    }
+
+    fn job(name: &'static str) -> Job {
+        Job {
+            name,
+            handle: |_| Box::pin(async { Ok(()) }),
+        }
     }
 
     #[test]
-    fn timeoutがretry_after以上なら警告する() {
-        let options = |timeout, retry_after| Options {
-            timeout,
-            retry_after,
+    fn ジョブごとの打ち切りは設定が先で_無ければtimeout() {
+        let options = Options {
+            timeout: 60,
+            timeouts: vec![("Long".into(), 1800), ("Long".into(), 5)],
             ..Options::default()
         };
-        // 短ければ何も言わない。
-        assert!(timeout_warning(&options(60, 90)).is_none());
-        assert!(timeout_warning(&options(89, 90)).is_none());
-        // 同じか長いと、打ち切る前に別のワーカーが取り直す。
-        for (timeout, retry_after) in [(90, 90), (120, 90), (u64::MAX, 90)] {
-            let warning = timeout_warning(&options(timeout, retry_after)).expect("警告する");
-            assert!(warning.contains("--timeout"), "{warning}");
-            assert!(warning.contains("--retry-after"), "{warning}");
-            assert!(warning.contains("二重"), "{warning}");
-        }
-        // 0 は無制限。比べる相手が無いので言わない。
-        assert!(timeout_warning(&options(0, 90)).is_none());
+        assert_eq!(
+            options.timeout_for("Long"),
+            (1800, TimeoutSource::Config),
+            "最初の 1 つ"
+        );
+        assert_eq!(options.timeout_for("Other"), (60, TimeoutSource::Flag));
+    }
+
+    #[test]
+    fn 設定の打ち切りで気になるものを警告する() {
+        let jobs = [job("Long"), job("Forever")];
+        let options = Options {
+            timeouts: vec![
+                ("Long".into(), 1800),
+                ("Long".into(), 5),
+                ("Typo".into(), 10),
+                ("Forever".into(), 0),
+            ],
+            ..Options::default()
+        };
+        let warnings = timeout_warnings(&options, &jobs);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("2 回"), "{}", warnings[0]);
+        assert!(warnings[1].contains("Typo"), "{}", warnings[1]);
+        assert!(warnings[2].contains("二重"), "{}", warnings[2]);
+
+        // `--timeout` が `--retry-after` より長くても、もう警告しない（予約を延ばすので）。
+        let long = Options {
+            timeout: 3600,
+            retry_after: 90,
+            ..Options::default()
+        };
+        assert!(timeout_warnings(&long, &jobs).is_empty());
+
+        // `--timeout 0` は設定の `0` と同じく、予約を延ばせないことを知らせる。
+        let forever = Options {
+            timeout: 0,
+            ..Options::default()
+        };
+        let warnings = timeout_warnings(&forever, &jobs);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("--timeout 0"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn 打ち切りが長いジョブは予約の目印を先にずらす() {
+        let now = 1_000_000;
+        let at = |secs| time::format_timestamp(now + secs);
+        // retry_after より 30 秒以上短ければ、いまの時刻のまま。
+        assert_eq!(reserved_until(now, 90, 60), at(0));
+        assert_eq!(reserved_until(now, 90, 1), at(0));
+        // 長ければ「打ち切り + 30 秒」で取り直されるようにずらす。
+        assert_eq!(reserved_until(now, 90, 61), at(1));
+        assert_eq!(reserved_until(now, 90, 1800), at(1800 + 30 - 90));
+        // 打ち切らない（0）ジョブは延ばせない。
+        assert_eq!(reserved_until(now, 90, 0), at(0));
+        // とても大きな値でも年が 5 桁にならない。
+        assert_eq!(reserved_until(now, 90, u64::MAX), "9999-12-31 23:59:59");
+        // retry_after が 0 以下でも 1 秒として扱う（reclaim_cutoff と同じ）。
+        assert_eq!(reserved_until(now, 0, 10), at(10 + 30 - 1));
+    }
+
+    #[test]
+    fn ずらした目印は打ち切りの時間が過ぎるまで取り直されない() {
+        // 取り直しの判定は `reserved_at <= reclaim_cutoff(now, retry_after)`。
+        let reserved_at = 1_000_000;
+        let marker = reserved_until(reserved_at, 90, 1800);
+        let reclaimable = |elapsed: i64| marker <= reclaim_cutoff(reserved_at + elapsed, 90);
+        assert!(!reclaimable(90), "retry_after では取り直さない");
+        assert!(!reclaimable(1800), "打ち切りの時間ちょうどでもまだ");
+        assert!(reclaimable(1800 + 30), "打ち切り + 30 秒で取り直す");
     }
 
     #[test]
@@ -964,6 +1144,7 @@ mod tests {
             &jobs,
             &reserved_of("Stuck"),
             Some(Duration::from_millis(30)),
+            TimeoutSource::Flag,
         )
         .await
         .unwrap_err();
@@ -986,10 +1167,32 @@ mod tests {
         );
 
         // 上限の中で終わるジョブと、無制限は今までどおり。
-        run_one(&jobs, &reserved_of("Quick"), Some(Duration::from_secs(5)))
+        run_one(
+            &jobs,
+            &reserved_of("Quick"),
+            Some(Duration::from_secs(5)),
+            TimeoutSource::Flag,
+        )
+        .await
+        .unwrap();
+        run_one(&jobs, &reserved_of("Quick"), None, TimeoutSource::Flag)
             .await
             .unwrap();
-        run_one(&jobs, &reserved_of("Quick"), None).await.unwrap();
+
+        // 設定で決めた時間で打ち切ったときは、そう書く。
+        let failure = run_one(
+            &jobs,
+            &reserved_of("Stuck"),
+            Some(Duration::from_millis(30)),
+            TimeoutSource::Config,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            failure.message.contains("config/queue.rs"),
+            "{}",
+            failure.message
+        );
     }
 
     /// `.await` を挟まずにスレッドをふさぐジョブ。`abort` では止められない。
@@ -1013,6 +1216,7 @@ mod tests {
             &jobs,
             &reserved_of("Blocking"),
             Some(Duration::from_millis(30)),
+            TimeoutSource::Flag,
             Duration::from_millis(50),
         )
         .await
@@ -1316,7 +1520,7 @@ mod tests {
 
         // 以前は `id` と取り直しの条件だけで更新が通り、待ち時間を無視して
         // 即再実行し、`attempts` を 0 に巻き戻していた。
-        let affected = claim_row(DEFAULT_QUEUE, id, 0, &now, &cutoff, 0)
+        let affected = claim_row(DEFAULT_QUEUE, id, 0, &now, &cutoff, 0, &now)
             .await
             .unwrap();
         assert_eq!(affected, 0, "負けたと見なす");
@@ -1464,6 +1668,47 @@ mod tests {
         assert_eq!(DB::table(TABLE).count().await.unwrap(), 1);
     }
 
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn 打ち切りが長いジョブは予約が延びて取り直されない() {
+        let _db = crate::testing::refresh_database().await;
+        表を作る().await;
+        crate::queue::Queue::push_raw("Long", "{}").await.unwrap();
+        crate::queue::Queue::push_raw("Short", "{}").await.unwrap();
+
+        let options = Options {
+            timeouts: vec![("Long".into(), 1800)],
+            ..Options::default()
+        };
+        let Reservation::Taken(long) = reserve(&options).await.unwrap() else {
+            panic!("取れる");
+        };
+        assert_eq!(long.job, "Long");
+        let Reservation::Taken(short) = reserve(&options).await.unwrap() else {
+            panic!("取れる");
+        };
+        assert_eq!(short.job, "Short");
+
+        // 長いほうは先の時刻、短いほう（`--timeout` 60 秒）はいまの時刻。
+        let now = time::format_timestamp(time::now_seconds());
+        assert!(long.reserved_at > now, "{} > {now}", long.reserved_at);
+        assert!(short.reserved_at <= now, "{} <= {now}", short.reserved_at);
+
+        // 表の値も同じ（`finish` / `fail` は目印の一致で自分の予約か見分ける）。
+        let stored: Option<String> = DB::table(TABLE)
+            .where_("id", long.id)
+            .value("reserved_at")
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(long.reserved_at.as_str()));
+
+        // retry_after（90 秒）を過ぎたころに別のワーカーが見ても、長いほうは取り直さない。
+        let later = time::now_seconds() + 120;
+        let cutoff = reclaim_cutoff(later, options.retry_after);
+        assert!(long.reserved_at > cutoff, "長いほうはまだ予約のまま");
+        assert!(short.reserved_at <= cutoff, "短いほうは取り直しの対象");
+    }
+
     /// 処理中の目印が残ったままのジョブを 1 本入れて、その id を返す。
     #[cfg(feature = "sqlite")]
     async fn 放置されたジョブを入れる(attempts: i64) -> i64 {
@@ -1495,9 +1740,7 @@ mod tests {
         // 以前はここで予約し直し、`attempts` が `tries` を超えても回収され
         // 続けました。`order_by("id") limit 1` なので、この 1 件で
         // キュー全体が止まりました。
-        let taken = reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
-            .await
-            .unwrap();
+        let taken = reserve(&Options::default()).await.unwrap();
         assert!(matches!(taken, Reservation::Lost), "予約しない");
         assert_eq!(
             DB::table(TABLE).count().await.unwrap(),
@@ -1517,9 +1760,7 @@ mod tests {
 
         // 詰まりが解けて、次は空になる。
         assert!(matches!(
-            reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
-                .await
-                .unwrap(),
+            reserve(&Options::default()).await.unwrap(),
             Reservation::Empty
         ));
     }
@@ -1535,9 +1776,7 @@ mod tests {
 
         // 列の値（2）で見ていたころは `2 >= 3` が偽で予約し直し、
         // `--tries 3` でも 4 回走っていた。数え直した値（3）で諦める。
-        let taken = reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
-            .await
-            .unwrap();
+        let taken = reserve(&Options::default()).await.unwrap();
         assert!(matches!(taken, Reservation::Lost), "予約しない");
         assert_eq!(
             DB::table(TABLE).count().await.unwrap(),
@@ -1567,10 +1806,7 @@ mod tests {
         // 読んだ値を `max(0)` で丸めていたころは、2 文目の
         // `where attempts = 0` が永久に 0 件になり、`Lost` を待たずに
         // 繰り返して全力ループになった（キューは 1 件も進まない）。
-        match reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
-            .await
-            .unwrap()
-        {
+        match reserve(&Options::default()).await.unwrap() {
             Reservation::Taken(reserved) => {
                 assert_eq!(reserved.id, id);
                 assert_eq!(reserved.attempts, -1, "読んだ値をそのまま持つ");
@@ -1604,10 +1840,7 @@ mod tests {
         let id = 放置されたジョブを入れる(1).await;
 
         // `tries` に届いていない行は、今までどおり取り直す（`attempts` は +1）。
-        match reserve(DEFAULT_QUEUE, DEFAULT_RETRY_AFTER, 3)
-            .await
-            .unwrap()
-        {
+        match reserve(&Options::default()).await.unwrap() {
             Reservation::Taken(reserved) => {
                 assert_eq!(reserved.id, id);
                 assert_eq!(reserved.attempts, 2);

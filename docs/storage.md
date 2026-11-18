@@ -27,6 +27,7 @@ Storage::delete("notes/memo.txt").await?;
 | `get_bytes(パス)`                | `Result<Option<Vec<u8>>>` | 無ければ `None`          |
 | `exists(パス)` / `missing(パス)` | `Result<bool>`            |                          |
 | `delete(パス)`                   | `Result<()>`              | 無くてもエラーにしない   |
+| `append(パス, 文字)`             | `Result<()>`              | 末尾に書き足す（下の「書き足す」） |
 
 - 書く途中で落ちると、途中までのファイルが残ります（Laravel と同じ）。
 - `storage/` そのものが無いと、書き込みはエラーです。先に `storage:init` で作ります（下の「置き場所を動かす」）。
@@ -63,6 +64,8 @@ let real: PathBuf = disk.path("logo.png")?;         // 実際の場所
 | `size(パス)`           | `Result<Option<u64>>`     | –                      |
 | `files(頭のパス)`      | `Result<Vec<String>>`     | –                      |
 | `path(パス)`           | `Result<PathBuf>`         | –                      |
+| `append_bytes(パス, Vec<u8>)` | `Result<()>`       | –（`append` は改行を挟む別物） |
+| `write_stream(パス, BodyStream)` | `Result<u64>`   | –                      |
 
 - **設定に無い名前を `Storage::disk` に渡すと、パニックします。** 書き間違いにすぐ気づけるようにするためです。
 - 既定のディスクそのものは `Storage::default_disk()?` で取れます。`size` や `files` を使うときに呼びます。
@@ -103,6 +106,66 @@ Storage::default_disk()?.files("notes").await?;
 - 無いディレクトリやファイルを渡すと、空の一覧です。
 - シンボリックリンクはたどりません。
 - 深さ 32 より下、名前が UTF-8 でないもの、読めないディレクトリは飛ばします（警告がログに出ます）。
+
+## 書き足す
+
+```rust
+Storage::append("logs/notes.txt", "1 行目").await?;
+Storage::append("logs/notes.txt", "2 行目").await?;   // 中身は "1 行目\n2 行目"
+
+Storage::disk("local").append_bytes("chunks/a.bin", bytes).await?;
+```
+
+| メソッド                              | 動き                                                   |
+|---------------------------------------|--------------------------------------------------------|
+| `Storage::append(パス, 文字)`         | ファイルがあれば、間に改行（`\n`）を挟んで足す。無ければ作る（挟まない） |
+| `disk.append_bytes(パス, Vec<u8>)`    | 何も挟まずに末尾へ足す。無ければ作る                   |
+
+- `Storage::append` は Laravel の `Storage::append` と同じ決まりです。
+- Laravel の改行は OS ごとに違います。bengara は**どの OS でも `\n`** です。
+- **同時に `append` すると、改行の有無がずれることがあります。**
+  ファイルがあるかを見てから書くまでの間に、別の書き足しが入るためです。
+  何本ものリクエストから 1 行ずつ足すときは、自分で `\n` を付けて `append_bytes` を使います。
+- `append_bytes` は OS の追記モードで書きます。ファイル全体を読み直しません。途中のディレクトリも作ります。
+- `append_bytes` の 1 回の書き足しが途中で切れることはあります。前の中身は壊しません。
+- 既定のディスクに `append_bytes` するときは `Storage::default_disk()?.append_bytes(..)` と書きます。
+
+### 名前が違う理由
+
+Rust では、同じ型に同じ名前の関数を 2 つ置けません。
+そのため、`Storage::` の静的メソッドとディスクのメソッドで名前を分けています（`put` と `write`、`get` と `read` と同じ理由）。
+
+- 静的メソッドは Laravel の名前どおり `append`（改行を挟む）だけです。
+- ディスクのほうは、`write` と同じくバイト列を受ける `append_bytes` と `write_stream` です。
+
+## 本文を少しずつ書く
+
+`.stream_body()` のルートで受けた本文（[requests-and-responses.md](requests-and-responses.md)）を、
+全部メモリに載せずにファイルへ書きます。Laravel の `writeStream` に当たります。
+
+```rust
+pub async fn upload(req: Request) -> Result<Response> {
+    let name: String = req.param_as("name")?;
+    let body = req.body_stream()?;
+    let bytes = Storage::disk("local").write_stream(&format!("uploads/{name}"), body).await?;
+    text(format!("{bytes} バイト保存しました"))
+}
+```
+
+- 返すのは書いたバイト数です。
+- **最後まで受け取れたときだけ、その名前のファイルになります。**
+  書いている間は、同じディレクトリの `.名前.<16進の乱数>.part` に書きます。終わったら置き換えます。
+- Windows でファイルが「使用中」のときは、少し待ってやり直します。
+- 途中で失敗したら、書きかけを消します。**前からあったファイルはそのまま残ります。**
+- 失敗は、本文の上限超え（413）・時間切れ（408）・切断（400）と、書き込みの失敗です。
+  本文のエラーは同じ状態コードで返るので、`?` で返せばその応答になります。
+- 待つのをやめたとき（`tokio::time::timeout` で包んだ、キューの打ち切りで止められた、など）も、書きかけを消します。
+  ただし、ちょうど裏のスレッドで書いている最中だと、Windows では消せません。ログに警告が出て、`.part` が残ります。
+- 書いている間の `.part` のファイルは、`files()` の一覧にも見えます。
+- `fsync`（ディスクへの書き出しを待つこと）はしません。ほかの書き込みと同じです。
+
+**書き口（`Storage::writer` のようなもの）はありません。** 閉じ忘れなど、使い方を誤りやすいためです。
+少しずつ届くデータは、かたまりごとに `append_bytes` するか、本文なら `write_stream` を使います。
 
 ## 断るパス
 

@@ -73,6 +73,10 @@ Route::get("/admin", AdminController::index).middleware("admin");
 
 - 404・405・静的ファイル（`public/` と `/storage/`）にも掛かります。
 - 本文を受け取れなかったとき（413・400・408）だけは通りません。
+  本文はルートを照合した後、ミドルウェアより前に受け取るためです（[requests-and-responses.md](requests-and-responses.md)）。
+- `.stream_body()` のルートでは、本文を読む前にミドルウェアが通ります（共通のものも、ルートに付けたものも）。
+  申告された長さが上限を超えているときだけは、ミドルウェアを通らずに 413 です。
+  それ以外の失敗（読んだ合計が上限を超えた・切れた・遅すぎる）は、ハンドラが本文を読んだときに起きます。
 - ルートに付けたミドルウェアは、そのルートに当たったときだけ通ります。
 - 組み込みの `StartSession` と `VerifyCsrfToken` は、ルートが無いと動きを変えます（[session.md](session.md)）。
 

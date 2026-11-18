@@ -187,6 +187,23 @@ impl Storage {
         Self::default_disk()?.remove(path).await
     }
 
+    /// 文字列を末尾に書き足す。ファイルがあれば、間に改行（`\n`）を挟みます。
+    ///
+    /// Laravel の `Storage::append` と同じ決まりです（Laravel の改行は OS ごとに
+    /// 違いますが、bengara はどの OS でも `\n` です）。ファイルが無ければ作ります。
+    ///
+    /// 何も挟まずにつなげたいとき（バイナリのかたまりなど）は、
+    /// [`append_bytes`](Self::append_bytes) を使ってください。
+    ///
+    /// **同時に書き足すと、改行の有無がずれることがあります。** あるかどうかを
+    /// 見てから書くまでの間に、別の書き足しが入るためです。何本ものリクエストから
+    /// 1 行ずつ足すときは、自分で `\n` を付けて `append_bytes` を使ってください。
+    pub async fn append(path: &str, contents: impl Into<String>) -> Result<()> {
+        Self::default_disk()?
+            .append_line(path, contents.into())
+            .await
+    }
+
     // ---- 置き場所を指定したとき ----
 
     /// 文字列を書く。
@@ -205,6 +222,134 @@ impl Storage {
             std::fs::write(&full, contents).map_err(Error::Io)
         })
         .await?
+    }
+
+    /// `Storage::append` の中身。ファイルがあれば改行を挟んで書き足す。
+    ///
+    /// 置き場所を指定した形は公開しません。静的な `append` と同じ名前にできない
+    /// （Rust は同じ型に同じ名前の関数を 2 つ置けない）ためで、`put` と `write` の関係と同じです。
+    async fn append_line(&self, path: &str, contents: String) -> Result<()> {
+        let full = self.file_path(path)?;
+        self.ensure_storage(&full)?;
+        crate::support::blocking(move || {
+            let exists = full.is_file();
+            let mut bytes = Vec::with_capacity(contents.len() + 1);
+            if exists {
+                bytes.push(b'\n');
+            }
+            bytes.extend_from_slice(contents.as_bytes());
+            append_to(&full, &bytes)
+        })
+        .await?
+    }
+
+    /// バイト列を末尾にそのまま書き足す（間に何も挟みません）。
+    ///
+    /// ファイルが無ければ作ります。途中のディレクトリも作ります。
+    /// 少しずつ届くデータ（WebSocket のバイナリ、`body_stream()` のかたまり）を
+    /// 1 つのファイルにつなげるときに使います。
+    ///
+    /// ファイル全体を読み直さず、末尾にだけ書きます（OS の追記モード）。
+    /// 1 回の書き足しが途中で切れることはありますが、前の中身は壊しません。
+    pub async fn append_bytes(&self, path: &str, contents: Vec<u8>) -> Result<()> {
+        let full = self.file_path(path)?;
+        self.ensure_storage(&full)?;
+        crate::support::blocking(move || append_to(&full, &contents)).await?
+    }
+
+    /// 少しずつ届く本文（`req.body_stream()?`）を、そのままファイルに書く。
+    /// 書いたバイト数を返します。
+    ///
+    /// ```ignore
+    /// // routes/web.rs: Route::post("/uploads", ..).stream_body().max_body(512 * 1024 * 1024)
+    /// let written = Storage::disk("local")
+    ///     .write_stream("uploads/movie.mp4", req.body_stream()?)
+    ///     .await?;
+    /// ```
+    ///
+    /// Laravel の `writeStream` に当たります。本文を全部メモリに載せずに書けます。
+    ///
+    /// **最後まで受け取れたときだけ、その名前のファイルになります。** 書いている
+    /// 間は同じディレクトリの別の名前（`.名前.<乱数>.part`）に書き、終わったら
+    /// 置き換えます。途中で失敗したとき（上限超えの 413・時間切れの 408・切断の 400）は
+    /// 書きかけを消し、前からあったファイルはそのまま残します。エラーは
+    /// 本文と同じ状態コードで返るので、`?` で返せばその応答になります。
+    ///
+    /// 待つのをやめたとき（`tokio::time::timeout` で包んだ、キューの `--timeout` で
+    /// 打ち切られた、など）も書きかけを消します。ただし、ちょうど裏のスレッドで
+    /// 書いている最中だと Windows では消せず、`tracing::warn!` で知らせて残ります。
+    ///
+    /// 書いている間の別の名前は、[`files`](Self::files) の一覧にも見えます。
+    pub async fn write_stream(&self, path: &str, mut body: crate::http::BodyStream) -> Result<u64> {
+        let full = self.file_path(path)?;
+        self.ensure_storage(&full)?;
+        let temp = part_path(&full)?;
+
+        let opened = {
+            let (full, temp) = (full.clone(), temp.clone());
+            crate::support::blocking(move || -> Result<std::fs::File> {
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp)
+                    .map_err(Error::Io)
+            })
+            .await?
+        };
+        let mut file = opened?;
+
+        // ここから先は、失敗しても待つのをやめられても、書きかけを消す。
+        // 置き換えが済んだら外す（`disarm`）。
+        //
+        // 宣言の順に意味があります。後に作る `async` の中身（ファイルを持っている）が
+        // 先に捨てられ、ファイルが閉じてから、この見張りが消します。
+        let mut guard = PartGuard(Some(temp.clone()));
+
+        let written = {
+            let (temp, full) = (temp.clone(), full.clone());
+            async move {
+                let mut written: u64 = 0;
+                while let Some(chunk) = body.chunk().await? {
+                    written = written.saturating_add(chunk.len() as u64);
+                    // ファイルを裏のスレッドへ渡して書き、返してもらう。
+                    file = crate::support::blocking(move || -> Result<std::fs::File> {
+                        use std::io::Write;
+                        file.write_all(&chunk)?;
+                        Ok(file)
+                    })
+                    .await??;
+                }
+                crate::support::blocking(move || -> Result<()> {
+                    use std::io::Write;
+                    file.flush()?;
+                    // Windows は開いたままのファイルを置き換えられないので、先に閉じる。
+                    drop(file);
+                    crate::support::fs::rename_with_retry(&temp, &full).map_err(Error::Io)
+                })
+                .await??;
+                Ok::<u64, Error>(written)
+            }
+            .await
+        };
+
+        match written {
+            Ok(written) => {
+                // 置き換え済み。書きかけの名前はもう無いので、消さない。
+                guard.disarm();
+                Ok(written)
+            }
+            Err(error) => {
+                // 消すのは裏のスレッドで行う（`Drop` の中で消すと、ここで待たされる）。
+                // 消せなくても、元のエラーを返す（消せない理由はログに出す）。
+                if let Some(temp) = guard.disarm() {
+                    let _ = crate::support::blocking(move || remove_part(&temp)).await;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// `storage/` そのものが無ければ、作らずに知らせる（決定記録 #023）。
@@ -428,6 +573,68 @@ pub(crate) fn usable_name(part: &str) -> std::result::Result<(), &'static str> {
 /// 印（シンボリックリンク・ジャンクション）は飛ばすので輪にはなりませんが、
 /// 深いだけのディレクトリでもスタックを使い切らないよう上限を置きます。
 const MAX_DEPTH: usize = 32;
+
+/// 末尾に書き足す（OS の追記モード）。途中のディレクトリは作ります。
+fn append_to(full: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(full)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+/// `write_stream` が書いている間の名前（`.名前.<乱数>.part`）。
+///
+/// 置き換える先と**同じディレクトリ**に置きます。別のファイルシステムをまたぐと
+/// `rename` が原子的でなくなるためです。乱数を入れるので、同じ名前へ同時に
+/// 書いても互いの書きかけを壊しません（最後に置き換えたほうが残ります）。
+fn part_path(full: &Path) -> Result<PathBuf> {
+    let name = full
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::msg("ファイルの名前が読めません"))?;
+    let random = crate::support::crypto::to_hex(&crate::support::crypto::random_bytes::<8>());
+    Ok(full.with_file_name(format!(".{name}.{random}.part")))
+}
+
+/// `write_stream` の書きかけを見張る。外さないまま捨てられたら、書きかけを消す。
+///
+/// エラーの道は `write_stream` が裏のスレッドで消します。ここで消すのは、
+/// 待つのをやめられたとき（`future` ごと捨てられたとき）だけです。
+/// `Drop` は待てないので、その場で消します（ファイル 1 つの削除なので短い）。
+struct PartGuard(Option<PathBuf>);
+
+impl PartGuard {
+    /// 見張りを外し、見張っていたパスを返す。
+    fn disarm(&mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if let Some(temp) = self.0.take() {
+            remove_part(&temp);
+        }
+    }
+}
+
+/// 書きかけを消す。無ければ何もしない。消せなければログに出す。
+fn remove_part(temp: &Path) {
+    if let Err(e) = std::fs::remove_file(temp) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                "書きかけのファイル {} を消せませんでした: {e}",
+                temp.display()
+            );
+        }
+    }
+}
 
 /// ディレクトリの中のファイルを集める（再帰）。
 ///
@@ -842,5 +1049,159 @@ mod tests {
         assert!(disk.files("../secret").await.is_err());
 
         let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    // ---- 書き足しと、少しずつ届く本文 ----
+
+    fn stream_of(bytes: &[u8], limit: u64) -> crate::http::BodyStream {
+        crate::http::BodyStream::new(
+            crate::http::body::PendingBody::memory(bytes.to_vec()),
+            limit,
+        )
+    }
+
+    #[tokio::test]
+    async fn appendはあれば改行を挟んで書き足す() {
+        let disk = disk("append");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        // 無ければ作る。最初は改行を挟まない（Laravel と同じ）。
+        disk.append_line("logs/a.log", "1 行目".into())
+            .await
+            .unwrap();
+        disk.append_line("logs/a.log", "2 行目".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            disk.read("logs/a.log").await.unwrap().as_deref(),
+            Some("1 行目\n2 行目")
+        );
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[tokio::test]
+    async fn append_bytesは何も挟まずにつなげる() {
+        let disk = disk("append-bytes");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        disk.append_bytes("bin/a.dat", vec![0, 1]).await.unwrap();
+        disk.append_bytes("bin/a.dat", vec![2]).await.unwrap();
+        disk.append_bytes("bin/a.dat", Vec::new()).await.unwrap();
+        assert_eq!(
+            disk.read_bytes("bin/a.dat").await.unwrap(),
+            Some(vec![0, 1, 2])
+        );
+
+        // 置き場所の外には書けない。
+        assert!(disk.append_bytes("../out.dat", vec![1]).await.is_err());
+        assert!(disk.append_line("../out.txt", "x".into()).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[tokio::test]
+    async fn write_streamは届いた本文を書いて大きさを返す() {
+        let disk = disk("stream");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        let written = disk
+            .write_stream("uploads/a.bin", stream_of(b"hello", 10))
+            .await
+            .unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(
+            disk.read_bytes("uploads/a.bin").await.unwrap(),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            disk.files("uploads").await.unwrap(),
+            vec!["uploads/a.bin".to_string()],
+            "書きかけの名前は残らない"
+        );
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[tokio::test]
+    async fn write_streamは失敗したら書きかけを消して前のファイルを残す() {
+        let disk = disk("stream-fail");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        disk.write("uploads/a.bin", b"old".to_vec()).await.unwrap();
+        let error = disk
+            .write_stream("uploads/a.bin", stream_of(b"too large body", 4))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), 413, "本文のエラーをそのまま返す");
+        assert_eq!(
+            disk.read_bytes("uploads/a.bin").await.unwrap(),
+            Some(b"old".to_vec()),
+            "前のファイルはそのまま"
+        );
+        assert_eq!(
+            disk.files("uploads").await.unwrap(),
+            vec!["uploads/a.bin".to_string()],
+            "書きかけは消える"
+        );
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[tokio::test]
+    async fn write_streamは空の本文なら空のファイルを作る() {
+        let disk = disk("stream-empty");
+        let _ = std::fs::remove_dir_all(&disk.root);
+
+        assert_eq!(
+            disk.write_stream("empty.bin", stream_of(b"", 4))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            disk.read_bytes("empty.bin").await.unwrap(),
+            Some(Vec::new())
+        );
+        assert!(disk
+            .write_stream("../out.bin", stream_of(b"x", 4))
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&disk.root);
+    }
+
+    #[test]
+    fn 見張りを外さずに捨てたら書きかけを消す() {
+        // 待つのをやめられた（future ごと捨てられた）ときの後始末。
+        let dir = std::env::temp_dir().join(format!("bengara-part-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join(".a.bin.0000.part");
+        std::fs::write(&part, b"half").unwrap();
+        drop(PartGuard(Some(part.clone())));
+        assert!(!part.exists(), "捨てたら消える");
+
+        // 外したら消さない（置き換えが済んだ後）。
+        std::fs::write(&part, b"done").unwrap();
+        let mut guard = PartGuard(Some(part.clone()));
+        assert_eq!(guard.disarm(), Some(part.clone()));
+        drop(guard);
+        assert!(part.exists(), "外したら残す");
+
+        // 無いものを消そうとしても落ちない。
+        std::fs::remove_file(&part).unwrap();
+        drop(PartGuard(Some(part)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 書きかけの名前は同じディレクトリの隠れた名前() {
+        let full = std::env::temp_dir().join("uploads").join("movie.mp4");
+        let part = part_path(&full).unwrap();
+        assert_eq!(part.parent(), full.parent());
+        let name = part.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(".movie.mp4."), "{name}");
+        assert!(name.ends_with(".part"), "{name}");
+        assert_ne!(part_path(&full).unwrap(), part, "毎回違う名前");
     }
 }

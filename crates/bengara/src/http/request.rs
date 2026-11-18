@@ -49,6 +49,15 @@ pub struct Request {
     ///
     /// ふつうのリクエストでは空で、確保もしません。
     upgrade: crate::websocket::Slot<crate::websocket::Handoff>,
+    /// まだ読んでいない本文（`server.rs` とテストのクライアントが載せる）。
+    ///
+    /// 照合の後に [`receive_body`](Self::receive_body) が取り出し、全部読むか、
+    /// `stream` へ移します。
+    pending: crate::websocket::Slot<crate::http::body::PendingBody>,
+    /// 少しずつ読む本文（`.stream_body()` のルートだけ）。取り出せるのは 1 回だけ。
+    stream: crate::websocket::Slot<crate::http::body::BodyStream>,
+    /// `.stream_body()` のルートに当たったか。`body_stream()` のエラー文を分けるために持ちます。
+    streaming: bool,
 }
 
 impl Request {
@@ -76,7 +85,85 @@ impl Request {
             cookie_cache: OnceLock::new(),
             query_cache: OnceLock::new(),
             upgrade: crate::websocket::Slot::default(),
+            pending: crate::websocket::Slot::default(),
+            stream: crate::websocket::Slot::default(),
+            streaming: false,
         }
+    }
+
+    /// まだ読んでいない本文を載せる。`server.rs` とテストのクライアントが入れます。
+    pub(crate) fn with_pending_body(mut self, body: crate::http::body::PendingBody) -> Self {
+        self.pending = crate::websocket::Slot::new(body);
+        self
+    }
+
+    /// ルートの決まりに従って本文を受け取る。`Application` が照合の直後に 1 回呼びます。
+    ///
+    /// | ルート | すること |
+    /// |---|---|
+    /// | ふつう | 全部読んで `body` に入れる（上限・30 秒） |
+    /// | `.stream_body()` | 読まずに `body_stream()` で取り出せるようにする |
+    ///
+    /// 長さの申告（`Content-Length`）が上限を超えていれば、どちらも読まずに 413 です。
+    /// エラー（413・400・408）はミドルウェアを通さずに返します。
+    pub(crate) async fn receive_body(
+        &mut self,
+        policy: crate::http::body::BodyPolicy,
+    ) -> Result<()> {
+        use crate::http::body::{read_all, too_large, BodyStream, PendingBody};
+
+        let Some(pending) = self.pending.take() else {
+            // 中身を直に載せた `Request`（枠組みの単体テスト）。読むものは無い。
+            if policy.stream {
+                let bytes = std::mem::take(&mut self.body);
+                self.stream = crate::websocket::Slot::new(BodyStream::new(
+                    PendingBody::memory(bytes),
+                    policy.limit,
+                ));
+                self.streaming = true;
+            }
+            return Ok(());
+        };
+
+        let declared = self
+            .header("content-length")
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        if declared.is_some_and(|length| length > policy.limit) {
+            return Err(too_large());
+        }
+
+        if policy.stream {
+            self.stream = crate::websocket::Slot::new(BodyStream::new(pending, policy.limit));
+            self.streaming = true;
+            return Ok(());
+        }
+        self.body = read_all(pending, policy.limit, declared).await?;
+        Ok(())
+    }
+
+    /// 本文を少しずつ読む口を取り出す。`.stream_body()` を付けたルートだけで使えます。
+    ///
+    /// ```ignore
+    /// let mut body = req.body_stream()?;
+    /// while let Some(chunk) = body.chunk().await? {
+    ///     // chunk: Vec<u8>
+    /// }
+    /// ```
+    ///
+    /// | 起きたこと | 結果 |
+    /// |---|---|
+    /// | `.stream_body()` のルート（1 回目） | `Ok(BodyStream)` |
+    /// | 2 回目（`Request` を複製したものも含む） | `Err`（500） |
+    /// | `.stream_body()` が無いルート | `Err`（500）。本文は `body()` で読めます |
+    pub fn body_stream(&self) -> Result<crate::http::body::BodyStream> {
+        if !self.streaming {
+            return Err(Error::msg(
+                "このルートには `.stream_body()` が付いていません。本文は `req.body()` で読めます",
+            ));
+        }
+        self.stream.take().ok_or_else(|| {
+            Error::msg("本文はもう取り出してあります（`body_stream()` は 1 回だけ呼べます）")
+        })
     }
 
     /// WebSocket への切り替えの口を載せる。`server.rs` が入れます。
@@ -125,6 +212,10 @@ impl Request {
         self
     }
 
+    /// 読み終えた本文を直に載せる（枠組みの単体テスト用）。
+    ///
+    /// サーバーとテストのクライアントは [`with_pending_body`](Self::with_pending_body) を使います。
+    #[cfg(test)]
     pub(crate) fn with_body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
         self
@@ -387,6 +478,8 @@ impl Request {
     }
 
     /// 本文。
+    ///
+    /// `.stream_body()` のルートでは空です（[`body_stream`](Self::body_stream) で読みます）。
     pub fn body(&self) -> &[u8] {
         &self.body
     }

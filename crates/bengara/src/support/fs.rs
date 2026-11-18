@@ -168,7 +168,9 @@ const RENAME_RETRIES: u32 = 5;
 const RENAME_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// 一時ファイルを本体へ置き換える。「使用中」系の失敗は少し待ってやり直す。
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+///
+/// `write_atomic` のほか、少しずつ書いたファイルを置き換える `Storage::write_stream` も使います。
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut attempt = 0;
     loop {
         match std::fs::rename(from, to) {

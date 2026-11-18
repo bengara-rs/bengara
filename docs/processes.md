@@ -1,0 +1,219 @@
+# 外部コマンドと重い処理
+
+外部のコマンド（`ffmpeg` や `git` など）を起動して、終わりを待つ仕組みです。
+Laravel の `Process` に当たります。
+
+あわせて、時間のかかる同期の処理を裏のスレッドへ逃がす `support::blocking` も説明します。
+
+| 使うもの | 場所 | 向いているもの |
+|---|---|---|
+| `Process` | `bengara::process` | 外部のコマンドを起動して待つ |
+| `blocking` | `bengara::support` | Rust で書いた同期の重い処理（計算・同期のファイル操作など） |
+
+どちらも `prelude` には入っていません。`use` を書いてください。
+
+## コマンドを起動する
+
+```rust
+use bengara::prelude::*;
+use bengara::process::Process;
+
+let result = Process::run(["git", "--version"]).await?;
+println!("{}", result.output());
+```
+
+- コマンドは「**プログラムと引数の並び**」で渡します。最初がプログラム、残りが引数です。
+- 配列のほか、`Vec<String>` なども渡せます。
+- 並びが空ならエラーです。
+- 終わるまで `await` で待ちます。待っている間も、ほかのリクエストは止まりません。
+
+### 設定を足す
+
+`Process::timeout(..)` のように設定から始め、続けて書き、最後に `.run(コマンド)` を呼びます。
+
+```rust
+let result = Process::timeout(30 * 60)
+    .path(storage_path("app/videos"))
+    .env("LANG", "C")
+    .run(["ffmpeg", "-i", "in.mp4", "out.webm"])
+    .await?
+    .throw()?;
+```
+
+| 書き方 | 意味 | 決めないとき |
+|---|---|---|
+| `timeout(秒)` | この時間で打ち切る。`0` は打ち切らない | **60 秒**（Laravel と同じ） |
+| `forever()` | 打ち切らない | — |
+| `path(ディレクトリ)` | 作業ディレクトリ | このプロセスと同じ |
+| `env(名前, 値)` | 環境変数を足す。何回でも書ける | このプロセスの環境変数をそのまま引き継ぐ |
+| `input(バイト列)` | 標準入力に渡す中身 | 標準入力は空（端末を引き継がない） |
+| `quietly()` | 標準出力とエラー出力を受け取らずに捨てる | 両方を受け取る |
+
+### 結果を読む
+
+`run` は、コマンドが終われば `ProcessResult` を返します。**終了コードが 0 でなくても `Ok` です。**
+
+| メソッド | 返すもの |
+|---|---|
+| `successful()` | 終了コードが 0 だったか |
+| `failed()` | 終了コードが 0 でなかったか |
+| `exit_code()` | 終了コード（`Option<i32>`）。Unix でシグナルで止められたら `None` |
+| `output()` | 標準出力（`&str`） |
+| `error_output()` | エラー出力（`&str`） |
+| `throw()` | 失敗ならエラーにする。成功ならそのまま返す |
+
+- 出力は UTF-8 として読みます。読めないバイトは置換文字（U+FFFD）になります。
+- `quietly()` を付けたときは、どちらの出力も空です。
+
+### 失敗をエラーにする（`throw`）
+
+```rust
+let result = Process::run(["git", "pull"]).await?.throw()?;
+```
+
+失敗していたら、次の形のエラーになります。
+
+```
+`git` が失敗しました（終了コード 1）: <エラー出力の末尾>
+```
+
+- エラー出力は**末尾の 2,000 文字**だけを入れます。失敗の理由はたいてい最後のほうに出るためです。
+- エラー出力が空なら「エラー出力はありません」と入ります。
+
+### `run` の結果
+
+| 起きたこと | 結果 |
+|---|---|
+| 終わった（終了コードが 0 でなくても） | `Ok(ProcessResult)`。`failed()` で見分ける |
+| 起動できなかった（プログラムが無いなど） | `Err`。プログラムが見つからないときは PATH を確かめるよう案内する |
+| 打ち切りの時間を過ぎた | 子プロセスを止めて `Err`（「`名前` が N 秒で終わらなかったので止めました」） |
+
+**エラー文に入れるのはプログラムの名前だけです。** 引数にはパスワードやトークンが入ることがあり、エラー文はログに出るためです。
+
+## キューのジョブから起動する
+
+動画の変換のような長い処理は、画面の中で待たずにキューへ積みます（[queue.md](queue.md)）。
+
+```rust
+// app/Jobs/TranscodeVideo.rs
+use bengara::prelude::*;
+use bengara::process::Process;
+
+#[derive(bengara::serde::Serialize, bengara::serde::Deserialize)]
+#[serde(crate = "bengara::serde")]
+pub struct Payload {
+    pub video_id: i64,
+}
+
+pub async fn handle(payload: String) -> Result<()> {
+    let payload: Payload = bengara::serde_json::from_str(&payload)?;
+    let input = format!("{}.mp4", payload.video_id);
+    let output = format!("{}.webm", payload.video_id);
+
+    // 打ち切りはジョブの側（config/queue.rs）に任せる。
+    Process::forever()
+        .path(storage_path("app/videos"))
+        .run(["ffmpeg", "-y", "-loglevel", "error", "-i", input.as_str(), output.as_str()])
+        .await?
+        .throw()?;
+    Ok(())
+}
+```
+
+ジョブの打ち切りの時間は `config/queue.rs` に書きます。
+
+```rust
+// config/queue.rs
+use bengara::queue::QueueConfig;
+
+pub fn config() -> QueueConfig {
+    QueueConfig::default().timeout("TranscodeVideo", 30 * 60)
+}
+```
+
+- ジョブが打ち切られると、待っていた `ffmpeg` も止まります（下の「打ち切ると子プロセスを止める」）。
+- 打ち切りの時間が `--retry-after` より長くてもかまいません。ワーカーが予約を延ばすので、途中で別のワーカーに取り直されません（[queue.md](queue.md)）。
+
+## Laravel と違うところ
+
+| Laravel | bengara |
+|---|---|
+| `Process::run('ls -la')` | `Process::run(["ls", "-la"]).await?` |
+| `Process::timeout(120)->run(..)` | `Process::timeout(120).run(..).await?` |
+| `->path(..)` / `->env([..])` / `->input(..)` / `->quietly()` / `->forever()` | 同じ名前。`env` は 1 組ずつ書く |
+| `$result->exitCode()` / `errorOutput()` | `exit_code()` / `error_output()` |
+| 時間切れは例外 | `run` が `Err` を返す |
+
+### シェルを通さない
+
+**文字列のコマンドは受けません。** シェルを通すと、次の問題があるためです。
+
+- 外から来た値を混ぜると、別のコマンドを走らせられる。
+- OS ごとにシェルの文法が違う。
+
+パイプやリダイレクトが要るときは、自分でシェルを起動します。
+
+```rust
+Process::run(["sh", "-c", "ls -la | wc -l"]).await?;
+```
+
+シェルに渡す文字列に、外から来た値を混ぜないでください。
+
+### 打ち切ると子プロセスを止める
+
+次のどちらでも、起動したコマンドを止めます。
+
+- `timeout` の時間を過ぎたとき。
+- 待っている側が待つのをやめたとき（キューの打ち切り、リクエストの切断など）。
+
+## `support::blocking`（同期の重い処理を逃がす）
+
+`await` を挟まずにしばらく CPU やディスクを使う処理を、裏のスレッドで動かして結果を待ちます。
+ハンドラやジョブの中でそのまま呼ぶと、同じスレッドで動いているほかのリクエストが止まるためです。
+
+```rust
+use bengara::support::blocking;
+
+let total = blocking(move || {
+    // 何秒も CPU を使う同期の計算
+    rows.iter().map(score).sum::<u64>()
+})
+.await?;
+```
+
+| 起きたこと | 結果 |
+|---|---|
+| 処理が値を返した | `Ok(値)` |
+| 処理がパニックした | `Err`（500）。パニックはその処理に閉じ込める |
+
+- 処理が `Result` を返すなら、`.await??` と 2 回 `?` を付けます。
+- 裏のスレッドは tokio の待ち用のスレッドです（`spawn_blocking`）。
+
+### どちらを使うか
+
+| やりたいこと | 使うもの |
+|---|---|
+| 外部のコマンドを起動して待つ | `Process` |
+| Rust の同期の処理（計算・同期のファイル操作など）を逃がす | `blocking` |
+
+**外部のコマンドを `blocking` の中で `std::process::Command` で待たないでください。** `blocking` は途中で止められないので、打ち切っても動き続けます。
+
+## 制限
+
+| 制限 | どうするか |
+|---|---|
+| `Process` の出力は全部メモリに溜める | 出力が多いコマンドは `quietly()` で捨てるか、コマンドにファイルへ書かせる |
+| `Process` が止めるのは起動した 1 本だけ。そこから起動された孫のプロセスは残ることがある | 子が自分の子を後始末する形にする |
+| 終わりは、出力のパイプが閉じたことで知る。裏で動き続ける孫が出力を開いたままだと（`["sh", "-c", "daemon & echo hi"]` など）、起動した 1 本が終わっていても打ち切りまで待ち、`Err` になる | `quietly()` を付けるか、孫の出力を別の所へ向ける |
+| シェルのスクリプトは直接起動できるとは限らない | `["sh", "-c", ".."]` のように、シェルを自分で起動する |
+| `blocking` は途中で止められない。待つのをやめても最後まで走る | 外部のコマンドは `Process` を使う |
+| `blocking` の待ち用スレッドは既定で最大 512 本 | 何十分も占有する処理を大量に並べない。枠組みの読み書き（セッション・キャッシュ・ファイル）まで待たされる |
+
+- 打ち切りで子が止まる動きは、Windows でだけ確かめています。Linux・macOS ではまだ確かめていません。
+- 裏で走らせて後で待つ（`start()`）・`pool`・`pipe`・`Process::fake()` などは、まだありません（[backlog.md](backlog.md)）。
+
+## 関連
+
+- [queue.md](queue.md) — ジョブと、ジョブごとの打ち切りの時間
+- [console-commands.md](console-commands.md) — 自分のコマンドから起動する
+- [laravel-differences.md](laravel-differences.md) — Laravel と違う点
