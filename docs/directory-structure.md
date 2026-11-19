@@ -166,8 +166,8 @@ app/Jobs/
 
 ## テストの置き場所
 
-テストは `tests/Feature/` か `tests/Unit/` に置きます（[testing.md](testing.md)）。
-**`tests/` の直下に `.rs` を置かないでください。** 警告が出ます。
+テストは `tests/Feature/` か `tests/Unit/` に置きます（[testing.md](testing.md)）。 **`tests/` の直下に `.rs`
+を置かないでください。** 警告が出ます。
 
 ## 置いたのに動かないとき
 

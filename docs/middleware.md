@@ -196,8 +196,8 @@ Route::post("/login", AuthController::login).middleware("throttle");
 ### 前段のプロキシ
 
 前にプロキシ（中継するサーバー）がいると、接続元はいつもプロキシです。
-本当の相手を知るために `X-Forwarded-For` と `X-Real-IP` を見ます。
-**見るのは `TRUSTED_PROXIES` に載っている相手から届いたときだけです。**
+本当の相手を知るために `X-Forwarded-For` と `X-Real-IP` を見ます。 **見るのは `TRUSTED_PROXIES`
+に載っている相手から届いたときだけです。**
 
 | `TRUSTED_PROXIES` | 動き                       |
 |-------------------|----------------------------|

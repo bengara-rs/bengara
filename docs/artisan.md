@@ -70,7 +70,8 @@
 | `schedule:list` | 定期処理の一覧                 | [scheduling.md](scheduling.md)     |
 | `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
-- データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
+-
+データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
 - `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます（[console-commands.md](console-commands.md)）。
 - 無い名前を打つと、エラーと一覧を出して終了コード 1 で終わります。
 - ファイルを生成する `make:*` コマンドはありません。ファイルは手で作ります。
@@ -106,7 +107,8 @@ $ cargo artisan cache:clear --tries=9
 | `--retry-after=90`  | 90        | 処理中のまま残ったジョブを取り直すまでの秒数（1 以上）     |
 | `--once`            | —         | 1 件だけ処理して終わる                                     |
 
-ジョブごとの打ち切りの時間は `config/queue.rs` で決めます。載っているジョブは `--timeout` より優先します（[queue.md](queue.md)）。
+ジョブごとの打ち切りの時間は `config/queue.rs` で決めます。載っているジョブは `--timeout`
+より優先します（[queue.md](queue.md)）。
 
 ### データベース
 
@@ -140,7 +142,8 @@ $ cargo artisan cache:clear --tries=9
 
 `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
-**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
+**表を変えるコマンドは同時に流せません。** 2
+つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
 
 ## serve の動き
 
@@ -195,7 +198,8 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 Ctrl+C で止めます。
 
 - **`serve` は本体をすぐに止めます。** 処理中のリクエストは待ちません。
-- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめるときは、`cargo run -- serve` で動かします（[deployment.md](deployment.md#止める)）。
+- 待ってから止まる動き（`APP_SHUTDOWN_TIMEOUT`）を確かめるときは、`cargo run -- serve`
+  で動かします（[deployment.md](deployment.md#止める)）。
 - `serve` を強制終了したとき（`kill -9`、タスクマネージャ）は、本体が残ります。手で止めてください。
 
 ## 関連

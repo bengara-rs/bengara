@@ -31,11 +31,11 @@ println!("{}", result.output());
 
 ```rust
 let result = Process::timeout(30 * 60)
-    .path(storage_path("app/videos"))
-    .env("LANG", "C")
-    .run(["ffmpeg", "-i", "in.mp4", "out.webm"])
-    .await?
-    .throw()?;
+.path(storage_path("app/videos"))
+.env("LANG", "C")
+.run(["ffmpeg", "-i", "in.mp4", "out.webm"])
+.await?
+.throw() ?;
 ```
 
 | 書き方               | 意味                                     | 書かないとき                       |
@@ -156,9 +156,9 @@ Process::run(["sh", "-c", "ls -la | wc -l"]).await?;
 ```rust
 use bengara::support::blocking;
 
-let total = blocking(move || {
-    // 何秒も CPU を使う同期の計算
-    rows.iter().map(score).sum::<u64>()
+let total = blocking(move | | {
+// 何秒も CPU を使う同期の計算
+rows.iter().map(score).sum::< u64 > ()
 })
 .await?;
 ```

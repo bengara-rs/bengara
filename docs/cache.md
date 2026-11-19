@@ -97,7 +97,8 @@ let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().awai
 
 - 知らない名前を書くと、警告を出して `file` にします。
 - **プロセスを 2 つ以上動かすときは `file` にします。** 全部が同じ `storage/` を見るようにしてください。
-- `file` は `storage/` が無いと書き込みでエラーになります。`storage:init` で作ってください（[deployment.md](deployment.md)）。
+- `file` は `storage/` が無いと書き込みでエラーになります。`storage:init`
+  で作ってください（[deployment.md](deployment.md)）。
 - `storage/` の中のキャッシュのディレクトリは自分で作ります。作るときは所有者だけが読める権限にします。
 
 `config/cache.rs` を置くと、そちらを使います。無くても動きます。
@@ -144,8 +145,7 @@ async fn 数を足し引きできる() {
 
 ## 置き場所を自分で作る
 
-`CacheStore` を実装して、`bootstrap/app.rs` で入れ替えます。
-**効くのは 1 回目だけです。** キャッシュを最初に使う前に呼んでください。
+`CacheStore` を実装して、`bootstrap/app.rs` で入れ替えます。 **効くのは 1 回目だけです。** キャッシュを最初に使う前に呼んでください。
 
 ```rust
 // bootstrap/app.rs の中で

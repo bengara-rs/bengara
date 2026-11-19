@@ -139,7 +139,8 @@ DB_PASSWORD="p#ss"
 | 先頭の BOM      | 外して読む（メモ帳で保存しても読める）                                   |
 
 - Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C:\data\app.sqlite"`）。
-- 読めない行は、起動時のログに行番号つきの警告が出ます。`=` が無い行や、名前に英数字と `_` 以外が入った行（`APP-PORT=8000`）です。
+- 読めない行は、起動時のログに行番号つきの警告が出ます。`=` が無い行や、名前に英数字と `_` 以外が入った行（`APP-PORT=8000`
+  ）です。
 
 ## 環境変数の一覧
 
@@ -158,7 +159,8 @@ DB_PASSWORD="p#ss"
 | `RUST_LOG`  | （なし）                | ログの細かさ（[ログ](#ログ)）           | —            |
 
 - `APP_NAME` と `APP_URL` の既定は、`init` が作る `config/app.rs` のものです。
-- `APP_ENV=production` にすると、中身が消えるコマンド（`migrate:fresh` など）が `--force` を求めます（[artisan.md](artisan.md)）。
+- `APP_ENV=production` にすると、中身が消えるコマンド（`migrate:fresh` など）が `--force`
+  を求めます（[artisan.md](artisan.md)）。
 - 同じく、セッションの Cookie に `Secure` が付きます。HTTPS でないと Cookie が送られません。
 
 ### 待ち受けと停止

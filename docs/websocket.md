@@ -328,8 +328,8 @@ pub fn config() -> BroadcastConfig {
 
 ### 切り替えの要求を送る
 
-`#[bengara::test]` の `client` で、切り替えのヘッダーを付けて送ります。
-**ソケットが無いので、確かめた 101 を返すだけです。クロージャは動きません。**
+`#[bengara::test]` の `client` で、切り替えのヘッダーを付けて送ります。 **ソケットが無いので、確かめた 101
+を返すだけです。クロージャは動きません。**
 認証や `Origin` の確かめを、ソケット無しで書けます。
 
 ```rust
@@ -355,8 +355,8 @@ async fn 切り替えの要求に101を返す() {
 
 ### 配信を確かめる
 
-`Broadcast::fake()` を呼ぶと、以後の `publish` を記録だけして送りません。
-**記録はプロセスで 1 つです。** 先に `exclusive()` の札を取ってください。
+`Broadcast::fake()` を呼ぶと、以後の `publish` を記録だけして送りません。 **記録はプロセスで 1 つです。** 先に
+`exclusive()` の札を取ってください。
 
 ```rust
 use bengara::broadcast::Broadcast;

@@ -125,7 +125,8 @@ pub fn down(schema: &mut Schema) {
 | `t.soft_deletes()`                        | `deleted_at`（日時、NULL 可）                 | 同左                          | 同左               |
 
 - `t.foreign_id(列)` は `t.id()` と型がそろうので、そのまま外部キーを張れます。
-- `t.float` と `t.double` は、どのドライバでも 8 バイトです（Laravel と違います）。4 バイトなら `t.raw_column(列, "float")` です。
+- `t.float` と `t.double` は、どのドライバでも 8 バイトです（Laravel と違います）。4 バイトなら `t.raw_column(列, "float")`
+  です。
 - **PostgreSQL では、日付・日時・JSON が `text` 列になります。** bengara は日時を文字列で渡すためです。
 
 ## 列に付ける指定
@@ -181,7 +182,8 @@ schema.create("comments", |t| {
 - 外部キーの名前は、表を作るときも後から足すときも同じです。
 - 同じ名前が 2 つできるときや 63 バイトを超えるときは、末尾に 8 桁の 16 進を足します。
 - 表の名前の `.` と `-` は `_` にします（`main.posts` → `main_posts_status_index`）。
-- `unique()` が作るのは一意「索引」です。PostgreSQL の `on conflict (列)` は使えますが、`on conflict on constraint 名前` には使えません。
+- `unique()` が作るのは一意「索引」です。PostgreSQL の `on conflict (列)` は使えますが、`on conflict on constraint 名前`
+  には使えません。
 
 ## 表を変える
 
@@ -245,7 +247,8 @@ pub fn down(schema: &mut Schema) {
 名前が合わないときは、次のようにします。
 
 - 名前の末尾に 16 進が付いたもの: `drop_index_named` で名前を直に書きます。
-- SQL で `unique` と書いて作った制約: MySQL は `drop_index_named("users", "email")`（列の名前）です。PostgreSQL は `{表}_{列}_key` を `raw` で `drop constraint` します。SQLite は表を作り直します。
+- SQL で `unique` と書いて作った制約: MySQL は `drop_index_named("users", "email")`（列の名前）です。PostgreSQL は
+  `{表}_{列}_key` を `raw` で `drop constraint` します。SQLite は表を作り直します。
 - 無い索引を落とすと、SQLite と PostgreSQL は何もしません。MySQL はエラーです。
 
 ## エラーと警告
