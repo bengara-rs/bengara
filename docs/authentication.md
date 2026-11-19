@@ -134,7 +134,8 @@ pub async fn login(req: Request) -> Result<Response> {
 | `user_or_fail::<U>()`                       | 同じ。いなければ 401                              |
 | `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする                        |
 
-- **ログインすると、セッション ID と CSRF トークンが変わります。** ログイン後の画面で取り直します（[session.md](session.md)）。
+- **ログインすると、セッション ID と CSRF トークンが変わります。**
+  ログイン後の画面で取り直します（[session.md](session.md)）。
 - `user()` は呼ぶたびに DB を引きます。何度も使うときは変数に入れます。
 - `check()` / `guest()` / `id()` と `auth` ミドルウェアは、セッションだけを見ます。
 - そのため、利用者の行を消してもセッションが残るあいだは通ります。**利用者を消したら `logout_user(id)` を呼びます。**
@@ -294,7 +295,8 @@ req.auth().logout_user_async(user.key()).await?;
 `verify` のあとに `consume` を呼ぶ形だと、その間に同じトークンを 2 回使われることがあります。
 
 - トークンは 1 つのアドレスに 1 本です。作り直すと前のものは使えません。
-- `create` 自体は回数を止めません。再送の間隔は `recently_created` で確かめます（`PasswordReset::THROTTLE_SECONDS` = 60 秒）。
+- `create` 自体は回数を止めません。再送の間隔は `recently_created` で確かめます（`PasswordReset::THROTTLE_SECONDS` = 60
+  秒）。
 - 期限切れ・不一致・記録なしは、どれも同じ「偽」です。
 - **知らないアドレスを頼まれたときも、同じ応答を返します。** 応答が違うと、登録の有無が分かります。
 - リンクは `GET` で開かれます。同じパスに `GET` のルートも用意します。
