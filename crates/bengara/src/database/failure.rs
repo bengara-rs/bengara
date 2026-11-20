@@ -70,6 +70,9 @@ pub(crate) fn failed(sql: &str, error: sqlx::Error) -> Error {
 }
 
 /// `failed` と同じ。よくある理由の文を 1 行添えます。
+///
+/// いまは SQLite だけが使います。
+#[cfg(any(feature = "sqlite", test))]
 pub(crate) fn failed_with_hint(sql: &str, error: sqlx::Error, hint: &'static str) -> Error {
     Error::other(SqlFailure {
         sql: sql.to_string(),
