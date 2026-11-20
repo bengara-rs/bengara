@@ -61,6 +61,12 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// 中継の DB の失敗を、続けて警告しない間隔。
 const WARN_EVERY: Duration = Duration::from_secs(60);
 
+/// `publish` のついでに古い行を消す割合（この回数に 1 回ほど）。
+///
+/// 掃除は中継（websocket 付きの `serve`）しかしていませんでした。
+/// サーバーが動いていない構成（キューやコマンドだけが送る）では、表が育ち続けます。
+const SWEEP_ON_INSERT_ONE_IN: u32 = 100;
+
 /// 配信の設定。`config/broadcasting.rs` などが返します。
 ///
 /// ```ignore
@@ -320,7 +326,29 @@ async fn insert_row(channel: &str, kind: &Kind<'_>, origin: &str) -> Result<()> 
             ("created_at", Value::Text(crate::database::now())),
         ])
         .await?;
+    // ときどき古い行を消す。失敗しても送ったことは取り消さない。
+    if sweep_roll(crate::support::crypto::random_bytes::<4>()) {
+        if let Err(e) = sweep_old_rows(retention_secs(config())).await {
+            tracing::debug!("配信の表 {TABLE} の古い行を消せませんでした: {e}");
+        }
+    }
     Ok(())
+}
+
+/// 乱数 4 バイトから、`publish` のついでに掃除するかを決める。
+fn sweep_roll(random: [u8; 4]) -> bool {
+    u32::from_le_bytes(random) % SWEEP_ON_INSERT_ONE_IN == 0
+}
+
+/// 残す長さ（秒）より古い行を消す。返るのは消した件数。
+async fn sweep_old_rows(retention_secs: i64) -> Result<u64> {
+    let cutoff = crate::support::time::format_timestamp(
+        crate::support::time::now_seconds().saturating_sub(retention_secs),
+    );
+    DB::table(TABLE)
+        .where_op("created_at", "<", cutoff)
+        .delete()
+        .await
 }
 
 /// 配信の入口。
@@ -466,6 +494,9 @@ pub(crate) fn start_relay() {
 /// - 起動時: いまの最大の id を `settled`（ここまでは届けない）とする
 /// - 毎回: `id > settled` の行を id の順に読む。届けた id は `delivered` に入れ、二度届けない
 /// - `settled` は「`created_at` が 5 秒より古い行の最大の id」まで進め、`delivered` からそれ以下を捨てる
+/// - `delivered` のうち `settled + 1` から切れ目なく続く部分は、その場で `settled` に畳む
+///   （その範囲の id はすべて届けたので、後から若い id が来る余地が無い）。
+///   畳まないと、毎回 5 秒分の行を読み直していました
 /// - 500 行届けたら、待たずに続けて読む
 struct Relay {
     origin: String,
@@ -585,6 +616,10 @@ impl Relay {
             }
         }
 
+        // 届けた id が切れ目なく続く分は、5 秒を待たずに進める。
+        self.compact();
+        let settled = self.settled.unwrap_or(settled);
+
         // 5 秒より古い行までは、もう若い id が後から来ないと見なして進める。
         let cutoff = crate::support::time::format_timestamp(
             crate::support::time::now_seconds() - SETTLE_AFTER_SECS,
@@ -606,18 +641,27 @@ impl Relay {
         Ok(frontier.is_some())
     }
 
+    /// `delivered` の先頭が `settled + 1` から切れ目なく続く分を `settled` に畳む。
+    ///
+    /// 間が空いていたら止めます。空いた id は、まだコミットされていない行かもしれません
+    /// （その分は 5 秒の規則で進めます）。
+    fn compact(&mut self) {
+        let Some(mut settled) = self.settled else {
+            return;
+        };
+        while self.delivered.first() == Some(&(settled + 1)) {
+            self.delivered.pop_first();
+            settled += 1;
+        }
+        self.settled = Some(settled);
+    }
+
     /// 1 分に 1 回、残す長さより古い行を消す。
     async fn sweep(&mut self) -> Result<()> {
         if self.last_sweep.is_some_and(|at| at.elapsed() < SWEEP_EVERY) {
             return Ok(());
         }
-        let cutoff = crate::support::time::format_timestamp(
-            crate::support::time::now_seconds().saturating_sub(self.retention_secs),
-        );
-        DB::table(TABLE)
-            .where_op("created_at", "<", cutoff)
-            .delete()
-            .await?;
+        sweep_old_rows(self.retention_secs).await?;
         self.last_sweep = Some(std::time::Instant::now());
         Ok(())
     }
@@ -685,6 +729,18 @@ mod tests {
         };
         assert_eq!(poll_interval(&defaults), Duration::from_millis(250));
         assert_eq!(retention_secs(&defaults), 60);
+    }
+
+    #[test]
+    fn publishのついでの掃除はときどき() {
+        assert!(sweep_roll(0u32.to_le_bytes()));
+        assert!(sweep_roll(SWEEP_ON_INSERT_ONE_IN.to_le_bytes()));
+        assert!(!sweep_roll(1u32.to_le_bytes()));
+        // 1 万通りのうち、ほぼ 100 回に 1 回。
+        let hits = (0..10_000u32)
+            .filter(|n| sweep_roll(n.to_le_bytes()))
+            .count();
+        assert_eq!(hits, 100);
     }
 
     #[test]
@@ -974,6 +1030,51 @@ mod tests {
             assert_eq!(rest.len(), 20);
             assert_eq!(rest.first().map(String::as_str), Some("500"), "順番どおり");
             registry::unregister(conn.id());
+        }
+
+        #[tokio::test]
+        async fn 届けたidが切れ目なく続く分はすぐ畳む() {
+            let _db = crate::testing::refresh_database().await;
+            表を作る().await;
+            let channel = unique("compact");
+            let (conn, mut rx) = member(&channel);
+            let mut relay = Relay::new(origin().to_string(), 60);
+            relay.step().await;
+            assert_eq!(relay.settled, Some(0));
+
+            // 1・2・3 は続いている。5 秒を待たずに settled へ畳む。
+            for payload in ["a", "b", "c"] {
+                other(None, &channel, payload, &crate::database::now()).await;
+            }
+            relay.step().await;
+            assert_eq!(texts(&mut rx), vec!["a", "b", "c"]);
+            assert_eq!(relay.settled, Some(3));
+            assert!(relay.delivered.is_empty());
+
+            // 5 が先に来て 4 が空いている。4 は後からコミットされるかもしれないので畳まない。
+            other(Some(5), &channel, "five", &crate::database::now()).await;
+            relay.step().await;
+            assert_eq!(texts(&mut rx), vec!["five"]);
+            assert_eq!(relay.settled, Some(3));
+            assert_eq!(relay.delivered.iter().copied().collect::<Vec<_>>(), vec![5]);
+
+            // 4 が届いたら、4 と 5 をまとめて畳む。取りこぼしもない。
+            other(Some(4), &channel, "four", &crate::database::now()).await;
+            relay.step().await;
+            assert_eq!(texts(&mut rx), vec!["four"]);
+            assert_eq!(relay.settled, Some(5));
+            assert!(relay.delivered.is_empty());
+            registry::unregister(conn.id());
+        }
+
+        #[tokio::test]
+        async fn publishのついでに古い行を消せる() {
+            let _db = crate::testing::refresh_database().await;
+            表を作る().await;
+            other(None, "c", "old", &ago(120)).await;
+            other(None, "c", "new", &crate::database::now()).await;
+            assert_eq!(sweep_old_rows(60).await.unwrap(), 1);
+            assert_eq!(DB::table(TABLE).count().await.unwrap(), 1);
         }
 
         #[tokio::test]

@@ -100,7 +100,13 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
     // Windows のメモ帳などは UTF-8 BOM を付ける。残すと1行目のキーが
     // `\u{feff}APP_NAME` になり、英数字の判定に落ちて黙って捨てられる。
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let (pairs, warnings) = parse_dotenv(text);
+    // `${VAR}` は「本物の環境変数 > `.env` の前の行」で展開する。
+    let real = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let (pairs, warnings) = parse_dotenv(text, &real);
     for (key, value) in pairs {
         if is_unset(std::env::var_os(&key).as_deref()) {
             // SAFETY: 起動直後、スレッドを作る前に1回だけ呼ぶ。
@@ -117,7 +123,7 @@ pub(crate) fn load_dotenv(base: &Path) -> (Option<std::path::PathBuf>, Vec<Strin
 /// 実際の環境変数が「未設定」かどうか。無いか、空白だけなら未設定。
 ///
 /// UTF-8 でない値は中身があるものとして扱います（上書きしない）。
-fn is_unset(value: Option<&std::ffi::OsStr>) -> bool {
+pub(crate) fn is_unset(value: Option<&std::ffi::OsStr>) -> bool {
     match value {
         None => true,
         Some(raw) => raw.to_str().is_some_and(|text| text.trim().is_empty()),
@@ -145,14 +151,33 @@ pub(crate) fn strip_export(line: &str) -> &str {
 /// 読めなかった行は飛ばしますが、黙って捨てずに警告を返します。起動時に1回しか
 /// 通らないので、行番号を数える費用は気にしません。
 ///
+/// # `${VAR}` の展開
+///
+/// Laravel（phpdotenv）と同じく、**引用符なしと `"..."` の値**の中の `${VAR}` を
+/// 展開します。`'...'` の中は展開しません。
+///
+/// - 値は「本物の環境変数（`real`）> この `.env` の前の行」の順で探します。
+///   後の行に書いた変数は使えません。
+/// - どちらにも無い（か空の）変数は空文字になります。
+/// - `$VAR`（波かっこなし）は展開しません。閉じていない `${` はそのまま残します。
+///
+/// ```text
+/// APP_NAME=bengara
+/// MAIL_FROM_NAME="${APP_NAME}"   # → bengara
+/// RAW='${APP_NAME}'              # → ${APP_NAME}
+/// ```
+///
 /// # `#` を含む値は必ず引用符で囲んでください
 ///
 /// 引用符で囲んでいない値は、**最初の `#` より前までが値になります。**
 /// `DB_PASSWORD=p#ss` は `p` になり、警告も出ません。
 /// `#` を値に入れたいときは囲みます（`DB_PASSWORD="p#ss"`）。
 /// 囲んだ値の中の `#` は、そのまま値に残ります。
-fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
-    let mut out = Vec::new();
+fn parse_dotenv(
+    text: &str,
+    real: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut warnings = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let number = index + 1;
@@ -180,10 +205,20 @@ fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
             ));
             continue;
         }
-        out.push((
-            key.to_string(),
-            parse_value(rest.trim(), number, &mut warnings),
-        ));
+        let (value, expandable) = parse_raw(rest.trim(), number, &mut warnings);
+        let value = if expandable {
+            expand(&value, |name| {
+                real(name).or_else(|| {
+                    // 同じキーが 2 回あれば、読み込みと同じく先の行を採る。
+                    out.iter()
+                        .find(|(earlier, _)| earlier == name)
+                        .map(|(_, value)| value.clone())
+                })
+            })
+        } else {
+            value
+        };
+        out.push((key.to_string(), value));
     }
     (out, warnings)
 }
@@ -193,12 +228,53 @@ fn parse_dotenv(text: &str) -> (Vec<(String, String)>, Vec<String>) {
 /// `key:generate` が「`APP_KEY` は設定済みか」を見るのに使います。別々に
 /// 読むと、`APP_KEY=""` や `APP_KEY= # 後で` を「設定済み」と見てしまいます
 /// （読み込みではどちらも空です）。警告は読み込みのときに出るので、ここでは捨てます。
+///
+/// `${VAR}` は本物の環境変数だけで展開します（前の行までは見ません）。
 pub(crate) fn dotenv_value(raw: &str) -> String {
-    parse_value(raw.trim(), 0, &mut Vec::new())
+    let (value, expandable) = parse_raw(raw.trim(), 0, &mut Vec::new());
+    if expandable {
+        expand(&value, |name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+    } else {
+        value
+    }
+}
+
+/// 値の中の `${VAR}` を `resolve` の結果に置き換える。
+///
+/// 見つからない変数は空文字にします（phpdotenv と同じ）。名前に英数字と `_`
+/// 以外が入っているもの・閉じていない `${` は、そのまま残します。
+fn expand(value: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let name = after.find('}').map(|end| &after[..end]).filter(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        match name {
+            Some(name) => {
+                out.push_str(&resolve(name).unwrap_or_default());
+                rest = &after[name.len() + 1..];
+            }
+            None => {
+                out.push_str("${");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `=` の右側を値にする。`number` は警告に出す行番号。
-fn parse_value(raw: &str, number: usize, warnings: &mut Vec<String>) -> String {
+///
+/// 2 つ目は `${VAR}` を展開してよいか（引用符なしと `"..."` は真、`'...'` は偽）。
+fn parse_raw(raw: &str, number: usize, warnings: &mut Vec<String>) -> (String, bool) {
     let mut chars = raw.chars().peekable();
     match chars.peek() {
         Some('"') => {
@@ -230,7 +306,7 @@ fn parse_value(raw: &str, number: usize, warnings: &mut Vec<String>) -> String {
                 }
             }
             warn_unclosed(closed, number, warnings);
-            out
+            (out, true)
         }
         Some('\'') => {
             chars.next();
@@ -244,10 +320,10 @@ fn parse_value(raw: &str, number: usize, warnings: &mut Vec<String>) -> String {
                 out.push(c);
             }
             warn_unclosed(closed, number, warnings);
-            out
+            (out, false)
         }
         // 引用符なしの値は、`#` より前までを取り、前後の空白を落とす。
-        _ => strip_comment(raw).trim().to_string(),
+        _ => (strip_comment(raw).trim().to_string(), true),
     }
 }
 
@@ -262,7 +338,7 @@ fn warn_unclosed(closed: bool, number: usize, warnings: &mut Vec<String>) {
 
 /// 値から `#` 以降を落とす。
 ///
-/// **引用符で囲んでいない値にだけ使います。** 囲んだ値は `parse_value` が
+/// **引用符で囲んでいない値にだけ使います。** 囲んだ値は `parse_raw` が
 /// 閉じ引用符までを値にするので、ここは通りません。
 ///
 /// doc どおり「`#` から行末まではコメント」にします。`#` の前に空白を求めると
@@ -283,12 +359,60 @@ mod tests {
 
     /// 警告を捨てて `KEY=VALUE` の並びだけを見る、テスト用の近道。
     fn pairs(text: &str) -> Vec<(String, String)> {
-        parse_dotenv(text).0
+        parse_dotenv(text, &|_| None).0
     }
 
     /// 警告の一覧だけを見る、テスト用の近道。
     fn warnings(text: &str) -> Vec<String> {
-        parse_dotenv(text).1
+        parse_dotenv(text, &|_| None).1
+    }
+
+    #[test]
+    fn 波かっこの変数を前の行の値で展開する() {
+        let v = pairs("APP_NAME=bengara\nMAIL_FROM_NAME=\"${APP_NAME}\"\nB=${APP_NAME}-app\n");
+        assert_eq!(v[1].1, "bengara");
+        assert_eq!(v[2].1, "bengara-app");
+    }
+
+    #[test]
+    fn initの雛形は警告なしに読めて差出人の名前はアプリ名になる() {
+        // `init` が作る `.env`。`MAIL_FROM_NAME="${APP_NAME}"`（Laravel と同じ書き方）が効くこと。
+        let text = include_str!("cli/stubs/env.stub").replace("{{name}}", "myapp");
+        let (v, warnings) = parse_dotenv(&text, &|_| None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let get = |key: &str| v.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        assert_eq!(get("MAIL_FROM_NAME"), Some("myapp"));
+        assert_eq!(get("MAIL_FROM_ADDRESS"), Some("noreply@example.com"));
+        assert_eq!(get("APP_KEY"), Some(""));
+    }
+
+    #[test]
+    fn 単一引用符の中は展開しない() {
+        let v = pairs("A=x\nB='${A}'\n");
+        assert_eq!(v[1].1, "${A}");
+    }
+
+    #[test]
+    fn 本物の環境変数が前の行より優先される() {
+        let real = |key: &str| (key == "APP_NAME").then(|| "real".to_string());
+        let (v, _) = parse_dotenv("APP_NAME=dotenv\nA=\"${APP_NAME}\"\n", &real);
+        assert_eq!(v[1].1, "real");
+    }
+
+    #[test]
+    fn 展開できないものの扱い() {
+        // 後の行・どこにも無い変数は空になる。
+        let v = pairs("A=[${B}]\nB=1\n");
+        assert_eq!(v[0].1, "[]");
+        // 同じキーが 2 回あれば先の行を使う（読み込みと同じ）。
+        let v = pairs("A=1\nA=2\nB=${A}\n");
+        assert_eq!(v[2].1, "1");
+        // `$VAR`・閉じていない `${`・名前に使えない文字はそのまま残す。
+        let v = pairs("A=1\nB=$A\nC=\"${A\"\nD=\"${A-B}\"\nE=\"${}\"\n");
+        assert_eq!(v[1].1, "$A");
+        assert_eq!(v[2].1, "${A");
+        assert_eq!(v[3].1, "${A-B}");
+        assert_eq!(v[4].1, "${}");
     }
 
     #[test]

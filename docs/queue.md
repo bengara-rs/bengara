@@ -31,6 +31,31 @@ pub fn down(schema: &mut Schema) {
 
 置いたら `cargo artisan migrate` を流します。
 
+### 前の版で作った表の索引を付け替える
+
+前の版の `Queue::define` は、`jobs` 表に `(queue, available_at)` の索引を付けていました。
+いまは `(queue, id)` です。件数が多いと、古い索引では取り出しが遅くなります。
+`Queue::define` は作ってある表には効かないので、次のマイグレーションで付け替えます。
+
+```rust
+// database/migrations/2026_11_20_000000_add_queue_id_index_to_jobs_table.rs
+use bengara::prelude::*;
+
+pub fn up(schema: &mut Schema) {
+    schema.table(bengara::queue::TABLE, |t| {
+        t.index(&["queue", "id"]);
+    });
+    schema.drop_index(bengara::queue::TABLE, &["queue", "available_at"]);
+}
+
+pub fn down(schema: &mut Schema) {
+    schema.table(bengara::queue::TABLE, |t| {
+        t.index(&["queue", "available_at"]);
+    });
+    schema.drop_index(bengara::queue::TABLE, &["queue", "id"]);
+}
+```
+
 ## ジョブを書く
 
 `app/Jobs/` に置きます。**ファイル名がジョブの名前になります**（`SendWelcome.rs` → `SendWelcome`）。
@@ -62,16 +87,16 @@ pub async fn handle(Json(payload): Json<Payload>) -> Result<()> {
 }
 ```
 
-`handle` が受け取る形は 2 つです。どちらで読むかは、引数の型から決まります。
+`handle` が受け取る形は 2 つです。引数の型で決まります。
 
-| 引数                      | 受け取るもの                                   |
-|---------------------------|------------------------------------------------|
-| `Json(payload): Json<T>`  | 中身を `T` に読んだもの（`bengara::queue::Json`） |
-| `payload: String`         | 積んだ JSON の文字列そのまま。自分で読む         |
+| 引数                     | 受け取るもの                                      |
+|--------------------------|---------------------------------------------------|
+| `Json(payload): Json<T>` | 中身を `T` に読んだもの（`bengara::queue::Json`） |
+| `payload: String`        | 積んだ JSON の文字列そのまま。自分で読む          |
 
-- `Json<T>` で読めない中身は、ジョブの失敗になります（下の再挑戦と `failed_jobs` に乗ります）。
 - `Ok(())` で成功です。行は消えます。
 - `Err` で失敗です。待ってから再挑戦します。パニックも同じで、worker は止まりません。
+- `Json<T>` で読めない中身も、ジョブの失敗になります。
 - **2 回動いても困らない作りにしてください。** 時間切れなどで、もう一度動くことがあります。
 
 ## ジョブを積む
@@ -103,6 +128,7 @@ Queue::push_raw("SendWelcome", r#"{"user_id":1}"#).await?;                    //
 
 - 数える 3 つは `i64`、捨てる 2 つは消した件数（`u64`）を返します。
 - `size()` には、処理中や遅らせて待っているものも入ります。
+- `ready_size()` は処理中のものを数えません。worker が落ちて取り直し待ちの行も、処理中として外れます。
 - **`clear()` は処理中の行も消します。** 動いているジョブは止まりませんが、失敗しても再挑戦されません。
 - 諦めたもの（`failed_jobs` 表）は消しません。
 
@@ -134,8 +160,7 @@ Ctrl+C を押すと、いま動かしている 1 件を終わらせてから止�
 
 - もう 1 回押すと、待たずに強制終了します（終了コード 130）。
 - `systemctl stop` や `docker stop` の合図（SIGTERM）でも同じです。
-- 待つのは長くても、そのジョブの打ち切りの時間までです。
-- 打ち切りの時間が `0` のジョブは、**終わるまで上限なく待ちます。** 待てないときは 2 回目の Ctrl+C か、外から強制終了します。
+- 待つのは長くても、そのジョブの打ち切りの時間までです。`0` のジョブは終わるまで待ちます。
 - 本番での止め方は [deployment.md](deployment.md) にあります。
 
 ### 時間切れ
@@ -151,7 +176,6 @@ Ctrl+C を押すと、いま動かしている 1 件を終わらせてから止�
 - `.await` を挟まない長い計算は打ち切れません。このときは **worker をエラーで終えます**（同じジョブが 2 本同時に動くのを防ぐため）。
 - 長い計算は小さく区切って、間に `.await` を挟んでください。
 - 再挑戦は最初からやり直します。途中まで進んだ分は戻りません。
-- **systemd などで、落ちたら起動し直す設定にしてください**（[deployment.md](deployment.md)）。
 
 ### ジョブごとの打ち切りの時間
 
@@ -170,12 +194,9 @@ pub fn config() -> QueueConfig {
 ```
 
 - 名前は `app/Jobs/` のファイル名です。
-- 載っているジョブには、`--timeout` より優先して効きます。
+- 載っているジョブには、`--timeout` より優先して効きます。`0` は打ち切りません。
 - 同じ名前が 2 回あれば、最初の 1 つを使います。
-- `0` は打ち切りません。
 - `QueueConfig` は `prelude` に入っていません。`bengara::QueueConfig` でも使えます。
-
-失敗の文には、どこで決めた時間かが入ります（`（config/queue.rs）` か `（--timeout）`）。
 
 `queue:work` は、起動時に次のものを警告します。起動は止めません。
 
@@ -188,12 +209,10 @@ pub fn config() -> QueueConfig {
 ### 同じジョブが 2 回動くとき
 
 2 つの worker が、同じジョブを同時に取り出すことはありません。
-取り出したジョブには「処理中」の印を付けます。
-印が古くなると、別の worker が取り直します（失敗 1 回として数えます）。
+処理中のまま古くなったジョブは、別の worker が取り直します（失敗 1 回として数えます）。
 
 取り直すまでの時間は、「打ち切りの時間 + 30 秒」と `--retry-after` の遅いほうです。
-そのため、長いジョブが動いている途中に取り直されることはありません。
-ただし worker が落ちたときも、取り直しはそれだけ待ちます（30 分のジョブなら 30 分 30 秒後）。
+長いジョブが、動いている途中で取り直されることはありません。
 
 2 回動くのは次のときだけです。
 
@@ -230,16 +249,8 @@ cargo artisan queue:flush           # 記録を捨てる
 `queue:work` は常駐します。**落ちたら上げ直す仕組みを、外に用意してください**（Linux なら systemd の `Restart=always`）。
 
 - `queue:work` と `serve` は別のプロセスです。同じ `.env` と同じ DB を見るようにします。
+- DB に一時的につながらないときは、数回待ってやり直します。直らなければエラーで終わります。
 - 設定の例は [deployment.md](deployment.md) にあります。
-
-DB に一時的につながらないときは、待ってやり直します。直らなければエラーで終わります。
-
-| 失敗したところ   | やり直し                           |
-|------------------|------------------------------------|
-| ジョブの取り出し | 5 回まで。待ちは 1・2・4・8・10 秒 |
-| 成功・失敗の記録 | 3 回まで。待ちは 1・2・4 秒        |
-
-成功の記録を書けずに終わったジョブは、予約が切れた後にもう 1 回動きます。
 
 ## テスト
 
@@ -275,11 +286,8 @@ crate::app::jobs::send_welcome::handle(Json(Payload { user_id: user.id }))
     .unwrap();
 ```
 
-`String` で受け取る `handle` には、JSON の文字列を渡します。
-
-メールを送るジョブを確かめる全体の例は [mail.md](mail.md#テスト) にあります。
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
+- `String` で受け取る `handle` には、JSON の文字列を渡します。
+- メールを送るジョブを確かめる例は [mail.md](mail.md#テスト) にあります。
 
 ## 関連
 

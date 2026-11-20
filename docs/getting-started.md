@@ -7,20 +7,35 @@
 
 ```sh
 cargo new myapp && cd myapp
-cargo add bengara --features sqlite
 ```
 
-**crates.io には公開していません。** 取得したソースを `Cargo.toml` の `[patch.crates-io]` で指します。
+**crates.io には公開していません。** そのため `cargo add bengara` は失敗します。
+`Cargo.toml` に依存の行を手で書き、取得したソースを `[patch.crates-io]` で指します。
 
-`--features`（機能フラグ）は使うものに合わせて選びます。データベースを使わないなら付けません。
+```toml
+[dependencies]
+bengara = { version = "0.1", features = ["sqlite"] }
 
-| 使うもの            | 機能フラグ  |
-|---------------------|-------------|
-| SQLite              | `sqlite`    |
-| MySQL / MariaDB     | `mysql`     |
-| PostgreSQL          | `postgres`  |
-| SMTP でのメール送信 | `mail`      |
-| WebSocket           | `websocket` |
+# 取得したソースの場所を書く（下は myapp の隣に置いた例）
+[patch.crates-io]
+bengara = { path = "../bengara/crates/bengara" }
+bengara-build = { path = "../bengara/crates/bengara-build" }
+bengara-macros = { path = "../bengara/crates/bengara-macros" }
+```
+
+- `bengara-build` は、手順 3 の `init` が `[build-dependencies]` に足します。
+- それまでは「使われていない patch」の警告が出ます。そのままで構いません。
+
+`features`（機能フラグ）は、使うものに合わせて選びます。データベースを使わないなら書きません。
+
+| 使うもの                           | 機能フラグ  |
+|------------------------------------|-------------|
+| SQLite                             | `sqlite`    |
+| MySQL / MariaDB                    | `mysql`     |
+| PostgreSQL                         | `postgres`  |
+| SMTP でのメール送信                | `mail`      |
+| WebSocket                          | `websocket` |
+| テンプレート（`resources/views/`） | `view`      |
 
 一覧は [configuration.md](configuration.md#機能フラグ) にあります。
 
@@ -40,19 +55,23 @@ fn main() { bengara::run() }
 cargo run -- init
 ```
 
-Laravel と同じ構成のディレクトリとファイルができます。 **何度実行しても壊れません。** 足りないものだけを作ります。
+Laravel と同じ構成のディレクトリとファイルができます。
+**何度実行しても壊れません。** 足りないものだけを作ります。
 
-| すること                        | 中身                                                    |
-|---------------------------------|---------------------------------------------------------|
-| ディレクトリとファイルを作る    | 構成は [directory-structure.md](directory-structure.md) |
-| 直下に `main.rs` を置く         | 中身は `bengara::app!();` の 1 行                       |
-| `src/main.rs` を消す            | `src/` が空になれば `src/` も消す                       |
-| `.env` と `.env.example` を作る | `.env` は Unix では所有者だけが読める（0600）           |
-| `storage/` を作る               | Unix では所有者だけが使える（0700）                     |
-| `Cargo.toml` に足りない行を足す | すでにある行には触らない                                |
+| すること                        | 中身                                                                |
+|---------------------------------|---------------------------------------------------------------------|
+| ディレクトリとファイルを作る    | 構成は [directory-structure.md](directory-structure.md)             |
+| 直下に `main.rs` を置く         | 中身は `bengara::app!();` の 1 行                                   |
+| `src/main.rs` を消す            | `src/` が空になれば `src/` も消す                                   |
+| `.env` と `.env.example` を作る | `.env` には `APP_KEY` を入れる。Unix では所有者だけが読める（0600） |
+| `storage/` を作る               | Unix では所有者だけが使える（0700）                                 |
+| `Cargo.toml` に足りない行を足す | すでにある行には触らない                                            |
 
-`Cargo.toml` に足すのは、入口の `[[bin]]` 2 つ（本体の `main.rs` と `artisan.rs`）、依存、
-リリースビルドの設定などです。
+`Cargo.toml` に足すのは、次のようなものです。
+
+- 入口の `[[bin]]` 2 つ（本体の `main.rs` と、開発用の `artisan.rs`）
+- 依存（`bengara` と `bengara-build`）
+- リリースビルドの設定（`[profile.release]`）
 
 ### すでにあるファイルの扱い
 
@@ -67,13 +86,17 @@ Laravel と同じ構成のディレクトリとファイルができます。 **
 **上の 4 つのどれかが読めないときは、何も書き換えずに止まります。**
 多いのは UTF-8 でないファイルです。UTF-8 で保存し直してください。
 
-## 4. APP_KEY を作る
+## 4. APP_KEY を確かめる
+
+`init` は `.env` を**新しく作ったときだけ**、`APP_KEY`（署名と暗号化の鍵）を作って書き込みます。
+Laravel の `composer create-project` と同じです。
+
+- すでにあった `.env` には触りません。`APP_KEY` が空なら、次で作ります。
 
 ```sh
 cargo artisan key:generate
 ```
 
-`init` が作る `.env` の `APP_KEY`（署名と暗号化の鍵）は空です。
 空のままだと、セッションや署名付き URL を使うリクエストがエラーになります。
 
 ## 5. 起動する
@@ -118,10 +141,14 @@ async fn 生存確認が応答する() {
 ## 8. リリースビルド
 
 ```sh
-cargo build --release
+cargo build --release --bin myapp
 ```
 
-実行ファイルが 2 つできます（本体と `artisan`）。本番に置くのは本体だけです。
+`--bin` には本体の名前（`Cargo.toml` の `[package]` の `name`）を書きます。
+本番に置くのは本体だけです。
+
+- `--bin` を付けないと、開発用の `artisan` もリリースの設定で作ります。ビルドが倍近くかかります。
+
 手順は [deployment.md](deployment.md) にあります。
 
 ## つまずいたとき
@@ -136,8 +163,8 @@ cargo build --release
 
 ### cargo artisan の別名
 
-`cargo artisan` は Cargo の別名です。`init` が次のファイルを作ります。 **このファイルを `.gitignore`
-に入れないでください。**
+`cargo artisan` は Cargo の別名です。`init` が次のファイルを作ります。
+**このファイルを `.gitignore` に入れないでください。**
 
 ```toml
 # .cargo/config.toml

@@ -14,7 +14,7 @@ use sqlx::sqlite::{
 use sqlx::{Column, Row as SqlxRow, Sqlite, TypeInfo, ValueRef};
 
 use super::backend::{Backend, DbFuture, RawTx};
-use super::failure::failed;
+use super::failure::{failed, failed_with_hint};
 use super::grammar::Driver;
 use super::value::{Affected, Row, Value};
 use super::ConnectionConfig;
@@ -22,6 +22,11 @@ use crate::error::{Error, Result};
 
 /// つなぐ。
 pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backend>> {
+    Ok(Arc::new(open(settings).await?))
+}
+
+/// 接続プールを作る。テストで中身を見られるよう、`connect` から分けています。
+async fn open(settings: &ConnectionConfig) -> Result<SqliteBackend> {
     let memory = settings.is_memory();
     let options = build_options(settings)?;
 
@@ -33,10 +38,14 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
     });
     if memory {
         // 接続が切れると中身も消えるので、ずっと持っておく。
+        // 接続は 1 本なので、空くのは使っている処理が終わったときだけです。
+        // トランザクションの途中で外の接続を使うと、終わりが来ないまま待ち続けます。
+        // 既定の 30 秒ではなく、早めに諦めて理由を添えます（`SqliteBackend::fail`）。
         pool = pool
             .min_connections(1)
             .idle_timeout(None)
-            .max_lifetime(None);
+            .max_lifetime(None)
+            .acquire_timeout(MEMORY_ACQUIRE_TIMEOUT);
     }
 
     let pool = pool.connect_with(options).await.map_err(|e| {
@@ -46,8 +55,23 @@ pub(crate) async fn connect(settings: &ConnectionConfig) -> Result<Arc<dyn Backe
             super::connection_target(settings)
         ))
     })?;
-    Ok(Arc::new(SqliteBackend { pool }))
+    Ok(SqliteBackend { pool, memory })
 }
+
+/// メモリの SQLite で、接続が空くのを待つ長さ。
+const MEMORY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// トランザクションを始める文。
+///
+/// `BEGIN IMMEDIATE` は、始めた時点で書き込みの権利を取ります。
+/// 既定の `BEGIN`（DEFERRED）は、最初に書くときに取ります。WAL で
+/// 「読んでから書く」トランザクションが 2 つ同時に走ると、後から書く側は
+/// `SQLITE_BUSY_SNAPSHOT` ですぐ失敗し、`busy_timeout` で待ちません。
+/// IMMEDIATE なら、始めるところで `busy_timeout` の間だけ順番を待ちます。
+///
+/// メモリの SQLite は接続が 1 本で競り合わないので、同じ文でも困りません。
+/// 経路を分けないために、どちらも同じ文にします。
+const BEGIN: &str = "BEGIN IMMEDIATE";
 
 /// どの経路でも同じ設定を付ける。
 ///
@@ -104,7 +128,22 @@ fn build_options(settings: &ConnectionConfig) -> Result<SqliteConnectOptions> {
 /// SQLite の接続プール。
 struct SqliteBackend {
     pool: SqlitePool,
+    /// メモリの上か。接続を待ちきれなかったときの文を変えます。
+    memory: bool,
 }
+
+impl SqliteBackend {
+    /// 失敗を包む。メモリの SQLite で接続を待ちきれなかったときは、よくある理由を添えます。
+    fn fail(&self, sql: &str, error: sqlx::Error) -> Error {
+        if self.memory && matches!(error, sqlx::Error::PoolTimedOut) {
+            return failed_with_hint(sql, error, MEMORY_POOL_HINT);
+        }
+        failed(sql, error)
+    }
+}
+
+/// メモリの SQLite で、接続を待ちきれなかったときに添える文。
+const MEMORY_POOL_HINT: &str = "メモリの SQLite は接続が 1 本だけです。トランザクションの途中で DB::table / save() を呼んでいませんか。トランザクションの中では、渡された tx を使ってください";
 
 impl Backend for SqliteBackend {
     fn driver(&self) -> Driver {
@@ -116,7 +155,7 @@ impl Backend for SqliteBackend {
             let rows = bind(sqlx::query(sql), bindings)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| failed(sql, e))?;
+                .map_err(|e| self.fail(sql, e))?;
             convert_rows(&rows)
         })
     }
@@ -126,14 +165,18 @@ impl Backend for SqliteBackend {
             let result = bind(sqlx::query(sql), bindings)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| failed(sql, e))?;
+                .map_err(|e| self.fail(sql, e))?;
             Ok(affected(sql, &result))
         })
     }
 
     fn begin(&self) -> DbFuture<'_, Box<dyn RawTx>> {
         Box::pin(async move {
-            let tx = self.pool.begin().await.map_err(|e| failed("begin", e))?;
+            let tx = self
+                .pool
+                .begin_with(BEGIN)
+                .await
+                .map_err(|e| self.fail(BEGIN, e))?;
             Ok(Box::new(SqliteTx { tx }) as Box<dyn RawTx>)
         })
     }
@@ -145,7 +188,7 @@ impl Backend for SqliteBackend {
             let rows = sqlx::query(sql)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| failed(sql, e))?;
+                .map_err(|e| self.fail(sql, e))?;
             convert_rows(&rows)?
                 .iter()
                 .map(|row| row.get::<String>("name"))
@@ -611,5 +654,107 @@ mod tests {
         // 小数は小数で返る（SQLite に小数専用の型が無いため）。
         assert_eq!(row.value("total"), Some(&Value::Float(1234.56)));
         assert_eq!(row.get::<f64>("total").unwrap(), 1234.56);
+    }
+
+    /// 一時ディレクトリに、テストごとに別のファイル名を作る。
+    fn temp_database(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!("bengara-{label}-{}-{nanos}.db", std::process::id()))
+    }
+
+    /// 本体と WAL の付属ファイルを消す。
+    fn remove_database(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(name));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ファイルのsqliteで読んでから書くトランザクションが同時に走っても両方成功する() {
+        // 以前は `BEGIN`（DEFERRED）だった。WAL で両方が先に読むと、後から書く側が
+        // `SQLITE_BUSY_SNAPSHOT` ですぐ失敗し、`busy_timeout` で待たなかった。
+        let path = temp_database("immediate");
+        let settings = ConnectionConfig::sqlite("test", path.to_string_lossy().as_ref());
+        let db = connect(&settings)
+            .await
+            .expect("ファイルの SQLite につながる");
+        db.execute("create table t (a integer)", &[]).await.unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for n in 0..2_i64 {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                // 2 つが同時に始めるよう、そろえてから begin する。
+                barrier.wait().await;
+                let mut tx = db.begin().await?;
+                let rows = tx.fetch_all("select count(*) as c from t", &[]).await?;
+                let count = rows[0].get::<i64>("c")?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tx.execute(
+                    "insert into t (a) values (?)",
+                    &[Value::Int(count * 10 + n)],
+                )
+                .await?;
+                tx.commit().await
+            }));
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.expect("タスクが終わる"));
+        }
+        let rows = db.fetch_all("select a from t", &[]).await.unwrap();
+        drop(db);
+        remove_database(&path);
+
+        for result in results {
+            result.expect("どちらのトランザクションも確定できる");
+        }
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn メモリのsqliteは接続を早めに諦める() {
+        let memory = open(&ConnectionConfig::sqlite("test", ":memory:"))
+            .await
+            .unwrap();
+        assert!(memory.memory);
+        assert_eq!(
+            memory.pool.options().get_acquire_timeout(),
+            MEMORY_ACQUIRE_TIMEOUT
+        );
+        // 待ちきれなかったときは、よくある理由を添える。
+        let message = memory
+            .fail("select 1", sqlx::Error::PoolTimedOut)
+            .to_string();
+        assert!(message.contains("DB::table / save()"), "{message}");
+        // ほかの失敗には添えない。
+        let message = memory
+            .fail("select 1", sqlx::Error::RowNotFound)
+            .to_string();
+        assert!(!message.contains("DB::table / save()"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn ファイルのsqliteは待ち時間を変えず理由も添えない() {
+        let path = temp_database("timeout");
+        let settings = ConnectionConfig::sqlite("test", path.to_string_lossy().as_ref());
+        let file = open(&settings).await.unwrap();
+        assert!(!file.memory);
+        assert_ne!(
+            file.pool.options().get_acquire_timeout(),
+            MEMORY_ACQUIRE_TIMEOUT
+        );
+        let message = file.fail("select 1", sqlx::Error::PoolTimedOut).to_string();
+        assert!(!message.contains("DB::table / save()"), "{message}");
+        file.pool.close().await;
+        drop(file);
+        remove_database(&path);
     }
 }

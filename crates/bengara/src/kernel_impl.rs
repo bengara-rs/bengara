@@ -216,6 +216,15 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, _) = split_command(&args);
 
+    // 知らない名前は、置き場所を確かめる**前**にヘルプを出して終える。
+    // 先に確かめると、打ち間違いでも「基準ディレクトリが決まりません」と言われ、
+    // 本当の原因（そんなコマンドは無い）が見えないため。
+    if resolve(command, (hooks.commands)()) == Target::Unknown {
+        eprintln!("`{command}` というコマンドはありません。");
+        print_help(hooks);
+        std::process::exit(1);
+    }
+
     // 置き場所が決まらないまま動き出さない（決定記録 #064）。
     // **`.env` を読む前**に確かめる。読む場所そのものが決まっていないため。
     // つまり `APP_BASE_PATH` は `.env` に書いても効きません。
@@ -489,10 +498,46 @@ fn generate_key(rest: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // 書き換える**前**の `.env` で見分ける（書いた後だと、新しい鍵と比べてしまう）。
+    let real_key = real_app_key_present(&body);
     let key = crate::support::crypto::random_token();
     replace_file(&path, &write_app_key(&body, &key))?;
     println!("APP_KEY を {} に書き込みました。", path.display());
+    if let Some(warning) = real_app_key_warning(real_key) {
+        eprintln!("{warning}");
+    }
     Ok(())
+}
+
+/// 本物の環境変数に `APP_KEY` が入っているか（`.env` から入れたものを除く）。
+///
+/// 起動のときに `.env` を読み込んでいるので、`std::env::var` だけでは見分けられません。
+/// 書き換える前の `.env`（`body`）の値と同じなら、`.env` から来たものと見なします。
+fn real_app_key_present(body: &str) -> bool {
+    std::env::var("APP_KEY").is_ok_and(|value| is_real_app_key(&value, body))
+}
+
+/// 環境変数の値 `value` が、`.env`（`body`）から読み込んだものでないか。
+fn is_real_app_key(value: &str, body: &str) -> bool {
+    if value.trim().is_empty() {
+        return false;
+    }
+    let from_dotenv = body
+        .lines()
+        .find_map(app_key_value)
+        .map(env_vars::dotenv_value);
+    from_dotenv.as_deref() != Some(value)
+}
+
+/// `.env` に書いても、本物の環境変数の `APP_KEY` が勝つときの警告。
+///
+/// `.env` は設定済みの変数を上書きしません。書いた鍵が使われないまま
+/// 「書き込みました」で終わると、気づけないためです。
+fn real_app_key_warning(present: bool) -> Option<&'static str> {
+    present.then_some(
+        "警告: 環境変数 APP_KEY が設定されています。環境変数 APP_KEY が優先されます。\n\
+         .env に書いた鍵を使うには、環境変数 APP_KEY を外してください。",
+    )
 }
 
 /// `.env` の中身で、`APP_KEY` がすでに設定されているか。
@@ -730,8 +775,8 @@ fn print_about(hooks: &Hooks) {
         ("環境", app.env.clone()),
         ("デバッグ表示", yes_no(app.debug)),
         ("URL", app.url.clone()),
-        // 鍵そのものは出さない。設定されているかだけを出す。
-        ("APP_KEY", yes_no(!app.key.trim().is_empty())),
+        // 鍵そのものは出さない。署名に使えるか（あり／なし／短すぎる）だけを出す。
+        ("APP_KEY", app_key_label(app)),
         (
             "基準ディレクトリ",
             format!(
@@ -761,8 +806,9 @@ fn print_about(hooks: &Hooks) {
                 crate::Lang::available()
             ),
         ),
-        ("セッション", env("SESSION_DRIVER", "file".to_string())),
-        ("キャッシュ", env("CACHE_DRIVER", "file".to_string())),
+        // 書いた値ではなく、実際に使う方式を出す（知らない名前は file になる）。
+        ("セッション", session_driver_label()),
+        ("キャッシュ", cache_driver_label()),
         // いま実際に使う方式と強さ（`HASH_DRIVER`）。
         ("パスワード", crate::auth::hash_driver_label()),
         // `MAIL_MAILER` → `MAIL_DRIVER` の順に見る（`config/mail.rs` があればそちら）。
@@ -787,6 +833,44 @@ fn print_about(hooks: &Hooks) {
 /// 真偽を日本語にする。
 fn yes_no(value: bool) -> String {
     if value { "あり" } else { "なし" }.to_string()
+}
+
+/// `about` に出す `APP_KEY` の状態。署名に使うときと同じ判定（`signing_key`）を通す。
+///
+/// 以前は「空でなければあり」でした。短すぎる鍵も「あり」と出て、
+/// 起動するとセッションが 500 になるのに気づけませんでした。
+fn app_key_label(app: &crate::config_registry::AppConfig) -> String {
+    match app.signing_key() {
+        Ok(_) => "あり".to_string(),
+        Err(_) if app.key.is_empty() => "なし".to_string(),
+        Err(_) => format!("短すぎる（{} 文字）", app.key.chars().count()),
+    }
+}
+
+/// 方式の名前を、実際に使うものに直す。
+///
+/// セッションもキャッシュも `memory`（別名 `array`）と `file` だけを知っていて、
+/// 知らない名前は警告を出して `file` にします（`session/middleware.rs`・`cache/mod.rs`）。
+fn driver_label(driver: &str) -> String {
+    match driver {
+        "memory" | "array" => "memory".to_string(),
+        "file" => "file".to_string(),
+        other => format!("file（`{other}` は知らないため）"),
+    }
+}
+
+/// いま使うセッションの方式。`StartSession::from_env` と同じく `SESSION_DRIVER` を見る
+/// （前後の空白を落とし、大文字小文字を区別しない）。
+fn session_driver_label() -> String {
+    driver_label(&env::<String>("SESSION_DRIVER", "file").to_ascii_lowercase())
+}
+
+/// いま使うキャッシュの方式。`config/cache.rs` があればその値、無ければ `CACHE_DRIVER`。
+fn cache_driver_label() -> String {
+    let driver = crate::try_config::<crate::cache::CacheConfig>()
+        .map(|config| config.driver.clone())
+        .unwrap_or_else(|| crate::cache::CacheConfig::default().driver);
+    driver_label(&driver)
 }
 
 fn print_help(hooks: Hooks) {
@@ -934,6 +1018,9 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
         // `.env` の値まで尊重すると、開発用に下げた値（や上げた値）でテストが走り、
         // 1 件ごとに数秒かかってしまう。環境変数で明示したときだけ従う。
         crate::auth::install_test_iterations();
+        // `APP_ENV`・セッション・キャッシュのテスト用の既定も **`.env` を読む前**に入れる。
+        // `.env` は設定済みの変数を上書きしないので、`.env` の `APP_ENV=local` に負けない。
+        install_test_env();
 
         let base = paths::base_path().to_path_buf();
         let (_, warnings) = env_vars::load_dotenv(&base);
@@ -943,7 +1030,6 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
         }
         // 設定を登録する**前**に入れる。`AppConfig` は登録のときに `APP_KEY` を読むため。
         install_test_app_key();
-        install_test_env();
         if !config_registry::installed() {
             let mut registry = Registry::new();
             (hooks.configs)(&mut registry);
@@ -985,23 +1071,36 @@ fn install_test_app_key() {
     tracing::debug!("APP_KEY が無いので、テスト用の固定の鍵を使います");
 }
 
-/// `.env` を読んだあとも `APP_ENV` が空なら、`testing` を入れる。
+/// テストで使う環境変数の既定。Laravel の `phpunit.xml` の `<env>` と同じ役目です。
 ///
-/// 本体の既定は `production`（安全側）。そのままテストが走ると、本番だけの
-/// 振る舞い（Cookie の `Secure` 強制、開発用の確認情報を出さない）が効いて、
-/// `.env` の有無でテストの結果が変わる。Laravel の `phpunit.xml` が
-/// `APP_ENV=testing` を入れるのと同じ既定を持たせる。
+/// | 変数 | 値 | 理由 |
+/// |---|---|---|
+/// | `APP_ENV` | `testing` | 本体の既定は `production`。本番だけの振る舞いで結果が変わらないように |
+/// | `SESSION_DRIVER` | `memory` | 開発用の `storage/framework/sessions/` にファイルを溜めない |
+/// | `CACHE_DRIVER` | `memory` | 開発用の `storage/framework/cache/` を汚さない |
+const TEST_ENV: &[(&str, &str)] = &[
+    ("APP_ENV", "testing"),
+    ("SESSION_DRIVER", "memory"),
+    ("CACHE_DRIVER", "memory"),
+];
+
+/// 本物の環境変数に無いものだけ、[`TEST_ENV`] の値を入れる。
+///
+/// **`.env` を読む前**に呼びます。`.env` は設定済みの変数を上書きしないので、
+/// 優先順位は「本物の環境変数 > テスト用の既定 > `.env`」になります
+/// （Laravel の `phpunit.xml` と同じ）。以前は `.env` の後に入れていたので、
+/// README どおり `APP_ENV=local` の `.env` を置くとテストが `local` で走りました。
+///
+/// 空の環境変数は「無い」と見なします（`.env` の読み込みと同じ規則）。
 ///
 /// `boot_for_tests` の `Once` の中からだけ呼ぶ。
 fn install_test_env() {
-    let present = std::env::var("APP_ENV")
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    if present {
-        return;
+    for (key, value) in TEST_ENV {
+        if env_vars::is_unset(std::env::var_os(key).as_deref()) {
+            // edition 2021 では set_var は安全な関数（`load_dotenv` と同じ理由）。
+            std::env::set_var(key, value);
+        }
     }
-    std::env::set_var("APP_ENV", "testing");
-    tracing::debug!("APP_ENV が無いので、testing として動かします");
 }
 
 static TEST_HOOKS: std::sync::OnceLock<Hooks> = std::sync::OnceLock::new();
@@ -1454,6 +1553,62 @@ mod tests {
         );
         // 足すときも元の改行にそろえる。
         assert_eq!(write_app_key("A=1\r\n", "new"), "A=1\r\nAPP_KEY=new\r\n");
+    }
+
+    #[test]
+    fn テスト用の既定はenvより先に入れる値() {
+        // Laravel の phpunit.xml と同じ 3 つ。セッションとキャッシュは開発用の
+        // storage/ に書かない方式にする。
+        let get = |key: &str| TEST_ENV.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        assert_eq!(get("APP_ENV"), Some("testing"));
+        assert_eq!(get("SESSION_DRIVER"), Some("memory"));
+        assert_eq!(get("CACHE_DRIVER"), Some("memory"));
+    }
+
+    #[test]
+    fn aboutの方式は実際に使うものを出す() {
+        assert_eq!(driver_label("memory"), "memory");
+        assert_eq!(driver_label("array"), "memory");
+        assert_eq!(driver_label("file"), "file");
+        // 知らない名前は file で動くので、書いた名前のまま出さない。
+        let label = driver_label("redis");
+        assert!(
+            label.starts_with("file") && label.contains("redis"),
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn aboutのapp_keyは署名に使えるかで出す() {
+        let with_key = |key: &str| crate::config_registry::AppConfig {
+            name: String::new(),
+            env: String::new(),
+            debug: false,
+            url: String::new(),
+            key: key.to_string(),
+        };
+        assert_eq!(app_key_label(&with_key("")), "なし");
+        assert_eq!(app_key_label(&with_key("short")), "短すぎる（5 文字）");
+        assert_eq!(app_key_label(&with_key(TEST_APP_KEY)), "あり");
+    }
+
+    #[test]
+    fn 本物の環境変数のapp_keyを見分ける() {
+        // `.env` から読み込んだ値と同じなら、本物の環境変数ではない。
+        assert!(!is_real_app_key("abc", "APP_KEY=abc\n"));
+        assert!(!is_real_app_key("abc", "APP_KEY=\"abc\" # コメント\n"));
+        // 違う値・`.env` に無い値は本物の環境変数。
+        assert!(is_real_app_key("abc", "APP_KEY=xyz\n"));
+        assert!(is_real_app_key("abc", "APP_NAME=x\n"));
+        // 空は「無い」。
+        assert!(!is_real_app_key("  ", "APP_NAME=x\n"));
+        // 警告の文。
+        assert!(real_app_key_warning(false).is_none());
+        let warning = real_app_key_warning(true).unwrap();
+        assert!(
+            warning.contains("環境変数 APP_KEY が優先されます"),
+            "{warning}"
+        );
     }
 
     #[test]

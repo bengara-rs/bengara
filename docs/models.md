@@ -26,19 +26,20 @@ pub struct Post {
 }
 ```
 
-| 指定                        | 付ける所   | 意味                                                |
-|-----------------------------|------------|-----------------------------------------------------|
-| `#[model(table = "posts")]` | 構造体     | 表の名前。**必須**です                              |
-| `#[model(columns)]`         | 構造体     | 型付きの列の定数を作る（下の「型付きの列」）。`table` と並べて書く |
-| `#[model(primary)]`         | フィールド | 主キーにする。無ければ `id` の項目が主キー          |
-| `#[model(column = "名前")]` | フィールド | 列名を変える。無ければフィールド名と同じ            |
-| `#[model(skip)]`            | フィールド | 表に無い項目にする。読むときは `Default` の値が入る |
+| 指定                        | 付ける所   | 意味                                                           |
+|-----------------------------|------------|----------------------------------------------------------------|
+| `#[model(table = "posts")]` | 構造体     | 表の名前。**必須**です                                         |
+| `#[model(columns)]`         | 構造体     | 型付きの列の定数を作る（下の「型付きの列」）。`table` と並べる |
+| `#[model(primary)]`         | フィールド | 主キーにする。無ければ `id` の項目が主キー                     |
+| `#[model(column = "名前")]` | フィールド | 列名を変える。無ければフィールド名と同じ                       |
+| `#[model(skip)]`            | フィールド | 表に無い項目にする。読むときは `Default` の値が入る            |
 
 - 使える型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>`・`Carbon`（日時）です。ふだんは `i64` と `String` を使います。
 - **NULL を許す列は `Option<...>` にします。** そうしないと、読むときにエラーです。
 - **主キーは自動採番の整数です。** `Option` にはできません。
 - `r#type` のようなフィールドは、`type` が列名になります。
 - 列名の一覧は `Post::COLUMNS` で取れます。
+- 名前に使えるのは英数字（日本語も可）と `_` です。表名には `.`（`スキーマ.表`）も使えます。
 
 ### コンパイルエラーになる書き方
 
@@ -53,11 +54,7 @@ pub struct Post {
 | 同じ列名が 2 回出る                                      | `insert` が失敗する                  |
 | 主キー以外の列が無い                                     | `save()` で入れるものが無い          |
 | タプル構造体・型引数・ライフタイムがある                 | 名前付きフィールドの構造体だけ使える |
-| `columns` 付きで、定数の名前が `TABLE`・`PRIMARY_KEY`・`COLUMNS`・`INTEGER_KEY` になる | `Model` の定数と同じ名前になる |
-| `columns` 付きで、2 つの列の定数の名前が同じになる（`title` と `TITLE`） | 定数が 2 つ作れない |
-| `columns` 付きで、列名が Rust の名前にならない（`2fa` など） | 定数が作れない |
-
-名前に使えるのは英数字（日本語も可）と `_` です。表名には `.`（`スキーマ.表`）も使えます。
+| `columns` 付きで、定数が作れない列名がある               | 下の「型付きの列」を参照             |
 
 ## 読む
 
@@ -95,6 +92,7 @@ let posts = Post::query()
 | `update(&[...])` / `delete()`           | `u64`（件数）                                                    |
 | `paginate(per_page, page)`              | `Paginator<Post>`（[database.md](database.md) の「ページ分け」） |
 
+- **`update` は、モデルに `updated_at` の列があれば今の時刻を足します**（Laravel と同じ）。自分で渡したときは、その値を使います。
 - **`get()` や `first()` は全部の列を読みます。** `select` で列を絞ると、足りない列でエラーです。
 - 一部の列だけ欲しいときは、`pluck` か下の `query_builder()` を使います。
 
@@ -113,95 +111,6 @@ let rows = Post::query()
     .await?;        // Vec<Row>
 ```
 
-## 型付きの列
-
-`#[model(table = "...", columns)]` と書くと、列ごとに定数ができます。
-条件に文字列の列名の代わりに渡すと、値の型をコンパイルのときに確かめます。
-
-```rust
-use bengara::Carbon;
-
-#[derive(Model, Debug, Clone)]
-#[model(table = "posts", columns)]
-pub struct Post {
-    pub id: i64,
-    pub title: String,
-    pub views: i64,
-    pub published_at: Option<Carbon>,
-}
-
-let posts = Post::query()
-    .where_(Post::TITLE, "はじめての投稿")
-    .where_op(Post::VIEWS, ">", 100)
-    .where_op(Post::PUBLISHED_AT, "<", Carbon::now())
-    .order_by_desc(Post::PUBLISHED_AT)
-    .get()
-    .await?;
-
-let titles = Post::query().pluck::<String>(Post::TITLE).await?;
-```
-
-- 定数の名前は**列名を大文字にしたもの**です（`title` → `Post::TITLE`）。`#[model(column = "...")]` で変えた後の名前を使います。
-- 定数の型は `bengara::Column<Post, 型>` です。型はフィールドの型そのまま（`Option<...>` も含む）。
-- `skip` の項目には作りません。
-- `columns` を書かないときは、定数を作りません。自分で書いた同じ名前の定数とぶつからないためです。
-- 文字列の列名も今までどおり使えます。同じクエリに混ぜても動きます。
-- `DB::table("posts")` のクエリビルダにも渡せます。
-
-### 型付きの列を渡せるメソッド
-
-| 種類 | メソッド |
-|------|----------|
-| 条件 | `where_` / `or_where` / `where_op` / `or_where_op` / `where_in` / `where_not_in` / `or_where_in` / `where_null` / `where_not_null` / `where_between` / `where_not_between` / `where_like` / `where_column` |
-| 並び | `order_by` / `order_by_desc` / `latest_by` / `oldest_by` |
-| 値を読む | `value` / `pluck` / `sum` / `avg` / `min` / `max` |
-| 増やす・減らす | `increment` / `decrement`（クエリビルダだけ） |
-
-### 渡せる値
-
-| 列の型 | 渡せる値 |
-|--------|----------|
-| `T` | `T` と、`T` に欠けなく広げられる型 |
-| `Option<T>` | 上に加えて、その `Option`（`None` は `is null` になる） |
-
-欠けなく広げられる組は次のとおりです。
-
-| 列の型 | 渡せる型 |
-|--------|----------|
-| `i16` | `i8` `u8` |
-| `i32` | `i8` `i16` `u8` `u16` |
-| `i64` | `i8` `i16` `i32` `u8` `u16` `u32` |
-| `u16` | `u8` |
-| `u32` | `u8` `u16` |
-| `u64` | `u8` `u16` `u32` |
-| `f64` | `f32` |
-| `String` | `&str` `&String` |
-| `Vec<u8>` | `&[u8]` |
-
-### コンパイルで止まる書き方
-
-| 書き方 | 理由 |
-|--------|------|
-| `where_(Post::VIEWS, "abc")` | `i64` の列に文字列 |
-| `where_(User::EMAIL, "a@example.com")`（`Post::query()` で） | 別のモデルの列 |
-| `where_(Post::VIEWS, n)`（`n` は `u64`） | `i64` に収まらない値がある |
-| `where_(Post::PUBLISHED_AT, 5)` | `Option<Carbon>` の列に整数 |
-| `where_(f64 の列, 2)` | 整数は小数に広げない。`2.0` と書く |
-| `where_(Post::VIEWS, Value::Int(1))` | 型付きの列に `Value` は渡せない。文字列の列名を使う |
-
-### 一覧で列を渡すところ
-
-`select` / `add_select` / `group_by` / `having_op` / `join` / `insert` / `update` などは、文字列で受けます。
-型の違う列を 1 つの配列に並べられないためです。`.name()` で列名を渡します。
-
-```rust
-let rows = Post::query()
-    .select(&[Post::ID.name(), Post::TITLE.name()])
-    .query_builder()
-    .get()
-    .await?;
-```
-
 ## 保存する
 
 ```rust
@@ -218,6 +127,7 @@ post.delete().await?;                     // 返るのは件数
 - 主キーが `0` なら新しい行を入れて、採番された値を主キーに入れます。
 - 主キーが `0` 以外なら、その行を更新します。
 - `Post::draft` は自分で用意する関数です（下の「書きやすくする」）。
+- まだ保存していないモデルの `delete()` は、何もせずに 0 を返します。
 
 ### 変える列だけ書く（`save_only`）
 
@@ -243,11 +153,11 @@ if post.save_only(&["title"]).await? == 0 {
 | 当てはまる行が無い | **エラー**                       | **`Ok(0)`**                         |
 | 返るもの           | `()`                             | 当てはまった行の数（`u64`）         |
 
-- 次のときはエラーです。SQL は流しません。
+- 次のときは、SQL を流さずにエラーです。
     - 列を 1 つも指定していない
     - モデルに無い列か、主キーの列を指定した
     - まだ保存していない行（主キーが `0`）
-- 持ち主や状態でも絞りたいときは、クエリビルダの `update` を使います。`updated_at` は自分で入れます。
+- 持ち主や状態でも絞りたいときは、`Post::query().where_(..).update(..)` を使います。
 
 ### `save()` がエラーになるとき
 
@@ -258,66 +168,19 @@ if post.save_only(&["title"]).await? == 0 {
 | 採番された値が返らなかった         | 主キーが自動採番の列か確かめる       |
 
 - 下の 2 つは「行は入ったのに主キーが空」です。呼び直すと 2 行目が入るので、エラーにしています。
-- 主キーに値を入れて `save()` すると、更新になります。主キーを自分で決める行は `DB::table(..).insert(..)` で入れます。
-- まだ保存していないモデルの `delete()` は、何もせずに 0 を返します。
+- 主キーを自分で決める行は `DB::table(..).insert(..)` で入れます。主キーに値を入れて `save()` すると、更新になるためです。
 
 ### `created_at` と `updated_at`
 
-その列名のフィールドがあると、`save()` が `now()` の時刻を入れます。
+その列名のフィールドがあると、`save()` が今の時刻を入れます。
 
 | とき     | `created_at` | `updated_at` |
 |----------|--------------|--------------|
 | 新しい行 | 入る         | 入る         |
 | 更新     | 書き戻さない | 入る         |
 
-**`DB::table(...)` で直接入れた行には、時刻が入りません。**
-`timestamps()` の列は NULL を許すので、`String` のフィールドで読むとエラーです。
-`now()` を自分で入れるか、フィールドを `Option<String>` にします。
-
-### 日時の列を `Carbon` で持つ
-
-日時の列は `bengara::Carbon` で持てます。`String` のままでもかまいません。
-
-```rust
-use bengara::Carbon;
-
-#[derive(Model, Debug, Clone)]
-#[model(table = "posts")]
-pub struct Post {
-    pub id: i64,
-    pub title: String,
-    pub published_at: Option<Carbon>,
-    pub created_at: Carbon,
-    pub updated_at: Carbon,
-}
-
-// 3 日後に公開する
-post.published_at = Some(Carbon::now().add_days(3));
-```
-
-| 項目              | 中身                                                                        |
-|-------------------|-----------------------------------------------------------------------------|
-| 使える型          | `Carbon`・`Option<Carbon>`                                                  |
-| DB に書く形       | `YYYY-MM-DD HH:MM:SS`（UTC）の文字列。`String` の列と同じ                   |
-| 読める値          | その形の文字列と、UNIX 秒の整数                                             |
-| JSON にしたとき   | `"2026-11-20 09:30:00"`。`String` の列と同じ                                |
-| `created_at` など | `String`・`Option<String>`・`Carbon`・`Option<Carbon>` のどれでも時刻が入る |
-
-主なメソッドです。
-
-| メソッド                                                        | 中身                                          |
-|-----------------------------------------------------------------|-----------------------------------------------|
-| `Carbon::now()` / `Carbon::parse("2026-11-20 09:30:00")?`       | いまの時刻 / 文字列から作る                   |
-| `add_days(3)` / `sub_hours(1)` など                             | 秒・分・時・日・月・年を足す / 引く           |
-| `add_months(1)`                                                 | 月を足す。**日は月末で止まる**（1/31 → 2/28） |
-| `start_of_day()` / `end_of_day()`                               | その日の 00:00:00 / 23:59:59                  |
-| `diff_in_days(&other)` など                                     | `other - self`。符号付きの整数                |
-| `is_past()` / `is_future()`                                     | いまより前 / 後                               |
-| `to_date_string()` / `to_time_string()` / `to_iso8601_string()` | `YYYY-MM-DD` / `HH:MM:SS` / `…T…Z`            |
-
-- `parse` が読むのは `YYYY-MM-DD`・`YYYY-MM-DD HH:MM:SS`（区切りは `T` も可）と、末尾の `Z`・小数の秒だけです。
-- `+09:00` のような時差付きは読みません。タイムゾーンは UTC だけです。
-- 入力から取り出すときは `validated.get_as::<Carbon>("published_at")?` と書けます。
+- フィールドの型は `String`・`Option<String>`・`Carbon`・`Option<Carbon>` のどれでもかまいません。
+- **`DB::table(...)` で直接入れた行には、時刻が入りません。** `timestamps()` の列は NULL を許すので、`String` のフィールドで読むとエラーです。`now()` を自分で入れるか、フィールドを `Option` にします。
 
 ### 書きやすくする
 
@@ -338,18 +201,6 @@ impl Post {
     }
 }
 ```
-
-## 主キーに文字列を渡したとき
-
-パス引数は文字列で届きます。
-`Post::find("12")` のように、**整数に読める文字列は整数に直して**探します。
-整数に読めない値（`"abc"`）は、SQL エラーにせず「無い」とします。
-
-- `Post::find("abc")` と `req.auth().user::<User>()` は `None` です。
-- `Post::find_or_fail("abc")` と `req.model::<Post>("post")` は 404 です。
-- `where_("id", "abc")` は 0 件、`where_op("id", "!=", "abc")` は全部当たります。
-- `where_in` に混ざった `"abc"` は、一覧から外します。
-- 直すのは主キーの列だけです。
 
 ## よく使う条件をまとめる
 
@@ -412,6 +263,134 @@ for post in &posts {
 }
 ```
 
+## 型付きの列
+
+`#[model(table = "...", columns)]` と書くと、列ごとに定数ができます。
+条件に文字列の列名の代わりに渡すと、値の型をコンパイルのときに確かめます。
+
+```rust
+use bengara::Carbon;
+
+#[derive(Model, Debug, Clone)]
+#[model(table = "posts", columns)]
+pub struct Post {
+    pub id: i64,
+    pub title: String,
+    pub views: i64,
+    pub published_at: Option<Carbon>,
+}
+
+let posts = Post::query()
+    .where_(Post::TITLE, "はじめての投稿")
+    .where_op(Post::VIEWS, ">", 100)
+    .where_op(Post::PUBLISHED_AT, "<", Carbon::now())
+    .order_by_desc(Post::PUBLISHED_AT)
+    .get()
+    .await?;
+
+let titles = Post::query().pluck::<String>(Post::TITLE).await?;
+```
+
+- 定数の名前は**列名を大文字にしたもの**です（`title` → `Post::TITLE`）。`#[model(column = "...")]` で変えた後の名前を使います。
+- 定数の型は `bengara::Column<Post, 型>` です。型はフィールドの型そのまま（`Option<...>` も含む）。
+- `skip` の項目には作りません。`columns` を書かないときは、定数を作りません。
+- 文字列の列名も使えます。同じクエリに混ぜても動きます。`DB::table("posts")` にも渡せます。
+
+### 渡せるメソッド
+
+| 種類           | メソッド                                                                                      |
+|----------------|-----------------------------------------------------------------------------------------------|
+| 条件           | `where_` 系・`where_in` 系・`where_null` 系・`where_between` 系・`where_like`・`where_column` |
+| 並び           | `order_by` / `order_by_desc` / `latest_by` / `oldest_by`                                      |
+| 値を読む       | `value` / `pluck` / `sum` / `avg` / `min` / `max`                                             |
+| 増やす・減らす | `increment` / `decrement`（クエリビルダだけ）                                                 |
+
+`select` / `group_by` / `having_op` / `join` / `insert` / `update` などは、文字列で受けます。
+型の違う列を 1 つの配列に並べられないためです。`.name()` で列名を渡します。
+
+```rust
+let rows = Post::query()
+    .select(&[Post::ID.name(), Post::TITLE.name()])
+    .query_builder()
+    .get()
+    .await?;
+```
+
+### 渡せる値
+
+列の型 `T` と同じ型か、`T` に欠けなく広げられる型を渡せます。
+`Option<T>` の列には、その `Option` も渡せます（`None` は `is null`）。
+
+| 列の型    | ほかに渡せる型                    |
+|-----------|-----------------------------------|
+| `i16`     | `i8` `u8`                         |
+| `i32`     | `i8` `i16` `u8` `u16`             |
+| `i64`     | `i8` `i16` `i32` `u8` `u16` `u32` |
+| `u16`     | `u8`                              |
+| `u32`     | `u8` `u16`                        |
+| `u64`     | `u8` `u16` `u32`                  |
+| `f64`     | `f32`                             |
+| `String`  | `&str` `&String`                  |
+| `Vec<u8>` | `&[u8]`                           |
+
+### コンパイルで止まる書き方
+
+| 書き方                                                       | 理由                                                |
+|--------------------------------------------------------------|-----------------------------------------------------|
+| `where_(Post::VIEWS, "abc")`                                 | `i64` の列に文字列                                  |
+| `where_(User::EMAIL, "a@example.com")`（`Post::query()` で） | 別のモデルの列                                      |
+| `where_(Post::VIEWS, n)`（`n` は `u64`）                     | `i64` に収まらない値がある                          |
+| `where_(Post::PUBLISHED_AT, 5)`                              | `Option<Carbon>` の列に整数                         |
+| `where_(f64 の列, 2)`                                        | 整数は小数に広げない。`2.0` と書く                  |
+| `where_(Post::VIEWS, Value::Int(1))`                         | 型付きの列に `Value` は渡せない。文字列の列名を使う |
+| `where_like(Post::PUBLISHED_AT, "2026-%")`                   | パターンも列の型で受ける。`.name()` を渡す          |
+
+`columns` を付けたとき、次の構造体も止まります。
+
+- 定数の名前が `TABLE`・`PRIMARY_KEY`・`COLUMNS`・`INTEGER_KEY` になる
+- 2 つの列の定数の名前が同じになる（`title` と `TITLE`）
+- 列名が Rust の名前にならない（`2fa` など）
+
+## 日時の列（`Carbon`）
+
+日時の列は `bengara::Carbon` で持てます。`String` のままでもかまいません。
+
+```rust
+use bengara::Carbon;
+
+#[derive(Model, Debug, Clone)]
+#[model(table = "posts")]
+pub struct Post {
+    pub id: i64,
+    pub title: String,
+    pub published_at: Option<Carbon>,
+    pub created_at: Carbon,
+    pub updated_at: Carbon,
+}
+
+// 3 日後に公開する
+post.published_at = Some(Carbon::now().add_days(3));
+```
+
+- DB には `YYYY-MM-DD HH:MM:SS`（UTC）の文字列で書きます。`String` の列と同じ形です。
+- 読めるのは、その形の文字列と UNIX 秒の整数です。
+- JSON にすると `"2026-11-20 09:30:00"` になります。
+
+| メソッド                                                        | 中身                                          |
+|-----------------------------------------------------------------|-----------------------------------------------|
+| `Carbon::now()` / `Carbon::parse("2026-11-20 09:30:00")?`       | いまの時刻 / 文字列から作る                   |
+| `add_days(3)` / `sub_hours(1)` など                             | 秒・分・時・日・月・年を足す / 引く           |
+| `add_months(1)`                                                 | 月を足す。**日は月末で止まる**（1/31 → 2/28） |
+| `start_of_day()` / `end_of_day()`                               | その日の 00:00:00 / 23:59:59                  |
+| `diff_in_days(&other)` など                                     | `other - self`。符号付きの整数                |
+| `is_past()` / `is_future()`                                     | いまより前 / 後                               |
+| `to_date_string()` / `to_time_string()` / `to_iso8601_string()` | `YYYY-MM-DD` / `HH:MM:SS` / `…T…Z`            |
+
+- `parse` が読むのは `YYYY-MM-DD` と `YYYY-MM-DD HH:MM:SS` です。区切りの `T`、末尾の `Z`、小数の秒も読みます。
+- 桁はちょうどにそろえます。`2026-1-5` や `09:30:00:00` は読めません。
+- **タイムゾーンは UTC だけです。** `+09:00` のような時差付きは読みません。
+- 入力から取り出すときは `validated.get_as::<Carbon>("published_at")?` と書けます。
+
 ## トランザクションの中で使う
 
 トランザクションの中では、`tx` を渡す形を使います。
@@ -434,7 +413,24 @@ tx.commit().await?;
 ```
 
 - **`save()` や `Post::find()` は、トランザクションの外で流れます。** 取り消しても残ります。
-- メモリ上の SQLite は接続が 1 本です。中から `save()` を呼ぶと、待ち続けて時間切れになります。
+- メモリ上の SQLite は接続が 1 本です。中から `save()` を呼ぶと、待った末に時間切れになります。
+
+## 主キーに文字列を渡したとき
+
+パス引数は文字列で届きます。
+`Post::find("12")` のように、**整数に読める文字列は整数に直して**探します。
+整数に読めない値（`"abc"`）は、SQL エラーにせず「無い」とします。
+
+| 書き方                                             | `"abc"` を渡したとき |
+|----------------------------------------------------|----------------------|
+| `Post::find` / `req.auth().user::<User>()`         | `None`               |
+| `Post::find_or_fail` / `req.model::<Post>("post")` | 404                  |
+| `where_("id", ..)` / `where_between`               | 0 件                 |
+| `where_op("id", "!=", ..)` / `where_not_between`   | 全部当たる           |
+| `where_in`                                         | 一覧から外す         |
+
+- 直すのは主キーの列だけです。`where_like` は直しません。
+- `where_group` の中は直しません。中では整数で渡してください。
 
 ## 文字列の主キー
 
@@ -453,7 +449,7 @@ DB::table("sessions")
 
 ソフトデリートは、行を消す代わりに `deleted_at` に印を付ける方法です。
 列は `t.soft_deletes()` で作れます。
-`post.delete()` は行を消し、`Post::all()` は印の付いた行も返すので、絞り込みは自分で書きます。
+`post.delete()` は行を消し、`Post::all()` は印の付いた行も返します。絞り込みは自分で書きます。
 
 ```rust
 impl Post {
@@ -504,8 +500,6 @@ pub fn make(i: i64) -> Post {
 ```
 
 ## 関連
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
 
 - [database.md](database.md) — 接続とクエリビルダ
 - [migrations.md](migrations.md) — 表を作る

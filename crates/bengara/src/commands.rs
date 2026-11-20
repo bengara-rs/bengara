@@ -43,13 +43,24 @@ pub(crate) fn run(name: &str, args: &[String], hooks: Hooks) -> Result<()> {
     result
 }
 
+/// 自作コマンドが終わったあと、残った裏の処理を待つ上限。
+///
+/// 普通に `drop` すると、`spawn_blocking` で始めて待たなかった処理が終わるまで
+/// 待つので、止まらない処理が 1 つ残るとプロセスが終わりません。
+/// かといって待たずに手放すと、書きかけのファイルなどが途中で切れます。
+/// 少しだけ待ってから手放します（Laravel でも `handle` が返れば終わります）。
+const CUSTOM_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 自作コマンドを実行する。
 pub(crate) fn run_custom(name: &str, args: &[String], hooks: Hooks) -> Result<()> {
     let commands = (hooks.commands)();
     let command = crate::console::find(commands, name)
         .ok_or_else(|| Error::msg(format!("`{name}` というコマンドはありません")))?;
     let args = args.to_vec();
-    runtime()?.block_on((command.handle)(args))
+    let runtime = runtime()?;
+    let result = runtime.block_on((command.handle)(args));
+    runtime.shutdown_timeout(CUSTOM_SHUTDOWN_GRACE);
+    result
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {

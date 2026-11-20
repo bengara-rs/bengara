@@ -472,6 +472,21 @@ fn check_reentrant(held: &'static std::thread::LocalKey<std::cell::Cell<bool>>, 
     }
 }
 
+/// 札を逆の順番（`exclusive()` → `refresh_database()`）で取ろうとしていないか確かめる。
+///
+/// 順番がテストごとにばらばらだと、2 つのテストが互いの札を待って**永久に止まります**
+/// （片方が DB の札を持って汎用の札を待ち、もう片方がその逆）。
+/// `refresh_database()` の最初で、汎用の札を持っていたら分かる文でパニックさせます。
+fn check_order(holds_exclusive: &'static std::thread::LocalKey<std::cell::Cell<bool>>) {
+    if holds_exclusive.get() {
+        panic!(
+            "exclusive() を取ったまま refresh_database() を呼んでいます。\n\
+             先に refresh_database() を取ってから exclusive() を取ってください\n\
+             （順番がそろわないと、テスト同士が札を取り合って永久に止まります）。"
+        );
+    }
+}
+
 /// テスト用のデータベースにつなげなかったときのパニックの文。
 ///
 /// 機能フラグは「features に足す」と言います。以前は `features = ["sqlite"]` と
@@ -507,10 +522,14 @@ fn connect_failure(cause: &dyn std::fmt::Display) -> String {
 ///
 /// **1 つのテストで 2 回呼んだときもパニックします。** 錠は再入できないので、
 /// そのまま待つと何も言わずに永久に止まります。
+///
+/// **`exclusive()` の札を持ったまま呼んだときもパニックします。** 札は
+/// 「先に `refresh_database()`、次に `exclusive()`」の順で取ります。
 // 錠を `await` の向こうまで持ち越すのは意図どおりです。これが DB を使うテストの
 // 順番を守る仕組みで、持ち越さないと意味がありません。テストの中だけで使います。
 #[allow(clippy::await_holding_lock)]
 pub async fn refresh_database() -> DatabaseGuard {
+    check_order(&HOLDS_EXCLUSIVE);
     check_reentrant(&HOLDS_DATABASE, "refresh_database()");
     let guard = DATABASE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -702,6 +721,25 @@ mod tests {
         DUMMY.set(false);
         // 手放したあとはまた取れる。
         check_reentrant(&DUMMY, "refresh_database()");
+    }
+
+    #[test]
+    fn 汎用の札を先に取っているとパニックする() {
+        // 汎用の札を持っていなければ通る。
+        check_order(&DUMMY);
+        DUMMY.set(true);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_order(&DUMMY)));
+        DUMMY.set(false);
+        let payload = caught.expect_err("パニックする");
+        // 埋め込む値の無い `panic!` は `&str` を投げる。
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("先に refresh_database() を取ってから exclusive() を取ってください"),
+            "{message}"
+        );
     }
 
     #[test]

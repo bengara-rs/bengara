@@ -1,6 +1,7 @@
 //! セッションを読み書きするミドルウェアと、CSRF の確認。
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Session, SessionStore};
@@ -129,6 +130,11 @@ enum StoreKind {
     Given,
 }
 
+/// 本番でメモリに置こうとしているか（警告を出すか）。
+fn warns_memory_in_production(kind: StoreKind, is_production: bool) -> bool {
+    kind == StoreKind::Memory && is_production
+}
+
 impl StartSession {
     /// 置き場所を指定して作る。
     ///
@@ -141,7 +147,20 @@ impl StartSession {
     }
 
     /// 作り方つきで組み立てる（中だけで使います）。
+    ///
+    /// 本番（`APP_ENV=production`）でメモリに置くときは、プロセスで 1 回だけ警告します。
+    /// 起動し直すと全員がログアウトし、複数のプロセスでは中身を分け合えないためです。
     fn of(store: Arc<dyn SessionStore>, config: SessionConfig, kind: StoreKind) -> Self {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if warns_memory_in_production(kind, crate::config_registry::app_config().is_production())
+            && !WARNED.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "本番（APP_ENV=production）でセッションをメモリに置いています。\
+                 起動し直すと全員がログアウトし、複数のプロセスでは分け合えません。\
+                 SESSION_DRIVER=file にしてください"
+            );
+        }
         Self {
             store,
             config: config.resolved(),
@@ -172,8 +191,11 @@ impl StartSession {
     ///
     /// `SESSION_LIFETIME` は分で指定します（既定 120）。
     ///
+    /// 前後の空白を落とし、大文字小文字を区別せずに比べます（`HASH_DRIVER` と同じ）。
     /// 知らない `SESSION_DRIVER`（`redis` や書き間違い）は、**警告を出してから**
     /// `file` にします。
+    ///
+    /// 本番（`APP_ENV=production`）で `memory` にすると、起動時に警告を 1 回出します。
     pub fn from_env() -> Self {
         let config = SessionConfig {
             lifetime_secs: lifetime_secs_from_env(),
@@ -185,16 +207,17 @@ impl StartSession {
 
     /// 置き場所の名前から作る（`from_env` の中身）。
     fn from_driver(driver: &str, config: SessionConfig) -> Self {
-        match driver {
+        let driver = driver.trim();
+        match driver.to_ascii_lowercase().as_str() {
             "memory" | "array" => {
                 let store = Arc::new(super::MemoryStore::new(config.lifetime_secs));
                 Self::of(store, config, StoreKind::Memory)
             }
-            other => {
+            lower => {
                 // 黙って file にすると、`redis` のつもりで動かしていても気づけない。
                 // 文面は `CACHE_DRIVER` とそろえてあります。
-                if other != "file" {
-                    tracing::warn!("SESSION_DRIVER `{other}` は知りません。file を使います");
+                if lower != "file" {
+                    tracing::warn!("SESSION_DRIVER `{driver}` は知りません。file を使います");
                 }
                 let store = Arc::new(super::FileStore::default_path(config.lifetime_secs));
                 Self::of(store, config, StoreKind::File)
@@ -1308,6 +1331,18 @@ mod tests {
         assert_eq!(kind("redis"), StoreKind::File, "知らない値");
         assert_eq!(kind("flie"), StoreKind::File, "書き間違い");
         assert_eq!(kind(""), StoreKind::File);
+        // 大文字小文字と前後の空白は区別しない（HASH_DRIVER と同じ）。
+        assert_eq!(kind("Memory"), StoreKind::Memory);
+        assert_eq!(kind(" ARRAY "), StoreKind::Memory);
+        assert_eq!(kind("FILE"), StoreKind::File);
+    }
+
+    #[test]
+    fn 本番でメモリに置くときだけ警告する() {
+        assert!(warns_memory_in_production(StoreKind::Memory, true));
+        assert!(!warns_memory_in_production(StoreKind::Memory, false));
+        assert!(!warns_memory_in_production(StoreKind::File, true));
+        assert!(!warns_memory_in_production(StoreKind::Given, true));
     }
 
     #[test]

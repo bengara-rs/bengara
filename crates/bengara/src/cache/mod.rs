@@ -252,19 +252,16 @@ impl Cache {
     }
 
     /// `serde` の型を読む。形が変わっていたら `None` にします。
+    ///
+    /// **読めない値を消しません。** 読んでから消すまでの間に、別のリクエストが
+    /// 新しい形の値を書いているかもしれないからです（消すと、その新しい値を
+    /// 捨ててしまう）。`FileCache::get` が期限切れを消さないのと同じ理由です。
+    /// 古い値は、`remember_json` や `put_json` の上書きで入れ替わります。
     pub async fn get_json<T: serde::de::DeserializeOwned>(key: &str) -> Result<Option<T>> {
         let Some(text) = Self::get(key).await? else {
             return Ok(None);
         };
-        match serde_json::from_str(&text) {
-            Ok(value) => Ok(Some(value)),
-            Err(e) => {
-                // 型を変えた後に古い値が残っていることがある。捨てて作り直させる。
-                tracing::warn!("キャッシュ `{key}` を読めませんでした: {e}");
-                Self::forget(key).await?;
-                Ok(None)
-            }
-        }
+        Ok(decode_json(key, &text))
     }
 
     /// 無ければ作って入れる（`serde` の型）。
@@ -283,9 +280,37 @@ impl Cache {
     }
 }
 
+/// キャッシュの文字を `serde` の型に読む。読めなければ警告して `None`（値は消さない）。
+fn decode_json<T: serde::de::DeserializeOwned>(key: &str, text: &str) -> Option<T> {
+    match serde_json::from_str(text) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            // 型を変えた後に古い値が残っていることがある。作り直させる。
+            tracing::warn!("キャッシュ `{key}` を読めませんでした: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 読めない値はnoneにして消さない() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct Stats {
+            posts: i64,
+        }
+        assert_eq!(
+            decode_json::<Stats>("stats", r#"{"posts":3}"#),
+            Some(Stats { posts: 3 })
+        );
+        // 形が変わった古い値。None を返すだけで、置き場所には触らない
+        // （消すのは、間に書かれた新しい値を捨てる競合になるため）。
+        assert_eq!(decode_json::<Stats>("stats", r#"{"count":3}"#), None);
+        assert_eq!(decode_json::<Stats>("stats", "壊れた"), None);
+    }
 
     #[test]
     fn 鍵はそのまま使える形に直す() {

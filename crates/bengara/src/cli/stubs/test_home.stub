@@ -1,6 +1,8 @@
 #[bengara::test]
 async fn トップページが表示される() {
-    get("/").await.assert_ok().assert_see("{{name}}");
+    // 画面に出るのは `APP_NAME`。`.env` の値によらないよう、設定から読んで比べる。
+    let name = bengara::config::<bengara::AppConfig>().name.clone();
+    get("/").await.assert_ok().assert_see(&name);
 }
 
 #[bengara::test]

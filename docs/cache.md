@@ -30,13 +30,8 @@ Cache::flush().await?;                           // 全部捨てる
 | `prune()`         | `Result<Option<usize>>`  | 期限切れだけ消す（[掃除](#掃除)）  |
 | `location()`      | `Option<String>`         | 置き場所の表示。`await` は要らない |
 
-壊れたファイルは「無い」として扱います。エラーにはなりません。
-
-### 鍵の付け方
-
-**小文字の英数字と `. _ -` だけで付けてください**（`stats.posts`、`post.1`）。
-ほかの文字や 150 バイトより長い鍵も動きます。
-ただしファイル名がハッシュ（中身から作る英数字の列）になり、どの鍵のファイルか見分けられません。
+- 壊れたファイルは「無い」として扱います。エラーにはなりません。
+- **鍵は小文字の英数字と `. _ -` で付けてください**（`stats.posts`、`post.1`）。ほかの文字や 150 バイトより長い鍵も動きますが、ファイル名が英数字の列になり、どの鍵か見分けられません。
 
 ## 無ければ作る
 
@@ -84,7 +79,8 @@ let stats: Option<Stats> = Cache::get_json("stats").await?;
 let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().await?) }).await?;
 ```
 
-構造体の形を変えて読めなくなった値は、消して `None` を返します。
+構造体の形を変えて読めなくなった値は、`None` を返します。
+消しはしません。`remember_json` か `put_json` で上書きされて入れ替わります。
 
 ## 置き場所
 
@@ -97,9 +93,8 @@ let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().awai
 
 - 知らない名前を書くと、警告を出して `file` にします。
 - **プロセスを 2 つ以上動かすときは `file` にします。** 全部が同じ `storage/` を見るようにしてください。
-- `file` は `storage/` が無いと書き込みでエラーになります。`storage:init`
-  で作ってください（[deployment.md](deployment.md)）。
-- `storage/` の中のキャッシュのディレクトリは自分で作ります。作るときは所有者だけが読める権限にします。
+- `storage/` が無いと、`file` は書き込みでエラーになります。`storage:init` で作ってください（[deployment.md](deployment.md)）。
+- `storage/framework/cache/` は、無ければ作ります。所有者だけが読める権限にします。
 
 `config/cache.rs` を置くと、そちらを使います。無くても動きます。
 
@@ -145,12 +140,15 @@ async fn 数を足し引きできる() {
 
 ## 置き場所を自分で作る
 
-`CacheStore` を実装して、`bootstrap/app.rs` で入れ替えます。 **効くのは 1 回目だけです。** キャッシュを最初に使う前に呼んでください。
+`CacheStore` を実装して、`bootstrap/app.rs` で入れ替えます。
 
 ```rust
 // bootstrap/app.rs の中で
 bengara::cache::install_store(std::sync::Arc::new(MyStore::new()));
 ```
+
+- **効くのは 1 回目だけです。** キャッシュを最初に使う前に呼んでください。
+- 複数のプロセスから使われます。プロセスのメモリだけに置かないでください。
 
 必ず書くのは次の 4 つです。`async` ではないので、待つ処理をそのまま書けます。
 
@@ -163,8 +161,7 @@ impl CacheStore for MyStore {
 }
 ```
 
-- `seconds` が `None` なら期限なしです。期限切れは、読むときに捨ててください。
-- 複数のプロセスから使われます。プロセスのメモリだけに置かないでください。
+`seconds` が `None` なら期限なしです。期限切れは、読むときに捨ててください。
 
 残りのメソッドには既定の動きがあります。必要なら書き足します。
 
@@ -176,8 +173,6 @@ impl CacheStore for MyStore {
 | `prunable`  | `false`                            | `prune` を書いたとき（`true` にする）  |
 | `location`  | `None`                             | 置き場所を見せたいとき                 |
 | `blocking`  | `true`（裏のスレッドで呼ぶ）       | メモリだけで済むとき（`false` にする） |
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

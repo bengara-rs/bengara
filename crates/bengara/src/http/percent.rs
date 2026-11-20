@@ -104,6 +104,21 @@ pub(crate) fn cookie_safe(byte: u8) -> bool {
         )
 }
 
+/// 空白・制御文字・非 ASCII だけを `%XX` にする。それ以外（`%` も）はそのまま。
+///
+/// `Location` と Cookie の `Path` に使います。どちらも URL の一部で、ブラウザは
+/// `%XX` の形で受け取ります。生の非 ASCII を入れると、HTTP の上では通っても
+/// 受け手ごとに読み方が揺れます（Cookie の `Path` は、送られてくるパスと合わなくなる）。
+///
+/// `%` を逃がさないので、**符号化済みの `%XX` は二重になりません。**
+/// 逃がす文字が無ければ借りたまま返すので、確保は増えません。
+pub(crate) fn escape_unsafe_in_url(input: &str) -> Cow<'_, str> {
+    if input.bytes().all(|b| b.is_ascii_graphic()) {
+        return Cow::Borrowed(input);
+    }
+    Cow::Owned(encode(input, |b| b.is_ascii_graphic()))
+}
+
 /// `%xx` と `+` を元に戻す。壊れた並びはそのまま残します。
 pub(crate) fn decode(input: &str) -> String {
     decode_with(input, true)
@@ -231,7 +246,7 @@ mod tests {
             assert!(path_literal(*ok), "{} は通すはず", *ok as char);
         }
         for bad in b" \"<>\\^`{}|?#\t\n\x7f\xe3" {
-            assert!(!path_literal(*bad), "{:#04x} は断るはず", bad);
+            assert!(!path_literal(*bad), "{bad:#04x} は断るはず");
         }
     }
 
@@ -269,6 +284,20 @@ mod tests {
         assert_eq!(upcase_hex("/あ%2f"), "/あ%2F");
         // `%` が無ければ確保しない。
         assert!(matches!(upcase_hex("/posts"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn urlに入れる前に空白と非asciiだけ逃がす() {
+        assert_eq!(escape_unsafe_in_url("/日本"), "/%E6%97%A5%E6%9C%AC");
+        assert_eq!(escape_unsafe_in_url("/a b?x=1#y"), "/a%20b?x=1#y");
+        // 符号化済みの `%XX` は二重にしない。
+        assert_eq!(escape_unsafe_in_url("/%E6%97%A5?q=%20"), "/%E6%97%A5?q=%20");
+        assert_eq!(escape_unsafe_in_url("/%E6%97%A5本"), "/%E6%97%A5%E6%9C%AC");
+        // 逃がすものが無ければ確保しない。
+        assert!(matches!(
+            escape_unsafe_in_url("https://example.com/a?b=c"),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

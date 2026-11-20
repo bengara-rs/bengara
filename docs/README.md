@@ -41,8 +41,8 @@ bengara を使う人のための資料です。読むページをここで探し
 
 ## 知っておく
 
-| ページ                                           | 内容                             |
-|--------------------------------------------------|----------------------------------|
-| [laravel-differences.md](laravel-differences.md) | Laravel と違う点                 |
-| [backlog.md](backlog.md)                         | まだ無いものと、分かっている制限 |
-| [decisions.md](decisions.md)                     | 設計判断の記録                   |
+| ページ                                           | 内容                                                     |
+|--------------------------------------------------|----------------------------------------------------------|
+| [laravel-differences.md](laravel-differences.md) | Laravel と違う点                                         |
+| [backlog.md](backlog.md)                         | まだ無い機能・直っていない所・直さないと決めた制限の一覧 |
+| [decisions.md](decisions.md)                     | 設計判断の記録                                           |

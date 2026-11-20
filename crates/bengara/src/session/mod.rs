@@ -73,6 +73,29 @@ struct Inner {
     regenerated: bool,
     /// セッションごと捨てたか。
     flushed: bool,
+    /// [`Session::old`] が読んだ `__old_input` の中身。`None` はまだ読んでいない。
+    ///
+    /// `old()` は画面の項目の数だけ呼ばれるので、JSON を読むのはリクエストで 1 回にします。
+    /// `__old_input` を書き換えたとき（[`Inner::touch`]）に捨てます。
+    old_input: Option<BTreeMap<String, String>>,
+}
+
+impl Inner {
+    /// 今回の flash → 持ち越しの flash → `put` の値、の順で探す。
+    fn lookup(&self, key: &str) -> Option<&String> {
+        self.flash
+            .get(key)
+            .or_else(|| self.old_flash.get(key))
+            .or_else(|| self.data.get(key))
+    }
+
+    /// `key` を書き換えた印を付ける。`__old_input` なら、読んだ中身を捨てる。
+    fn touch(&mut self, key: &str) {
+        self.dirty = true;
+        if key == OLD_INPUT_KEY {
+            self.old_input = None;
+        }
+    }
 }
 
 impl Session {
@@ -86,6 +109,7 @@ impl Session {
                 dirty: false,
                 regenerated: false,
                 flushed: false,
+                old_input: None,
             })),
             store: None,
             loaded: false,
@@ -146,13 +170,7 @@ impl Session {
     /// 逆にすると、`put("status", "1")` のあとの `flash("status", "2")` が
     /// `get` から永久に見えなくなります。
     pub fn get(&self, key: &str) -> Option<String> {
-        let inner = self.lock();
-        inner
-            .flash
-            .get(key)
-            .or_else(|| inner.old_flash.get(key))
-            .or_else(|| inner.data.get(key))
-            .cloned()
+        self.lock().lookup(key).cloned()
     }
 
     /// 値を読む。無ければ既定値。
@@ -210,7 +228,7 @@ impl Session {
     pub(crate) fn put_internal(&self, key: &str, value: String) {
         let mut inner = self.lock();
         inner.data.insert(key.to_string(), value);
-        inner.dirty = true;
+        inner.touch(key);
     }
 
     /// **次のリクエストまでだけ**残る値を入れる。
@@ -227,7 +245,7 @@ impl Session {
     fn flash_internal(&self, key: &str, value: String) {
         let mut inner = self.lock();
         inner.flash.insert(key.to_string(), value);
-        inner.dirty = true;
+        inner.touch(key);
     }
 
     /// 値があるか。
@@ -242,7 +260,7 @@ impl Session {
         let removed_flash = inner.flash.remove(key).is_some();
         let removed_old = inner.old_flash.remove(key).is_some();
         if removed || removed_flash || removed_old {
-            inner.dirty = true;
+            inner.touch(key);
         }
     }
 
@@ -261,7 +279,7 @@ impl Session {
         inner.data.clear();
         inner.flash.clear();
         inner.old_flash.clear();
-        inner.dirty = true;
+        inner.touch(OLD_INPUT_KEY);
         inner.flushed = true;
     }
 
@@ -355,10 +373,19 @@ impl Session {
     }
 
     /// 前のリクエストの入力を読む。
+    ///
+    /// 中身の JSON を読むのは、リクエストで最初に呼んだときの 1 回だけです。
     pub fn old(&self, key: &str) -> Option<String> {
-        let raw = self.get(OLD_INPUT_KEY)?;
-        let map: BTreeMap<String, String> = serde_json::from_str(&raw).ok()?;
-        map.get(key).cloned()
+        let mut inner = self.lock();
+        if inner.old_input.is_none() {
+            // 無い・読めないときは空として覚える（呼ぶたびに読み直さない）。
+            let parsed = inner
+                .lookup(OLD_INPUT_KEY)
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            inner.old_input = Some(parsed);
+        }
+        inner.old_input.as_ref()?.get(key).cloned()
     }
 
     /// 保存が要るか。
@@ -663,6 +690,39 @@ mod tests {
         s.flash_input(&[("title".to_string(), "下書き".to_string())]);
         assert_eq!(s.old("title").as_deref(), Some("下書き"));
         assert!(s.old("missing").is_none());
+    }
+
+    #[test]
+    fn 前の入力は1回だけ読んで書き換えたら読み直す() {
+        // 呼ぶたびに JSON を読み直していた。読んだ中身を覚えておく。
+        let s = Session::new(
+            new_id(),
+            Data::new(),
+            Data::from([(OLD_INPUT_KEY.to_string(), r#"{"title":"前回"}"#.to_string())]),
+        );
+        assert!(s.lock().old_input.is_none(), "呼ぶまでは読まない");
+        assert_eq!(s.old("title").as_deref(), Some("前回"));
+        assert!(s.lock().old_input.is_some(), "読んだ中身を覚える");
+        assert!(s.old("missing").is_none());
+
+        // 書き換えたら覚えた中身を捨てる。
+        s.flash_input(&[("title".to_string(), "今回".to_string())]);
+        assert_eq!(s.old("title").as_deref(), Some("今回"));
+        s.forget(OLD_INPUT_KEY);
+        assert!(s.old("title").is_none(), "消したら読めない");
+        s.put_internal(OLD_INPUT_KEY, r#"{"title":"入れ直し"}"#.to_string());
+        assert_eq!(s.old("title").as_deref(), Some("入れ直し"));
+        s.flush();
+        assert!(s.old("title").is_none(), "捨てたら読めない");
+
+        // 読めない JSON は空として覚える。
+        let s = Session::new(
+            new_id(),
+            Data::from([(OLD_INPUT_KEY.to_string(), "壊れた値".to_string())]),
+            Data::new(),
+        );
+        assert!(s.old("title").is_none());
+        assert_eq!(s.lock().old_input.as_ref().map(BTreeMap::len), Some(0));
     }
 
     #[test]

@@ -608,6 +608,16 @@ fn check_pbkdf2(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8) -
 }
 
 /// Argon2id の値を照合する。
+///
+/// # 保存されている m・t が違う値も、同じだけ計算する
+///
+/// 照合は保存されている m・t・p で計算し、空回しは [`argon_burn_config`] で計算します。
+/// そのままでは、強い値の利用者は空回しより遅く、弱い値の利用者は速く終わり、
+/// 登録の有無が分かります。そこで次の 2 つをします。
+///
+/// - 照合した値の m・t・p の最大を覚え、空回しをそれに合わせる（PBKDF2 の
+///   [`MAX_SEEN_ITERATIONS`] と同じ考え方）。
+/// - 保存値が空回しより軽ければ、足りないぶん（[`argon_padding`]）を空回しする。
 #[cfg(feature = "argon2")]
 fn check_argon2id(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8) -> bool {
     let stored = match argon::parse(hashed) {
@@ -619,7 +629,16 @@ fn check_argon2id(password: &str, hashed: &str, policy: Policy, seen: &AtomicU8)
         }
     };
     let marks = seen.fetch_or(SEEN_ARGON2ID, Ordering::Relaxed) | SEEN_ARGON2ID;
+    // 空回しが同じだけ計算できるよう、保存されていた m・t・p の最大を覚えておく。
+    remember_argon(stored.memory, stored.time, stored.threads);
     let ok = argon::verify(password, &stored);
+    // 弱い値で保存されていても、空回しと同じだけの時間をかける。
+    let target = argon_burn_config(policy.argon, seen_argon());
+    if let Some(padding) = argon_padding(stored.memory, stored.time, target) {
+        #[cfg(test)]
+        counts::bump(&counts::ARGON_PADS);
+        argon::burn(password, padding);
+    }
     if pbkdf2_cost(policy, marks) {
         burn_pbkdf2(password);
     }
@@ -668,12 +687,76 @@ fn burn_pbkdf2(password: &str) {
     ));
 }
 
-/// 設定の m・t・p で Argon2id を 1 回回す。
+/// [`argon_burn_config`] の m・t・p で Argon2id を 1 回回す。
 #[cfg(feature = "argon2")]
 fn burn_argon2id(password: &str, config: ArgonConfig) {
     #[cfg(test)]
     counts::bump(&counts::ARGON_BURNS);
-    argon::burn(password, config);
+    argon::burn(password, argon_burn_config(config, seen_argon()));
+}
+
+/// これまでに照合した Argon2id の値の m・t・p の最大。0 は「まだ読んでいない」。
+///
+/// [`MAX_SEEN_ITERATIONS`] と同じで、一度上がったら下がりません。
+/// 覚えるのは上限（`MAX_ARGON_*`）を通った値だけです。
+static MAX_SEEN_ARGON_MEMORY: AtomicU32 = AtomicU32::new(0);
+static MAX_SEEN_ARGON_TIME: AtomicU32 = AtomicU32::new(0);
+static MAX_SEEN_ARGON_THREADS: AtomicU32 = AtomicU32::new(0);
+
+/// 照合した値の m・t・p を覚える。
+#[cfg_attr(not(feature = "argon2"), allow(dead_code))]
+fn remember_argon(memory: u32, time: u32, threads: u32) {
+    MAX_SEEN_ARGON_MEMORY.fetch_max(memory, Ordering::Relaxed);
+    MAX_SEEN_ARGON_TIME.fetch_max(time, Ordering::Relaxed);
+    MAX_SEEN_ARGON_THREADS.fetch_max(threads, Ordering::Relaxed);
+}
+
+/// 覚えている m・t・p の最大。
+#[cfg_attr(not(feature = "argon2"), allow(dead_code))]
+fn seen_argon() -> ArgonConfig {
+    ArgonConfig {
+        memory: MAX_SEEN_ARGON_MEMORY.load(Ordering::Relaxed),
+        time: MAX_SEEN_ARGON_TIME.load(Ordering::Relaxed),
+        threads: MAX_SEEN_ARGON_THREADS.load(Ordering::Relaxed),
+    }
+}
+
+/// 空回しに使う m・t・p。設定と覚えている最大の、項目ごとの大きいほうです。
+///
+/// 覚えている値を引数にして、テストから確かめられる形にしています。
+/// 上限は超えません（覚えるのは上限を通った値だけで、念のため寄せます）。
+///
+/// 強い値を一度でも照合すると、プロセスを起動し直すまで、
+/// Argon2id の照合と空回しはすべてその強さぶんの時間がかかります。
+#[cfg_attr(not(feature = "argon2"), allow(dead_code))]
+fn argon_burn_config(config: ArgonConfig, seen: ArgonConfig) -> ArgonConfig {
+    ArgonConfig {
+        memory: config.memory.max(seen.memory),
+        time: config.time.max(seen.time),
+        threads: config.threads.max(seen.threads),
+    }
+    .clamped()
+}
+
+/// 保存値（m・t）の照合が空回し（`target`）より軽いとき、足りないぶんの計算。
+///
+/// 計算の量はおおよそ m × t に比例するので、差を m × t で埋めます。
+/// メモリが `target` の m を超えないよう、t を先に決めます。足りていれば `None`。
+#[cfg_attr(not(feature = "argon2"), allow(dead_code))]
+fn argon_padding(memory: u32, time: u32, target: ArgonConfig) -> Option<ArgonConfig> {
+    let want = u64::from(target.memory) * u64::from(target.time);
+    let deficit = want.saturating_sub(u64::from(memory) * u64::from(time));
+    if deficit == 0 {
+        return None;
+    }
+    let time = deficit.div_ceil(u64::from(target.memory.max(8)));
+    let memory = deficit.div_ceil(time).max(8);
+    // t は target の t 以下、m は target の m 以下（8 未満のときだけ 8）に収まる。
+    Some(ArgonConfig {
+        memory: memory as u32,
+        time: time as u32,
+        threads: 1,
+    })
 }
 
 /// フラグなしでは呼ばれない（[`argon_cost`] が偽）。
@@ -698,7 +781,11 @@ fn needs_rehash_using(hashed: &str, policy: Policy) -> bool {
         Driver::Argon2id => {
             #[cfg(feature = "argon2")]
             if let Ok(stored) = argon::parse(hashed) {
-                return stored.memory < policy.argon.memory || stored.time < policy.argon.time;
+                // Laravel の `password_needs_rehash` と同じく、設定と違えば作り直す。
+                // 強い値も設定にそろえないと、照合と空回しが重いまま下がりません。
+                return stored.memory != policy.argon.memory
+                    || stored.time != policy.argon.time
+                    || stored.threads != policy.argon.threads;
             }
             // PBKDF2 の値・上限を超える値・読めない値は作り直す。
             true
@@ -748,7 +835,8 @@ impl Hash {
     /// 方式が Argon2id（`HASH_DRIVER=argon2id`）のとき、真になるのは次のときです。
     ///
     /// - PBKDF2 の値。
-    /// - 保存されている `m` か `t` が、いまの設定より小さい。
+    /// - 保存されている `m`・`t`・`p` のどれかが、いまの設定と違う（Laravel の
+    ///   `password_needs_rehash` と同じ）。設定より強い値も、設定にそろえます。
     /// - `m`・`t`・`p` が上限を超えている。値の形が読めない。
     ///
     /// **設定を上げたら、作り直してください。** 作り直さないかぎり、
@@ -763,7 +851,8 @@ impl Hash {
     /// 「そのメールアドレスは登録されていない」ことが応答の速さから分かってしまいます。
     ///
     /// 回すのは、いまの方式と、これまでに照合した値の方式です（両方のこともあります）。
-    /// PBKDF2 は [`dummy_iterations`] 回、Argon2id は設定の m・t・p で 1 回です。
+    /// PBKDF2 は [`dummy_iterations`] 回、Argon2id は [`argon_burn_config`] の m・t・p で 1 回です
+    /// （いまの設定と、これまでに照合した値の m・t・p の最大の、大きいほう）。
     /// 比べる相手は作りません。計算するだけなので、初回だけ重くなることもありません。
     ///
     /// **送られてきたパスワードをそのまま渡します。** 固定のダミーを使うと、
@@ -866,6 +955,7 @@ mod argon {
         hash: PasswordHash,
         pub(super) memory: u32,
         pub(super) time: u32,
+        pub(super) threads: u32,
     }
 
     /// Argon2id・版 19 の計算機。
@@ -911,6 +1001,7 @@ mod argon {
         Ok(Stored {
             memory: params.m_cost(),
             time: params.t_cost(),
+            threads: params.p_cost(),
             hash,
         })
     }
@@ -991,6 +1082,8 @@ mod counts {
         pub(super) static PBKDF2_BURNS: Cell<u32> = const { Cell::new(0) };
         pub(super) static ARGON_BURNS: Cell<u32> = const { Cell::new(0) };
         pub(super) static ARGON_VERIFIES: Cell<u32> = const { Cell::new(0) };
+        /// 弱い値の照合のあとの埋め合わせ。`take` には入れません（`pads` で読む）。
+        pub(super) static ARGON_PADS: Cell<u32> = const { Cell::new(0) };
     }
 
     pub(super) fn bump(key: &'static LocalKey<Cell<u32>>) {
@@ -1004,6 +1097,12 @@ mod counts {
             ARGON_BURNS.with(|c| c.replace(0)),
             ARGON_VERIFIES.with(|c| c.replace(0)),
         )
+    }
+
+    /// 埋め合わせの数を 0 に戻して返す。
+    #[cfg_attr(not(feature = "argon2"), allow(dead_code))]
+    pub(super) fn pads() -> u32 {
+        ARGON_PADS.with(|c| c.replace(0))
     }
 }
 
@@ -1507,7 +1606,7 @@ mod tests {
         assert!(needs_rehash_using("$2y$10$abc", ARGON));
         assert!(needs_rehash_using("$argon2id$壊れた値", ARGON));
 
-        // 設定より小さい m・t は作り直す。p は見ない。
+        // 設定と違う m・t・p は作り直す。
         let stronger = Policy {
             driver: Driver::Argon2id,
             argon: ArgonConfig {
@@ -1527,7 +1626,11 @@ mod tests {
         };
         assert!(needs_rehash_using(&argon, longer), "t が小さい");
         let wider = format!("$argon2id$v=19$m=16,t=1,p=2${}", &PHP_ARGON[27..]);
-        assert!(!needs_rehash_using(&wider, ARGON), "p は見ない");
+        assert!(needs_rehash_using(&wider, ARGON), "p が違う");
+        // 設定より強い値も、設定にそろえる（Laravel の `password_needs_rehash` と同じ）。
+        let heavier = PHP_ARGON.replace("m=8,t=1,", "m=16,t=2,");
+        assert!(needs_rehash_using(&heavier, ARGON), "m・t が大きい");
+        assert!(!needs_rehash_using(PHP_ARGON, ARGON), "設定どおり");
 
         // 上限を超える値は作り直す。
         let over = PHP_ARGON.replace("m=8,", "m=2000000,");
@@ -1658,6 +1761,88 @@ mod tests {
         assert!(needs_rehash_using(PHP_ARGON, ARGON));
         // 方式を Argon2id にしても、フラグが無ければ PBKDF2 で作る。
         assert!(make_using("x", ARGON).starts_with(PBKDF2_PREFIX));
+    }
+
+    #[test]
+    fn argon2id_の空回しは設定と見た最大の大きいほうに合わせる() {
+        let config = |memory, time, threads| ArgonConfig {
+            memory,
+            time,
+            threads,
+        };
+        // 何も見ていなければ設定のまま。
+        assert_eq!(argon_burn_config(TEST_ARGON, config(0, 0, 0)), TEST_ARGON);
+        // 項目ごとに大きいほう。
+        assert_eq!(
+            argon_burn_config(config(64, 1, 1), config(16, 3, 2)),
+            config(64, 3, 2)
+        );
+        // 上限は超えない。
+        assert_eq!(
+            argon_burn_config(TEST_ARGON, config(u32::MAX, u32::MAX, u32::MAX)),
+            config(MAX_ARGON_MEMORY, MAX_ARGON_TIME, MAX_ARGON_THREADS)
+        );
+    }
+
+    #[test]
+    fn argon2id_の弱い値は足りないぶんを埋める() {
+        let config = |memory, time, threads| ArgonConfig {
+            memory,
+            time,
+            threads,
+        };
+        // 同じか強ければ埋めない。
+        assert_eq!(argon_padding(64, 4, config(64, 4, 1)), None);
+        assert_eq!(argon_padding(128, 4, config(64, 4, 1)), None);
+        // m × t の差を、m が target を超えない形で埋める。
+        let pad = argon_padding(64, 2, config(64, 4, 1)).unwrap();
+        assert_eq!(u64::from(pad.memory) * u64::from(pad.time), 128);
+        assert!(pad.memory <= 64);
+        let pad = argon_padding(8, 1, config(65_536, 4, 1)).unwrap();
+        assert!(pad.memory <= 65_536 && pad.time <= 4, "{pad:?}");
+        let total = u64::from(pad.memory) * u64::from(pad.time);
+        let deficit = 65_536 * 4 - 8;
+        assert!(total >= deficit && total < deficit + u64::from(pad.time));
+        // 最小のメモリ（8 KiB）は下回らない。
+        assert_eq!(argon_padding(8, 1, config(9, 1, 1)).unwrap().memory, 8);
+    }
+
+    #[cfg(feature = "argon2")]
+    #[test]
+    fn argon2id_の値を照合するとm_t_pの最大を覚えて弱い値は埋める() {
+        // 空回しが設定の m・t・p だけで回っていたころは、強い値の利用者の照合だけ
+        // 遅く終わり、登録の有無が分かった。
+        install_test_iterations();
+        let marks = AtomicU8::new(0);
+        // 小さな値にしておく（覚えた値はほかのテストの空回しにも効くため）。
+        let heavy = ArgonConfig {
+            memory: 16,
+            time: 2,
+            threads: 2,
+        };
+        let heavier = make_using(
+            "ひみつ",
+            Policy {
+                driver: Driver::Argon2id,
+                argon: heavy,
+            },
+        );
+        assert!(check_using("ひみつ", &heavier, ARGON, &marks));
+        let seen = seen_argon();
+        assert!(
+            seen.memory >= 16 && seen.time >= 2 && seen.threads >= 2,
+            "{seen:?}"
+        );
+
+        // 設定どおり（m=8, t=1）の値は、覚えた最大より軽いので埋める。
+        counts::pads();
+        assert!(check_using("ひみつのパスワード", PHP_ARGON, ARGON, &marks));
+        assert_eq!(counts::pads(), 1, "弱い値は埋める");
+        // 覚えた最大と同じ強さの値は埋めない。
+        assert!(check_using("ひみつ", &heavier, ARGON, &marks));
+        if seen_argon() == heavy {
+            assert_eq!(counts::pads(), 0, "最大の値は埋めない");
+        }
     }
 
     // ---- 7.2 計算の同時数 ----

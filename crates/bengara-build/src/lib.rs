@@ -223,7 +223,13 @@ impl Generator {
     fn run(&mut self, root: &Path) {
         for target in TARGETS {
             let dir = root.join(target.name);
-            if !self.watch(&dir) {
+            // `database/` だけは中を 1 つずつ見張る（`watch_database` を参照）。
+            let found = if target.name == "database" {
+                self.watch_database(&dir)
+            } else {
+                self.watch(&dir)
+            };
+            if !found {
                 continue;
             }
             let Some(module) = self.module_name(target.name, &dir) else {
@@ -262,6 +268,44 @@ impl Generator {
             dir.display()
         ));
         false
+    }
+
+    /// `database/` を見張る。**ディレクトリごとではなく、中を 1 つずつ**見張ります。
+    ///
+    /// `database/` には SQLite のファイル（`database.sqlite` とその `-wal`・`-journal`）が
+    /// 置かれます。ディレクトリごと見張ると、cargo は中を再帰的にたどるので、
+    /// **DB に書くたびに**更新時刻が変わり、本体を作り直していました。
+    ///
+    /// そこで次のものだけを見張ります。
+    ///
+    /// - 中のサブディレクトリ（`migrations/`・`seeders/`・`factories/` など、実在するもの）
+    /// - 直下の `.rs`
+    ///
+    /// **直下に `.rs` やサブディレクトリを新しく足したときは気づけません。**
+    /// `touch build.rs` で作り直してください（無いディレクトリを後から作ったときと同じ）。
+    ///
+    /// 中を読めないときは、作り直しが余分に走るほうに倒して、ディレクトリごと見張ります。
+    ///
+    /// 戻り値は「そのディレクトリがあったか」です。
+    fn watch_database(&mut self, dir: &Path) -> bool {
+        if !dir.is_dir() {
+            return self.watch(dir);
+        }
+        let Ok(read) = fs::read_dir(dir) else {
+            self.watch_existing(dir);
+            return true;
+        };
+        let mut paths: Vec<PathBuf> = read.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                self.watch_existing(&path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                self.watched.push(path.clone());
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+        true
     }
 
     /// あると分かっているディレクトリを見張る。
@@ -848,7 +892,8 @@ impl Generator {
             let _ = writeln!(self.tree, "pub use crate::{flat} as {module};");
 
             // PSR-4 と同じ約束。先頭が大文字のファイルは、同じ名前の型を公開する。
-            // ただし seeders と factories は「関数を置く場所」なので、型は探さない。
+            // ただし関数を置く場所（seeders・factories・jobs・commands・listeners）では、
+            // 型は探さない。
             if target.reexport && starts_upper(stem) && !function_dir {
                 // ファイル名をそのまま型の名前として書くので、識別子に使えるか確かめる。
                 // `My-Model.rs` はモジュール名にはできるが、型の名前にはできない。
@@ -1139,7 +1184,11 @@ impl Generator {
             // （Windows のジャンクションも同じ）は `is_dir` が偽になり、
             // `.rs` でもないので黙って飛ばされます。辿らないのは循環で落ちないという
             // 良い面があるのでそのままにして、気づけるように1行知らせます。
-            if file_type.is_some_and(|kind| kind.is_symlink()) {
+            //
+            // **ファイルへのリンクは知らせません。** `is_dir` が偽のまま普通のファイルと
+            // 同じ道を通り、`.rs` なら取り込まれ、`public/` なら埋め込まれるためです。
+            // 先がディレクトリかは `metadata()`（リンクを辿る）で見ます。
+            if file_type.is_some_and(|kind| kind.is_symlink()) && entry.path().is_dir() {
                 warn(&format!(
                     "{} はリンクなのでたどりません。中のファイルは取り込まれません",
                     entry.path().display()
@@ -2183,6 +2232,72 @@ mod tests {
         assert!(!generator.watched.contains(&root.join("app/Models")));
         assert!(!generator.watched.contains(&root.to_path_buf()));
         assert!(!generator.watched.contains(&root.join("config")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn databaseは中を1つずつ見張る() {
+        let root = temp_root("watch_database");
+        touch(&root.join("database/migrations/m0001_create_users.rs"), "");
+        touch(&root.join("database/seeders/DatabaseSeeder.rs"), "");
+        touch(&root.join("database/helpers.rs"), "");
+        touch(&root.join("database/database.sqlite"), "");
+        touch(&root.join("database/database.sqlite-wal"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+
+        // SQLite に書くたびに作り直さないよう、database/ そのものは見張らない。
+        assert!(!generator.watched.contains(&root.join("database")));
+        assert!(!generator
+            .watched
+            .contains(&root.join("database/database.sqlite")));
+        assert!(!generator
+            .watched
+            .contains(&root.join("database/database.sqlite-wal")));
+        // 中のディレクトリと直下の .rs は見張る。
+        assert!(generator
+            .watched
+            .contains(&root.join("database/migrations")));
+        assert!(generator.watched.contains(&root.join("database/seeders")));
+        assert!(generator
+            .watched
+            .contains(&root.join("database/helpers.rs")));
+        // 無い factories/ は出さない（出すと毎回走る）。
+        assert!(!generator.watched.contains(&root.join("database/factories")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ファイルへのリンクは取り込む() {
+        let root = temp_root("file_link");
+        touch(&root.join("shared/Post.rs"), "");
+        fs::create_dir_all(root.join("app/Models")).unwrap();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(
+            root.join("shared/Post.rs"),
+            root.join("app/Models/Post.rs"),
+        )
+        .is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(
+            root.join("shared/Post.rs"),
+            root.join("app/Models/Post.rs"),
+        )
+        .is_ok();
+        if !made {
+            // Windows は権限（開発者モード）が無いと作れない。
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+        let code = generator.finish();
+        // 普通のファイルと同じく取り込む（モジュール `post` ができる）。
+        assert!(code.contains(" as post;"), "{code}");
 
         let _ = fs::remove_dir_all(&root);
     }

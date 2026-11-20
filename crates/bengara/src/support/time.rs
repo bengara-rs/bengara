@@ -41,6 +41,15 @@ pub(crate) fn now_millis() -> i64 {
 ///
 /// 日付だけ（`YYYY-MM-DD`）も受け付け、00:00:00 として扱います。
 ///
+/// # 桁はちょうどにそろえます
+///
+/// - 日付は `YYYY-MM-DD`（4 桁・2 桁・2 桁）。`2026-1-5` や `+2026-01-01` は読みません。
+/// - 時刻は `HH:MM` か `HH:MM:SS`（どれも 2 桁）。`10`（時だけ）や `10:00:00:00`
+///   （4 つ目の区切り）は読みません。
+///
+/// 以前は数として読めれば何桁でも通していました（`+5` も `parse` が読みます）。
+/// 入力の検査（`date` の規則）がこれを使うので、崩れた値を日付として通さないためです。
+///
 /// # 時刻の後ろに付いたものは落とします
 ///
 /// 秒より細かい桁（`.123`）と、タイムゾーンの指定（`Z`・`+09:00`・`-05:00`）は
@@ -58,9 +67,9 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
     };
 
     let mut date_parts = date.split('-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
-    let month: u32 = date_parts.next()?.parse().ok()?;
-    let day: u32 = date_parts.next()?.parse().ok()?;
+    let year: i64 = fixed_digits(date_parts.next()?, 4)?.parse().ok()?;
+    let month: u32 = fixed_digits(date_parts.next()?, 2)?.parse().ok()?;
+    let day: u32 = fixed_digits(date_parts.next()?, 2)?.parse().ok()?;
     // 年に上限が無かったころ、`99999999999999-01-01` が
     // `days * 86_400` の桁あふれでデバッグビルドではパニックし、
     // リリースでは巻き戻って過去の秒になりました。`PasswordReset::expired`
@@ -84,9 +93,16 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
         .find(|c: char| !(c.is_ascii_digit() || c == ':'))
         .unwrap_or(time.len());
     let mut time_parts = time[..end].split(':');
-    let hour: i64 = time_parts.next()?.parse().ok()?;
-    let minute: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
-    let second: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
+    let hour: i64 = fixed_digits(time_parts.next()?, 2)?.parse().ok()?;
+    let minute: i64 = fixed_digits(time_parts.next()?, 2)?.parse().ok()?;
+    let second: i64 = match time_parts.next() {
+        Some(second) => fixed_digits(second, 2)?.parse().ok()?,
+        None => 0,
+    };
+    // 4 つ目の区切りは読まない（`10:00:00:00`）。
+    if time_parts.next().is_some() {
+        return None;
+    }
     // うるう秒（60 秒）は受け付けません。保存する側が作らない値です。
     if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..60).contains(&second) {
         return None;
@@ -94,6 +110,13 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
 
     let days = days_from_civil(year, month, day);
     Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// ちょうど `len` 桁の数字だけでできていれば、そのまま返す。
+///
+/// `str::parse` は `+5` や `0005` も読むので、桁と符号はここで確かめます。
+fn fixed_digits(text: &str, len: usize) -> Option<&str> {
+    (text.len() == len && text.bytes().all(|b| b.is_ascii_digit())).then_some(text)
 }
 
 /// その月の日数。
@@ -222,6 +245,36 @@ mod tests {
         ] {
             assert_eq!(parse_timestamp(broken), None, "{broken}");
         }
+    }
+
+    #[test]
+    fn 桁がちょうどでない値はnoneになる() {
+        for broken in [
+            // 日付は 4-2-2 桁。
+            "2026-1-05",
+            "2026-01-5",
+            "26-01-05",
+            "02026-01-05",
+            "+2026-01-05",
+            "2026-+1-05",
+            "2026-01-+5",
+            // 時刻は 2:2(:2) 桁。
+            "2026-01-05 10",
+            "2026-01-05 1:00:00",
+            "2026-01-05 10:0:00",
+            "2026-01-05 10:00:0",
+            "2026-01-05 010:00:00",
+            // 4 つ目以降の区切り。
+            "2026-01-05 10:00:00:00",
+            "2026-01-05 10:00:00:",
+        ] {
+            assert_eq!(parse_timestamp(broken), None, "{broken}");
+        }
+        // 秒は省ける。
+        assert_eq!(
+            parse_timestamp("1970-01-02 01:02"),
+            Some(86_400 + 3_600 + 120)
+        );
     }
 
     #[test]

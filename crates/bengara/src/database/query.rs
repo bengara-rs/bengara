@@ -133,6 +133,10 @@ pub struct QueryBuilder {
     /// 断るのは PostgreSQL のときだけですが、**ドライバは後から替わります**
     /// （`using(&tx)`）。書いた時点では決めず、終端で、いまのドライバと照らします。
     raw_dollar: Option<String>,
+    /// 1 つのドライバだけが持つ演算子（`ilike` / `<=>`）を書いた最初の場所と演算子。
+    ///
+    /// `raw_dollar` と同じく、ドライバは後から替わるので終端で照らします。
+    dialect_operator: Option<(String, String)>,
     table: String,
     columns: Vec<String>,
     distinct: bool,
@@ -182,6 +186,7 @@ impl QueryBuilder {
             driver_error,
             deferred_error: None,
             raw_dollar: None,
+            dialect_operator: None,
             table: table.into(),
             columns: Vec::new(),
             distinct: false,
@@ -224,7 +229,37 @@ impl QueryBuilder {
         if let Some(message) = &self.deferred_error {
             return Some(message.clone());
         }
-        self.dollar_error()
+        self.dollar_error().or_else(|| self.dialect_error())
+    }
+
+    /// いまのドライバに無い演算子（`ilike` / `<=>`）を書いていたときの文。
+    fn dialect_error(&self) -> Option<String> {
+        let (place, operator) = self.dialect_operator.as_ref()?;
+        let only = grammar::operator_driver(operator)?;
+        if only == self.driver {
+            return None;
+        }
+        let (name, instead) = match only {
+            Driver::Postgres => (
+                "PostgreSQL",
+                "大文字小文字を区別せずに探すときは、like を使ってください（SQLite の like は英字の大文字小文字を区別しません。MySQL は照合順序によります）",
+            ),
+            _ => (
+                "MySQL",
+                "NULL どうしも等しいとみなしたいときは、where_null と or_where_group で書いてください",
+            ),
+        };
+        Some(format!(
+            "{place} に渡した演算子 `{operator}` は {name} だけのものです。いまの接続（{}）では使えません。{instead}",
+            self.driver.as_str()
+        ))
+    }
+
+    /// 1 つのドライバだけが持つ演算子なら覚える。最初の 1 つだけ残します。
+    fn note_dialect_operator(&mut self, place: &str, operator: &str) {
+        if self.dialect_operator.is_none() && grammar::operator_driver(operator).is_some() {
+            self.dialect_operator = Some((place.to_string(), operator.trim().to_string()));
+        }
     }
 
     /// PostgreSQL へ投げるのに、`*_raw` に `$` を書いていたときの文。
@@ -274,6 +309,7 @@ impl QueryBuilder {
     /// 列と列を比べる演算子として受け付けるか確かめる。
     fn check_operator(&mut self, place: &str, operator: &str) {
         if grammar::is_allowed_operator(operator) {
+            self.note_dialect_operator(place, operator);
             return;
         }
         // 以前は通していた演算子。列と列の間では SQL が成り立たないので、
@@ -299,6 +335,7 @@ impl QueryBuilder {
     /// 案内します。
     fn check_value_operator(&mut self, place: &str, operator: &str) {
         if grammar::is_allowed_value_operator(operator) {
+            self.note_dialect_operator(place, operator);
             return;
         }
         if grammar::is_set_operator(operator) {
@@ -616,6 +653,10 @@ impl QueryBuilder {
         // `$` の直書きも引き継ぐ。断るかどうかは、外側の終端が決める。
         if self.raw_dollar.is_none() {
             self.raw_dollar = nested.raw_dollar;
+        }
+        // ドライバだけの演算子も同じ。
+        if self.dialect_operator.is_none() {
+            self.dialect_operator = nested.dialect_operator;
         }
         if !nested.wheres.is_empty() {
             self.wheres.push(Where::Nested {
@@ -1136,6 +1177,10 @@ impl QueryBuilder {
         if let Some(message) = self.dollar_error() {
             return Err(Error::msg(message));
         }
+        // ドライバだけの演算子も、ここで、いまのドライバと照らす。
+        if let Some(message) = self.dialect_error() {
+            return Err(Error::msg(message));
+        }
         if !self.havings.is_empty() && self.groups.is_empty() {
             // `having` は束ねた結果を絞るものなので、束ねていないと意味が決まらない。
             // group_by と集計を断っているのと同じ方針です。
@@ -1337,12 +1382,24 @@ impl QueryBuilder {
     /// `group_by` が付いているときは**グループの数**を返します。
     /// `distinct()` が付いているときは重なりを除いて数えます。
     ///
-    /// **`distinct()` を付けたときは `select` で列を1つ指定してください。**
-    /// 数える列が決まらないと断ります（理由は `count_sql` にあります）。
+    /// **`distinct()` を付けたときの数え方は、選んだ列で決まります。**
+    ///
+    /// | 選んだ列                                         | 数え方                                   |
+    /// |--------------------------------------------------|------------------------------------------|
+    /// | 列が 1 つ（`select(&["author_id"])`）            | `count(distinct 列)`。NULL は数えない    |
+    /// | 出力の名前が重ならない列（`posts.*` 1 つも可）   | 副問い合わせの行を数える                 |
+    /// | それ以外（`join` した `*`・式・名前の重なり）    | 断る                                     |
+    ///
+    /// 断る理由は `count_sql` にあります。
     pub async fn count(&self) -> Result<i64> {
         self.check()?;
         let (sql, bindings) = self.count_sql()?;
-        let rows = self.fetch(&sql, &bindings).await?;
+        self.count_with(&sql, &bindings).await
+    }
+
+    /// 件数の SQL を流して、数を読む。
+    async fn count_with(&self, sql: &str, bindings: &[Value]) -> Result<i64> {
+        let rows = self.fetch(sql, bindings).await?;
         match rows.first().and_then(|row| row.at(0)) {
             None | Some(Value::Null) => Ok(0),
             Some(value) => i64::from_value(value),
@@ -1361,19 +1418,68 @@ impl QueryBuilder {
         }
         if self.distinct {
             // 数える列が1つに決まるなら `count(distinct 列)`。
-            let Some(column) = self.distinct_count_column() else {
-                // 決まらない（指定なし・複数・式）ときは断る。
-                // 派生表で数えると、MySQL は列名が重なってエラー 1060 になります
-                // （`join` を併用したとき）。SQL を出さずに書き方を伝えます。
-                return Err(Error::msg(
-                    "distinct() を付けた問い合わせの件数は、数える列が1つに決まらないと\
-                     数えられません。select で列を1つ指定してください\
-                     （例: select(&[\"author_id\"])）",
-                ));
-            };
-            return Ok(self.plain_count_sql(&format!("count(distinct {column})")));
+            if let Some(column) = self.distinct_count_column() {
+                return Ok(self.plain_count_sql(&format!("count(distinct {column})")));
+            }
+            // 出力の名前が重ならないと分かるなら、副問い合わせの行を数える。
+            if self.distinct_rows_countable() {
+                return Ok(self.distinct_sub_count_sql());
+            }
+            // それ以外は断る。派生表の列の名前が重なると、MySQL はエラー 1060 に
+            // なります（`join` した `*` など）。SQL を出さずに書き方を伝えます。
+            return Err(Error::msg(DISTINCT_COUNT_ERROR));
         }
         Ok(self.plain_count_sql("count(*)"))
+    }
+
+    /// ページ分けの件数の SQL。
+    ///
+    /// `count_sql` と違い、`distinct()` で列が 1 つのときも副問い合わせの行を数えます。
+    /// `count(distinct 列)` は NULL を数えませんが、`select distinct 列` は NULL の行も
+    /// 返します。数と中身を合わせるためです。
+    fn pagination_count_sql(&self) -> Result<(String, Vec<Value>)> {
+        if self.groups.is_empty() && self.distinct && self.distinct_rows_countable() {
+            return Ok(self.distinct_sub_count_sql());
+        }
+        self.count_sql()
+    }
+
+    /// `select distinct …` の行を、副問い合わせの外から数えてよいか。
+    ///
+    /// 派生表（`from (…) as 別名`）の列の名前が重なると、MySQL はエラー 1060 で断ります。
+    /// **出力の名前が重ならないと、組み立てた形から言えるときだけ**真にします。
+    ///
+    /// | 選んだ列                         | 真になる条件                                   |
+    /// |----------------------------------|------------------------------------------------|
+    /// | 指定なし・`*`                    | `join` が無い（1 つの表の列だけになる）        |
+    /// | `posts.*` が 1 つだけ            | いつでも（1 つの表の列だけになる）             |
+    /// | ただの列名だけ（`posts.id` など） | 最後の部分が重ならない（大文字小文字は見ない） |
+    ///
+    /// 式（`count(*)`・`id as key`）を含むときは偽です。出力の名前を読み切れないためです。
+    fn distinct_rows_countable(&self) -> bool {
+        match self.columns.as_slice() {
+            [] => self.joins.is_empty(),
+            [only] if only.trim() == "*" => self.joins.is_empty(),
+            [only] if is_table_star(only) => true,
+            columns => {
+                let mut seen = std::collections::HashSet::new();
+                columns.iter().all(|column| {
+                    grammar::is_plain_identifier(column)
+                        && seen.insert(output_name(column).to_lowercase())
+                })
+            }
+        }
+    }
+
+    /// `select distinct …` を副問い合わせにして、外から行を数える形。
+    ///
+    /// 内側は組み立てたままの列と `distinct` を使います。並びと件数は外します。
+    fn distinct_sub_count_sql(&self) -> (String, Vec<Value>) {
+        let (inner, bindings) = self.select_sql(&self.aggregate_shape());
+        (
+            format!("select count(*) as bengara_aggregate from ({inner}) as bengara_sub"),
+            bindings,
+        )
     }
 
     /// `count(distinct …)` に使える列。1列だけ指定されているときだけ決まります。
@@ -1820,9 +1926,11 @@ impl QueryBuilder {
     /// 断られます**（指している側が空でも同じ）。SQLite は `delete` なので、
     /// 指している行が無ければ通ります。
     ///
-    /// **MySQL の `truncate table` は、いまのトランザクションを暗黙に確定します。**
-    /// `tx.table(...).truncate()` の後で `rollback()` しても、それまでの書き込みと
-    /// 消した行は戻りません。巻き戻したいときは `delete()` を使ってください。
+    /// **MySQL では、トランザクションの中で呼ぶとエラーにします。**
+    /// MySQL の `truncate table` は、いまのトランザクションを暗黙に確定するためです。
+    /// 流すと、それまでの書き込みも後の書き込みも `rollback()` で戻らなくなります。
+    /// トランザクションの中で空にしたいときは `delete()` を使ってください
+    /// （採番は戻りません）。
     ///
     /// SQLite は文を 3 本流すので、1つのトランザクションにまとめます。
     /// トランザクションの外で呼んだら、ここで始めて確定します。
@@ -1833,6 +1941,13 @@ impl QueryBuilder {
         if !self.wheres.is_empty() {
             return Err(Error::msg(
                 "truncate では条件が効きません。delete() を使ってください",
+            ));
+        }
+        if self.driver == Driver::MySql && matches!(self.source, Source::Tx(_)) {
+            // 流すとトランザクションが暗黙に確定し、以後の rollback() が効かなくなる。
+            // それでも状態は「使える」のままなので、黙って戻らない書き込みになる。
+            return Err(Error::msg(
+                "MySQL の truncate はトランザクションを暗黙に確定するので、トランザクションの中では使えません。delete() を使ってください",
             ));
         }
         match self.driver {
@@ -1905,7 +2020,9 @@ impl QueryBuilder {
     pub async fn paginate(&self, per_page: u64, page: u64) -> Result<Paginator<Row>> {
         let per_page = per_page.max(1);
         let page = page.max(1);
-        let total = self.count().await?;
+        self.check()?;
+        let (sql, bindings) = self.pagination_count_sql()?;
+        let total = self.count_with(&sql, &bindings).await?;
         if total == 0 {
             // 1件も無いなら、どのページも空。本体の問い合わせは流さない。
             return Ok(Paginator {
@@ -1915,7 +2032,7 @@ impl QueryBuilder {
                 current_page: page,
             });
         }
-        // `count()` が `check()` を通している。ここでは組み立てるだけ。
+        // 上で `check()` を通している。ここでは組み立てるだけ。
         let (sql, bindings) = self.select_sql(&Shape {
             limit: Some(per_page),
             offset: Some(page_offset(page, per_page)),
@@ -1929,6 +2046,23 @@ impl QueryBuilder {
             current_page: page,
         })
     }
+}
+
+/// `distinct()` の件数を数えられないときの文。
+const DISTINCT_COUNT_ERROR: &str = "distinct() を付けた問い合わせの件数を数えられません。select で列を指定してください。列が 1 つ（例: select(&[\"author_id\"])）か、出力の名前が重ならない列（例: select(&[\"posts.*\"])・select(&[\"posts.id\", \"users.name\"])）なら数えられます";
+
+/// `posts.*` の形か。`*` の前はただの表名に限ります。
+fn is_table_star(column: &str) -> bool {
+    column
+        .trim()
+        .strip_suffix(".*")
+        .is_some_and(grammar::is_plain_identifier)
+}
+
+/// ただの列名の、出力の名前（`.` で区切った最後の部分）。
+fn output_name(column: &str) -> &str {
+    let column = column.trim();
+    column.rsplit_once('.').map_or(column, |(_, name)| name)
 }
 
 /// ページ番号から読み飛ばす件数を決める。あふれたら上限に張り付く。
@@ -2882,18 +3016,131 @@ mod tests {
     }
 
     #[test]
-    fn 数える列が決まらないdistinctは断る() {
-        // 以前は派生表で数えていた。MySQL は join した列名が重なってエラー 1060。
+    fn 出力の名前が重なりうるdistinctは数えずに断る() {
+        // 派生表で数えると、MySQL は列名が重なってエラー 1060 になる。
         for query in [
-            builder().distinct(),
-            builder().distinct().select(&["id", "author_id"]),
+            // join した `*` は、両方の表の `id` が並ぶ。
             builder()
                 .distinct()
                 .join("comments", "comments.post_id", "=", "posts.id"),
+            builder().distinct().select(&["*"]).join(
+                "comments",
+                "comments.post_id",
+                "=",
+                "posts.id",
+            ),
+            // 最後の部分が重なる（大文字小文字は見ない）。
+            builder().distinct().select(&["posts.id", "comments.id"]),
+            builder().distinct().select(&["posts.id", "comments.ID"]),
+            // `posts.*` に別の列を足すと、名前が重なるか分からない。
+            builder().distinct().select(&["posts.*", "users.name"]),
+            // 式は出力の名前を読み切れない。
+            builder().distinct().select(&["id", "count(*) as c"]),
+            builder().distinct().select(&["id as key", "title"]),
         ] {
             let message = query.count_sql().expect_err("断られる").to_string();
-            assert!(message.contains("select で列を1つ"), "{message}");
+            assert!(message.contains("select で列を指定"), "{message}");
+            assert!(message.contains("posts.*"), "{message}");
+            let message = query
+                .pagination_count_sql()
+                .expect_err("断られる")
+                .to_string();
+            assert!(message.contains("select で列を指定"), "{message}");
         }
+    }
+
+    #[test]
+    fn 出力の名前が重ならないdistinctは副問い合わせで数える() {
+        // Laravel でよくある `join(..).select(&["posts.*"]).distinct().paginate(..)`。
+        // 以前は必ずエラーだった。
+        let query = builder()
+            .distinct()
+            .select(&["posts.*"])
+            .join("comments", "comments.post_id", "=", "posts.id")
+            .where_("comments.approved", true)
+            .latest()
+            .limit(10);
+        let expected = "select count(*) as bengara_aggregate from (select distinct \"posts\".* from \"posts\" inner join \"comments\" on \"comments\".\"post_id\" = \"posts\".\"id\" where \"comments\".\"approved\" = ?) as bengara_sub";
+        let (sql, bindings) = query.count_sql().expect("組み立てられる");
+        assert_eq!(sql, expected);
+        assert_eq!(bindings, vec![Value::Bool(true)]);
+        let (sql, _) = query.pagination_count_sql().expect("組み立てられる");
+        assert_eq!(sql, expected);
+
+        // 名前の重ならない列、指定なし（join 無し）。
+        let (sql, _) = builder()
+            .distinct()
+            .select(&["posts.id", "users.name"])
+            .count_sql()
+            .expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "select count(*) as bengara_aggregate from (select distinct \"posts\".\"id\", \"users\".\"name\" from \"posts\") as bengara_sub"
+        );
+        let (sql, _) = builder().distinct().count_sql().expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "select count(*) as bengara_aggregate from (select distinct * from \"posts\") as bengara_sub"
+        );
+    }
+
+    #[test]
+    fn ページ分けは列が1つのdistinctも行で数える() {
+        // `count(distinct 列)` は NULL を数えないが、`select distinct 列` は NULL の行も返す。
+        let query = builder().distinct().select(&["author_id"]);
+        let (sql, _) = query.count_sql().expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "select count(distinct \"author_id\") as bengara_aggregate from \"posts\""
+        );
+        let (sql, _) = query.pagination_count_sql().expect("組み立てられる");
+        assert_eq!(
+            sql,
+            "select count(*) as bengara_aggregate from (select distinct \"author_id\" from \"posts\") as bengara_sub"
+        );
+        // distinct でなければ、ページ分けも count() と同じ。
+        let (sql, _) = builder()
+            .latest()
+            .pagination_count_sql()
+            .expect("組み立てられる");
+        assert_eq!(sql, "select count(*) as bengara_aggregate from \"posts\"");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn joinしたdistinctのページ分けは重なりを除いて数える() {
+        let tx = live().await;
+        tx.statement(
+            "create table comments (id integer primary key, post_id integer, body text)",
+            &[],
+        )
+        .await
+        .expect("表が作れる");
+        for title in ["a", "b", "c"] {
+            tx.table("posts")
+                .insert(&[("title", Value::Text(title.into()))])
+                .await
+                .expect("入る");
+        }
+        // 1 番に 3 件、2 番に 1 件、3 番は無し。
+        for post_id in [1, 1, 1, 2] {
+            tx.table("comments")
+                .insert(&[("post_id", Value::Int(post_id))])
+                .await
+                .expect("入る");
+        }
+        let page = tx
+            .table("posts")
+            .join("comments", "comments.post_id", "=", "posts.id")
+            .select(&["posts.*"])
+            .distinct()
+            .order_by("posts.id")
+            .paginate(1, 1)
+            .await
+            .expect("数えられる");
+        assert_eq!(page.total, 2, "重なりを除いて 2 件");
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].get::<i64>("id").unwrap(), 1);
     }
 
     #[test]
@@ -3252,11 +3499,65 @@ mod tests {
             .expect_err("断られる")
             .to_string();
         assert!(message.contains("使えません"), "{message}");
-        // 列と列を比べる側では `<=>` が通る。
-        builder()
-            .where_column("a", "<=>", "b")
+        // 列と列を比べる側では、MySQL なら `<=>` が通る。
+        QueryBuilder {
+            driver: Driver::MySql,
+            ..builder()
+        }
+        .where_column("a", "<=>", "b")
+        .check()
+        .expect("列と列の比較では通る");
+    }
+
+    #[test]
+    fn ドライバに無い演算子は検査で断る() {
+        // 以前は 3 つのドライバで検査を通り、流してから SQL エラーになっていた。
+        let on = |driver| QueryBuilder {
+            driver,
+            ..builder()
+        };
+        // `ilike` は PostgreSQL だけ。
+        for driver in [Driver::Sqlite, Driver::MySql] {
+            for query in [
+                on(driver).where_op("title", "ilike", "%a%"),
+                on(driver).or_where_op("title", "not ilike", "%a%"),
+                on(driver).where_column("a", "ILIKE", "b"),
+                on(driver).join("users", "users.name", "ilike", "posts.author"),
+                on(driver).where_group(|q| q.where_op("title", "ilike", "%a%")),
+            ] {
+                let message = query.check().expect_err("断られる").to_string();
+                assert!(message.contains("PostgreSQL だけ"), "{message}");
+                assert!(message.contains(driver.as_str()), "{message}");
+                assert!(message.contains("like"), "{message}");
+            }
+        }
+        on(Driver::Postgres)
+            .where_op("title", "ilike", "%a%")
+            .where_column("a", "not ilike", "b")
             .check()
-            .expect("列と列の比較では通る");
+            .expect("PostgreSQL では通る");
+
+        // `<=>` は MySQL だけ。
+        for driver in [Driver::Sqlite, Driver::Postgres] {
+            for query in [
+                on(driver).where_column("a", "<=>", "b"),
+                on(driver).left_join("users", "users.id", "<=>", "posts.user_id"),
+            ] {
+                let message = query.check().expect_err("断られる").to_string();
+                assert!(message.contains("MySQL だけ"), "{message}");
+            }
+        }
+
+        // ドライバは後から替わる。照らすのは終端のときのドライバ。
+        let query = on(Driver::Sqlite).where_op("title", "ilike", "%a%");
+        let message = format!("{query:?}");
+        assert!(message.contains("PostgreSQL だけ"), "{message}");
+        QueryBuilder {
+            driver: Driver::Postgres,
+            ..query
+        }
+        .check()
+        .expect("替えた先が PostgreSQL なら通る");
     }
 
     #[test]
@@ -3274,7 +3575,8 @@ mod tests {
             }
         }
         // 比較の演算子と `like` はこれまでどおり通る。
-        for operator in ["=", "!=", "<>", "<", ">=", "like", "not ilike", "<=>"] {
+        // `ilike` と `<=>` はドライバで決まる（`ドライバに無い演算子は検査で断る`）。
+        for operator in ["=", "!=", "<>", "<", ">=", "like", "not like"] {
             builder()
                 .where_column("a", operator, "b")
                 .join("users", "users.id", operator, "posts.user_id")

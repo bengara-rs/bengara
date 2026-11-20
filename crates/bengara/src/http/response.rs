@@ -10,7 +10,9 @@ use crate::error::{reason_phrase, Error, Result};
 ///
 /// 本文は `Cow` で持ちます。バイナリに埋め込んだ `public/` を配信するときに、
 /// `&'static [u8]` をコピーせずそのまま返せるようにするためです。
-#[derive(Debug, Clone)]
+///
+/// `Debug` は手で書いてあります。`Set-Cookie` の値と本文を出さないためです。
+#[derive(Clone)]
 pub struct Response {
     status: u16,
     headers: Vec<(String, String)>,
@@ -20,6 +22,20 @@ pub struct Response {
     /// ふつうの応答では空で、確保もしません。`with_header` などは `self` を
     /// 受け取って返すので、ミドルウェアがヘッダーを足しても残ります。
     upgrade: crate::websocket::Slot<crate::websocket::Pending>,
+}
+
+/// ステータス・ヘッダー（秘密は伏せる）・本文の長さだけを出す。
+///
+/// 以前は `derive(Debug)` だったので、`{res:?}` でセッションの Cookie や
+/// 本文（トークンを含む JSON など）がそのままログに出ました。
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &super::request::RedactedHeaders(&self.headers))
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Response {
@@ -192,6 +208,10 @@ impl Response {
 /// （`redirect().to(req.input("next"))` に `?next=/a%0Ab` が来ると起きました）。
 /// 黙って落とすので、落としたときだけ1行だけ残します。`Cookie` の属性
 /// （`cookie::sanitize_attribute`）と同じやり方です。
+///
+/// ASCII 以外の文字は通します。送るところ（`server::into_axum`）は値をバイト列として
+/// 渡すので、ここを通った値はそこでも落ちません。**テストで見える値と、本番で
+/// 送られる値が食い違わない**ようにしてあります。
 fn header_value_ok(name: &str, value: &str) -> bool {
     // 水平タブだけは HTTP でも値に使えるので通す。
     if !value.chars().any(|c| c.is_control() && c != '\t') {
@@ -302,6 +322,9 @@ impl Redirect {
     /// `Set-Cookie` は残ったまま 500 になります。
     ///
     /// `with_status` で転送でないステータスを決めていたときもエラーにします。
+    ///
+    /// 空白と ASCII 以外の文字は `%XX` にしてから入れます（`/記事 1` → `/%E8%A8%98%E4%BA%8B%201`）。
+    /// すでに `%XX` になっている所は二重にしません。
     pub fn to(self, path: impl Into<String>) -> Result<Response> {
         if !is_redirect_status(self.status) {
             return Err(Error::msg(format!(
@@ -315,7 +338,8 @@ impl Redirect {
                 "転送先に使えない文字が入っています（改行などの制御文字は Location ヘッダーに入れられません）",
             ));
         }
-        Ok(Response::new(self.status).with_header("location", path))
+        let location = super::percent::escape_unsafe_in_url(&path).into_owned();
+        Ok(Response::new(self.status).with_header("location", location))
     }
 
     /// 名前付きルートへリダイレクトする。
@@ -412,7 +436,9 @@ fn build_error_response(error: &Error, options: RenderOptions) -> Response {
         }
     }
 
-    let status = error.status();
+    // 範囲外（`abort(1000)`）は、ここで先に 500 に寄せる。応答の側だけで寄せると、
+    // 題が「1000 Unknown」のまま、実際のステータスは 500 になって食い違っていました。
+    let status = normalize_status(error.status());
 
     // 入力の検査だけは、どの項目が駄目かを機械が読める形で返す。
     if let Error::Validation(errors) = error {
@@ -443,6 +469,8 @@ fn build_error_response(error: &Error, options: RenderOptions) -> Response {
             source = e.source();
         }
         detail
+    } else if status != error.status() {
+        reason_phrase(status).to_string()
     } else {
         error.public_message()
     };
@@ -567,6 +595,21 @@ mod tests {
     }
 
     #[test]
+    fn デバッグ表示に秘密を出さない() {
+        let res = Response::json(&serde_json::json!({"access_token": "t0ken"}))
+            .unwrap()
+            .with_cookie(&crate::http::cookie::Cookie::new("session", "s3cret"))
+            .with_header("authorization", "Bearer abc");
+        let shown = format!("{res:?}");
+        for secret in ["t0ken", "s3cret", "Bearer"] {
+            assert!(!shown.contains(secret), "{secret} が出ている: {shown}");
+        }
+        for kept in ["200", "set-cookie", "application/json", "body_len: 24"] {
+            assert!(shown.contains(kept), "{kept} が無い: {shown}");
+        }
+    }
+
+    #[test]
     fn テキストのレスポンス() {
         let res = Response::text("hello");
         assert_eq!(res.status(), 200);
@@ -628,9 +671,29 @@ mod tests {
                 "何が悪いか分かる文面にする: {err}"
             );
         }
-        // 普通の行き先はそのまま通る。
+        // 普通の行き先は通る。空白は `%20` にする。
         let res = redirect().to("/a b.html?x=1#y").unwrap();
-        assert_eq!(res.header("location"), Some("/a b.html?x=1#y"));
+        assert_eq!(res.header("location"), Some("/a%20b.html?x=1#y"));
+    }
+
+    #[test]
+    fn 転送先のascii以外は符号化する() {
+        // 以前は生のまま入れていたので、本番（axum の `HeaderValue`）で
+        // `Location` が消え、白い画面の 302 になっていた。テストでは通っていた。
+        let res = redirect().to("/記事/1").unwrap();
+        assert_eq!(
+            res.header("location"),
+            Some("/%E8%A8%98%E4%BA%8B/1"),
+            "UTF-8 のバイトを %XX にする"
+        );
+        // 符号化済みの所は二重にしない。
+        let res = redirect().to("/%E8%A8%98%E4%BA%8B?q=a%20b").unwrap();
+        assert_eq!(res.header("location"), Some("/%E8%A8%98%E4%BA%8B?q=a%20b"));
+        // 逃がした区切り（`%2F`）も元に戻さない。
+        assert_eq!(
+            redirect().to("/a%2Fb").unwrap().header("location"),
+            Some("/a%2Fb")
+        );
     }
 
     #[test]
@@ -705,6 +768,29 @@ mod tests {
         assert_eq!(Response::new(100).status(), 100);
         assert_eq!(Response::new(599).status(), 599);
         assert_eq!(Response::new(204).status(), 204);
+    }
+
+    #[test]
+    fn 範囲外のステータスのエラーは題も500にそろえる() {
+        // 以前は題が「1000 Unknown」で、実際のステータスは 500 だった。
+        let error = Error::http(1000, "");
+        let res = error_response(&error, RenderOptions::new(false, false));
+        assert_eq!(res.status(), 500);
+        let body = res.body_text();
+        assert!(body.contains("500 Internal Server Error"), "{body}");
+        assert!(!body.contains("Unknown"), "{body}");
+
+        let res = error_response(&error, RenderOptions::new(false, true));
+        assert_eq!(res.status(), 500);
+        assert_eq!(res.body_text(), "{\"message\":\"Internal Server Error\"}");
+    }
+
+    #[test]
+    fn 説明文の一覧に無かったステータスも題が付く() {
+        let error = Error::http(413, "");
+        let res = error_response(&error, RenderOptions::new(false, false));
+        assert_eq!(res.status(), 413);
+        assert!(res.body_text().contains("413 Content Too Large"));
     }
 
     #[test]

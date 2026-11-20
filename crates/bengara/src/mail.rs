@@ -25,6 +25,7 @@
 //! bengara = { version = "0.1", features = ["sqlite", "mail"] }
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{Error, Result};
@@ -76,31 +77,107 @@ pub struct MailConfig {
 impl Default for MailConfig {
     /// 環境変数から組み立てます。
     ///
-    /// | 環境変数          | 既定値                 |
-    /// |-------------------|------------------------|
-    /// | `MAIL_MAILER`     | 空なら `MAIL_DRIVER`   |
-    /// | `MAIL_DRIVER`     | `log`                  |
-    /// | `MAIL_FROM`       | `noreply@example.com`  |
-    /// | `MAIL_FROM_NAME`  | `bengara`              |
-    /// | `MAIL_HOST`       | `127.0.0.1`            |
-    /// | `MAIL_PORT`       | 0（暗号化から決める）  |
-    /// | `MAIL_ENCRYPTION` | `starttls`（空も同じ。暗号化しないなら `none`） |
-    /// | `MAIL_USERNAME`   | 空（認証しない）       |
-    /// | `MAIL_PASSWORD`   | 空                     |
-    /// | `MAIL_EHLO_NAME`  | 空                     |
-    /// | `MAIL_TIMEOUT`    | 10（秒）               |
+    /// | 環境変数            | 既定値                 |
+    /// |---------------------|------------------------|
+    /// | `MAIL_MAILER`       | 空なら `MAIL_DRIVER`   |
+    /// | `MAIL_DRIVER`       | `log`                  |
+    /// | `MAIL_FROM_ADDRESS` | 空なら `MAIL_FROM`（Laravel の名前が先） |
+    /// | `MAIL_FROM`         | `noreply@example.com`  |
+    /// | `MAIL_FROM_NAME`    | `bengara`              |
+    /// | `MAIL_HOST`         | `127.0.0.1`            |
+    /// | `MAIL_PORT`         | 0（暗号化から決める）  |
+    /// | `MAIL_SCHEME`       | 空（Laravel 11 の `smtp` / `smtps`。書けば `MAIL_ENCRYPTION` より先） |
+    /// | `MAIL_ENCRYPTION`   | `starttls`（空も同じ。暗号化しないなら `none`） |
+    /// | `MAIL_USERNAME`     | 空（認証しない。`null` も空） |
+    /// | `MAIL_PASSWORD`     | 空（`null` も空）      |
+    /// | `MAIL_EHLO_NAME`    | 空                     |
+    /// | `MAIL_TIMEOUT`      | 10（秒）               |
     fn default() -> Self {
+        let port = crate::env::<u16>("MAIL_PORT", 0u16);
         Self {
             driver: driver_from_env(),
-            from: crate::env("MAIL_FROM", "noreply@example.com"),
+            from: from_address(
+                &crate::env::<String>("MAIL_FROM_ADDRESS", ""),
+                &crate::env::<String>("MAIL_FROM", ""),
+            ),
             from_name: crate::env("MAIL_FROM_NAME", "bengara"),
             host: crate::env("MAIL_HOST", "127.0.0.1"),
-            port: crate::env::<u16>("MAIL_PORT", 0u16),
-            encryption: crate::env("MAIL_ENCRYPTION", "starttls"),
-            username: crate::env("MAIL_USERNAME", ""),
-            password: crate::env("MAIL_PASSWORD", ""),
+            port,
+            encryption: encryption_from(
+                &crate::env::<String>("MAIL_SCHEME", ""),
+                &crate::env::<String>("MAIL_ENCRYPTION", "starttls"),
+                port,
+            ),
+            username: null_as_empty(crate::env("MAIL_USERNAME", "")),
+            password: null_as_empty(crate::env("MAIL_PASSWORD", "")),
             ehlo_name: crate::env("MAIL_EHLO_NAME", ""),
             timeout: crate::env::<u64>("MAIL_TIMEOUT", 10u64),
+        }
+    }
+}
+
+/// Laravel の `.env` の `null`（大文字小文字は見ない）を空にする。
+///
+/// Laravel の `.env.example` は `MAIL_USERNAME=null` と書きます。PHP の `env()` は
+/// これを null に読みますが、そのまま使うと「`null` という利用者名」で認証していました。
+fn null_as_empty(value: String) -> String {
+    if value.trim().eq_ignore_ascii_case("null") {
+        String::new()
+    } else {
+        value
+    }
+}
+
+/// 差出人のアドレスを決める。`MAIL_FROM_ADDRESS`（Laravel の名前）が先、空なら `MAIL_FROM`。
+///
+/// どちらも空（か `null`）なら `noreply@example.com` です。
+fn from_address(laravel: &str, legacy: &str) -> String {
+    [laravel, legacy]
+        .into_iter()
+        .map(str::trim)
+        .find(|value| !value.is_empty() && !value.eq_ignore_ascii_case("null"))
+        .unwrap_or("noreply@example.com")
+        .to_string()
+}
+
+/// 暗号化の仕方を決める。`MAIL_SCHEME`（Laravel 11）を書いていれば先に見ます。
+///
+/// Laravel 11 は `MAIL_ENCRYPTION` をやめて `MAIL_SCHEME` を読みます。書いてあれば
+/// `MAIL_ENCRYPTION` より先です（Laravel の `MailManager` と同じ順番）。
+///
+/// | `MAIL_SCHEME`   | 使う暗号化 |
+/// |-----------------|------------|
+/// | 空・`null`      | `MAIL_ENCRYPTION` のまま（判断 222 の `null` = 暗号化なし も同じ） |
+/// | `smtps`         | `smtps`（ポートに関係なく最初から暗号化） |
+/// | `smtp`          | 465 番なら `smtps`。ほかは `starttls`。ただし `MAIL_ENCRYPTION` が `none` / `null` / `false` なら暗号化しない |
+/// | ほかの語        | 警告を出して `MAIL_ENCRYPTION` のまま |
+///
+/// `smtp` で `MAIL_ENCRYPTION` の「暗号化しない」を残すのは、手元の受け口
+/// （Mailpit など）が `STARTTLS` を持たないためです。Laravel（Symfony Mailer）は
+/// サーバが `STARTTLS` を持たなければ平文で送りますが、bengara は切り替えを必ず求めます。
+fn encryption_from(scheme: &str, encryption: &str, port: u16) -> String {
+    let scheme = scheme.trim().to_ascii_lowercase();
+    match scheme.as_str() {
+        "" | "null" => encryption.to_string(),
+        "smtps" => "smtps".to_string(),
+        "smtp" => {
+            let plain = matches!(
+                encryption.trim().to_ascii_lowercase().as_str(),
+                "none" | "null" | "false"
+            );
+            if port == 465 {
+                "smtps".to_string()
+            } else if plain {
+                "none".to_string()
+            } else {
+                "starttls".to_string()
+            }
+        }
+        other => {
+            tracing::warn!(
+                "MAIL_SCHEME `{other}` は知りません（smtp か smtps）。MAIL_ENCRYPTION を使います"
+            );
+            encryption.to_string()
         }
     }
 }
@@ -482,13 +559,47 @@ impl Builder {
 /// `MAIL_FROM_NAME`（既定はアプリ名）に `,` や `"` が入ると SMTP 側の読み取りが
 /// 「From のアドレスが読めません」で落ち、1 通も送れませんでした。
 /// 引用符の中では `\` と `"` を `\` で逃がします（RFC 5322 の quoted-string）。
+///
+/// アドレスに `名前 <addr>` の形を書いたときは、`<>` の中だけを使います
+/// （[`bare_address`]）。そのまま包むと `"名前" <名前 <addr>>` になり、送れませんでした。
 fn from_header(name: &str, address: &str) -> String {
+    let address = bare_address(address);
     let name = name.trim();
     if name.is_empty() {
         return address.to_string();
     }
     let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\" <{address}>")
+}
+
+/// 差出人のアドレスに `名前 <addr>` を書いたとき、`<>` の中だけを返す。
+///
+/// Laravel の `MAIL_FROM_ADDRESS` はアドレスだけを書く欄です。名前は `MAIL_FROM_NAME`
+/// に書きます。エラーにせずアドレスを取り出し、直し方を警告で 1 回だけ知らせます
+/// （1 通ごとに出すとログが埋まるため）。
+/// `<` があっても `<..>` の形になっていなければ、そのまま返します。
+fn bare_address(address: &str) -> &str {
+    let trimmed = address.trim();
+    if !trimmed.contains('<') {
+        return trimmed;
+    }
+    let inner = trimmed
+        .strip_suffix('>')
+        .and_then(|rest| rest.rfind('<').map(|at| rest[at + 1..].trim()))
+        .filter(|inner| !inner.is_empty() && !inner.contains(['<', '>']));
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "差出人のアドレス `{trimmed}` に名前が入っています。MAIL_FROM_ADDRESS（MAIL_FROM）には\
+             アドレスだけを書き、名前は MAIL_FROM_NAME に書いてください{}",
+            if inner.is_some() {
+                "（`<>` の中のアドレスだけを使います）"
+            } else {
+                "（形が読めないので、そのまま使います）"
+            }
+        );
+    }
+    inner.unwrap_or(trimmed)
 }
 
 /// 送れる形になっているか。
@@ -671,6 +782,56 @@ mod tests {
             from_header("a\\b", "a@example.com"),
             "\"a\\\\b\" <a@example.com>"
         );
+    }
+
+    #[test]
+    fn 差出人のアドレスに名前があればアドレスだけを使う() {
+        // 以前は `"myapp" <myapp <noreply@example.com>>` と二重に包んでいた。
+        assert_eq!(
+            from_header("myapp", "myapp <noreply@example.com>"),
+            "\"myapp\" <noreply@example.com>"
+        );
+        assert_eq!(from_header("", " 店 < a@example.com > "), "a@example.com");
+        assert_eq!(bare_address("a@example.com"), "a@example.com");
+        // `<..>` の形になっていなければ、そのまま。
+        assert_eq!(bare_address("a <b@example.com"), "a <b@example.com");
+        assert_eq!(bare_address("<>"), "<>");
+    }
+
+    #[test]
+    fn laravelのenvの名前と値を読める() {
+        // MAIL_FROM_ADDRESS（Laravel）が先。空や null なら MAIL_FROM。
+        assert_eq!(
+            from_address("a@example.com", "b@example.com"),
+            "a@example.com"
+        );
+        assert_eq!(from_address("", "b@example.com"), "b@example.com");
+        assert_eq!(from_address("NULL", "b@example.com"), "b@example.com");
+        assert_eq!(from_address("", ""), "noreply@example.com");
+        // MAIL_USERNAME=null は認証しない（空）。
+        assert_eq!(null_as_empty("null".into()), "");
+        assert_eq!(null_as_empty(" Null ".into()), "");
+        assert_eq!(null_as_empty("nullable".into()), "nullable");
+        assert_eq!(null_as_empty("user".into()), "user");
+    }
+
+    #[test]
+    fn mail_schemeはmail_encryptionより先に見る() {
+        // 書かない・null なら MAIL_ENCRYPTION のまま（判断 222 の null も壊さない）。
+        assert_eq!(encryption_from("", "tls", 587), "tls");
+        assert_eq!(encryption_from("null", "null", 0), "null");
+        assert_eq!(encryption_from("NULL", "starttls", 0), "starttls");
+        // smtps はポートに関係なく最初から暗号化。
+        assert_eq!(encryption_from("smtps", "none", 2525), "smtps");
+        // smtp は 465 番なら最初から暗号化、ほかは STARTTLS。
+        assert_eq!(encryption_from("smtp", "starttls", 465), "smtps");
+        assert_eq!(encryption_from("smtp", "starttls", 587), "starttls");
+        assert_eq!(encryption_from(" SMTP ", "tls", 0), "starttls");
+        // smtp で MAIL_ENCRYPTION が「暗号化しない」なら、それを残す（Mailpit など）。
+        assert_eq!(encryption_from("smtp", "null", 1025), "none");
+        assert_eq!(encryption_from("smtp", "none", 1025), "none");
+        // 知らない語は MAIL_ENCRYPTION のまま。
+        assert_eq!(encryption_from("ftp", "tls", 465), "tls");
     }
 
     #[test]

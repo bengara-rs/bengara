@@ -10,7 +10,9 @@ use crate::error::{Error, Result};
 /// 受け取ったリクエスト。
 ///
 /// 起動後は読むだけなので、ハンドラには所有した `Request` を渡します。
-#[derive(Debug, Clone)]
+///
+/// `Debug` は手で書いてあります。秘密を出さないためです（下の `impl Debug`）。
+#[derive(Clone)]
 pub struct Request {
     method: String,
     path: String,
@@ -58,6 +60,61 @@ pub struct Request {
     stream: crate::websocket::Slot<crate::http::body::BodyStream>,
     /// `.stream_body()` のルートに当たったか。`body_stream()` のエラー文を分けるために持ちます。
     streaming: bool,
+}
+
+/// ログに出してよい形だけを出す。
+///
+/// 以前は `derive(Debug)` だったので、`{req:?}` で Cookie・`Authorization`・
+/// 本文（パスワードを含むフォーム）がそのままログに出ました。
+///
+/// | 出すもの | 形 |
+/// |---|---|
+/// | メソッド | そのまま |
+/// | パスとクエリ | アクセスログと同じく伏せる（`server::log_target`） |
+/// | ヘッダー | 名前は全部。秘密になる値は `***`（[`RedactedHeaders`]） |
+/// | 本文 | 長さだけ |
+///
+/// セッションの中身・解析済みの入力・パス引数の値は出しません。
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let target = crate::server::log_target(self);
+        let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("path", &path)
+            .field("query", &query)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("body_len", &self.body.len())
+            .field("route_name", &self.route_name.as_deref())
+            .finish_non_exhaustive()
+    }
+}
+
+/// ヘッダーの一覧を、秘密になる値を伏せて出す（`Request` と `Response` の `Debug`）。
+///
+/// 伏せるのは次の値です。名前は全部そのまま出します。
+///
+/// - `cookie`・`set-cookie`・`authorization`・`proxy-authorization`
+/// - 名前が伏せる語に当たるもの（`x-csrf-token`・`x-api-key` など。[`is_sensitive`]）
+pub(crate) struct RedactedHeaders<'a>(pub(crate) &'a [(String, String)]);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(name, value)| {
+                let hidden = [
+                    "cookie",
+                    "set-cookie",
+                    "authorization",
+                    "proxy-authorization",
+                ]
+                .iter()
+                .any(|secret| name.eq_ignore_ascii_case(secret))
+                    || is_sensitive(name);
+                (name.as_str(), if hidden { "***" } else { value.as_str() })
+            }))
+            .finish()
+    }
 }
 
 impl Request {
@@ -745,6 +802,13 @@ const SENSITIVE: &[&str] = &[
     "backup",
     "answer",
     "signature",
+    // `sig` は署名の短い書き方です（Azure の SAS の `?sig=...` など）。
+    "sig",
+    "jwt",
+    // `author` は語の単位で見るので当たりません。
+    "authorization",
+    "session",
+    "sid",
     // WebSocket はクエリで使い捨てのチケットを渡すのが普通です（`/gateway?ticket=...`）。
     // 一覧に無いと、アクセスログに平文で残ります。
     "ticket",
@@ -791,8 +855,14 @@ pub(crate) fn is_sensitive(name: &str) -> bool {
 
 /// 名前を語に区切って1語ずつ渡す。真を返した時点で止めて真を返します。
 ///
-/// 区切りは `_` `-` `.` `[` `]` 空白と、**小文字から大文字へ変わる所**です
-/// （`apiKey` は `api` と `Key`）。
+/// 区切りは `_` `-` `.` `[` `]` 空白と、次の 2 つの大文字の境目です。
+///
+/// | 境目 | 例 |
+/// |---|---|
+/// | 小文字から大文字へ変わる所 | `apiKey` → `api` と `Key` |
+/// | 大文字が続いた後、「大文字＋小文字」が来る所（その大文字の前） | `APIKey` → `API` と `Key` |
+///
+/// 2 つ目が無かったころは、`APIKey` や `JWTToken` が 1 語になり、素通りしていました。
 ///
 /// `[` `]` を区切りにしているのは、PHP 風の配列の名前のためです。`?token[]=...` は
 /// `token[]` という 1 語になり、どの語にも当たらずに素通りしていました
@@ -808,8 +878,12 @@ fn for_each_word(name: &str, mut found: impl FnMut(&str) -> bool) -> bool {
     for index in 0..bytes.len() {
         let byte = bytes[index];
         let separator = matches!(byte, b'_' | b'-' | b'.' | b' ' | b'[' | b']');
-        let upper =
-            byte.is_ascii_uppercase() && index > start && bytes[index - 1].is_ascii_lowercase();
+        // `aB` の `B`、または `ABc` の `B`（大文字の並びの最後の 1 文字が次の語の頭）。
+        let upper = byte.is_ascii_uppercase()
+            && index > start
+            && (bytes[index - 1].is_ascii_lowercase()
+                || (bytes[index - 1].is_ascii_uppercase()
+                    && bytes.get(index + 1).is_some_and(u8::is_ascii_lowercase)));
         if !separator && !upper {
             continue;
         }
@@ -856,6 +930,45 @@ pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn デバッグ表示に秘密を出さない() {
+        // 以前は `derive(Debug)` だったので、`{req:?}` で全部出ていた。
+        let req = Request::new("POST", "/login")
+            .with_query("page=2&token=abc")
+            .with_headers(vec![
+                ("Cookie".into(), "session=s3cret".into()),
+                ("authorization".into(), "Bearer t0ken".into()),
+                ("proxy-authorization".into(), "Basic cHJveHk=".into()),
+                ("x-csrf-token".into(), "csrfvalue".into()),
+                ("accept".into(), "text/html".into()),
+            ])
+            .with_body(b"email=a%40example.com&password=hunter2".to_vec());
+        let shown = format!("{req:?}");
+        for secret in [
+            "s3cret",
+            "t0ken",
+            "cHJveHk=",
+            "csrfvalue",
+            "hunter2",
+            "abc",
+            "example.com",
+        ] {
+            assert!(!shown.contains(secret), "{secret} が出ている: {shown}");
+        }
+        // 調べるのに要るものは出す。
+        for kept in [
+            "POST",
+            "/login",
+            "page=2&token=***",
+            "Cookie",
+            "authorization",
+            "text/html",
+            "body_len: 38",
+        ] {
+            assert!(shown.contains(kept), "{kept} が無い: {shown}");
+        }
+    }
 
     #[test]
     fn ページ番号は1から始まる() {
@@ -1108,6 +1221,55 @@ mod tests {
         assert_eq!(collect("API_KEY"), ["API", "KEY"]);
         assert_eq!(collect("PASSWORD"), ["PASSWORD"]);
         assert_eq!(collect("X-CSRF-TOKEN"), ["X", "CSRF", "TOKEN"]);
+        // 大文字の並びの後に「大文字＋小文字」が来たら、その大文字の前で切る。
+        assert_eq!(collect("APIKey"), ["API", "Key"]);
+        assert_eq!(collect("XMLHttpRequest"), ["XML", "Http", "Request"]);
+        assert_eq!(collect("userJWTToken"), ["user", "JWT", "Token"]);
+    }
+
+    #[test]
+    fn 大文字の並びに続く語も伏せる() {
+        // 以前は `APIKey` が 1 語になり、どの語にも当たらなかった。
+        for name in [
+            "APIKey",
+            "JWTToken",
+            "OAuthToken",
+            "myAPISecret",
+            "AWSSecretKey",
+        ] {
+            assert!(is_sensitive(name), "{name} は残してはいけない");
+        }
+        for name in ["XMLHttpRequest", "HTMLTitle", "URLPath"] {
+            assert!(!is_sensitive(name), "{name} は残してよい");
+        }
+    }
+
+    #[test]
+    fn 署名と認証の語も伏せる() {
+        for name in [
+            "sig",
+            "jwt",
+            "id_jwt",
+            "authorization",
+            "Authorization",
+            "session",
+            "session_id",
+            "sid",
+            "PHPSESSID_sid",
+        ] {
+            assert!(is_sensitive(name), "{name} は残してはいけない");
+        }
+        // 語の単位で見るので、似た綴りの普通の項目は残る。
+        for name in [
+            "author",
+            "author_name",
+            "side",
+            "signal",
+            "sigma",
+            "sessions_count",
+        ] {
+            assert!(!is_sensitive(name), "{name} は残してよい");
+        }
     }
 
     #[test]

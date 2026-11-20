@@ -476,6 +476,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mysqlのトランザクションの中のtruncateは断る() {
+        // MySQL の `truncate table` は暗黙に確定する。流すと rollback() が効かない。
+        let tx = Transaction {
+            shared: Arc::new(TxShared {
+                driver: Driver::MySql,
+                inner: Mutex::new(State::Ready(Box::new(FakeTx))),
+            }),
+        };
+        let message = tx
+            .table("posts")
+            .truncate()
+            .await
+            .expect_err("断られる")
+            .to_string();
+        assert!(message.contains("delete()"), "{message}");
+        assert!(message.contains("暗黙に確定"), "{message}");
+        // 断っただけなので、トランザクションはそのまま使える。
+        assert!(is_ready(&tx.shared), "使える状態のまま");
+
+        // SQLite と PostgreSQL のトランザクションでは断らない。
+        for driver in [Driver::Sqlite, Driver::Postgres] {
+            let tx = Transaction {
+                shared: Arc::new(TxShared {
+                    driver,
+                    inner: Mutex::new(State::Ready(Box::new(FakeTx))),
+                }),
+            };
+            tx.table("posts").truncate().await.expect("流せる");
+        }
+    }
+
+    #[tokio::test]
     async fn 確定したトランザクションはdropで巻き戻さない() {
         let tx = Transaction {
             shared: Arc::new(shared(Box::new(FakeTx))),

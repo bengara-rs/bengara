@@ -225,11 +225,43 @@ impl Drop for FileLock {
     ///
     /// パスだけを見て消していたころは、古いと判定されて奪われた後の
     /// 錠（別の持ち主のもの）まで消していました。
+    ///
+    /// 消し方は [`release`] です。先に読むのは、他人の錠を毎回退避して戻す
+    /// 手間を省くためだけです（判定は退避した後にやり直します）。
     fn drop(&mut self) {
         if read_stamp(&self.path).as_deref() == Some(self.stamp.as_str()) {
-            let _ = std::fs::remove_file(&self.path);
+            release(&self.path, &self.stamp);
         }
     }
+}
+
+/// 自分の錠を外す。**退避してから印を確かめ、自分のものだけを消します。**
+///
+/// 「印を読む → 消す」の 2 つの操作だと、その間に錠が古いと判定されて
+/// 奪われ、別の持ち主が置き直した錠を消してしまいます（[`remove_stale`] と同じ隙間）。
+/// 固有の名前へ `rename` してから退避先の印を見れば、見たものと消すものが
+/// 同じファイルになります。印が違えば、`hard_link` で元の名前へ戻します
+/// （中身も更新時刻もそのまま）。
+///
+/// 返すのは**自分の錠を消せたか**です。
+fn release(path: &Path, stamp: &str) -> bool {
+    let seq = STALE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let moved = path.with_extension(format!("release.{}.{seq}", std::process::id()));
+    if std::fs::rename(path, &moved).is_err() {
+        // もう無い（奪われて外された）。何もしない。
+        return false;
+    }
+    let moved_stamp = read_stamp(&moved);
+    let mine = moved_stamp.as_deref() == Some(stamp);
+    if !mine && !restore(path, &moved, moved_stamp.as_deref()) {
+        tracing::warn!(
+            "{} を戻す前に別の側が錠を取りました。\
+             しばらくの間、2 つの処理が同じ錠を持ったつもりで動くことがあります",
+            path.display()
+        );
+    }
+    let _ = std::fs::remove_file(&moved);
+    mine
 }
 
 /// 最後に書かれてから `secs` 秒以上たっているか。読めないときは偽。
@@ -446,6 +478,36 @@ mod tests {
         // 取り直すと別の印になる。
         let _again = FileLock::acquire(&path).unwrap();
         assert_ne!(read_stamp(&path).as_deref(), Some(stamp.as_str()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 外すときは退避してから印を確かめる() {
+        let dir = temp_dir("release");
+        let path = dir.join("a.lock");
+
+        // 自分の錠は消える。退避先も残らない。
+        std::fs::write(&path, "自分の印").unwrap();
+        assert!(release(&path, "自分の印"));
+        assert!(!path.exists());
+
+        // 読んだ後に奪われ、別の持ち主が置き直した形。退避した後の印で気づいて戻す。
+        std::fs::write(&path, "別の持ち主").unwrap();
+        assert!(!release(&path, "自分の印"));
+        assert_eq!(read_stamp(&path).as_deref(), Some("別の持ち主"), "戻す");
+
+        // 退避先（`*.release.*`）が残っていない。
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["a.lock".to_string()], "残っている: {left:?}");
+
+        // 既に無ければ何もしない。
+        std::fs::remove_file(&path).unwrap();
+        assert!(!release(&path, "自分の印"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

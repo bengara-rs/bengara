@@ -159,12 +159,15 @@ where
     }
 }
 
-/// `0.0.0.0` のままだと分かりにくいので、ブラウザで開けるアドレスにして見せる。
+/// `0.0.0.0` や `::` のままだと分かりにくいので、ブラウザで開けるアドレスにして見せる。
+///
+/// IPv6 の `::` は `[::1]` にします。以前は `127.0.0.1` と出していましたが、
+/// IPv6 だけで待ち受けている環境では、そのアドレスで開けません。
 fn display_addr(addr: SocketAddr) -> String {
-    if addr.ip().is_unspecified() {
-        format!("127.0.0.1:{}", addr.port())
-    } else {
-        addr.to_string()
+    match addr {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => format!("127.0.0.1:{}", v4.port()),
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => format!("[::1]:{}", v6.port()),
+        _ => addr.to_string(),
     }
 }
 
@@ -424,6 +427,13 @@ fn is_sensitive_name(name: &str) -> bool {
 /// 組み立てられないと応答のヘッダーが全部消え、素の 500 になっていました
 /// （直前にセッションが付けた `Set-Cookie` まで失われました）。
 /// いまは組み立てに失敗したヘッダーだけを飛ばします。
+///
+/// 値は**バイト列として**渡します（`HeaderValue::from_bytes`）。`from_str` は
+/// 見える ASCII しか通さないので、ASCII 以外を含む 1 本が本番だけで消えていました
+/// （テストはここを通らないので気づけませんでした）。HTTP では 0x80 以上のバイトも
+/// 値に使えます（RFC 9110 の obs-text）。PHP もヘッダーをバイト列のまま送ります。
+/// 入れるときの検査（`response::header_value_ok`）はこれより厳しいので、
+/// `Response` に入った値はここで落ちません。テストと本番の結果がそろいます。
 fn into_axum(response: Response) -> axum::response::Response {
     let mut headers = axum::http::HeaderMap::with_capacity(response.headers().len());
     for (name, value) in response.headers() {
@@ -431,7 +441,7 @@ fn into_axum(response: Response) -> axum::response::Response {
             tracing::warn!("ヘッダーの名前 {name} が使えないので、この1本を飛ばします");
             continue;
         };
-        let Ok(header_value) = axum::http::HeaderValue::from_str(value) else {
+        let Ok(header_value) = axum::http::HeaderValue::from_bytes(value.as_bytes()) else {
             tracing::warn!("ヘッダー {name} の値が使えないので、この1本を飛ばします");
             continue;
         };
@@ -631,6 +641,30 @@ mod tests {
 
         let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(display_addr(local), "127.0.0.1:8080");
+
+        // `--host ::` のとき。以前は 127.0.0.1 と出していた。
+        let any6: SocketAddr = "[::]:8000".parse().unwrap();
+        assert_eq!(display_addr(any6), "[::1]:8000");
+        let local6: SocketAddr = "[::1]:8000".parse().unwrap();
+        assert_eq!(display_addr(local6), "[::1]:8000");
+    }
+
+    #[test]
+    fn ascii以外のヘッダーも本番で消えない() {
+        // 以前は `HeaderValue::from_str` だったので、`Response` に入った値が
+        // ここで落ちていた。テストはここを通らないので気づけなかった。
+        let response = Response::text("ok")
+            .with_header("x-name", "山田")
+            .with_header("content-disposition", "attachment; filename=\"表.csv\"");
+        assert_eq!(response.header("x-name"), Some("山田"));
+        let axum_response = into_axum(response);
+        let headers = axum_response.headers();
+        assert_eq!(
+            headers.get("x-name").map(|v| v.as_bytes()),
+            Some("山田".as_bytes()),
+            "テストで見える値と同じものが送られる"
+        );
+        assert!(headers.get("content-disposition").is_some());
     }
 
     #[test]

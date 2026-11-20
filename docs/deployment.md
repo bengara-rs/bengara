@@ -9,7 +9,7 @@
 
 ```sh
 # 1. 作る
-cargo build --release
+cargo build --release --bin myapp   # 本体だけを作る（artisan は要らない）
 
 # 2. 置く。動いている実行ファイルには上書きできないので、名前を変えてから置く
 mv /opt/myapp/myapp /opt/myapp/myapp.old
@@ -49,12 +49,12 @@ cp /path/to/.env.example .env   # 中身を本番用に直す
 
 起動したときに「基準ディレクトリ」を 1 つ決めます。`.env`・`storage/`・`public/` はここから探します。
 
-| 順 | 見るもの                       | 条件                                       |
-|----|--------------------------------|--------------------------------------------|
-| 1  | 環境変数 `APP_BASE_PATH`       | **絶対パスのみ。** その場所があること      |
-| 2  | cargo のプロジェクト           | `cargo run` で動かしたとき                 |
-| 3  | 実行ファイルのあるディレクトリ | **そこに `.env` か `storage/` があるとき** |
-| 4  | カレントディレクトリ           | **そこに `.env` か `storage/` があるとき** |
+| 順  | 見るもの                       | 条件                                       |
+|-----|--------------------------------|--------------------------------------------|
+| 1   | 環境変数 `APP_BASE_PATH`       | **絶対パスのみ。** その場所があること      |
+| 2   | cargo のプロジェクト           | `cargo run` で動かしたとき                 |
+| 3   | 実行ファイルのあるディレクトリ | **そこに `.env` か `storage/` があるとき** |
+| 4   | カレントディレクトリ           | **そこに `.env` か `storage/` があるとき** |
 
 **決まらなければ起動しません。** 探した場所と直し方を書いたエラーが出ます。
 
@@ -114,7 +114,9 @@ storage           /opt/myapp/storage
 
 - `APP_ENV=production` にすると、セッションの Cookie に `Secure` が付きます。**利用者には HTTPS で見せてください。**
 - **鍵を作り直す（`key:generate --force`）と、全員がログアウトします。** 暗号化した値と、配った署名付き URL も無効になります。
-- 項目の一覧は [configuration.md](configuration.md) にあります。ログは標準出力に出ます。
+- 環境変数で渡した `APP_KEY` は、`.env` より優先されます。
+- 項目の一覧は [configuration.md](configuration.md) にあります。
+- ログは標準出力に出ます。
 
 ## 止める
 
@@ -136,8 +138,7 @@ storage           /opt/myapp/storage
 | 待っている間に 2 回目の合図 | **待たずに終わる**（終了コード 130）。無制限のときも効く  |
 
 - **上限より長くかかるリクエストは切られます。** 長い処理は [キュー](queue.md) に回してください。
-- WebSocket の接続には 1001（サーバーが止まる）を送ります。待つのは上限と 5
-  秒の短いほうです（[websocket.md](websocket.md#止めるとき)）。
+- WebSocket の接続には 1001（サーバーが止まる）を送ります。待つのは上限と 5 秒の短いほうです（[websocket.md](websocket.md#止めるとき)）。
 - **Windows のサービス停止要求は受け取れません。** `nssm` などでサービスにすると、止めるときに強制終了になります。
 
 ### queue:work を止める
@@ -211,7 +212,7 @@ WebSocket（[websocket.md](websocket.md)）を使うなら、その URL に切�
 
 ```nginx
 location /gateway {
-    proxy_pass http://127.0.0.1:8000;
+    proxy_pass http://myapp;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -246,7 +247,8 @@ TRUSTED_PROXIES=127.0.0.1
 
 ## migrate の同時実行
 
-表を変えるコマンドは、実行の前に「実行中」の札を置きます。**2 つ目は待たずに止まります**（誰が取ったかを表示します）。
+表を変えるコマンドは、実行の前に「実行中」の札を置きます。
+**2 つ目は待たずに止まります。** 誰が札を取ったかを表示します。
 札は `migration_locks` 表に置きます。この表は自動で作ります。
 
 | 札を取る                                                                                                       | 札を取らない                        |

@@ -32,6 +32,9 @@ schema.create("users", |t| {
 
 ```rust
 // app/Models/User.rs
+use bengara::prelude::*;
+use bengara::Carbon;
+
 #[derive(Model, Debug, Clone)]
 #[model(table = "users")]
 pub struct User {
@@ -40,8 +43,8 @@ pub struct User {
     pub email: String,
     pub password: String,   // Hash::make_async が作った文字列。平文は入れない
     pub is_admin: bool,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: Carbon,
+    pub updated_at: Carbon,
 }
 
 impl Authenticatable for User {
@@ -52,7 +55,7 @@ impl Authenticatable for User {
 ```
 
 パスワードの列が `password` でないときは、`auth_password_name()` も書いて列名を返します。
-ログインのついでにパスワードを作り直すとき、この列に書くためです（下の「ハッシュの回数」）。
+ログインのついでにパスワードを作り直すとき、この列に書くためです（下の「ハッシュの強さを上げたあと」）。
 
 ### 3. 登録
 
@@ -79,8 +82,8 @@ user.password = Hash::make_async(password).await?;
 | `Hash::make_async(平文)`               | 保存する形に変える。同じ平文でも毎回違う値になる |
 | `Hash::check_async(平文, 保存した値)`  | 合っているか                                     |
 | `Hash::make(平文)` / `Hash::check(..)` | 上の 2 つの同期版                                |
-| `Hash::make_with(平文, 回数)`          | 回数を決めて変える（同期）                       |
-| `Hash::needs_rehash(保存した値)`       | 作り直すべきか（下の「ハッシュの回数」）         |
+| `Hash::make_with(平文, 回数)`          | 回数を決めて変える（同期。いつも PBKDF2）        |
+| `Hash::needs_rehash(保存した値)`       | 作り直すべきか                                   |
 
 - **`async fn` の中では `make_async` / `check_async` を使います。** 同期版はスレッドを約 0.2 秒止めます。
 - 同期版は、シーダーやテストの準備など同期の関数の中でだけ使います。
@@ -91,13 +94,9 @@ user.password = Hash::make_async(password).await?;
 ("password", "required|min:8|max:1024|confirmed")
 ```
 
-平文の上限は 4096 バイトです。
-`check` は、上限を超える平文を計算せずに偽とします。
-ところが `make` は、上限を超えてもハッシュを作ってしまいます（ログにエラーが出ます）。
-
-**そのハッシュでは、その人は二度とログインできません。**
-登録・変更・再設定の 3 か所すべてに `max:1024` を付けます。
-1 文字は最大 4 バイトなので、1024 文字なら必ず 4096 バイトに収まります。
+- 平文の上限は 4096 バイトです。`check` は、上限を超える平文を偽とします。
+- ところが `make` は、上限を超えてもハッシュを作ります。**そのハッシュでは、二度とログインできません。**
+- 登録・変更・再設定の 3 か所すべてに `max:1024` を付けます。1024 文字なら必ず 4096 バイトに収まります。
 
 ## ログインする
 
@@ -134,13 +133,12 @@ pub async fn login(req: Request) -> Result<Response> {
 | `user_or_fail::<U>()`                       | 同じ。いなければ 401                              |
 | `validate_password::<U>(&user, パスワード)` | ログインせずに照合だけする                        |
 
-- **ログインすると、セッション ID と CSRF トークンが変わります。**
-  ログイン後の画面で取り直します（[session.md](session.md)）。
+- **ログインすると、セッション ID と CSRF トークンが変わります。** ログイン後の画面で取り直します（[session.md](session.md)）。
+- `login(&user)` は、保存していないモデル（主キーが `0`・空など）では `Err` です。先に `save()` します。
 - `user()` は呼ぶたびに DB を引きます。何度も使うときは変数に入れます。
 - `check()` / `guest()` / `id()` と `auth` ミドルウェアは、セッションだけを見ます。
-- そのため、利用者の行を消してもセッションが残るあいだは通ります。**利用者を消したら `logout_user(id)` を呼びます。**
+  利用者の行を消しても、セッションが残るあいだは通ります。**利用者を消したら `logout_user(id)` を呼びます。**
 - 利用者がいないときも、`attempt` は照合と同じだけ時間をかけます。応答の速さで登録の有無が分からないようにするためです。
-- ログイン中の人は `req.auth()` から取ります。
 
 ### ログインの回数を制限する
 
@@ -174,10 +172,8 @@ req.auth().logout_other_devices_async().await?;
 ```
 
 - **`async fn` の中では `_async` の付いた版を使います。** 同期版は置き場所を全部見るので、ほかのリクエストが止まります。
-    - `logout_other_devices_async()` / `logout_all_devices_async()` / `logout_user_async(id)`
-    - `logout()` は同期のままで構いません。
+  `logout()` だけは同期のままで構いません。
 - **パスワードを変えたら `logout_other_devices()` を呼びます。** 変えただけでは、盗まれたセッションが期限まで残ります。
-- `logout_other_devices()` を呼んだ本人は残ります。そのあと `regenerate()` しても残ります。
 - `logout()` と `logout_all_devices()` は、セッションの Cookie も消します。
 - ログインしていなければ、何もせず `0` を返します（`logout_user` を除く）。
 
@@ -198,11 +194,8 @@ Route::prefix("api/my/articles").middleware("auth").group(|| {
 | `Authenticate::new()`                 | 401                                    |
 | `Authenticate::redirect_to("/login")` | 302（JSON を求めるリクエストには 401） |
 
-ハンドラでは、ログイン中の人を次のように取ります。
-
-```rust
-let user = req.auth().user_or_fail::<User>().await?;   // 401 か User
-```
+- `StartSession` を登録していないと、`Authenticate` は 500 を返し、直し方をログに出します。
+- ハンドラでは `req.auth().user_or_fail::<User>().await?` で取ります（いなければ 401）。
 
 ### ログイン後に元のページへ戻す
 
@@ -214,11 +207,8 @@ let back = req.session().intended().unwrap_or_else(|| "/".to_string());
 redirect().to(back)
 ```
 
-覚えるのは、次をすべて満たすときだけです。
-
-- 302 で転送した（401 を返しただけなら覚えない）
-- メソッドが `GET` か `HEAD`
-- 自分のサイトの中を指すパス（`/` で始まり、`//` で始まらない）
+- 覚えるのは、`GET` か `HEAD` を 302 で転送したときだけです。自分のサイトの中のパスに限ります。
+- **クエリ文字列ごと覚えます。** トークンを URL に載せたページ（署名付き URL など）に `auth` を掛けると、そのトークンがセッションのファイルに平文で残ります。
 
 ## ログイン中の人を通さない（guest）
 
@@ -291,13 +281,9 @@ req.auth().logout_user_async(user.key()).await?;
 | `lifetime_minutes()`          | トークンを使える時間（60 分）                               |
 | `define(&mut Schema)`         | 表を作る定義                                                |
 
-**再設定の判定には、必ず `consume_if_valid` を使います。**
-`verify` のあとに `consume` を呼ぶ形だと、その間に同じトークンを 2 回使われることがあります。
-
+- **再設定の判定には、必ず `consume_if_valid` を使います。** `verify` の後に `consume` だと、間に同じトークンを 2 回使われることがあります。
 - トークンは 1 つのアドレスに 1 本です。作り直すと前のものは使えません。
-- `create` 自体は回数を止めません。再送の間隔は `recently_created` で確かめます（`PasswordReset::THROTTLE_SECONDS` = 60
-  秒）。
-- 期限切れ・不一致・記録なしは、どれも同じ「偽」です。
+- `create` 自体は回数を止めません。再送の間隔は `recently_created` で確かめます。
 - **知らないアドレスを頼まれたときも、同じ応答を返します。** 応答が違うと、登録の有無が分かります。
 - リンクは `GET` で開かれます。同じパスに `GET` のルートも用意します。
 
@@ -317,15 +303,22 @@ let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 - 鍵のもとは `APP_KEY` です（[configuration.md](configuration.md)）。
 - 改ざんを見抜くだけでよいなら、`signed_url` を使います（[routing.md](routing.md)）。
 
-## ハッシュの回数
+## ハッシュの方式と強さ
 
-既定の方式は PBKDF2-HMAC-SHA256 です（Argon2id にもできます。下の「Argon2id を使う」）。
-同じ計算を何回もくり返して、総当たりにかかる時間を延ばします。
-保存されるのは次の形の文字列です。
+方式は 2 つです。`HASH_DRIVER` で選びます。
 
-```
-$pbkdf2-sha256$i=240000$<塩>$<ハッシュ>
-```
+| 方式           | 選び方                                        | 保存される形                                     |
+|----------------|-----------------------------------------------|--------------------------------------------------|
+| PBKDF2（既定） | 何もしない                                    | `$pbkdf2-sha256$i=240000$<塩>$<ハッシュ>`        |
+| Argon2id       | 機能フラグ `argon2` と `HASH_DRIVER=argon2id` | `$argon2id$v=19$m=65536,t=4,p=1$<塩>$<ハッシュ>` |
+
+- Argon2id は、計算に大量のメモリを使わせる方式です。GPU での総当たりに PBKDF2 より強いです。
+- `check` は、どちらの方式の値でも照合します。方式を替えても、古い値でログインできます。
+- Laravel（PHP の `password_hash`）で作った `$argon2id$` の値は、そのまま照合できます。
+- **bcrypt（`$2y$`、Laravel の既定）と `$argon2i$` は照合できません。** 偽になります。
+- `cargo artisan about` の「パスワード」の行で、いまの方式と強さが分かります。
+
+### PBKDF2 の回数
 
 回数は `config/hashing.rs` で変えます。
 
@@ -338,54 +331,18 @@ pub fn config() -> HashConfig {
 }
 ```
 
-| 項目           | 値                                                               |
-|----------------|------------------------------------------------------------------|
-| 既定           | 240,000 回（リリースビルドで約 0.2 秒、デバッグビルドで約 4 秒） |
-| テストのとき   | 1,000 回。`.env` は見ない（[testing.md](testing.md)）            |
-| 設定の上限     | 10,000,000 回。超えると上限で計算し、警告を出す                  |
-| 保存済みの上限 | 10,000,000 回を超える値は、照合せずに偽とする                    |
+| 項目         | 値                                                               |
+|--------------|------------------------------------------------------------------|
+| 既定         | 240,000 回（リリースビルドで約 0.2 秒、デバッグビルドで約 4 秒） |
+| テストのとき | 1,000 回。`.env` は見ない（[testing.md](testing.md)）            |
+| 上限         | 10,000,000 回。超える設定は上限で計算し、超える保存値は偽とする  |
 
-- 回数は文字列に入っているので、回数を上げても古いパスワードを照合できます。
 - テストで回数を変えるときは、環境変数で渡します（`HASH_ITERATIONS=20000 cargo test`）。
 
-### 回数を上げたあと
-
-**保存済みのパスワードは、古い回数のままです。** `attempt` が、ログインのついでに作り直します。
-
-- 合ったパスワードの回数が設定より少なければ、その場で作り直して保存します（Laravel の `rehashOnLogin`）。
-- 書く列は `Authenticatable::auth_password_name()` です。既定は `password` です。
-- 作り直しに失敗しても、ログインは成功します。ログに警告が出ます。
-- 回数の違う値が混ざっていても、照合 1 回にかける時間はそろえます。
-
-`Hash::needs_rehash` は、回数が設定より少ないとき・10,000,000 回を超えるとき・形が読めないときに真です。
-
-`attempt` を使わずに自分で照合するときは、次のように書きます。
-
-```rust
-if ok && Hash::needs_rehash(&user.password) {
-    user.password = Hash::make_async(input.get("password")).await?;
-    user.save().await?;
-}
-```
-
-## Argon2id を使う
-
-Argon2id は、計算に大量のメモリを使わせる方式です。専用の機械（GPU）での総当たりに、PBKDF2 より強いです。
-機能フラグ `argon2` を足し、`HASH_DRIVER=argon2id` にします。
+### Argon2id の強さ
 
 ```toml
 bengara = { version = "0.1", features = ["sqlite", "argon2"] }
-```
-
-```sh
-# .env
-HASH_DRIVER=argon2id
-```
-
-保存されるのは次の形の文字列です（PHP の `password_hash` と同じ形）。
-
-```
-$argon2id$v=19$m=65536,t=4,p=1$<塩>$<ハッシュ>
 ```
 
 | 環境変数        | 既定     | 意味                   | 範囲                         |
@@ -396,66 +353,72 @@ $argon2id$v=19$m=65536,t=4,p=1$<塩>$<ハッシュ>
 | `ARGON_THREADS` | `1`      | 並列の数               | 1〜16                        |
 
 - 名前と既定値は Laravel 12 の `config/hashing.php` と同じです。
-- 範囲の外の値は、範囲に寄せて使います。ログに警告が 1 回出ます。
-- 強さは `ArgonConfig` を返す設定ファイルでも変えられます（[configuration.md](configuration.md)）。
+- 範囲の外の値は、範囲に寄せて使います。ログに警告が出ます。
 - テストのときは `m=8, t=1, p=1` に下げます。`ARGON_*` を環境変数で渡したときは、その値を使います。
-- フラグが無いのに `HASH_DRIVER=argon2id` にすると、ログにエラーが出て、PBKDF2 で作ります。
-- `HASH_DRIVER` が知らない名前のときは、ログに警告が出て、PBKDF2 で作ります。
-- `cargo artisan about` の「パスワード」の行で、いま使っている方式と強さが分かります。
+- フラグが無いのに `HASH_DRIVER=argon2id` にしたときと、知らない名前のときは、ログに出して PBKDF2 で作ります。
 
-### 方式ごとの関数の動き
+設定ファイルで決めるときは、`config/argon.rs` を置きます（[configuration.md](configuration.md)）。
 
-| 関数                 | `pbkdf2` のとき                   | `argon2id` のとき                                     |
-|----------------------|-----------------------------------|-------------------------------------------------------|
-| `Hash::make`         | PBKDF2 で作る                     | Argon2id で作る。失敗したらログに出して PBKDF2 で作る |
-| `Hash::make_with`    | PBKDF2 で作る                     | **PBKDF2 で作る**（回数を決める関数なので）           |
-| `Hash::check`        | 保存値の先頭で方式を見分ける      | 同左                                                  |
-| `Hash::needs_rehash` | Argon2id の値は偽（作り直さない） | PBKDF2 の値と、`m`・`t` が設定より小さい値で真        |
+```rust
+// config/argon.rs
+use bengara::prelude::*;
+use bengara::ArgonConfig;
 
-- `check` は、どちらの方式の値でも照合します。方式を替えても、古い値でログインできます。
-- `$argon2id$` 以外の Argon2（`$argon2i$`）と bcrypt（`$2y$`）は照合できません。偽になります。
-- `m`・`t`・`p` が上の範囲の上限を超える保存値は、照合せずに偽とします。
+pub fn config() -> ArgonConfig {
+    ArgonConfig {
+        memory: env("ARGON_MEMORY", 65_536u32),
+        time: env("ARGON_TIME", 4u32),
+        threads: env("ARGON_THREADS", 1u32),
+    }
+}
+```
 
-### PBKDF2 から移る
-
-`HASH_DRIVER=argon2id` にすると、`attempt` がログインのついでに Argon2id で作り直します（上の「回数を上げたあと」と同じ仕組み）。
-ログインしない人の値は、PBKDF2 のまま残ります。
-
-- `HASH_DRIVER=pbkdf2` に戻しても、Argon2id の値は作り直しません。強い方式から弱い方式へは移りません。
-- 両方の方式の値が混ざっている間は、照合のたびにもう片方の方式も空回しします。
-  どちらの方式の人でも、登録されていない人でも、同じだけ時間がかかります。
-  そのぶん、照合 1 回は 2 つの方式の時間の合計になります。
-
-### Laravel の値をそのまま照合する
-
-Laravel（PHP の `password_hash`）で作った `$argon2id$` の値は、そのまま照合できます。
-作り直す必要はありません。Laravel の既定の bcrypt（`$2y$`）は照合できません（[backlog.md](backlog.md)）。
-
-### 同時に計算する数
-
-パスワードの計算は、同時に走らせる数を `HASH_MAX_CONCURRENCY` までに抑えます。
-Argon2id は 1 件で既定 64 MiB を使うので、ログインが一度に押し寄せてもメモリを使いすぎないようにします。
-
-- 既定は CPU の数です（取れなければ 4）。1 より小さい値は 1 にします。
-- 上限を超えた分は、空くまで待ちます。
-- 上限を通るのは `Hash::make_async`・`Hash::check_async`・`attempt`・`validate_password` です。
-- **待たない形の `Hash::make` / `Hash::check` は、上限を通りません。**
-- PBKDF2 のときも同じ上限が効きます。
-
-### 開発中に速く計算する
-
-Argon2id は、デバッグビルドだと照合 1 回に約 3 秒かかります。
+デバッグビルドの Argon2id は、照合 1 回に約 3 秒かかります。
 アプリの `Cargo.toml` に次を書くと、約 0.2 秒になります。
 
 ```toml
-# Argon2id をデバッグビルドでも速く計算する
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 ```
 
-まだ無い機能は [backlog.md](backlog.md) にあります。
+### ハッシュの強さを上げたあと
+
+**保存済みのパスワードは、古い強さのままです。** `attempt` が、ログインのついでに作り直します（Laravel の `rehashOnLogin`）。
+
+- 作り直すのは、`Hash::needs_rehash` が真のときです。
+
+| いまの方式 | `needs_rehash` が真になる値                                     |
+|------------|-----------------------------------------------------------------|
+| `pbkdf2`   | 回数が設定より少ない値。形の読めない値                          |
+| `argon2id` | PBKDF2 の値。`m`・`t`・`p` が設定と違う値（設定より強くても真） |
+
+- 書く列は `Authenticatable::auth_password_name()` です。既定は `password` です。
+- 作り直しに失敗しても、ログインは成功します。ログに警告が出ます。
+- `HASH_DRIVER=pbkdf2` に戻しても、Argon2id の値は作り直しません。
+- ログインしない人の値は、古いまま残ります。
+
+`attempt` を使わずに自分で照合するときは、次のように書きます。
+
+```rust
+if ok && Hash::needs_rehash(&user.password) {
+    user.password = Hash::make_async(input.get("password")).await?;
+    user.save_only(&["password"]).await?;
+}
+```
+
+`save()` ではなく `save_only` でパスワードの列だけを書きます。
+`save()` は丸ごと書き戻すので、別のリクエストが変えた列を古い値で上書きします。
+
+### 同時に計算する数
+
+パスワードの計算は、同時に走らせる数を `HASH_MAX_CONCURRENCY` までに抑えます。
+Argon2id は 1 件で既定 64 MiB を使うので、ログインが押し寄せてもメモリを使いすぎないためです。
+
+- 既定は CPU の数です。上限を超えた分は、空くまで待ちます。
+- 上限が効くのは `make_async`・`check_async`・`attempt`・`validate_password` です。
+- **同期版の `Hash::make` / `Hash::check` には効きません。**
 
 ## 関連
 

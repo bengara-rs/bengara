@@ -77,8 +77,7 @@ Route::get("/admin", AdminController::index).middleware("admin");
 | 本文を受け取れなかった（413・400・408） | 通らない           | 通らない           |
 | `.stream_body()` のルート               | 本文を読む前に通る | 本文を読む前に通る |
 
-- 本文はルートの照合の後、ミドルウェアより前に受け取ります（[requests-and-responses.md](requests-and-responses.md)）。
-- `.stream_body()` のルートでも、申告された長さが上限を超えていれば、ミドルウェアを通らずに 413 です。
+- 本文の受け取りは [requests-and-responses.md](requests-and-responses.md) にあります。
 - 組み込みの `StartSession` と `VerifyCsrfToken` は、ルートが無いと動きを変えます（[session.md](session.md)）。
 
 自分のミドルウェアで分けたいときは `req.route_matched()` を見ます。
@@ -184,14 +183,16 @@ Route::post("/login", AuthController::login).middleware("throttle");
 - **ログイン・登録・パスワード再設定の口には `by_ip()` を付けます。**
   ID で数えると、登録し直すたびに新しい枠ができるためです。
 - 共通のミドルウェアにするときは、`StartSession` より後ろに置きます。前に置くと、いつもアドレスで数えます。
-- アドレスが分からないのは、アドレスを入れずに `Request` を作ったときだけです。警告を 1 回出します。
 - `#[bengara::test]` から送ると `127.0.0.1` です。テストでも制限が掛かります（[testing.md](testing.md)）。
 
 ルートは「ルート名」、無ければ「登録したパス（`/api/items/{id}`）」で見分けます。
-末尾に `/` を足しても、パス引数を変えても、枠は増えません。
 
+- **枠はルートごとです。** 同じ `throttle` を 2 つのルートに付けると、別々に数えます。
+- パス引数を変えても、末尾に `/` を足しても、枠は増えません。
 - 名前の無いルートは、メソッドが違っても同じパスなら同じ枠です。分けたいときは名前を付けます。
-- ルートに当たらなかったときは、届いたパスで数えます。
+
+Laravel の名前の無い `throttle:60,1` は、**ルートをまたいで**相手ごとに 1 つの枠で数えます。
+bengara はルートごとに数えるので、そこが違います（[laravel-differences.md](laravel-differences.md)）。
 
 ### 前段のプロキシ
 
@@ -199,15 +200,15 @@ Route::post("/login", AuthController::login).middleware("throttle");
 本当の相手を知るために `X-Forwarded-For` と `X-Real-IP` を見ます。 **見るのは `TRUSTED_PROXIES`
 に載っている相手から届いたときだけです。**
 
-| `TRUSTED_PROXIES` | 動き                       |
-|-------------------|----------------------------|
-| 空（既定）        | どちらのヘッダーも見ない   |
-| アドレスの列      | 載っている相手からだけ見る |
-| `*`               | すべて信頼する             |
+| `TRUSTED_PROXIES` | 動き                                        |
+|-------------------|---------------------------------------------|
+| 空（既定）        | どちらのヘッダーも見ない                    |
+| アドレスの列      | 載っている相手からだけ見る                  |
+| `*`               | 接続元を信頼する（Laravel の `'*'` と同じ） |
 
 - アドレスはカンマで 1 つずつ並べます。`10.0.0.0/8` のような範囲は読めず、警告を出して捨てます。
-- IPv4 は `10.0.0.1` の形で書きます。`::ffff:10.0.0.1` で届いても同じ相手とみなします。
-- どのアドレスを採るかは [configuration.md](configuration.md) にあります。
+- `*` でも `X-Forwarded-For` の**先頭は採りません。** 先頭は相手が自由に書けるためです。
+- くわしくは [configuration.md](configuration.md) にあります。
 
 ### 気をつけること
 
@@ -222,8 +223,6 @@ Route::post("/login", AuthController::login).middleware("throttle");
 ## 一覧を見る
 
 `cargo artisan route:list` の MIDDLEWARE の列に、ルートに付けた名前が出ます。共通のミドルウェアは出ません。
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

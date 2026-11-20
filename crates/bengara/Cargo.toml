@@ -47,7 +47,9 @@ database = ["dep:sqlx"]
 # ネットワーク越しの接続を暗号化する。mysql と postgres が内側で付けます。
 # 単体では指定しません。rustls と webpki-roots を使うので、OS の証明書置き場に
 # 依存しません（ビルドには C コンパイラが要ります）。
-tls = ["sqlx/tls-rustls-ring-webpki"]
+# `sqlx?/` と書くのは、tls だけを選んだときに sqlx を引き込まないためです
+# （`?` が無いと、sqlx が入っていなくても入れてしまいます）。
+tls = ["sqlx?/tls-rustls-ring-webpki"]
 
 # 暗号化（encrypt / decrypt）。既定では入りません。
 # 署名（SHA-256 / HMAC）は自前なのでフラグは要りませんが、

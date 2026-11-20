@@ -341,9 +341,21 @@ fn status_lines(rows: &[migrator::Status]) -> Vec<String> {
             text::pad(state_of(row), state_width)
         ));
     }
-    let done = rows.iter().filter(|r| r.batch.is_some()).count();
+    // 数えるのはファイルのある行だけ。以前は「ファイルなし」の行も分母と
+    // 実行済みに入れていたので、全部流したのに「3 本中 2 本」のように見えていました。
+    let present = rows.iter().filter(|r| r.present).count();
+    let done = rows
+        .iter()
+        .filter(|r| r.present && r.batch.is_some())
+        .count();
+    let missing = rows.len() - present;
     lines.push(String::new());
-    lines.push(format!("{} 本中 {done} 本が実行済みです", rows.len()));
+    lines.push(format!("{present} 本中 {done} 本が実行済みです"));
+    if missing > 0 {
+        lines.push(format!(
+            "ファイルなし {missing} 本（記録だけが残っています。数には入れていません）"
+        ));
+    }
     lines
 }
 
@@ -682,7 +694,32 @@ mod tests {
             assert_eq!(column_of(line, state), state_at, "{lines:#?}");
             assert_eq!(column_of(line, batch), batch_at, "{lines:#?}");
         }
-        assert_eq!(lines.last().unwrap(), "3 本中 2 本が実行済みです");
+        // 「ファイルなし」の行は分母にも実行済みにも入れず、別に出す。
+        let summary = &lines[lines.len() - 2..];
+        assert_eq!(summary[0], "2 本中 1 本が実行済みです", "{lines:#?}");
+        assert!(summary[1].starts_with("ファイルなし 1 本"), "{lines:#?}");
+    }
+
+    #[test]
+    fn ファイルなしが無いときは集計の行だけ出す() {
+        let rows = vec![
+            migrator::Status {
+                name: "a".to_string(),
+                batch: Some(1),
+                present: true,
+            },
+            migrator::Status {
+                name: "b".to_string(),
+                batch: None,
+                present: true,
+            },
+        ];
+        let lines = status_lines(&rows);
+        assert_eq!(lines.last().unwrap(), "2 本中 1 本が実行済みです");
+        assert!(
+            !lines.iter().any(|l| l.contains("ファイルなし")),
+            "{lines:#?}"
+        );
     }
 
     #[test]

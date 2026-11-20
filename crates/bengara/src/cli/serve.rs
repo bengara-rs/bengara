@@ -4,9 +4,13 @@
 //! - Windows では実行中の exe を上書きできないため、別の場所にコピーしてから起動します。
 //! - 変更の監視は更新時刻の見張り（既定 0.4 秒ごと）で行います。OS ごとの通知の仕組みに
 //!   頼らないので、依存クレートが増えず、どの OS でも同じように動きます。
-//! - 見張るのは**本体のビルドに影響するファイルだけ**です（`.rs` と
-//!   `resources/lang/*.toml`）。この2つだけなので、データベースのファイル
-//!   （`.sqlite` や `.db-wal`）は自動的に外れます。
+//! - 見張るのは**本体のビルドに影響するファイルだけ**です。
+//!   - [`WATCH_DIRS`] の中の `.rs`
+//!   - 言語のファイル（`resources/lang/*.toml` と `resources/lang/<locale>/*.toml`）
+//!   - ビルドの入り口になるファイル（[`WATCH_FILES`]。`.env`・`Cargo.toml`・`build.rs` など）と `Cargo.lock`
+//!
+//!   拡張子で絞るので、データベースのファイル（`.sqlite` や `.db-wal`）は自動的に外れます。
+//!   名前の変更と移動も見つけます（パスのハッシュで比べる。[`Snapshot`]）。
 //!   `public/` も見張りません（デバッグビルドではディスクから読むので、再ビルドが要りません）。
 //! - **`tests/` は見張りません**（[`WATCH_DIRS`] に入っていません）。`serve` は
 //!   アプリを動かすだけで、テストは走らせないためです。テストを足したときは
@@ -164,7 +168,7 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
                 // 止めた後なら、前の世代のコピーを消せる（Windows でも）。
                 // 消せないものは次の起動時に片付けるので、ここでは気にしない。
                 if let Some(dir) = run_dir.current() {
-                    clean_old_copies(dir, &prefix);
+                    clean_old_copies(dir, |file| file.starts_with(&prefix));
                 }
                 generation += 1;
                 // 失敗で見張りを終わらせない。直せばまた試せる。
@@ -283,7 +287,7 @@ impl RunDir {
             // コピーは別の pid なので、自分の pid に絞ると永久に残り、立ち上げ直すたびに
             // 実行ファイルが積み上がる。動いている `serve` のコピーは、Windows では
             // `remove_file` が失敗して自然に守られ、Unix では消しても動作に影響しない。
-            clean_old_copies(&dir, &self.startup_prefix);
+            clean_old_copies(&dir, |file| is_startup_copy(file, &self.startup_prefix));
             self.dir = Some(dir.clone());
         }
         Ok(dir)
@@ -310,8 +314,30 @@ fn copy_prefix(name: &str, pid: u32) -> String {
 ///
 /// プロセス id を入れません。前回の `serve` が残したコピー（別の pid）まで
 /// 消したいためです。**起動時の1回だけ**使います。
+///
+/// 前置きだけで決めると、名前が `myapp` のときに別の本体 `myapp-api` の
+/// コピーまで消します。残りの形は [`is_startup_copy`] で確かめます。
 fn startup_prefix(name: &str) -> String {
     format!("{name}-")
+}
+
+/// 起動時の片付けで消してよいコピーか。
+///
+/// `{name}-` のあとが「数字（pid）+ `-` + 数字（世代）」で、拡張子だけが
+/// 続くもの（`myapp-4242-1` と `myapp-4242-1.exe`）に限ります。
+/// `myapp-api-4242-1.exe`（別の本体）や `myapp-2-4242-1.exe`（名前が `myapp-2`）は消しません。
+fn is_startup_copy(file_name: &str, prefix: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let Some(rest) = file_name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((pid, rest)) = rest.split_once('-') else {
+        return false;
+    };
+    let generation = rest
+        .split_once('.')
+        .map_or(rest, |(generation, _)| generation);
+    digits(pid) && digits(generation)
 }
 
 /// できた実行ファイルを別の名前にコピーして起動する。
@@ -398,38 +424,44 @@ fn stop(child: &mut Option<Running>) {
 /// 起動時と、本体を止めた直後に呼びます。動いている本体のコピーは消せませんが、
 /// そのときは黙って残します（次の機会に消えます）。
 ///
-/// 消す範囲は `prefix` で決めます。
+/// 消す範囲は `matches`（ファイル名を受け取る）で決めます。
 ///
-/// | 呼ぶところ   | `prefix`                      | 消すもの               |
-/// |--------------|-------------------------------|------------------------|
-/// | 起動時に1回  | `startup_prefix`（pid 抜き）  | 前回の分も含めて全部   |
-/// | ビルドのたび | `copy_prefix`（自分の pid）   | 自分が作った分だけ     |
+/// | 呼ぶところ   | `matches`                                   | 消すもの               |
+/// |--------------|---------------------------------------------|------------------------|
+/// | 起動時に1回  | `is_startup_copy`（`startup_prefix`、pid 抜き） | 前回の分も含めて全部   |
+/// | ビルドのたび | `copy_prefix`（自分の pid）で始まるか       | 自分が作った分だけ     |
 ///
 /// **残っている細い窓**: `serve` を2つ同時に動かすと、起動時の片付け
 /// （pid 抜きの `startup_prefix`）が、もう一方の `serve` が `fs::copy` した直後・
 /// `spawn` する前のコピーを消すことがあります。消されたほうの起動はそこで
 /// 失敗します。起動のたびに1回しか起きず、`serve` をもう一度動かせば直るので、
 /// 鍵をかけてまでは守っていません。
-fn clean_old_copies(run_dir: &Path, prefix: &str) {
+fn clean_old_copies(run_dir: &Path, matches: impl Fn(&str) -> bool) {
     let Ok(entries) = std::fs::read_dir(run_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        if !file_name.to_string_lossy().starts_with(prefix) {
+        if !matches(&file_name.to_string_lossy()) {
             continue;
         }
         let _ = std::fs::remove_file(entry.path());
     }
 }
 
-/// 見張る対象をまとめた2つの値。
+/// 見張る対象をまとめた値。
 ///
 /// 0.4 秒ごとに作り直すので、パスの一覧は持ちません。**ファイル数**と
-/// **更新時刻の最大**だけを持ちます。追加と削除は数で分かり、中身の変更は
-/// 最大時刻で分かります。確保がほぼ 0 になり、比較も2値の比較で済みます。
+/// **更新時刻の最大**と**パスのハッシュの和**だけを持ちます。追加と削除は数で、
+/// 中身の変更は最大時刻で、名前の変更と移動はパスの和で分かります。
+/// 確保がほぼ 0 になり、比較も数個の値の比較で済みます。
 ///
-/// **割り切り**: 「数が同じで、最大の更新時刻も同じまま、中身だけが入れ替わった」
+/// 名前の変更と移動は、更新時刻を変えません（OS が中身に触らないため）。
+/// 数と最大時刻だけでは「変更なし」に見えて、`bengara-build` が古いモジュール名の
+/// まま動き続けていました。パスの和は**順番に関係なく**足し込むので、
+/// ディレクトリを読む順番が変わっても同じ値になります。
+///
+/// **割り切り**: 「数とパスが同じで、最大の更新時刻も同じまま、中身だけが入れ替わった」
 /// 場合は取りこぼします。実用上は起きにくいので受け入れます。
 ///
 /// `Cargo.lock` だけは別の欄（`lock`）で持ちます。理由は [`LOCK_FILE`] にあります。
@@ -439,6 +471,8 @@ struct Snapshot {
     count: usize,
     /// 更新時刻のうち、いちばん新しいもの（`Cargo.lock` を除く）。
     latest: Option<SystemTime>,
+    /// 見張っているファイルのパスのハッシュを足したもの（あふれは回り込ませる）。
+    paths: u64,
     /// `Cargo.lock` の更新時刻。無いとき・読めないときは `None`。
     lock: Option<SystemTime>,
 }
@@ -460,8 +494,14 @@ impl Snapshot {
     }
 
     /// 1ファイル数える。更新時刻が読めたときは最大を更新する。
-    fn add(&mut self, modified: Option<SystemTime>) {
+    fn add(&mut self, path: &Path, modified: Option<SystemTime>) {
+        use std::hash::{Hash, Hasher};
+
         self.count += 1;
+        // `DefaultHasher::new()` は鍵が固定なので、同じプロセスの中では同じ値になる。
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        self.paths = self.paths.wrapping_add(hasher.finish());
         if let Some(time) = modified {
             if self.latest.is_none_or(|latest| time > latest) {
                 self.latest = Some(time);
@@ -477,8 +517,9 @@ fn snapshot(root: &Path) -> Snapshot {
         walk(&root.join(dir), &mut snapshot);
     }
     for file in WATCH_FILES {
-        if let Ok(metadata) = std::fs::metadata(root.join(file)) {
-            snapshot.add(metadata.modified().ok());
+        let path = root.join(file);
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            snapshot.add(&path, metadata.modified().ok());
         }
     }
     snapshot.lock = lock_modified(root);
@@ -512,7 +553,7 @@ fn walk(dir: &Path, snapshot: &mut Snapshot) {
                 if is_watched_file(&path) {
                     // `read_dir` の結果を使い回す。`fs::metadata` だとパスをもう一度解決する。
                     if let Ok(metadata) = entry.metadata() {
-                        snapshot.add(metadata.modified().ok());
+                        snapshot.add(&path, metadata.modified().ok());
                     }
                 }
             }
@@ -651,7 +692,8 @@ mod tests {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
 
-        clean_old_copies(&dir, &startup_prefix("myapp"));
+        let prefix = startup_prefix("myapp");
+        clean_old_copies(&dir, |file| is_startup_copy(file, &prefix));
 
         assert!(!dir.join("myapp-4242-1.exe").exists());
         assert!(!dir.join("myapp-9999-3.exe").exists());
@@ -659,6 +701,19 @@ mod tests {
         assert!(dir.join("other-1-1.exe").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 起動時の片付けは数字とハイフンの形まで確かめる() {
+        let prefix = startup_prefix("myapp");
+        assert!(is_startup_copy("myapp-4242-1.exe", &prefix));
+        assert!(is_startup_copy("myapp-4242-12", &prefix));
+        // 名前が `myapp-` で始まる別の本体のコピーは消さない。
+        assert!(!is_startup_copy("myapp-api-4242-1.exe", &prefix));
+        assert!(!is_startup_copy("myapp-2-4242-1.exe", &prefix));
+        assert!(!is_startup_copy("myapp-4242-.exe", &prefix));
+        assert!(!is_startup_copy("myapp-4242", &prefix));
+        assert!(!is_startup_copy("other-4242-1.exe", &prefix));
     }
 
     #[test]
@@ -700,26 +755,33 @@ mod tests {
         let base = SystemTime::UNIX_EPOCH;
         let later = base + Duration::from_secs(1);
 
+        let (x, y) = (Path::new("app/x.rs"), Path::new("app/y.rs"));
         let mut a = Snapshot::default();
-        a.add(Some(base));
-        a.add(Some(later));
+        a.add(x, Some(base));
+        a.add(y, Some(later));
 
-        // 同じ数・同じ最大時刻なら、順番が違っても同じと見る。
+        // 同じファイル・同じ最大時刻なら、順番が違っても同じと見る。
         let mut b = Snapshot::default();
-        b.add(Some(later));
-        b.add(Some(base));
+        b.add(y, Some(later));
+        b.add(x, Some(base));
         assert_eq!(a, b);
 
         // ファイルが増えれば数で分かる。
         let mut added = a;
-        added.add(Some(base));
+        added.add(Path::new("app/z.rs"), Some(base));
         assert_ne!(a, added);
 
         // 中身が新しくなれば最大時刻で分かる。
         let mut touched = Snapshot::default();
-        touched.add(Some(base));
-        touched.add(Some(later + Duration::from_secs(1)));
+        touched.add(x, Some(base));
+        touched.add(y, Some(later + Duration::from_secs(1)));
         assert_ne!(a, touched);
+
+        // 名前の変更・移動は、数も時刻も変わらないがパスで分かる。
+        let mut renamed = Snapshot::default();
+        renamed.add(x, Some(base));
+        renamed.add(Path::new("app/Models/y.rs"), Some(later));
+        assert_ne!(a, renamed);
     }
 
     #[test]
@@ -754,7 +816,7 @@ mod tests {
     fn 更新時刻が読めないファイルも数える() {
         // 数が合わないと、消えたことにして毎回ビルドしてしまう。
         let mut s = Snapshot::default();
-        s.add(None);
+        s.add(Path::new("app/a.rs"), None);
         assert_eq!(s.count, 1);
         assert_eq!(s.latest, None);
     }

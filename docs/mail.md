@@ -26,8 +26,9 @@ Mail::to("alice@example.com")
 | `html(本文)`             | HTML の本文                |
 | `send()`                 | 送る                       |
 
-- `text` と `html` は両方書けます。
+- `text` と `html` は両方書けます。受け取る側が選べる形で送ります。
 - 文面は `format!` で組み立てます。
+- 宛先は `alice@example.com` と `アリス <alice@example.com>` のどちらでも書けます。
 - 送る前の中身は `message()` で見られます。
 
 ### 断るもの
@@ -42,8 +43,7 @@ Mail::to("alice@example.com")
 
 - 改行を断るのは、ヘッダーに偽の行を混ぜられないようにするためです。本文の改行は通ります。
 - 空白だけの宛先・写しは飛ばします（`.cc("")` でも落ちません）。
-- **アドレスの形は確かめません。** 入力から受け取るなら、`email`
-  の検査規則を通してください（[validation.md](validation.md)）。
+- **アドレスの形は確かめません。** 入力から受け取るなら、`email` の検査規則を通してください（[validation.md](validation.md)）。
 
 ### キューから送る
 
@@ -70,18 +70,17 @@ Queue::push("SendWelcome", &Payload { user_id: user.id }).await?;
 - `MAIL_MAILER` が無いか空なら、古い名前の `MAIL_DRIVER` を見ます。
 - **知らない名前は、送るときにエラーになります。** 打ち間違いのまま、送れたつもりにならないためです。
 
-```
-メールの送り先 `ses` は知りません（MAIL_MAILER / MAIL_DRIVER）。使えるのは log・array（memory）・smtp です
-```
-
 ### 差出人
 
-| 設定             | 既定                  | 意味             |
-|------------------|-----------------------|------------------|
-| `MAIL_FROM`      | `noreply@example.com` | 差出人のアドレス |
-| `MAIL_FROM_NAME` | `bengara`             | 差出人の名前     |
+| 設定                | 既定                  | 意味                                           |
+|---------------------|-----------------------|------------------------------------------------|
+| `MAIL_FROM_ADDRESS` | 空なら `MAIL_FROM`    | 差出人のアドレス（Laravel の名前。こちらが先） |
+| `MAIL_FROM`         | `noreply@example.com` | 差出人のアドレス（前からの名前）               |
+| `MAIL_FROM_NAME`    | `bengara`             | 差出人の名前                                   |
 
-**`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名を書いてください。
+- **`MAIL_FROM_NAME` の既定は `bengara` です。** 自分のアプリ名を書いてください。
+- アドレスの欄にはアドレスだけを書きます。`myapp <noreply@example.com>` と書くと、警告を出して `<>` の中だけを使います。
+- `null`（大文字小文字は見ない）は空と同じです。Laravel の `.env` をそのまま使えます。
 
 `config/mail.rs` を置くと、そちらを使います。無くても動きます。
 
@@ -123,6 +122,10 @@ Subject: ようこそ
 `#[bengara::test]` は、送り先を自動で `array` にします。溜まったメールを見て確かめます。
 
 ```rust
+use bengara::queue::Json;
+
+use crate::app::jobs::send_welcome::Payload;
+
 #[bengara::test]
 async fn お知らせを送る() {
     let _db = refresh_database().await;
@@ -134,8 +137,9 @@ async fn お知らせを送る() {
         .unwrap();
     user.save().await.unwrap();
 
-    let payload = bengara::serde_json::json!({ "user_id": user.id }).to_string();
-    crate::app::jobs::send_welcome::handle(payload).await.unwrap();
+    crate::app::jobs::send_welcome::handle(Json(Payload { user_id: user.id }))
+        .await
+        .unwrap();
 
     let sent = Mail::sent();            // Vec<Message>
     assert_eq!(sent.len(), 1);
@@ -154,6 +158,7 @@ async fn お知らせを送る() {
 ## SMTP で送る
 
 Cargo の機能フラグ `mail` を足します。**既定では入りません。**
+足すと、ビルドに C コンパイラが要ります（暗号化のため）。
 
 ```toml
 [dependencies]
@@ -168,19 +173,22 @@ MAIL_HOST=smtp.example.com
 MAIL_ENCRYPTION=starttls
 MAIL_USERNAME=noreply@example.com
 MAIL_PASSWORD=ここにパスワード
-MAIL_FROM=noreply@example.com
+MAIL_FROM_ADDRESS=noreply@example.com
 MAIL_FROM_NAME=myapp
 ```
 
-| 設定              | 既定                       | 意味                 |
-|-------------------|----------------------------|----------------------|
-| `MAIL_HOST`       | `127.0.0.1`                | SMTP サーバの名前    |
-| `MAIL_PORT`       | 暗号化に合わせる（下の表） | ポート               |
-| `MAIL_ENCRYPTION` | `starttls`                 | 暗号化の仕方         |
-| `MAIL_USERNAME`   | 空（認証しない）           | 利用者名             |
-| `MAIL_PASSWORD`   | 空                         | パスワード           |
-| `MAIL_EHLO_NAME`  | 空                         | サーバに名乗る名前   |
-| `MAIL_TIMEOUT`    | 10                         | 返事を待つ上限の秒数 |
+| 設定              | 既定                       | 意味                                      |
+|-------------------|----------------------------|-------------------------------------------|
+| `MAIL_HOST`       | `127.0.0.1`                | SMTP サーバの名前                         |
+| `MAIL_PORT`       | 暗号化に合わせる（下の表） | ポート                                    |
+| `MAIL_SCHEME`     | 空                         | Laravel 11 のつなぎ方（`smtp` / `smtps`） |
+| `MAIL_ENCRYPTION` | `starttls`                 | 暗号化の仕方                              |
+| `MAIL_USERNAME`   | 空（認証しない）           | 利用者名。`null` も空と同じ               |
+| `MAIL_PASSWORD`   | 空                         | パスワード。`null` も空と同じ             |
+| `MAIL_EHLO_NAME`  | 空（`[127.0.0.1]`）        | サーバに名乗る名前                        |
+| `MAIL_TIMEOUT`    | 10                         | 返事を待つ上限の秒数                      |
+
+フラグを足さずに `MAIL_MAILER=smtp` にすると、送るときに「features に `"mail"` を足してください」のエラーになります。
 
 ### 暗号化とポート
 
@@ -192,25 +200,30 @@ MAIL_FROM_NAME=myapp
 | `none`（`null` と `false` も） | 25           | 暗号化しない                                          |
 
 - 大文字小文字は見ません。
-- `tls` と `MAIL_PORT=587` の組み合わせは `starttls` でつなぎます。Laravel の `.env` をそのまま使えます。
-- 行が無いときや空のときは `starttls` です。暗号化しないなら `none` と書きます。
-- 知らない語は、警告を出して `starttls` にします。
+- 空のときは `starttls` です。知らない語は、警告を出して `starttls` にします。
 - 暗号化なしで `MAIL_USERNAME` を使うと、警告が出ます。パスワードが平文で流れるためです。
+
+### `MAIL_SCHEME`（Laravel 11）
+
+Laravel 11 の `.env` は、`MAIL_ENCRYPTION` の代わりに `MAIL_SCHEME` を書きます。
+**書いてあれば `MAIL_ENCRYPTION` より先に見ます。**
+
+| `MAIL_SCHEME` | つなぎ方                                              |
+|---------------|-------------------------------------------------------|
+| 空・`null`    | `MAIL_ENCRYPTION` で決める（上の表）                  |
+| `smtps`       | ポートに関係なく、最初から暗号化する                  |
+| `smtp`        | 465 番なら最初から暗号化。ほかのポートでは `starttls` |
+| ほかの語      | 警告を出して、`MAIL_ENCRYPTION` で決める              |
+
+- `smtp` で `MAIL_ENCRYPTION=none`（`null`・`false` も）なら、暗号化しません。
+- `MAIL_PORT` が空のとき、`smtp` は 587 番です（Laravel は 25 番）。
+- **Laravel と違うところ:** Laravel の `smtp` は、サーバが `STARTTLS` を持たなければ平文で送ります。bengara は切り替えを必ず求めます。手元の受け口（Mailpit など）に送るときは、`MAIL_ENCRYPTION=none` を足してください。
 
 ### 知っておくこと
 
-- `MAIL_EHLO_NAME` が空のときは `[127.0.0.1]` と名乗ります。断るサーバがあるので、そのときは自分のホスト名を書きます。
+- `MAIL_EHLO_NAME` が空だと `[127.0.0.1]` と名乗ります。断るサーバには、自分のホスト名を書きます。
 - 接続は 1 通目で張り、使い回します。
 - 自己署名の証明書のサーバにはつながりません。OS に足した証明書も見ません。
-- `text` と `html` の両方を書くと、受け取る側が選べる形で送ります。
-- 宛先は `alice@example.com` と `アリス <alice@example.com>` のどちらでも書けます。
-- `mail` を足すと、ビルドに C コンパイラが要ります（暗号化のため）。
-
-フラグを足さずに `MAIL_MAILER=smtp` にすると、送るときに次のエラーになります。
-
-```
-SMTP で送るには、Cargo.toml の bengara の features に `"mail"` を足してください（例: `features = ["sqlite", "mail"]`）
-```
 
 ## 送り先を自分で作る
 
@@ -229,8 +242,6 @@ bengara::mail::install_mailer(Box::new(MyMailer));
 
 - **効くのは 1 回目だけです。**
 - `send` は `async` ではありません。待つ処理をそのまま書けます。
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

@@ -30,8 +30,7 @@ Storage::delete("notes/memo.txt").await?;
 | `append(パス, 文字)`             | `Result<()>`              | 末尾に書き足す（[書き足す](#書き足す)） |
 
 - 書く途中で落ちると、途中までのファイルが残ります（Laravel と同じ）。
-- `storage/` そのものが無いと、書き込みはエラーです。先に `storage:init`
-  で作ります（[置き場所を動かす](#置き場所を動かす)）。
+- `storage/` そのものが無いと、書き込みはエラーです。先に `storage:init` で作ります（[置き場所を動かす](#置き場所を動かす)）。
 - 空のパス（`""` や `"."`）はエラーです。
 - 文字として読めない中身を `get` するとエラーです。`get_bytes` で読みます。
 
@@ -70,7 +69,6 @@ let real: PathBuf = disk.path("logo.png")?;         // 実際の場所
 
 - **設定に無い名前を `Storage::disk` に渡すと、パニックします。** 書き間違いにすぐ気づけるようにするためです。
 - 既定のディスクは `Storage::default_disk()?` で取れます。`size` や `files` を使うときに呼びます。
-- 名前が違うのは、Rust では同じ型に同じ名前の関数を 2 つ置けないためです。
 
 ### ディスクを増やす
 
@@ -104,13 +102,9 @@ Storage::default_disk()?.files("notes").await?;
 // => ["notes/2026/01.txt", "notes/memo.txt"]
 ```
 
-- `""` を渡すと、ディスク全部です。
-- 無いディレクトリやファイルを渡すと、空の一覧です。
+- `""` を渡すと、ディスク全部です。無いディレクトリなら空の一覧です。
 - 中のシンボリックリンクはたどりません。渡したパス自体が外を指すリンクならエラーです。
-- 次のものは飛ばして、ログに警告を出します。
-    - 深さ 32 より下
-    - 名前が UTF-8 でないもの
-    - 読めないディレクトリ
+- 深さ 32 より下・名前が UTF-8 でないもの・読めないディレクトリは、飛ばしてログに警告を出します。
 
 ## 書き足す
 
@@ -127,15 +121,13 @@ Storage::disk("local").append_bytes("chunks/a.bin", bytes).await?;
 | `disk.append_bytes(パス, Vec<u8>)` | 何も挟まずに末尾へ足す。無ければ作る                                     |
 
 - 改行はどの OS でも `\n` です（Laravel は OS ごとに違います）。
-- **同時に `append` すると、改行の有無がずれることがあります。** 何本ものリクエストから足すときは、自分で `\n` を付けて
-  `append_bytes` を使います。
-- `append_bytes` はファイル全体を読み直さず、末尾にだけ書きます。途中のディレクトリも作ります。
+- **同時に `append` すると、改行の有無がずれることがあります。** 何本ものリクエストから足すときは、自分で `\n` を付けて `append_bytes` を使います。
 - 既定のディスクには `Storage::default_disk()?.append_bytes(..)` と書きます。
 
 ## 本文を少しずつ書く
 
-`.stream_body()` のルートで受けた本文（[requests-and-responses.md](requests-and-responses.md)）を、
-全部メモリに載せずにファイルへ書きます。Laravel の `writeStream` に当たります。
+`.stream_body()` のルートで受けた本文（[requests-and-responses.md](requests-and-responses.md)）を、全部メモリに載せずにファイルへ書きます。
+Laravel の `writeStream` に当たります。
 
 ```rust
 pub async fn upload(req: Request) -> Result<Response> {
@@ -147,15 +139,11 @@ pub async fn upload(req: Request) -> Result<Response> {
 ```
 
 - 返すのは書いたバイト数です。
-- **最後まで受け取れたときだけ、その名前のファイルになります。** 書いている間は、同じディレクトリの `.名前.<乱数>.part`
-  に書きます。
+- **最後まで受け取れたときだけ、その名前のファイルになります。** 書いている間は、同じディレクトリの `.名前.<乱数>.part` に書きます。この `.part` は `files()` の一覧にも見えます。
 - 途中で失敗したら、書きかけを消します。前からあったファイルはそのまま残ります。
+- Windows では、書いている最中に止めると `.part` が残ることがあります（ログに警告が出ます）。
 - 本文のエラーは、上限超え（413）・時間切れ（408）・切断（400）です。`?` で返せば、その状態コードの応答になります。
-- 書いている間の `.part` は、`files()` の一覧にも見えます。
-- Windows では、裏で書いている最中に止めると `.part` が残ることがあります（ログに警告が出ます）。
-
-少しずつ書く口（`Storage::writer` のようなもの）はありません。
-かたまりごとに `append_bytes` するか、本文なら `write_stream` を使います。
+- 少しずつ書く口（`Storage::writer` のようなもの）はありません。かたまりごとに `append_bytes` するか、`write_stream` を使います。
 
 ## 断るパス
 
@@ -175,9 +163,8 @@ pub async fn upload(req: Request) -> Result<Response> {
 
 - **どの OS でもエラーにします。** 開発機で通ったコードが、本番で失敗しないようにするためです。
 - 装置の名前は `CON` `PRN` `AUX` `NUL` `COM0`〜`COM9` `LPT0`〜`LPT9` などです。大文字小文字は見ません。
-- リンク（シンボリックリンク・ジャンクション）は、実体の場所で確かめます。置き場所そのものがリンクなのは構いません。
-- 外を指すリンクには、`has` も `size` も `false` や `None` ではなくエラーを返します。
-- `delete` はリンクそのものを消します。先のファイルは消しません。
+- リンクは実体の場所で確かめます。置き場所そのものがリンクなのは構いません。
+- 外を指すリンクには、`has` や `size` もエラーを返します。`delete` はリンクそのものを消します。
 
 ```rust
 pub async fn write_note(req: Request) -> Result<Response> {
@@ -265,13 +252,7 @@ APP_STORAGE_PATH=/var/lib/myapp/storage
 | 開発                 | `cargo artisan storage:init`    |
 | 本番（cargo が無い） | `./<実行ファイル> storage:init` |
 
-無いときは、次のエラーになります。キャッシュなども同じ文です。
-
-```
-<場所>/storage がありません。storage:init（開発では `cargo artisan storage:init`、本番では `./<実行ファイル> storage:init`） を実行してください
-```
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
+無いときは「`<場所>/storage がありません。storage:init … を実行してください`」のエラーになります。キャッシュなども同じ文です。
 
 ## 関連
 

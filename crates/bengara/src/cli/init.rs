@@ -119,10 +119,13 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     write_if_missing(root, "public/robots.txt", stub("robots"), &mut report)?;
 
     let env_text = stub("env").replace("{{name}}", &name);
-    // `.env` には、あとで `key:generate` が `APP_KEY` を書き込む。
+    // `.env` を**新しく作るときだけ** `APP_KEY` を作って入れる（Laravel の
+    // `create-project` が `key:generate` を流すのと同じ）。すでにある `.env` には触らない。
     // 秘密を持つファイルなので、所有者だけが読めるようにする。
-    // `.env.example` は秘密を持たないので、ふつうの権限のままにする。
-    write_secret_if_missing(root, ".env", &env_text, &mut report)?;
+    // `.env.example` は秘密を持たないので、鍵を入れず、ふつうの権限のままにする。
+    let new_env = !root.join(".env").exists();
+    let env_with_key = with_app_key(&env_text, &crate::support::crypto::random_token());
+    write_secret_if_missing(root, ".env", &env_with_key, &mut report)?;
     write_if_missing(root, ".env.example", &env_text, &mut report)?;
 
     // アプリの骨組み。
@@ -180,10 +183,20 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     }
 
     report.print();
+    if new_env {
+        println!("\n.env を作り、APP_KEY を生成して書き込みました。");
+    }
     println!(
         "\n次の一歩\n\n  cargo artisan serve     サーバーを起動して、変更を見張る\n  cargo test              テストを走らせる\n  cargo artisan list      コマンドの一覧\n"
     );
     Ok(())
+}
+
+/// `.env` の雛形の空の `APP_KEY=` の行に、鍵を入れる。
+///
+/// 雛形に空の行が無ければ、そのまま返します（`key:generate` で入れられます）。
+fn with_app_key(env_text: &str, key: &str) -> String {
+    env_text.replacen("\nAPP_KEY=\n", &format!("\nAPP_KEY={key}\n"), 1)
 }
 
 /// 雛形の中身。フレームワークと同じ版のものが必ず使われます。
@@ -890,15 +903,40 @@ mod tests {
             assert!(root.join(&dir).is_dir(), "{dir}");
         }
 
-        // 2回目は何も変えない。
+        // 新しく作った .env には鍵が入る。.env.example には入らない。
+        let env_body = std::fs::read_to_string(root.join(".env")).unwrap();
+        let key = env_body
+            .lines()
+            .find_map(|line| line.strip_prefix("APP_KEY="))
+            .unwrap();
+        assert!(
+            key.chars().count() >= crate::config_registry::MIN_KEY_CHARS,
+            "{key}"
+        );
+        let example = std::fs::read_to_string(root.join(".env.example")).unwrap();
+        assert!(example.contains("\nAPP_KEY=\n"), "{example}");
+
+        // 2回目は何も変えない（すでにある .env の鍵も作り直さない）。
         let before = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
         run(&root).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("Cargo.toml")).unwrap(),
             before
         );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".env")).unwrap(),
+            env_body
+        );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn envの雛形には空のapp_keyの行がある() {
+        // 無いと、init が作る .env に鍵が入らない。
+        let text = stub("env");
+        assert!(text.contains("\nAPP_KEY=\n"));
+        assert_eq!(with_app_key(text, "k").matches("\nAPP_KEY=k\n").count(), 1);
     }
 
     #[test]

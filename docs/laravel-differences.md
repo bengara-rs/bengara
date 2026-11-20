@@ -1,301 +1,260 @@
 # Laravel と違う点
 
-Laravel の書き方を知っている人が、bengara で書き方や動きが違う所をまとめた表です。
-くわしい動きは、各節の最後にあるページで確かめてください。
-まだ無い機能は [backlog.md](backlog.md) にあります。
+Laravel から来た人がつまずきやすい違いを、分野ごとに並べます。
+左が Laravel、右が bengara です。くわしくは各節の最後のページを見てください。
 
-## 置き場所と参照
+## まず知っておくこと
 
-| Laravel                                    | bengara                                                          |
-|--------------------------------------------|------------------------------------------------------------------|
-| `public/index.php` が入口                  | 直下の `main.rs`（中身は `bengara::app!();`）                    |
-| `artisan`（PHP スクリプト）                | 直下の `artisan.rs`（中身は `fn main() { bengara::artisan() }`） |
-| Composer のオートロード                    | `build.rs` の `bengara_build::discover()` が自動で取り込む       |
-| `use App\Http\Controllers\HomeController;` | `use crate::app::http::controllers::HomeController;`             |
-| クラス名 = ファイル名                      | 大文字始まりのファイルに**同じ名前の型を 1 つ**書く              |
+| Laravel                                    | bengara                                                      |
+|--------------------------------------------|--------------------------------------------------------------|
+| `public/index.php` と `artisan` が入口     | 直下の `main.rs` と `artisan.rs`。`src/` は作らない          |
+| Composer のオートロード                    | `build.rs` が置いたファイルを自動で取り込む                  |
+| `use App\Http\Controllers\HomeController;` | `use crate::app::http::controllers::HomeController;`         |
+| クラス名 = ファイル名                      | 大文字始まりのファイルに**同じ名前の型を 1 つ**書く          |
+| ファサードとサービスコンテナ               | `use bengara::prelude::*;` の関数と型を使う                  |
+| 引数の型から自動で注入する                 | **しない。** ハンドラの形は `()` と `(req: Request)` の 2 つ |
+| 例外を投げる                               | `Err` を返す。状態コードを持つエラーならそのコードになる     |
+| `make:*` でファイルを作る                  | **無い。** ファイルは手で作る                                |
 
-`src/` は作りません（[directory-structure.md](directory-structure.md)）。
+置き場所は [directory-structure.md](directory-structure.md) にあります。
 
 ## コマンド
 
-| Laravel                                | bengara                                                                 |
-|----------------------------------------|-------------------------------------------------------------------------|
-| `php artisan ...`                      | `cargo artisan ...`（本番は `./myapp ...`）                             |
-| `serve` はビルド不要                   | ビルドしてから起動する。ソースが変わると作り直す                        |
-| 旗の扱いが緩い                         | **旗はコマンドごとに決まっている。** 知らない旗や余分な引数はエラー     |
-| 同じ名前の自作コマンドが勝つことがある | **フレームワークのコマンドが必ず先。** 自作のほうは呼ばれず、警告が出る |
-| `migrate --force`（本番で必要）        | `migrate` と `db:seed` は本番でも要らない（付けても通る）               |
-| `migrate:fresh` などは本番で確認する   | 本番では `--force` が無いと止まる（対象は 5 つ）                        |
-| `schedule:run`                         | 同じ名前。**失敗が 1 件でもあれば終了コード 1**                         |
+| Laravel                                | bengara                                                   |
+|----------------------------------------|-----------------------------------------------------------|
+| `php artisan ...`                      | `cargo artisan ...`。本番は `./myapp ...`                 |
+| `serve` はすぐ動く                     | ビルドしてから起動する。ソースが変わると作り直す          |
+| 旗の扱いが緩い                         | **知らない旗や余分な引数はエラー**                        |
+| 同じ名前の自作コマンドが勝つ           | **フレームワークのコマンドが先。** 自作のほうは呼ばれない |
+| 本番の `migrate` には `--force` が要る | 要らない（付けても通る）                                  |
+| `migrate:fresh` などは本番で確認する   | 本番では `--force` が無いと止まる                         |
+| `schedule:run`                         | 同じ。**失敗が 1 件でもあれば終了コード 1**               |
 
 くわしくは [artisan.md](artisan.md) にあります。
 
 ## 設定
 
-| Laravel                       | bengara                                           |
-|-------------------------------|---------------------------------------------------|
-| `config/app.php` が配列を返す | `config/app.rs` の `pub fn config() -> AppConfig` |
-| `config('app.name')`          | `config::<AppConfig>().name`。**型で引く**        |
-| `env()` は文字列中心          | `env(key, default)` の型は**既定値の型**で決まる  |
-| 設定ファイルを本番に置く      | 設定はコードなので実行ファイルに入る              |
-| `config:cache` / `optimize`   | **要らない。** 起動時に組み立てて固定する         |
-| ファサード                    | `use bengara::prelude::*;` の関数を使う           |
+| Laravel                     | bengara                                                     |
+|-----------------------------|-------------------------------------------------------------|
+| `config('app.name')`        | `config::<AppConfig>().name`。**型で引く**                  |
+| `config/app.php` が配列     | `config/app.rs` の `pub fn config() -> AppConfig`           |
+| `env()` は文字列中心        | `env(名前, 既定値)` の型は**既定値の型**で決まる            |
+| `config:cache` / `optimize` | **要らない。** 設定は起動時に組み立てて固定する             |
+| `app_path()` は `app/`      | **基準ディレクトリ**を指す。`app_path("app/Models")` と書く |
 
 くわしくは [configuration.md](configuration.md) にあります。
 
 ## ルーティングと URL
 
-| Laravel                                             | bengara                                                          |
-|-----------------------------------------------------|------------------------------------------------------------------|
-| `Route::get('/', [HomeController::class, 'index'])` | `Route::get("/", HomeController::index)`                         |
-| `/posts/{post}`                                     | 同じ。末尾までの全取りは `/files/{*path}`                        |
-| `route('posts.show', $post)`                        | `route_with("posts.show", &[("post", "12")])?`                   |
-| `route()` はパス引数をそのまま置く                  | **`%xx` に符号化する。** `/` も `%2F` になる                     |
-| `Route::prefix(...)->group(...)`                    | `Route::prefix("admin").group(...)`。`name` の点は自分で書く     |
-| `Route::middleware(...)`                            | `Route::get(...).middleware("admin")` と後ろに付ける             |
-| ルートの重複は後勝ち                                | **起動時にパニック**（パスの重複、ルート名の重複）               |
-| `URL::signedRoute(...)`                             | `signed_url("/unsubscribe", &[("user", "12")])?`。**パスを渡す** |
-| `$request->hasValidSignature()`                     | `has_valid_signature(&req)?`                                     |
-| ミドルウェア `signed` が自動で止める                | **自動では止まらない。** 自分で確かめて返し方を決める            |
-| メソッドの大文字小文字を区別しない                  | **区別する。** `get /x` は 405                                   |
-| 末尾の `/` は 301 で寄せる                          | **転送しない。** `/posts` と `/posts/` は同じルートに当たる      |
+| Laravel                                             | bengara                                                     |
+|-----------------------------------------------------|-------------------------------------------------------------|
+| `Route::get('/', [HomeController::class, 'index'])` | `Route::get("/", HomeController::index)`                    |
+| `route('posts.show', $post)`                        | `route_with("posts.show", &[("post", "12")])?`              |
+| `route()` はパス引数をそのまま置く                  | **`%xx` に符号化する。** `/` も `%2F` になる                |
+| `Route::middleware(...)`                            | `Route::get(...).middleware("admin")` と後ろに付ける        |
+| `Route::name('admin.')`                             | 同じ形。**点は自分で書く**（忘れると `adminindex`）         |
+| ルートの重複は後勝ち                                | **起動時にパニック**（パスの重複、ルート名の重複）          |
+| `URL::signedRoute('name', ...)`                     | `signed_url("/unsubscribe", ...)?`。**パスを渡す**          |
+| ミドルウェア `signed` が自動で止める                | **自動では止まらない。** `has_valid_signature` で確かめる   |
+| メソッドの大文字小文字を区別しない                  | **区別する。** `get /x` は 405                              |
+| 末尾の `/` は 301 で寄せる                          | **転送しない。** `/posts` と `/posts/` は同じルートに当たる |
 
 くわしくは [routing.md](routing.md) にあります。
 
-## コントローラとレスポンス
+## リクエストとレスポンス
 
-ハンドラの形は `async fn f() -> Result<Response>` と `async fn f(req: Request) -> Result<Response>` の 2 つだけです。
-引数の型から自動で注入する仕組みはありません。
-
-| Laravel                             | bengara                                                                      |
-|-------------------------------------|------------------------------------------------------------------------------|
-| `$request->route('post')`           | `req.param("post")`。型を変えるなら `req.param_as::<i64>("post")?`           |
-| パス引数の型が合わない              | `param_as` は **404**。ルートに無い名前なら **500**                          |
-| `view("welcome")`                   | `view("welcome", ())`。機能フラグ `view` が要る（次の節）                    |
-| `response()->json($data)`           | `json(&data)`                                                                |
-| `redirect('/login')`                | `redirect().to("/login")`                                                    |
-| `abort(403)`                        | `return abort(403);`                                                         |
-| 例外を投げる                        | `Err` を返す。状態コードを持つエラーならそのコードになる                     |
-| 本文の上限は PHP の `post_max_size` | `.env` の `APP_MAX_BODY_BYTES`（既定 2 MiB）と、ルートの `.max_body(バイト)` |
-| 本文を全部受け取ってから動く        | 同じ。ただし `.stream_body()` のルートは `req.body_stream()?` で少しずつ読む |
+| Laravel                             | bengara                                                            |
+|-------------------------------------|--------------------------------------------------------------------|
+| `$request->route('post')`           | `req.param("post")`。数にするなら `req.param_as::<i64>("post")?`   |
+| パス引数の型が合わない              | `param_as` は **404**。ルートに無い名前なら **500**                |
+| `abort(403)`                        | `return abort(403);`                                               |
+| 本文の上限は PHP の `post_max_size` | `.env` の `APP_MAX_BODY_BYTES`（既定 2 MiB）とルートの `.max_body` |
 
 くわしくは [requests-and-responses.md](requests-and-responses.md) にあります。
 
 ## テンプレート
 
-テンプレートは機能フラグ `view` で使えます。置き場所は Laravel と同じ `resources/views/` です。
-書き方は **Jinja 系**（minijinja）です。**Blade の構文は使えません。**
+機能フラグ `view` で使います。書き方は **Jinja 系**です。**Blade の構文は使えません。**
 
-| Laravel                                | bengara                                                  |
-|----------------------------------------|----------------------------------------------------------|
-| `welcome.blade.php`                    | `welcome.html`                                           |
-| `{{ $title }}`                         | `{{ title }}`（`$` は付けない）                          |
-| `{!! $html !!}`                        | `{{ html\|safe }}`                                       |
-| `@extends` / `@section` / `@yield`     | `{% extends %}` / `{% block %}`                          |
-| `@csrf`                                | `{{ csrf_field() }}`。`req.view(..)` の中だけ            |
-| `$errors`（検査に落ちた理由）          | **無い。** 検査に落ちると前の画面に戻さず 422 を返すため |
-| `@method('PUT')`                       | **無い。** `_method` による読み替えが無いため            |
-| `resources/views/errors/404.blade.php` | **使わない。** エラーページはテンプレートにならない      |
+| Laravel                            | bengara                                             |
+|------------------------------------|-----------------------------------------------------|
+| `welcome.blade.php`                | `welcome.html`                                      |
+| `view("welcome")`                  | `view("welcome", ())`。値が無くても第 2 引数を書く  |
+| `{{ $title }}`                     | `{{ title }}`（`$` は付けない）                     |
+| `{!! $html !!}`                    | `{{ html\|safe }}`                                  |
+| `@extends` / `@section` / `@yield` | `{% extends %}` / `{% block %}`                     |
+| `@csrf`                            | `{{ csrf_field() }}`。`req.view(..)` で描くときだけ |
+| エラーページを Blade で作る        | エラーページはテンプレートにならない                |
 
 くわしくは [views.md](views.md) にあります。
 
 ## 入力とバリデーション
 
-| Laravel                                  | bengara                                                             |
-|------------------------------------------|---------------------------------------------------------------------|
-| `$request->input('title')`               | `req.input("title")`（`Option<String>`）                            |
-| `$request->validate([...])`              | `req.validate(&[("title", "required\|max:255")])?`                  |
-| 規則は配列でも文字列でも書ける           | **文字列だけ**                                                      |
-| 規則の書き間違いは実行して分かる         | `rules!` で書けば**コンパイルが止まる**                             |
-| FormRequest のクラス（`rules()` と `authorize()`） | トレイト `FormRequest` と `const RULES`。`req.validate_as()?` で型付きの値を受け取る。`authorize()` は無い |
-| `date` は `strtotime` が読める形を全部通す | **`YYYY-MM-DD` と `YYYY-MM-DD HH:MM:SS` だけ**（`T` 区切り・末尾の `Z`・小数の秒も可。時差付きは落とす） |
-| `TrimStrings` で全部の入力の空白を落とす | **検査する値だけ**落とす。`req.input()` は落とさない                |
-| `nullable` で飛ばした値はそのまま残る    | **空文字が入る**                                                    |
-| `alpha` 系は空文字を通す                 | **落とす**（`alpha` / `alpha_num` / `alpha_dash`）                  |
-| 落ちると例外 → リダイレクトか JSON       | 422。JSON を求めた相手には JSON で返す                              |
-| `old('title')`                           | `req.session().old("title")`                                        |
-| メッセージは言語ファイルで変える         | **日本語で固定。** 変えるなら `ValidationErrors` を自分で組み立てる |
-| 重なりは `unique:` で止める              | 表の `unique` で止め、`is_unique_violation` で見分ける              |
+| Laravel                                  | bengara                                                              |
+|------------------------------------------|----------------------------------------------------------------------|
+| 落ちると前の画面に戻す（`$errors`）      | **422 を返す。** JSON を求めた相手には JSON                          |
+| 規則は配列でも文字列でも書ける           | **文字列だけ**（`"required\|max:255"`）                              |
+| 規則の書き間違いは実行して分かる         | `rules!` で書けば**コンパイルが止まる**                              |
+| FormRequest のクラス                     | トレイト `FormRequest` と `const RULES`。`req.validate_as()?` で読む |
+| メッセージは言語ファイルで変える         | **日本語で固定**                                                     |
+| `TrimStrings` で全部の入力の空白を落とす | **検査する値だけ**落とす。`req.input()` は落とさない                 |
+| `nullable` で飛ばした値はそのまま        | **空文字が入る**                                                     |
+| `alpha` 系は空文字を通す                 | **落とす**                                                           |
+| `date` はいろいろな形を通す              | **`YYYY-MM-DD` と `YYYY-MM-DD HH:MM(:SS)` だけ**。時差付きは落とす   |
+| 重なりは `unique:` 規則で止める          | 表の `unique` で止め、`is_unique_violation` で見分ける               |
 
 くわしくは [validation.md](validation.md) にあります。
 
 ## セッションと CSRF
 
-| Laravel                                                      | bengara                                                               |
-|--------------------------------------------------------------|-----------------------------------------------------------------------|
-| `session(['k' => 'v'])`                                      | `req.session().put("k", "v")`                                         |
-| `session()->flash('k', 'v')`                                 | `req.session().flash("k", "v")`                                       |
-| 初めて来た人にもトークンを配る                               | **`req.csrf_token()` を呼んだときだけ**作る                           |
-| Cookie は暗号化される                                        | **署名だけ。** 中身はサーバー側に置く                                 |
-| ログアウトのあと新しいセッションを配る                       | **Cookie を消す。** 空のセッションは作らない                          |
-| `@csrf` が隠しフィールドを出す                               | `req.csrf_token()` を自分で埋める                                     |
-| `_token` をクエリ文字列からも読む                            | **本文だけ**から読む（`X-CSRF-TOKEN` ヘッダーは同じく読む）           |
-| `VerifyCsrfToken::$except`                                   | `except("/webhook")`。ルート名で外す `except_route("api.*")` を勧める |
-| リクエストを 1 本ずつにするのは `block()` を付けたルートだけ | **同じセッションのリクエストはいつも 1 本ずつ**                       |
+CSRF は、別のサイトからの なりすまし送信のことです。
 
-`__` で始まる鍵は内部用です。自分の値には使わないでください。
-くわしくは [session.md](session.md) にあります。
+| Laravel                                   | bengara                                                           |
+|-------------------------------------------|-------------------------------------------------------------------|
+| 初めて来た人にもトークンを配る            | **`req.csrf_token()` を呼んだときだけ**作る                       |
+| Cookie は暗号化される                     | **署名だけ。** 中身はサーバー側に置く                             |
+| ログアウトのあと新しいセッションを配る    | **Cookie を消す。** 空のセッションは作らない                      |
+| `_token` をクエリ文字列からも読む         | **本文だけ**から読む（`X-CSRF-TOKEN` ヘッダーも読む）             |
+| `VerifyCsrfToken::$except`                | `except("/webhook")`。ルート名の `except_route("api.*")` を勧める |
+| 1 本ずつにするのは `block()` のルートだけ | **同じセッションのリクエストはいつも 1 本ずつ**                   |
 
-## ミドルウェア・エラー・回数の制限
+- `__` で始まるセッションの鍵は内部用です。自分の値には使わないでください。
+- くわしくは [session.md](session.md) にあります。
 
-| Laravel                                 | bengara                                                 |
-|-----------------------------------------|---------------------------------------------------------|
-| `bootstrap/app.php` の `withExceptions` | `with_exceptions(\|e\| e.render(...))`                  |
-| `throttle:60,1`                         | `Throttle::from_spec("60,1")?` を `alias` に登録する    |
-| 制限はキャッシュで共有される            | **プロセスごとに数える**（2 プロセスなら上限は約 2 倍） |
-| 数える単位                              | **相手とルート名の組**。名前が無ければ登録したパス      |
-| `TrustProxies` ミドルウェア             | 環境変数 `TRUSTED_PROXIES`。範囲指定（CIDR）は書けない  |
+## ミドルウェアと回数の制限
+
+| Laravel                           | bengara                                                    |
+|-----------------------------------|------------------------------------------------------------|
+| `throttle:60,1`                   | `Throttle::from_spec("60,1")?` を `alias` に登録する       |
+| 制限はキャッシュで共有される      | **プロセスごとに数える**（2 プロセスなら上限は約 2 倍）    |
+| 名前の無い `throttle` は 1 つの枠 | **ルートごとに別の枠**                                     |
+| `TrustProxies` ミドルウェア       | 環境変数 `TRUSTED_PROXIES`。範囲（`10.0.0.0/8`）は書けない |
 
 くわしくは [middleware.md](middleware.md) にあります。
 
 ## データベース
 
-| Laravel                                            | bengara                                                  |
-|----------------------------------------------------|----------------------------------------------------------|
-| `DB::table('posts')->where('status', 'published')` | `DB::table("posts").where_("status", "published")`       |
-| `->where('views', '>', 100)`                       | `.where_op("views", ">", 100)`                           |
-| `->where(function ($q) {...})`                     | `.where_group(\|q\| ...)`                                |
-| `->orderBy()` に式を書ける                         | **列名だけ。** 式は `order_by_raw`                       |
-| `->limit(1)->update([...])`                        | **エラー。** 黙って全件に当てないため                    |
-| `->groupBy()` ＋ `->count()`                       | **グループの数**を返す                                   |
-| `->increment('views')`                             | `.increment("views", 1)`（量は必ず書く）                 |
-| `->paginate(15)` が `?page=` を見る                | `.paginate(15, req.page())`（**引数で渡す**）            |
-| `->get()` が Collection を返す                     | `.get().await?` が `Vec<Row>` を返す                     |
-| `$row->title`                                      | `row.get::<String>("title")?`                            |
-| `DB::transaction(fn () => ...)`                    | `let tx = DB::begin().await?;` … `tx.commit().await?;`   |
-| 日時は `Carbon`（タイムゾーン付き）                | `bengara::Carbon`。**UTC だけ**。DB には文字列で入る     |
-| `addMonth()` は月末を超えると繰り上がる            | `add_months(1)` は**月末で止まる**（1/31 → 2/28）        |
-| `diffInDays()`                                     | `diff_in_days(&other)`。**符号付きの整数**               |
-| `$date->format('Y/m/d')`                           | **無い。** `to_date_string()` などの決まった形だけ       |
-| PostgreSQL の `timestamp` 列                       | **`text` 列**になる（日時は文字列のため）                |
+| Laravel                                      | bengara                                                      |
+|----------------------------------------------|--------------------------------------------------------------|
+| `->where('status', 'published')`             | `.where_("status", "published")`（`where` は Rust の予約語） |
+| `->where('views', '>', 100)`                 | `.where_op("views", ">", 100)`                               |
+| `->orderBy()` に式を書ける                   | **列名だけ。** 式は `order_by_raw`                           |
+| `->limit(1)->update([...])`                  | **エラー。** 黙って全件に当てないため                        |
+| `->groupBy()` ＋ `->count()`                 | **グループの数**を返す                                       |
+| `->increment('views')`                       | `.increment("views", 1)`。量は必ず書く                       |
+| `->paginate(15)` が `?page=` を見る          | `.paginate(15, req.page())`。**ページは引数で渡す**          |
+| `$row->title`                                | `row.get::<String>("title")?`                                |
+| `DB::transaction(fn () => ...)`              | `DB::begin().await?` で始めて `tx.commit().await?`           |
+| トランザクションの中の `truncate()`（MySQL） | **エラー。** `delete()` を使う                               |
+| `ilike` や `<=>` をどこでも書ける            | `ilike` は PostgreSQL だけ、`<=>` は MySQL だけ              |
+
+### 日時（Carbon）
+
+| Laravel                         | bengara                                              |
+|---------------------------------|------------------------------------------------------|
+| タイムゾーン付き                | **UTC だけ。** データベースには文字列で入る          |
+| `Carbon::parse()` は何でも読む  | **`YYYY-MM-DD` と `HH:MM(:SS)` だけ。** 桁はちょうど |
+| `addMonth()` は月末で繰り上がる | `add_months(1)` は**月末で止まる**（1/31 → 2/28）    |
+| `diffInDays()`                  | `diff_in_days(&other)` は**符号付き**                |
+| `format('Y/m/d')`               | 決まった形だけ（`to_date_string()` など）            |
+| PostgreSQL の `timestamp` 列    | **`text` 列**になる                                  |
 
 くわしくは [database.md](database.md) にあります。
 
 ## モデルとマイグレーション
 
-| Laravel                                   | bengara                                                   |
-|-------------------------------------------|-----------------------------------------------------------|
-| `class Post extends Model`                | `#[derive(Model)]` ＋ `#[model(table = "posts")]`         |
-| `Post::CREATED_AT` のような列名の定数      | `#[model(table = "posts", columns)]` で列ごとに `Post::TITLE` を作る。型付きで、条件に渡すと値の型を確かめる |
-| 表の名前はクラス名から推測                | **書く。** 推測しない                                     |
-| 文字列の主キー（`$keyType = 'string'`）   | `derive` では作れない。`Model` を手で実装する             |
-| `$post->comments` で自動的に読む          | `comments()` メソッドを自分で書き、`.get().await?` で読む |
-| `with('comments')` でまとめ読み           | `where_in` で読み、`bengara::database::group_by` で束ねる |
-| `Post::create([...])`                     | 構造体を作って `post.save().await?`                       |
-| `save()` が 0 件の更新でも成功を返す      | **`Err` になる**                                          |
-| `save()` は変わった属性だけを書く         | **主キーと `created_at` 以外の全列を書き戻す**（下の注）  |
-| `DB::transaction` の中で `$model->save()` | `post.save_using(&tx).await?`                             |
-| `$casts` で型を変える                     | 構造体の宣言がそのまま型                                  |
-| `Post::factory()->count(3)->create()`     | `database/factories/` のただの関数                        |
-| `up()` / `down()`                         | 同じ。ただし**同期の関数**                                |
-| `$table->dropUnique(['email'])`           | `schema.drop_unique("users", &["email"])`                 |
+| Laravel                               | bengara                                                   |
+|---------------------------------------|-----------------------------------------------------------|
+| `class Post extends Model`            | `#[derive(Model)]` ＋ `#[model(table = "posts")]`         |
+| 表の名前はクラス名から推測            | **書く。** 推測しない                                     |
+| `$post->comments` で自動的に読む      | `comments()` メソッドを自分で書き、`.get().await?` で読む |
+| `with('comments')` でまとめ読み       | `where_in` で読み、`bengara::database::group_by` で束ねる |
+| `Post::create([...])`                 | 構造体を作って `post.save().await?`                       |
+| `save()` は変わった属性だけを書く     | **主キーと `created_at` 以外の全列を書き戻す**            |
+| `save()` は 0 件の更新でも成功        | **`Err` になる**                                          |
+| トランザクションの中の `save()`       | `post.save_using(&tx).await?`                             |
+| `Post::factory()->count(3)->create()` | `database/factories/` にただの関数を書く                  |
+| `up()` / `down()`                     | 同じ。ただし**同期の関数**                                |
 
-**`save()` の書き戻しに気をつけてください。** 読んだ後に別の場所で増えた列（`views` など）は、古い値に戻ります。
-変える列だけを書くなら `save_only(&["title"])` かクエリビルダを使います（[models.md](models.md)）。
+**`save()` は全列を書き戻します。** 読んだ後に別の場所で増えた列（`views` など）は、古い値に戻ります。
+変える列だけを書くなら `save_only(&["title"])` を使います（[models.md](models.md)）。
 
 ## 認証と認可
 
-| Laravel                               | bengara                                                                    |
-|---------------------------------------|----------------------------------------------------------------------------|
-| `Hash::make($password)`（bcrypt）     | `Hash::make(password)`（既定は PBKDF2-HMAC-SHA256）                        |
-| `HASH_DRIVER=argon2id`                | 同じ。機能フラグ `argon2` が要る。`$argon2id$` をそのまま照合できる        |
-| `HASH_DRIVER=argon` / `bcrypt`        | 無い。Argon2i と bcrypt（`$2y$`）の値は照合できない                        |
-| 非同期の中でも `Hash::make`           | `Hash::make_async` / `Hash::check_async` を使う                            |
-| `Auth::attempt([...])`                | `req.auth().attempt::<User>("email", email, password).await?`              |
-| `Auth::user()`                        | `req.auth().user::<User>().await?`。`req` から読む                         |
-| `Auth::logout()`                      | `req.auth().logout()?`（いまのセッションだけ）                             |
-| `Auth::logoutOtherDevices($password)` | `req.auth().logout_other_devices_async().await?`。パスワードの確認は自分で |
-| `auth` ミドルウェア                   | `Authenticate::new()` を `alias("auth", ..)` で登録する                    |
-| `redirect()->intended('/')`           | `req.session().intended()` を読んで、自分で転送する                        |
-| `class User extends Authenticatable`  | `#[derive(Model)]` ＋ `impl Authenticatable`                               |
-| `$this->authorize('update', $post)`   | `authorize(PostPolicy::update(&user, &post))?`（ただの関数）               |
-| `encrypt()` / `decrypt()`             | 同じ名前。機能フラグ `encryption` が要る                                   |
-| `Password::sendResetLink()`           | `PasswordReset::create()` ＋ `link()`。送信は自分で書く                    |
-| `APP_KEY` は base64 の 32 バイト      | **64 文字以上**の文字列                                                    |
+| Laravel                               | bengara                                                             |
+|---------------------------------------|---------------------------------------------------------------------|
+| `Hash::make()` の既定は bcrypt        | 既定は PBKDF2。`HASH_DRIVER=argon2id` も使える（フラグ `argon2`）   |
+| bcrypt（`$2y$`）の値で照合する        | **照合できない。** Argon2id（`$argon2id$`）の値は照合できる         |
+| 非同期の中でも `Hash::make`           | `Hash::make_async` / `Hash::check_async` を使う                     |
+| `Auth::user()`                        | `req.auth().user::<User>().await?`。**`req` から読む**              |
+| `Auth::logoutOtherDevices($password)` | `req.auth().logout_other_devices_async()`。パスワードの確認は自分で |
+| `redirect()->intended('/')`           | `req.session().intended()` を読んで、自分で転送する                 |
+| `$this->authorize('update', $post)`   | `authorize(PostPolicy::update(&user, &post))?`（ただの関数）        |
+| `encrypt()` / `decrypt()`             | 同じ名前。機能フラグ `encryption` が要る                            |
+| `Password::sendResetLink()`           | `PasswordReset::create()` ＋ `link()`。送信は自分で書く             |
+| `APP_KEY` は base64 の 32 バイト      | **64 文字以上**の文字列                                             |
 
 くわしくは [authentication.md](authentication.md) と [authorization.md](authorization.md) にあります。
 
 ## テスト
 
-| Laravel                       | bengara                                     |
-|-------------------------------|---------------------------------------------|
-| `php artisan test`            | `cargo test`                                |
-| `$this->get('/')->assertOk()` | `get("/").await.assert_ok()`                |
-| トレイトを `use` する         | `#[bengara::test]` を付けるだけ             |
-| `RefreshDatabase`             | `let db = refresh_database().await;`        |
-| `$this->seed()`               | `seed_database(&db).await;`                 |
-| `$response->json()`           | `res.json()`。**JSON でない本文はパニック** |
+| Laravel                  | bengara                                              |
+|--------------------------|------------------------------------------------------|
+| `php artisan test`       | `cargo test`                                         |
+| トレイトを `use` する    | `#[bengara::test]` を付けるだけ                      |
+| `RefreshDatabase`        | `let db = refresh_database().await;`                 |
+| `$response->json()`      | `res.json()`。**JSON でない本文はパニック**          |
+| `phpunit.xml` の `<env>` | `#[bengara::test]` が `APP_ENV=testing` などを入れる |
 
 くわしくは [testing.md](testing.md) にあります。
 
-## キャッシュ・ファイル
+## キャッシュ・ファイル・キュー・イベント
 
-| Laravel                                 | bengara                                                                                                |
-|-----------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `Cache::remember('k', 60, fn() => ...)` | `Cache::remember("k", 60, \|\| async { ... }).await?`                                                  |
-| `Cache::increment` が期限を引き継ぐ     | **引き継がない。** 期限なしになる                                                                      |
-| `Storage::append('a.log', '行')`        | 同じ名前。挟む改行は**どの OS でも `\n`**。挟まないなら `append_bytes`                                 |
-| `Storage::writeStream(..)`              | `Storage::disk(名前).write_stream(パス, req.body_stream()?)`。**最後まで受け取れたときだけ**置き換わる |
+| Laravel                                  | bengara                                                    |
+|------------------------------------------|------------------------------------------------------------|
+| `Cache::increment` は期限を引き継ぐ      | **引き継がない。** 期限なしになる                          |
+| `Storage::append` が挟む改行             | **どの OS でも `\n`**。挟まないなら `append_bytes`         |
+| `SendWelcome::dispatch()`                | `Queue::push("SendWelcome", &payload)`。ジョブは名前で呼ぶ |
+| ジョブの `public $timeout = 120;`        | `config/queue.rs` の `QueueConfig`。無ければ `--timeout`   |
+| `retry_after` は設定ファイル             | `queue:work --retry-after=`（既定 90 秒）                  |
+| イベントクラス ＋ `EventServiceProvider` | 名前は文字列。登録は `bootstrap/app.rs` の `with_events`   |
+| `->everyMinute()`                        | `Every::Minute` などの列挙                                 |
 
-## キュー・定期処理・イベント
+くわしくは [cache.md](cache.md) / [storage.md](storage.md) / [queue.md](queue.md) / [events.md](events.md) にあります。
 
-| Laravel                                    | bengara                                                                                      |
-|--------------------------------------------|----------------------------------------------------------------------------------------------|
-| `SendWelcome::dispatch()`                  | `app/Jobs/SendWelcome.rs` の関数 ＋ `Queue::push("SendWelcome", &payload)`                   |
-| `->onQueue()` / `->delay()`                | `Queue::push_on` / `Queue::later` / `Queue::later_on`                                        |
-| ジョブのプロパティで型付きの値を受け取る   | `handle(Json(payload): Json<Payload>)`。文字列のままの `handle(payload: String)` も書ける      |
-| `retry_after` を設定ファイルに書く         | `queue:work --retry-after=`（既定 90 秒）                                                    |
-| ジョブの `public $timeout = 120;`          | `config/queue.rs` の `QueueConfig::default().timeout("ジョブ名", 120)`。無ければ `--timeout` |
-| `retry_after` を一番長いジョブより長くする | **要らない。** 打ち切りの時間が長いジョブは、予約を延ばす                                    |
-| 時間切れでワーカーごと落とす               | **そのジョブだけ失敗にする。** ワーカーは次へ進む                                            |
-| `->everyMinute()`                          | `Every::Minute` などの列挙                                                                   |
-| イベントクラス ＋ `EventServiceProvider`   | 名前は文字列。登録は `bootstrap/app.rs` の `with_events`                                     |
+## メール・外部コマンド・多言語
 
-## メール・外部コマンド・多言語・自作コマンド
+| Laravel                                     | bengara                                                         |
+|---------------------------------------------|-----------------------------------------------------------------|
+| `MAIL_ENCRYPTION=null` で暗号化しない       | `none` か `null`。**空にすると `starttls`**                     |
+| `MAIL_SCHEME=smtp` は STARTTLS をあれば使う | **STARTTLS を必ず求める**                                       |
+| `Process::run('ls -la')`                    | `Process::run(["ls", "-la"])`。**シェルを通さない**             |
+| `App::setLocale()`                          | `Lang::set` は**プロセス全体**。リクエストごとなら `Lang::with` |
+| 言語ファイルは PHP の配列                   | `resources/lang/<言語>.toml`。**ビルド時に読む**                |
+| `$signature` でコマンド名を決める           | **ファイル名**から決まる。名前に `:` は入れられない             |
 
-| Laravel                                        | bengara                                                                                    |
-|------------------------------------------------|--------------------------------------------------------------------------------------------|
-| `Mail::to(...)->send(new WelcomeMail)`         | `Mail::to(..).subject(..).text(..).send().await?`                                          |
-| 知らない `MAIL_MAILER` は例外                  | 送るときにエラー（`log` には落とさない）                                                   |
-| `MAIL_ENCRYPTION=null`                         | `none` か `null`。**空にすると `starttls`**                                                |
-| `Process::run('ls -la')`                       | `Process::run(["ls", "-la"]).await?`。**シェルを通さない**（[processes.md](processes.md)） |
-| `Process::timeout(120)->run(..)`（既定 60 秒） | 同じ（既定 60 秒）。打ち切ると**子プロセスを止める**。待つ側がやめたときも同じ             |
-| `__('messages.welcome')`                       | 同じ（`__`）。`:name` の差し替えは `__with`                                                |
-| `App::setLocale()`                             | `Lang::set`（プロセス全体）。リクエストごとなら `Lang::with`                               |
-| 言語ファイルは PHP の配列                      | `resources/lang/<言語>.toml`。**ビルド時に読む**                                           |
-| `make:command` ＋ `$signature`                 | `app/Console/Commands/*.rs` に `DESCRIPTION` と `handle`。名前はファイル名から             |
+くわしくは [mail.md](mail.md) / [processes.md](processes.md) / [localization.md](localization.md) / [console-commands.md](console-commands.md) にあります。
 
 ## WebSocket と配信
 
-| Laravel                                                         | bengara                                                              |
-|-----------------------------------------------------------------|----------------------------------------------------------------------|
-| WebSocket は Reverb（別のプロセス）か Pusher などの外部サービス | **本体が受ける。** `Route::get` ＋ `req.websocket()?.on_upgrade(..)` |
-| `routes/channels.php` でチャンネルの認可を書く                  | 切り替える前に確かめ、`socket.join` で入れる                         |
-| `broadcast(new OrderShipped($order))`（イベントのクラス）       | `Broadcast::publish("orders.1", 文字).await?`                        |
-| `BROADCAST_CONNECTION`（`reverb` / `pusher` / `log` など）      | 同じ名前。値は `memory` / `database`。知らない名前は送るときにエラー |
-| `ShouldBroadcast` でキューから送る                              | `publish` は直接送る。別のプロセスから送るなら `database`            |
+| Laravel                                      | bengara                                              |
+|----------------------------------------------|------------------------------------------------------|
+| Reverb（別のプロセス）や Pusher を使う       | **本体が受ける。** `req.websocket()?.on_upgrade(..)` |
+| `routes/channels.php` でチャンネルを認可する | 切り替える前に確かめ、`socket.join` で入れる         |
+| `broadcast(new OrderShipped($order))`        | `Broadcast::publish("orders.1", 文字).await?`        |
+| `ShouldBroadcast` でキューから送る           | 直接送る。別のプロセスから送るなら `database` にする |
 
-やり取りの形はアプリが決めます。くわしくは [websocket.md](websocket.md) にあります。
-
-## パスを返す関数
-
-| Laravel                                            | bengara                                                      |
-|----------------------------------------------------|--------------------------------------------------------------|
-| `app_path()` は `app/` を指す                      | **基準ディレクトリを指す。** `app_path("app/Models")` と書く |
-| `base_path()` / `public_path()` / `storage_path()` | 同じ意味                                                     |
-
-`app_path()` は名前だけ合わせています。移したコードで取り違えやすいところです。
+くわしくは [websocket.md](websocket.md) にあります。
 
 ## 本番で動かす
 
 | Laravel                                 | bengara                                                     |
 |-----------------------------------------|-------------------------------------------------------------|
 | `public/` を Web サーバーの公開先にする | 置くのは実行ファイル・`.env`・書き込める `storage/` の 3 つ |
-| `composer install --no-dev`             | 要らない。実行ファイル 1 つ                                 |
-| `storage/` を手で作る                   | `./myapp storage:init`（**起動時には作らない**）            |
-| `php artisan about`                     | 同じ名前。**`APP_KEY` の値は出さない**                      |
-| php-fpm のプロセス管理                  | 自分で 2 プロセス起動し、前段で振り分ける                   |
-| `migrate` の同時実行                    | **後から来たほうが止まる**                                  |
+| `composer install --no-dev`             | 要らない                                                    |
+| `storage/` を手で作る                   | `./myapp storage:init` で作る（**起動時には作らない**）     |
+| `storage:link`                          | 要らない。`/storage/...` は本体が配信する                   |
+| php-fpm がプロセスを管理する            | 自分でプロセスを起動し、前段で振り分ける                    |
 
 くわしくは [deployment.md](deployment.md) にあります。
 
@@ -310,5 +269,4 @@ PHP の言語や実行の形に結びついた機能は作りません。代わ�
 | マジックメソッド（`__get` / `__call`） | 読み込みはいつも明示する                      |
 | 緩い型比較（`==` の暗黙の変換）        | Rust の型を使う                               |
 
-借りられるものは、**Laravel と同じ名前のまま中身を Rust の形で作ります。**
-自動検出・型で引く設定・`prelude` の関数がその例です。理由は [decisions.md](decisions.md) にあります。
+借りられるものは、**Laravel と同じ名前のまま中身を Rust の形で作ります。** 理由は [decisions.md](decisions.md) にあります。

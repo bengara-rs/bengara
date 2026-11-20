@@ -36,6 +36,16 @@ use crate::error::Error;
 /// 読むのが続いたとき、送信の列から 1 通書くまでの回数。
 const READ_BURST: u32 = 16;
 
+/// ソケットを閉じた後、アプリのタスクが終わるのを待つ長さ。
+///
+/// 閉じた後の `recv` は `None` を返すので、ふつうはすぐ終わります。
+/// `recv` を呼ばずに回り続けるタスクは、待っても終わりません。
+/// 過ぎたら警告を出して止めます（`abort`）。止めないと接続ごとに残り続けます。
+#[cfg(not(test))]
+const APP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const APP_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// 読み込みの入れ物の大きさ。tungstenite の既定（128 KiB）は先に確保されるので、
 /// 1 万本つなぐと 1 GiB を超えます。足りなければ伸びるので小さくしておきます。
 const READ_BUFFER: usize = 8 * 1024;
@@ -116,11 +126,29 @@ pub(super) async fn serve<S>(
     );
 
     // ソケットは閉じたが、アプリのタスクがまだ動いている。`recv` は None を返すので
-    // ふつうはすぐ終わる。パニックを見落とさないように最後まで待つ。
+    // ふつうはすぐ終わる。パニックを見落とさないように待つ。
+    // 猶予を過ぎても終わらなければ止める（`recv` を見ずに回り続けるタスクが残らないように）。
     if let Some(app) = app {
-        if let Err(e) = app.await {
-            report_panic(id, e);
+        finish_app(id, app, APP_GRACE).await;
+    }
+}
+
+/// ソケットを閉じた後、アプリのタスクを `grace` まで待つ。過ぎたら警告して止める。
+async fn finish_app(id: super::ConnectionId, mut app: JoinHandle<()>, grace: std::time::Duration) {
+    let result = match tokio::time::timeout(grace, &mut app).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                "WebSocket {id} は閉じましたが、処理が {:.1} 秒たっても終わらないので止めます\
+                 （recv が None を返したら、クロージャから返ってください）",
+                grace.as_secs_f32()
+            );
+            app.abort();
+            app.await
         }
+    };
+    if let Err(e) = result {
+        report_panic(id, e);
     }
 }
 
@@ -235,8 +263,9 @@ where
                     }
                 }
                 Step::Close(code, reason) => {
-                    // `close` の前に積んだものは送り出す。列があふれた（1008）ときは送らない。
-                    let flow = if code == 1008 {
+                    // `close` の前に積んだものは送り出す。列があふれたときは送らない。
+                    // 番号では見分けない（アプリの `close(1008, ..)` は送ってから閉じる）。
+                    let flow = if self.conn.overflowed() {
                         Flow::Continue
                     } else {
                         self.drain_queue().await
@@ -465,8 +494,11 @@ fn shared_text(text: std::sync::Arc<String>) -> Utf8Bytes {
     match std::sync::Arc::try_unwrap(text) {
         Ok(owned) => owned.into(),
         Err(shared) => {
-            // `String` なので必ず UTF-8。確かめは中身をなめるだけで、写さない。
-            Utf8Bytes::try_from(Bytes::from_owner(SharedText(shared))).unwrap_or_default()
+            let bytes = Bytes::from_owner(SharedText(shared));
+            // SAFETY: 中身は `Arc<String>` の `as_bytes()` そのもの。`String` は
+            // 必ず UTF-8 で、`Arc` の中は書き換えられない。`try_from` で確かめると、
+            // 配信のたびに接続の数だけ同じ中身をなめ直していました。
+            unsafe { Utf8Bytes::from_bytes_unchecked(bytes) }
         }
     }
 }
@@ -959,6 +991,71 @@ mod tests {
         assert_eq!(frame.reason.as_str(), "session revoked");
         let _ = client.next().await;
         finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn アプリが1008で閉じても先に積んだものは送る() {
+        // 以前は番号 1008 を「列があふれた」と見なして、積んだものを捨てていた。
+        let (mut client, _state, task) = pair(|mut socket| async move {
+            socket.send_text("last").unwrap();
+            socket.close(1008, "policy").await;
+        })
+        .await;
+        assert_eq!(next(&mut client).await, Some(WsMessage::text("last")));
+        assert_eq!(close_code_of(&mut client).await, Some(1008));
+        let _ = client.next().await;
+        finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn チャンネルを1008で閉じても先に積んだものは送る() {
+        let channel = format!("test.io.disconnect1008.{}", std::process::id());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let joined = channel.clone();
+        let (mut client, _state, task) = pair(move |mut socket| async move {
+            socket.join(&joined);
+            let _ = ready_tx.send(());
+            while socket.recv().await.is_some() {}
+        })
+        .await;
+        ready_rx.await.unwrap();
+        registry::deliver(&channel, "before");
+        registry::close_channel(&channel, 1008, "kicked");
+        assert_eq!(next(&mut client).await, Some(WsMessage::text("before")));
+        assert_eq!(close_code_of(&mut client).await, Some(1008));
+        let _ = client.next().await;
+        finished(task).await;
+    }
+
+    #[tokio::test]
+    async fn 閉じた後も終わらないアプリのタスクは猶予の後に止める() {
+        // タスクが止められたら、持ち物が捨てられて知らせが届く。
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let (mut client, _state, task) = pair(move |_socket| async move {
+            let _guard = dropped_tx;
+            // recv を見ずに回り続ける。
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        })
+        .await;
+        client.close(None).await.unwrap();
+        let _ = client.next().await;
+        finished(task).await;
+        // 送り手が捨てられると Err が返る。
+        assert!(tokio::time::timeout(TEST_WAIT, dropped_rx)
+            .await
+            .expect("止められて持ち物が捨てられる")
+            .is_err());
+    }
+
+    #[test]
+    fn 共有の文字はそのまま渡す() {
+        let shared = Arc::new("配信の中身".to_string());
+        let _keep = shared.clone();
+        let text = shared_text(shared);
+        assert_eq!(text.as_str(), "配信の中身");
+        assert_eq!(shared_text(Arc::new("一人分".into())).as_str(), "一人分");
     }
 
     #[tokio::test]

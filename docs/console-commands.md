@@ -27,6 +27,10 @@ pub async fn handle(args: &[String]) -> Result<()> {
 
 `Err` を返すと、理由を出して終了コード 1 で終わります。
 
+- `handle` が返ったら、コマンドは終わります（Laravel と同じ）。
+- 待たずに始めた裏の処理（`tokio::spawn` や `spawn_blocking`）は、最大 1 秒だけ待ってから打ち切ります。
+  最後まで済ませたい処理は、`handle` の中で `.await` してください。
+
 ## 動かす
 
 ```sh
@@ -92,7 +96,7 @@ pub async fn handle(args: &[String]) -> Result<()> {
 }
 ```
 
-知らない指定も自分で断ってください。フレームワークのコマンドのような指定の確かめは掛かりません。
+知らない指定も自分で断ってください。フレームワークのコマンドと違い、指定の確かめは掛かりません。
 
 ## 中でできること
 
@@ -117,8 +121,6 @@ pub async fn handle(_args: &[String]) -> Result<()> {
 
 - 画面への出力は `println!` を使います。
 - 決まった時刻に動かす処理は、[scheduling.md](scheduling.md) の定期処理に書きます。
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

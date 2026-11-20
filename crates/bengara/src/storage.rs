@@ -457,12 +457,18 @@ impl Storage {
 
     /// あるか。
     ///
-    /// 問い合わせが少ないので、裏のスレッド（`spawn_blocking`）を経由しません。
-    /// 往復のほうが調べるより高く付きます。
+    /// ほかの関数と同じく、裏のスレッド（`spawn_blocking`）で調べます。
+    /// 置き場所の確かめ（`canonicalize`）と `metadata` は、遅いディスクや
+    /// ネットワークのドライブでは止まることがあります。async のスレッドで
+    /// 直に呼ぶと、その間ほかのリクエストが進みませんでした。
     pub async fn has(&self, path: &str) -> Result<bool> {
         let full = self.file_path(path)?;
-        self.jail().check(&full, true)?;
-        Ok(full.is_file())
+        let jail = self.jail();
+        crate::support::blocking(move || {
+            jail.check(&full, true)?;
+            Ok(full.is_file())
+        })
+        .await?
     }
 
     /// 消す。無くてもエラーにはしません。
@@ -483,15 +489,19 @@ impl Storage {
 
     /// バイト数。無ければ `None`。
     ///
-    /// `metadata()` 1 回だけなので、`has` と同じく裏のスレッドを経由しません。
+    /// `has` と同じく、裏のスレッドで調べます。
     pub async fn size(&self, path: &str) -> Result<Option<u64>> {
         let full = self.file_path(path)?;
-        self.jail().check(&full, true)?;
-        match std::fs::metadata(&full) {
-            Ok(meta) => Ok(Some(meta.len())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io(e)),
-        }
+        let jail = self.jail();
+        crate::support::blocking(move || {
+            jail.check(&full, true)?;
+            match std::fs::metadata(&full) {
+                Ok(meta) => Ok(Some(meta.len())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(Error::Io(e)),
+            }
+        })
+        .await?
     }
 
     /// その下にあるファイルの一覧（置き場所からの相対パス）。

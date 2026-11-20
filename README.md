@@ -22,11 +22,23 @@ Laravel と同じディレクトリ構成で、Web アプリを Rust で書け�
 
 ページごとの案内は [docs/README.md](docs/README.md) にあります。
 
-## 5 分で動かす
+## 動かす
+
+**crates.io には公開していません。** ソースを取得して、`Cargo.toml` から指します。
 
 ```sh
 cargo new myapp && cd myapp
-cargo add bengara --features sqlite
+```
+
+```toml
+# Cargo.toml に足す（ソースを myapp の隣に置いた例）
+[dependencies]
+bengara = { version = "0.1", features = ["sqlite"] }
+
+[patch.crates-io]
+bengara = { path = "../bengara/crates/bengara" }
+bengara-build = { path = "../bengara/crates/bengara-build" }
+bengara-macros = { path = "../bengara/crates/bengara-macros" }
 ```
 
 `src/main.rs` の中身を、次の 1 行だけにします。
@@ -40,8 +52,7 @@ cargo run -- init          # 骨組みを作る
 cargo artisan serve        # 起動する → http://127.0.0.1:8000
 ```
 
-- **crates.io には公開していません。** 取得したソースを `Cargo.toml` の `[patch.crates-io]` で指します。
-- データベースを使わないなら、`--features` は要りません。
+- データベースを使わないなら、`features` は要りません。
 - くわしい手順は [docs/getting-started.md](docs/getting-started.md) にあります。
 
 ## 書き味
@@ -81,11 +92,10 @@ impl HomeController {
 
 ## 知っておくこと
 
-- テンプレートは機能フラグ `view` で使えます（Jinja 系。Blade ではありません）。[docs/views.md](docs/views.md) にあります。
+- テンプレートは Jinja 系です。Blade ではありません（[docs/views.md](docs/views.md)）。
 - ファイルを生成する `make:*` コマンドはありません。ファイルは手で作ります。
+- Laravel と違う点は [docs/laravel-differences.md](docs/laravel-differences.md) にあります。
 - 手で動きを確かめているのは Windows 10 だけです。
-
-まだ無い機能は [docs/backlog.md](docs/backlog.md) にあります。
 
 ## ライセンス
 

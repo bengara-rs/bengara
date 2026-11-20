@@ -787,25 +787,45 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// 列が2つの値の間にある。
+    ///
+    /// 整数の主キーの列では、[`where_`](Self::where_) と同じく値を直します。
+    /// どちらかが整数として読めない文字列なら、必ず 0 件（`1 = 0`）です。
     pub fn where_between<C: ModelColumn<T>>(
         self,
         column: C,
         low: impl Bind<C::Accepts>,
         high: impl Bind<C::Accepts>,
     ) -> Self {
-        let (low, high) = (low.bind(), high.bind());
-        self.map(|q| q.where_between(column.column_name(), low, high))
+        let column = column.column_name();
+        match self.key_range(column, low.bind(), high.bind()) {
+            Some((low, high)) => self.map(|q| q.where_between(column, low, high)),
+            None => self.nothing(column, false),
+        }
     }
 
     /// 列が2つの値の間に無い。
+    ///
+    /// 整数の主キーの列では、[`where_`](Self::where_) と同じく値を直します。
+    /// どちらかが整数として読めない文字列なら、必ず当たる条件（`1 = 1`）です。
     pub fn where_not_between<C: ModelColumn<T>>(
         self,
         column: C,
         low: impl Bind<C::Accepts>,
         high: impl Bind<C::Accepts>,
     ) -> Self {
-        let (low, high) = (low.bind(), high.bind());
-        self.map(|q| q.where_not_between(column.column_name(), low, high))
+        let column = column.column_name();
+        match self.key_range(column, low.bind(), high.bind()) {
+            Some((low, high)) => self.map(|q| q.where_not_between(column, low, high)),
+            None => self.everything(column, false),
+        }
+    }
+
+    /// 範囲で比べるときの `key_condition`。どちらかが当たらない値なら `None`。
+    fn key_range(&self, column: &str, low: Value, high: Value) -> Option<(Value, Value)> {
+        Some((
+            self.key_condition(column, low)?,
+            self.key_condition(column, high)?,
+        ))
     }
 
     /// 列が形に当てはまる（`like`）。
@@ -1006,8 +1026,21 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// 条件に当てはまる行を更新する。
+    ///
+    /// **モデルに `updated_at` の列があれば、今の時刻を自動で足します**
+    /// （Laravel の `Post::where(...)->update([...])` と同じ）。
+    /// `values` に `updated_at` を渡したときは、渡した値を使います。
     pub async fn update(&self, values: &[(&str, Value)]) -> Result<u64> {
-        self.inner.update(values).await
+        // 空のときは足さない。`QueryBuilder::update` の「渡す列がありません」を活かす。
+        if values.is_empty()
+            || !T::COLUMNS.contains(&UPDATED_AT)
+            || values.iter().any(|(c, _)| is_updated_at(c))
+        {
+            return self.inner.update(values).await;
+        }
+        let mut values = values.to_vec();
+        values.push((UPDATED_AT, Value::from(crate::Carbon::now())));
+        self.inner.update(&values).await
     }
 
     /// 条件に当てはまる行を消す。
@@ -1022,6 +1055,17 @@ impl<T: Model> ModelQuery<T> {
         let data = data?;
         Ok(page.map_data(data))
     }
+}
+
+/// 更新した時刻の列。
+const UPDATED_AT: &str = "updated_at";
+
+/// 列の名前が `updated_at` か。前後の空白は見ません。
+///
+/// 表名付き（`posts.updated_at`）は見ません。書き込む列に表名は付けられず、
+/// `QueryBuilder::update` が断るためです。
+fn is_updated_at(column: &str) -> bool {
+    column.trim() == UPDATED_AT
 }
 
 /// 列の名前が、このモデルの主キーを指しているか。`posts.id` のような表名付きも見ます。
@@ -1530,6 +1574,38 @@ mod tests {
         );
         assert!(bindings.is_empty());
 
+        // 範囲も同じく直す。読めない値は between が 1 = 0、not between が 1 = 1。
+        // 以前は文字列のままで、PostgreSQL では `bigint` と `text` の比較で SQL エラーだった。
+        let (sql, bindings) = Post::query()
+            .where_between("id", "1", " 10 ")
+            .where_not_between("posts.id", "3", "4")
+            .to_sql();
+        assert_eq!(
+            sql,
+            "select * from \"posts\" where \"id\" between ? and ? and \"posts\".\"id\" not between ? and ?"
+        );
+        assert_eq!(
+            bindings,
+            vec![Value::Int(1), Value::Int(10), Value::Int(3), Value::Int(4)]
+        );
+        let (sql, bindings) = Post::query()
+            .where_between("id", "1", "abc")
+            .where_not_between("id", "x", "4")
+            .to_sql();
+        assert_eq!(sql, "select * from \"posts\" where 1 = 0 and 1 = 1");
+        assert!(bindings.is_empty());
+        // 主キー以外の列と文字列の主キーの範囲は、渡した値のまま。
+        let (_, bindings) = Post::query().where_between("title", "1", "abc").to_sql();
+        assert_eq!(
+            bindings,
+            vec![Value::Text("1".into()), Value::Text("abc".into())]
+        );
+        let (_, bindings) = Coded::query().where_between("code", "007", "a1").to_sql();
+        assert_eq!(
+            bindings,
+            vec![Value::Text("007".into()), Value::Text("a1".into())]
+        );
+
         // 主キー以外の列と、文字列の主キーは、渡した値のまま。
         let (_, bindings) = Post::query().where_in("title", &["1", "abc"]).to_sql();
         assert_eq!(
@@ -1759,6 +1835,55 @@ mod tests {
             sent.contains("insert into \"stamped\" (\"title\", \"created_at\", \"updated_at\")"),
             "{sent}"
         );
+    }
+
+    #[tokio::test]
+    async fn まとめて更新するとupdated_atを足す() {
+        // Laravel の `Post::where(...)->update([...])` は updated_at を自動で入れる。
+        let (found, tx) = spy().await;
+        Stamped::on(&tx)
+            .where_("id", 1)
+            .update(&[("title", Value::Text("x".into()))])
+            .await
+            .expect("更新できる");
+        let sent = joined(&found.tx);
+        assert!(
+            sent.contains("update \"stamped\" set \"title\" = ?, \"updated_at\" = ? where"),
+            "{sent}"
+        );
+        assert!(!sent.contains("created_at"), "{sent}");
+
+        // 渡したときは足さない（列が二重にならない）。
+        for column in ["updated_at", " updated_at "] {
+            let (found, tx) = spy().await;
+            Stamped::on(&tx)
+                .update(&[
+                    ("title", Value::Text("x".into())),
+                    (column, Value::Text("2020-01-01 00:00:00".into())),
+                ])
+                .await
+                .expect("更新できる");
+            let sent = joined(&found.tx);
+            assert_eq!(sent.matches("updated_at").count(), 1, "{sent}");
+        }
+
+        // updated_at の列が無いモデルには足さない。
+        let (found, tx) = spy().await;
+        Post::on(&tx)
+            .update(&[("title", Value::Text("x".into()))])
+            .await
+            .expect("更新できる");
+        let sent = joined(&found.tx);
+        assert!(sent.contains("set \"title\" = ?"), "{sent}");
+        assert!(!sent.contains("updated_at"), "{sent}");
+    }
+
+    #[test]
+    fn updated_atの列名は前後の空白を見ない() {
+        assert!(is_updated_at("updated_at"));
+        assert!(is_updated_at(" updated_at "));
+        assert!(!is_updated_at("updated_at_old"));
+        assert!(!is_updated_at("created_at"));
     }
 
     #[tokio::test]

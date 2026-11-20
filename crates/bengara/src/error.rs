@@ -125,40 +125,28 @@ impl From<&str> for Error {
 }
 
 /// ステータスコードの説明文。
+///
+/// 基本は `http` クレートの一覧（IANA の登録名）を使います。以前は手で並べた
+/// 一覧だけだったので、413 などが「413 Unknown」になっていました。
+///
+/// 次のものだけは上書きします。
+///
+/// | ステータス | 説明文 | 理由 |
+/// |---|---|---|
+/// | 413 | `Content Too Large` | RFC 9110 の名前。Symfony も同じ |
+/// | 419 | `Page Expired` | Laravel 独自（CSRF トークンの期限切れ） |
+/// | 422 | `Unprocessable Content` | RFC 9110 の名前。Symfony も同じ |
+///
+/// どちらの一覧にも無いもの（範囲外や未登録の番号）は `Unknown` です。
 pub(crate) fn reason_phrase(status: u16) -> &'static str {
     match status {
-        200 => "OK",
-        201 => "Created",
-        204 => "No Content",
-        301 => "Moved Permanently",
-        302 => "Found",
-        303 => "See Other",
-        304 => "Not Modified",
-        307 => "Temporary Redirect",
-        308 => "Permanent Redirect",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        402 => "Payment Required",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        406 => "Not Acceptable",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        410 => "Gone",
-        415 => "Unsupported Media Type",
+        413 => "Content Too Large",
         419 => "Page Expired",
         422 => "Unprocessable Content",
-        426 => "Upgrade Required",
-        428 => "Precondition Required",
-        429 => "Too Many Requests",
-        451 => "Unavailable For Legal Reasons",
-        500 => "Internal Server Error",
-        501 => "Not Implemented",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown",
+        _ => axum::http::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|code| code.canonical_reason())
+            .unwrap_or("Unknown"),
     }
 }
 
@@ -171,15 +159,24 @@ mod tests {
     fn よく使うステータスには説明文がある() {
         // `abort(409)` などが「HTTP 409 Unknown」にならないことを確かめる。
         for status in [
-            200, 201, 204, 301, 302, 303, 304, 307, 308, 400, 401, 402, 403, 404, 405, 406, 408,
-            409, 410, 415, 419, 422, 428, 429, 451, 500, 501, 502, 503, 504,
+            100, 101, 200, 201, 202, 204, 206, 301, 302, 303, 304, 307, 308, 400, 401, 402, 403,
+            404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 421,
+            422, 423, 424, 426, 428, 429, 431, 451, 500, 501, 502, 503, 504, 505, 507, 508, 511,
         ] {
             assert_ne!(reason_phrase(status), "Unknown", "{status}");
         }
         assert_eq!(reason_phrase(409), "Conflict");
         assert_eq!(reason_phrase(504), "Gateway Timeout");
+        // 以前は手で並べた一覧に無く「413 Unknown」になっていた。
+        assert_eq!(reason_phrase(413), "Content Too Large");
+        assert_eq!(reason_phrase(414), "URI Too Long");
+        assert_eq!(reason_phrase(431), "Request Header Fields Too Large");
+        // フレームワーク独自のものと、RFC 9110 の名前で上書きしたもの。
+        assert_eq!(reason_phrase(419), "Page Expired");
+        assert_eq!(reason_phrase(422), "Unprocessable Content");
         // 知らないものは Unknown のまま。
         assert_eq!(reason_phrase(599), "Unknown");
+        assert_eq!(reason_phrase(1000), "Unknown");
     }
 
     #[test]

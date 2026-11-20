@@ -311,8 +311,9 @@ fn convert_value(row: &PgRow, index: usize, name: &str) -> Result<Value> {
     if raw.is_null() {
         return Ok(Value::Null);
     }
-    let type_name = raw.type_info().name().to_string();
-    match type_name.as_str() {
+    // 型の名前は借りて比べます。セルごとに `String` を作らないためです。
+    let info = raw.type_info();
+    match info.name() {
         "BOOL" => read::<bool>(row, index, name).map(Value::Bool),
         // 整数は幅ごとに型が違います。`i64` ひとつでは照合が通りません。
         "INT2" => read::<i16>(row, index, name).map(|v| Value::Int(i64::from(v))),
@@ -332,7 +333,7 @@ fn convert_value(row: &PgRow, index: usize, name: &str) -> Result<Value> {
         // （ビルダーの `*_raw` は PostgreSQL で `$` を断ります）。
         // 詳しくは [`bind`] の説明にあります。
         "NUMERIC" => read::<sqlx::types::BigDecimal>(row, index, name)
-            .map(|v| Value::Text(super::decimal::normalize(&v.to_string()))),
+            .map(|v| Value::Text(numeric_string(&v))),
         // `CHAR` は `char(n)`（bpchar）です。1バイトの内部型は `"CHAR"` という
         // 別の名前になるので、ここには来ません。
         "TEXT" | "VARCHAR" | "CHAR" | "NAME" | "UNKNOWN" => {
@@ -353,6 +354,15 @@ fn convert_value(row: &PgRow, index: usize, name: &str) -> Result<Value> {
         }
         other => Err(unsupported_column(name, other)),
     }
+}
+
+/// `numeric` の値を文字列にする。
+///
+/// `to_string()` は小さな数や大きな数を指数の形（`1E-7`）で書きます。
+/// `decimal::normalize` は指数の形に触らないので、そのまま利用者に届いていました。
+/// `to_plain_string()` は必ず小数点の形（`0.0000001`）で書きます。
+fn numeric_string(value: &sqlx::types::BigDecimal) -> String {
+    super::decimal::normalize(&value.to_plain_string())
 }
 
 /// 型が分かっている値を取り出す。
@@ -488,6 +498,28 @@ mod tests {
         assert_eq!(row.value("blob"), Some(&Value::Bytes(vec![1, 2, 3])));
 
         assert!(db.table_names().await.unwrap().contains(&table.to_string()));
+    }
+
+    #[test]
+    fn numeric_は指数の形にせず小数点の形で返す() {
+        use std::str::FromStr;
+        let read = |text: &str| {
+            numeric_string(&sqlx::types::BigDecimal::from_str(text).expect("数として読める"))
+        };
+        // 以前は `to_string()` だったので、`1.0E-7` のような指数の形が素通りしていた。
+        assert_eq!(read("0.00000010"), "0.0000001");
+        assert_eq!(read("1E-10"), "0.0000000001");
+        assert_eq!(read("12.5000"), "12.5");
+        assert_eq!(read("-0.500"), "-0.5");
+        assert_eq!(read("1E+3"), "1000");
+        assert_eq!(
+            read("123456789012345678901234567890.12"),
+            "123456789012345678901234567890.12"
+        );
+        for text in ["0.00000010", "1E-10", "1E+3"] {
+            let value = read(text);
+            assert!(!value.contains(['e', 'E']), "{text} -> {value}");
+        }
     }
 
     #[test]

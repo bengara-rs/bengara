@@ -48,7 +48,7 @@ pub fn down(schema: &mut Schema) {
 | `migrate:fresh`    | **表を全部消して**から流し直す         |
 | `db:seed`          | シーダーだけ動かす                     |
 | `db:wipe`          | 表を全部消す                           |
-| `migrate:unlock`   | 途中で落ちて残った札（下で説明）を外す |
+| `migrate:unlock`   | 途中で落ちて残った錠（下で説明）を外す |
 
 バッチは、1 回の `migrate` で流したひとまとまりです。
 
@@ -58,12 +58,11 @@ pub fn down(schema: &mut Schema) {
 |-------------------|------------------------------------------|-------------------------------------------------|
 | `--database=名前` | 使う接続を選ぶ（既定は `DB_CONNECTION`） | すべて                                          |
 | `--seed`          | 流したあとにシーダーも動かす             | `migrate` / `migrate:refresh` / `migrate:fresh` |
-| `--class=名前`    | 動かすシーダーを 1 本に絞る              | `--seed` が使えるものと `db:seed`               |
+| `--class=名前`    | 動かすシーダーを 1 本に絞る              | `--seed` と一緒か、`db:seed`                    |
 | `--step=数`       | 巻き戻すバッチの数（既定 1。0 も 1）     | `migrate:rollback`                              |
 | `--force`         | 本番で、中身が消えるコマンドを通す       | `migrate:status` と `migrate:unlock` 以外       |
 
 - 使えない指定や知らない指定を付けると、何もせずにエラーになります。
-- `--class` は、`db:seed` 以外では `--seed` と一緒に使います。
 - **シーダーは既定の接続にだけ流せます。** 別の接続に流すときは、`DB_CONNECTION` をその名前にします。
 
 ### 本番で止まるコマンド
@@ -82,22 +81,16 @@ pub fn down(schema: &mut Schema) {
 - **MySQL は例外です。** 表を変える文はその場で確定するので、失敗より前の文は残ります。
 - `migrate:rollback` は、戻すファイルが全部いまの実行ファイルにあるかを先に確かめます。無ければ何も戻しません。
 - 組み立てに誤りがあると、SQL を 1 本も流さずに止まります（下の「エラーと警告」）。
-- `migrate:fresh` と `db:wipe` は全部の表を消します。`migration_locks` 表だけは残します。
+- `migrate:status` は、ファイルごとに `実行済み` / `未実行` / `ファイルなし` を出します。`ファイルなし` は、記録にあるのに実行ファイルに無いものです。
 
-### 二重に流さない札
+### 二重に流さない錠
 
-表を変えるコマンドは、流す前に `migration_locks` 表に「札」を 1 枚取ります。
+表を変えるコマンドは、流す前に `migration_locks` 表で錠を取ります。
 同じコマンドが 2 つ同時に走るのを防ぐためです。
 
-- `migrate:status` と `migrate:unlock` 以外の 7 つが札を取ります。終われば、失敗しても返します。
-- 誰かが札を持っていると、「別のプロセスがマイグレーションを実行中です」のエラーで止まります。持ち主（ホスト名とプロセス番号）と時刻も出ます。
-- プロセスが強制終了されると札が残ります。本当に止まっているかを確かめてから、`migrate:unlock` で外します。
-
-### 状態を見る
-
-`migrate:status` は、ファイルごとに `実行済み` / `未実行` / `ファイルなし` とバッチの番号を出します。
-`ファイルなし` は、記録にはあるのに、いまの実行ファイルに無いものです。
-`migrate:status` と `migrate:unlock` は読むだけで、表を作りません。
+- 誰かが錠を持っていると、「別のプロセスがマイグレーションを実行中です」で止まります。持ち主（ホスト名とプロセス番号）と時刻も出ます。
+- プロセスが強制終了されると錠が残ります。本当に止まっているかを確かめてから、`migrate:unlock` で外します。
+- `migrate:fresh` と `db:wipe` は全部の表を消しますが、`migration_locks` 表だけは残します。
 
 ## 列の種類
 
@@ -125,8 +118,7 @@ pub fn down(schema: &mut Schema) {
 | `t.soft_deletes()`                        | `deleted_at`（日時、NULL 可）                 | 同左                          | 同左               |
 
 - `t.foreign_id(列)` は `t.id()` と型がそろうので、そのまま外部キーを張れます。
-- `t.float` と `t.double` は、どのドライバでも 8 バイトです（Laravel と違います）。4 バイトなら `t.raw_column(列, "float")`
-  です。
+- `t.float` と `t.double` は、どのドライバでも 8 バイトです（Laravel と違います）。4 バイトなら `t.raw_column(列, "float")` です。
 - **PostgreSQL では、日付・日時・JSON が `text` 列になります。** bengara は日時を文字列で渡すためです。
 
 ## 列に付ける指定
@@ -145,6 +137,7 @@ pub fn down(schema: &mut Schema) {
 
 - `t.id()` と `t.increments(..)` には `nullable` / `default` / `unique` が効きません。警告が出ます。
 - 列の `unique()` と表の `t.unique(&["列"])` は同じものです。両方書いても索引は 1 つです。
+- **PostgreSQL では、日時の列に `default_raw("current_timestamp")` を書かないでください。** 列が `text` なので、bengara の `YYYY-MM-DD HH:MM:SS` と違う形で入ります。日時は `timestamps()` と `save()` で入れます。
 
 ## 表に付ける指定
 
@@ -179,11 +172,9 @@ schema.create("comments", |t| {
 形は `{表}_{列を _ でつないだもの}_{index|unique|foreign}` です。
 
 - 例: `posts_status_index`・`users_email_unique`・`comments_post_id_foreign`
-- 外部キーの名前は、表を作るときも後から足すときも同じです。
 - 同じ名前が 2 つできるときや 63 バイトを超えるときは、末尾に 8 桁の 16 進を足します。
 - 表の名前の `.` と `-` は `_` にします（`main.posts` → `main_posts_status_index`）。
-- `unique()` が作るのは一意「索引」です。PostgreSQL の `on conflict (列)` は使えますが、`on conflict on constraint 名前`
-  には使えません。
+- `unique()` が作るのは一意「索引」です。PostgreSQL の `on conflict (列)` は使えますが、`on conflict on constraint 名前` には使えません。
 
 ## 表を変える
 
@@ -247,8 +238,7 @@ pub fn down(schema: &mut Schema) {
 名前が合わないときは、次のようにします。
 
 - 名前の末尾に 16 進が付いたもの: `drop_index_named` で名前を直に書きます。
-- SQL で `unique` と書いて作った制約: MySQL は `drop_index_named("users", "email")`（列の名前）です。PostgreSQL は
-  `{表}_{列}_key` を `raw` で `drop constraint` します。SQLite は表を作り直します。
+- SQL で `unique` と書いて作った制約: MySQL は `drop_index_named("users", "email")`（列の名前）です。PostgreSQL は `{表}_{列}_key` を `raw` で `drop constraint` します。SQLite は表を作り直します。
 - 無い索引を落とすと、SQLite と PostgreSQL は何もしません。MySQL はエラーです。
 
 ## エラーと警告
@@ -256,26 +246,22 @@ pub fn down(schema: &mut Schema) {
 エラーのときは、SQL を 1 本も流さずに止まります。
 警告のときは、ログに出して先へ進みます。
 
-| 書き方                                                                                | どうなるか                                         |
-|---------------------------------------------------------------------------------------|----------------------------------------------------|
-| `pub fn up` / `pub fn down` が無い                                                    | コンパイルエラー                                   |
-| `t.foreign(列)` に `.on(表名)` が無い                                                 | エラー                                             |
-| `schema.table(..)` の中で `t.id()` / `t.increments(..)` / 列の `.primary()`           | エラー                                             |
-| `schema.create(..)` で主キーの指定を 2 つ重ねる（例: `t.id()` と `t.primary(&[..])`） | エラー。複合主キーは `t.primary(&[..])` だけで書く |
-| `t.primary(&[..])` を 2 回呼ぶ                                                        | 警告。後の指定で置き換わる                         |
-| `schema.table(..)` の中の `t.primary(&[..])`                                          | 警告。何も足さない                                 |
-| SQLite で `schema.table(..)` の中の `t.foreign(..)`                                   | 警告。何も足さない                                 |
-| `schema.table(..)` で NULL 不可かつ既定値なしの列                                     | 警告。SQLite と PostgreSQL で失敗する              |
-| `t.id()` に `nullable()` / `default()` / `unique()`                                   | 警告。無視する                                     |
-| `on_delete` / `on_update` に一覧外の値                                                | 警告。SQL にはそのまま出る                         |
-| `default(f64::NAN)` など `NaN` や無限                                                 | 警告。その文は流すときに失敗する                   |
-| `default(Vec<u8>)`（バイト列の既定値）                                                | 警告。値は無視して `null` を書く                   |
+| 書き方                                                                      | どうなるか                            |
+|-----------------------------------------------------------------------------|---------------------------------------|
+| `t.foreign(列)` に `.on(表名)` が無い                                       | エラー                                |
+| `schema.table(..)` の中で `t.id()` / `t.increments(..)` / 列の `.primary()` | エラー                                |
+| 主キーの指定を 2 つ重ねる（例: `t.id()` と `t.primary(&[..])`）             | エラー                                |
+| `t.primary(&[..])` を 2 回呼ぶ                                              | 警告。後の指定で置き換わる            |
+| `schema.table(..)` の中の `t.primary(&[..])`                                | 警告。何も足さない                    |
+| SQLite で `schema.table(..)` の中の `t.foreign(..)`                         | 警告。何も足さない                    |
+| `schema.table(..)` で NULL 不可かつ既定値なしの列                           | 警告。SQLite と PostgreSQL で失敗する |
+| `t.id()` に `nullable()` / `default()` / `unique()`                         | 警告。無視する                        |
+| `on_delete` / `on_update` に一覧外の値                                      | 警告。SQL にはそのまま出る            |
+| `default(f64::NAN)` など `NaN` や無限                                       | 警告。その文は流すときに失敗する      |
+| `default(Vec<u8>)`（バイト列の既定値）                                      | 警告。値は無視して `null` を書く      |
 
-主キーの指定は、`t.id()` / `t.increments(..)`、列の `.primary()`、表の `t.primary(&[..])` の 3 種類です。
-2 つ以上を重ねるとエラーです（列の `.primary()` を 2 つ付けたときも同じ）。
-`t.primary(&[..])` を 2 回呼ぶのは同じ指定の上書きなので、警告だけです。
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
+- 主キーの指定は、`t.id()` / `t.increments(..)`、列の `.primary()`、表の `t.primary(&[..])` の 3 種類です。
+- 複合主キーは `t.primary(&[..])` だけで書きます。
 
 ## 関連
 

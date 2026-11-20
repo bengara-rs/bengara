@@ -60,6 +60,12 @@ pub(crate) struct Conn {
     limit: usize,
     /// 閉じる途中か、閉じたか。立った後は送れない。
     closed: AtomicBool,
+    /// 送信の列があふれたか。
+    ///
+    /// I/O のタスクは、これが立っていたら列を送らずに閉じます。番号（1008）で
+    /// 見分けていたころは、アプリの `close(1008, ..)` や
+    /// `Broadcast::disconnect(.., 1008, ..)` でも列を捨てていました。
+    overflowed: AtomicBool,
     /// 相手が送ってきた Close（番号と理由）。
     peer_close: OnceLock<(u16, String)>,
     /// I/O のタスクが終わったか。`WebSocket::close` が待つ。
@@ -87,6 +93,7 @@ impl Conn {
             queued: AtomicUsize::new(0),
             limit,
             closed: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
             peer_close: OnceLock::new(),
             done: watch::channel(false).0,
         });
@@ -120,6 +127,8 @@ impl Conn {
                 "WebSocket {} の送信の列があふれたので、1008 で閉じます",
                 self.id
             );
+            // 閉じる要求より先に立てる（I/O のタスクは要求を受けてから見る）。
+            self.overflowed.store(true, Ordering::Release);
             self.close(1008, "send queue full");
             return Err(SendError::QueueFull);
         }
@@ -151,6 +160,11 @@ impl Conn {
     /// 閉じる途中か、閉じたか。
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// 送信の列があふれて閉じるところか。
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
     }
 
     /// 閉じたことにする（I/O のタスクが終わったとき）。
@@ -541,6 +555,9 @@ mod tests {
             small_rx.ctrl.try_recv().ok(),
             Some((1008, "send queue full".to_string()))
         );
+        // 「あふれた」は番号とは別に伝える（I/O のタスクが列を捨てる合図）。
+        assert!(small.overflowed());
+        assert!(!big.overflowed());
         assert_eq!(small.queued(), 5, "あふれた分は数えない");
         assert!(matches!(big_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t.as_str() == "12345"));
         assert!(matches!(big_rx.out.try_recv(), Ok(Outgoing::Text(t)) if t.as_str() == "67890"));
@@ -553,6 +570,15 @@ mod tests {
 
         unregister(small.id());
         unregister(big.id());
+    }
+
+    #[test]
+    fn 番号1008で閉じてもあふれたことにはしない() {
+        // アプリの close(1008) や Broadcast::disconnect(.., 1008) は、積んだものを送ってから閉じる。
+        let (a, mut rx) = Conn::new(1024);
+        a.close(1008, "policy");
+        assert_eq!(rx.ctrl.try_recv().ok(), Some((1008, "policy".to_string())));
+        assert!(!a.overflowed());
     }
 
     #[test]

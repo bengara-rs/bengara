@@ -259,12 +259,29 @@ fn mine(query: QueryBuilder, reserved: &Reserved) -> QueryBuilder {
 }
 
 /// 自分の予約ではなくなっていたことを知らせる。
-fn warn_not_mine(id: i64) {
-    tracing::warn!(
-        "ジョブ #{id} は自分の予約ではなくなっていたので、何もしません（\
-         処理に retry_after より長くかかって、別のワーカーが取り直しました。\
-         --retry-after を長くしてください）"
-    );
+///
+/// `retried` は記録のやり直し（[`with_retries`] の 2 回目以降）かどうかです。
+/// やり直しで 0 件なら、**前回の記録が実は通っていた**ことがあります
+/// （返事だけが届かなかった）。そこで「`retry_after` より長くかかった」とは言いません。
+fn warn_not_mine(id: i64, retried: bool) {
+    tracing::warn!("{}", not_mine_message(id, retried));
+}
+
+/// [`warn_not_mine`] の文。
+fn not_mine_message(id: i64, retried: bool) -> String {
+    if retried {
+        format!(
+            "ジョブ #{id} の行は、やり直したときにはもう自分の予約ではありませんでした。\
+             前回の記録が通っていた可能性があります（返事だけが届かなかった）。\
+             別のワーカーが取り直した場合もあります"
+        )
+    } else {
+        format!(
+            "ジョブ #{id} は自分の予約ではなくなっていたので、何もしません（\
+             処理に retry_after より長くかかって、別のワーカーが取り直しました。\
+             --retry-after を長くしてください）"
+        )
+    }
 }
 
 /// 取り出した 1 件。
@@ -469,10 +486,12 @@ async fn give_up_stale(row: &Row, id: i64, reserved_at: &str, attempts: i64) -> 
 /// **自分が予約したままの行だけ**を消します。`id` だけで消すと、
 /// `retry_after` で取り直した別のワーカーが動かしている行を消してしまい、
 /// そのワーカーの失敗が `failed_jobs` にも残りません。
-async fn finish(reserved: &Reserved) -> Result<()> {
+///
+/// `retried` は記録のやり直しかどうか（[`warn_not_mine`] の文を選ぶため）。
+async fn finish(reserved: &Reserved, retried: bool) -> Result<()> {
     let affected = mine(DB::table(TABLE), reserved).delete().await?;
     if affected == 0 {
-        warn_not_mine(reserved.id);
+        warn_not_mine(reserved.id, retried);
     }
     Ok(())
 }
@@ -482,10 +501,10 @@ async fn finish(reserved: &Reserved) -> Result<()> {
 /// こちらも**自分が予約したままの行だけ**を触ります。`reserved_at` を
 /// 戻すだけだと、まだ動いている別のワーカーがいるのに 3 つ目のワーカーが
 /// 同じジョブを取れてしまいます。
-async fn fail(reserved: &Reserved, tries: u32, error: &str) -> Result<bool> {
+async fn fail(reserved: &Reserved, tries: u32, error: &str, retried: bool) -> Result<bool> {
     let attempts = reserved.attempts.saturating_add(1);
     if attempts >= i64::from(tries) {
-        give_up(reserved, error).await?;
+        give_up(reserved, error, retried).await?;
         return Ok(true);
     }
 
@@ -498,7 +517,7 @@ async fn fail(reserved: &Reserved, tries: u32, error: &str) -> Result<bool> {
         ])
         .await?;
     if affected == 0 {
-        warn_not_mine(reserved.id);
+        warn_not_mine(reserved.id, retried);
     }
     Ok(false)
 }
@@ -510,12 +529,12 @@ async fn fail(reserved: &Reserved, tries: u32, error: &str) -> Result<bool> {
 ///
 /// **先に消します。** 0 件なら自分の予約ではないので、
 /// `failed_jobs` にも入れません（別のワーカーの結果を踏まない）。
-async fn give_up(reserved: &Reserved, error: &str) -> Result<()> {
+async fn give_up(reserved: &Reserved, error: &str, retried: bool) -> Result<()> {
     let tx = DB::begin().await?;
     let affected = mine(tx.table(TABLE), reserved).delete().await?;
     if affected == 0 {
         tx.commit().await?;
-        warn_not_mine(reserved.id);
+        warn_not_mine(reserved.id, retried);
         return Ok(());
     }
     tx.table(FAILED_TABLE)
@@ -713,6 +732,9 @@ fn retry_wait(failures: u32, unit: Duration) -> Duration {
 /// 2 回流しても害がありません（1 回目が実は通っていたら、2 回目は 0 件です）。
 ///
 /// 停止の合図が来ていたら待ちません。残りの回数をすぐ試して、駄目なら返します。
+///
+/// `operation` は「やり直しかどうか」を受け取ります（1 回目は `false`）。
+/// やり直しで 0 件だったときの警告を、1 回目と分けるためです。
 async fn with_retries<T, F, Fut>(
     what: &str,
     stop: &AtomicBool,
@@ -720,12 +742,12 @@ async fn with_retries<T, F, Fut>(
     mut operation: F,
 ) -> Result<T>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(bool) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
     let mut failures = 0u32;
     loop {
-        let error = match operation().await {
+        let error = match operation(failures > 0).await {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
@@ -822,7 +844,10 @@ async fn run_with(
         // ファイルを置き忘れたまま `queue:retry` で戻せるよう、記録は残す。
         if !jobs.iter().any(|j| j.name == reserved.job) {
             let message = unknown_job_message(&reserved.job);
-            with_retries("失敗", &stop, retry_unit, || give_up(&reserved, &message)).await?;
+            with_retries("失敗", &stop, retry_unit, |retried| {
+                give_up(&reserved, &message, retried)
+            })
+            .await?;
             eprintln!(
                 "  {} #{} 失敗（諦めました）: {message}",
                 reserved.job, reserved.id
@@ -840,7 +865,10 @@ async fn run_with(
         let started = std::time::Instant::now();
         match run_one(jobs, &reserved, timeout, source).await {
             Ok(()) => {
-                let finished = with_retries("成功", &stop, retry_unit, || finish(&reserved)).await;
+                let finished = with_retries("成功", &stop, retry_unit, |retried| {
+                    finish(&reserved, retried)
+                })
+                .await;
                 if let Err(error) = finished {
                     // ジョブは終わっているのに、行が残った。黙って終わると
                     // 「なぜ 2 回動いたか」が分からないので、ここで言っておく。
@@ -861,8 +889,8 @@ async fn run_with(
             }
             Err(failure) => {
                 let message = failure.message;
-                let gave_up = with_retries("失敗", &stop, retry_unit, || {
-                    fail(&reserved, options.tries, &message)
+                let gave_up = with_retries("失敗", &stop, retry_unit, |retried| {
+                    fail(&reserved, options.tries, &message, retried)
                 })
                 .await?;
                 if gave_up {
@@ -1278,7 +1306,7 @@ mod tests {
 
         // 2 回失敗して 3 回目に通る。以前は 1 回目でワーカーが終わった。
         let calls = AtomicU32::new(0);
-        let value = with_retries("成功", &stop, unit, || async {
+        let value = with_retries("成功", &stop, unit, |_| async {
             if calls.fetch_add(1, Ordering::SeqCst) < 2 {
                 Err(crate::error::Error::msg("一時的な失敗"))
             } else {
@@ -1292,7 +1320,7 @@ mod tests {
 
         // 失敗し続けるなら、決めた回数で諦めて元のエラーを返す。
         let calls = AtomicU32::new(0);
-        let error = with_retries("成功", &stop, unit, || async {
+        let error = with_retries("成功", &stop, unit, |_| async {
             calls.fetch_add(1, Ordering::SeqCst);
             Err::<(), _>(crate::error::Error::msg("直らない失敗"))
         })
@@ -1303,12 +1331,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn やり直しかどうかを操作に渡す() {
+        use std::sync::atomic::AtomicU32;
+
+        let stop = AtomicBool::new(false);
+        let calls = AtomicU32::new(0);
+        let seen = std::sync::Mutex::new(Vec::new());
+        with_retries("成功", &stop, Duration::from_millis(1), |retried| {
+            seen.lock().unwrap().push(retried);
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(crate::error::Error::msg("一時的な失敗"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![false, true, true]);
+    }
+
+    #[test]
+    fn やり直しで自分の行が無いときは別の文にする() {
+        // 1 回目の 0 件は、取り直されたとき。retry_after を案内する。
+        let first = not_mine_message(7, false);
+        assert!(first.contains("--retry-after"), "{first}");
+        // やり直しの 0 件は、前回の記録が通っていたことがある。
+        // 「retry_after より長くかかった」と言うと誤った案内になる。
+        let again = not_mine_message(7, true);
+        assert!(again.contains("前回の記録が通っていた可能性"), "{again}");
+        assert!(!again.contains("retry_after より長く"), "{again}");
+    }
+
+    #[tokio::test]
     async fn 停止の合図が来ていたら待たない() {
         // 待ちの単位を長くしても、合図が立っていればすぐ返る。
         let stop = AtomicBool::new(true);
         let started = std::time::Instant::now();
         pause(Duration::from_secs(30), &stop).await;
-        let result = with_retries("成功", &stop, Duration::from_secs(30), || async {
+        let result = with_retries("成功", &stop, Duration::from_secs(30), |_| async {
             Err::<(), _>(crate::error::Error::msg("失敗"))
         })
         .await;

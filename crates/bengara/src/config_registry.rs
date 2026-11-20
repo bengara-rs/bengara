@@ -139,8 +139,9 @@ impl AppConfig {
 
     /// テストの最中か。
     ///
-    /// `#[bengara::test]` は、`APP_ENV` が本物の環境変数にも `.env` にも無いとき
-    /// `testing` を入れます（Laravel の `phpunit.xml` と同じ既定）。
+    /// `#[bengara::test]` は、`APP_ENV` が本物の環境変数に無いとき `testing` を入れます。
+    /// `.env` を読む前に入れるので、`.env` の `APP_ENV=local` より強いです
+    /// （Laravel の `phpunit.xml` と同じ優先順位）。
     pub fn is_testing(&self) -> bool {
         self.env == "testing"
     }

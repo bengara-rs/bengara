@@ -225,8 +225,9 @@ fn convert_value(row: &MySqlRow, index: usize, name: &str) -> Result<Value> {
     if raw.is_null() {
         return Ok(Value::Null);
     }
-    let type_name = raw.type_info().name().to_string();
-    match type_name.as_str() {
+    // 型の名前は借りて比べます。セルごとに `String` を作らないためです。
+    let info = raw.type_info();
+    match info.name() {
         // `tinyint(1)` は MySQL では真偽値の置き場所。sqlx が BOOLEAN として伝えます。
         "BOOLEAN" => read::<bool>(row, index, name).map(Value::Bool),
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => {

@@ -113,8 +113,13 @@ impl Cookie {
     /// `Set-Cookie` ヘッダーの中身にする。
     pub fn to_header_value(&self) -> String {
         let mut out = format!("{}={}", encode(&self.name), encode(&self.value));
-        let _ = write!(out, "; Path={}", sanitize_attribute("Path", &self.path));
-        if let Some(domain) = &self.domain {
+        let path = sanitize_attribute("Path", &self.path);
+        let _ = write!(
+            out,
+            "; Path={}",
+            super::percent::escape_unsafe_in_url(&path)
+        );
+        if let Some(domain) = self.domain.as_deref().and_then(ascii_domain) {
             let _ = write!(out, "; Domain={}", sanitize_attribute("Domain", domain));
         }
         if let Some(max_age) = self.max_age {
@@ -157,6 +162,22 @@ fn sanitize_attribute<'a>(attribute: &str, value: &'a str) -> Cow<'a, str> {
     }
     tracing::warn!("Cookie の {attribute} に使えない文字があったので落としました");
     Cow::Owned(value.replace(bad, ""))
+}
+
+/// `Domain` が ASCII だけか。ASCII 以外が入っていれば `None`（属性を付けない）。
+///
+/// 日本語のドメインは Punycode（`xn--` の形）に直して書く決まりです。直す処理は
+/// 持っていないので、付けずに落とします。付けないと、Cookie は**いまのホストだけ**に
+/// 送られます（範囲が狭まる側なので、他のサイトに漏れることはありません）。
+/// 生のまま付けると、ブラウザは Cookie そのものを捨てます。
+fn ascii_domain(domain: &str) -> Option<&str> {
+    if domain.is_ascii() {
+        return Some(domain);
+    }
+    tracing::warn!(
+        "Cookie の Domain に ASCII 以外の文字があったので、Domain を付けません         （日本語のドメインは xn-- の形で書いてください）"
+    );
+    None
 }
 
 /// `Cookie` ヘッダーを名前と値に分ける。
@@ -269,8 +290,31 @@ mod tests {
             .to_header_value();
         assert!(!header.contains('\r'));
         assert!(!header.contains('\n'));
-        assert!(header.contains("; Path=/xSet-Cookie: evil=1"));
+        assert!(header.contains("; Path=/xSet-Cookie:%20evil=1"));
         assert!(header.contains("; Domain=example.com Secure"));
+    }
+
+    #[test]
+    fn pathとdomainのascii以外でcookieが消えない() {
+        // 以前は生のまま入れていたので、本番（axum の `HeaderValue`）で
+        // `Set-Cookie` が 1 本まるごと消えていた。テストでは通っていた。
+        let header = Cookie::new("a", "b")
+            .with_path("/記事 1/%E6%97%A5")
+            .with_domain("例え.jp")
+            .to_header_value();
+        assert!(header.is_ascii(), "{header:?}");
+        // パスは送られてくる形（%XX）にそろえる。符号化済みの所は二重にしない。
+        assert!(
+            header.contains("; Path=/%E8%A8%98%E4%BA%8B%201/%E6%97%A5;"),
+            "{header:?}"
+        );
+        // 日本語のドメインは付けない（いまのホストだけに送られる）。
+        assert!(!header.contains("Domain="), "{header:?}");
+        // ASCII のドメインはそのまま。
+        let header = Cookie::new("a", "b")
+            .with_domain("xn--r8jz45g.jp")
+            .to_header_value();
+        assert!(header.contains("; Domain=xn--r8jz45g.jp;"), "{header:?}");
     }
 
     #[test]

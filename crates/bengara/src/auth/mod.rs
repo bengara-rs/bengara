@@ -123,16 +123,30 @@ impl<'a> Auth<'a> {
     /// 照合せずにログインする。登録の直後などに使います。
     ///
     /// **セッション ID を作り直します。**
+    ///
+    /// 保存していないモデル（主キーが `0`・`NULL`・`""`）はエラーにします。
+    /// 主キーが決まる前にログインすると、別の利用者として扱われるためです。
     pub fn login<U: Authenticatable>(&self, user: &U) -> Result<()> {
+        if user.is_new() {
+            return Err(Error::msg(
+                "保存していないモデルではログインできません。先に save() してください",
+            ));
+        }
         self.login_using_id(user.key())
     }
 
     /// 主キーの値だけでログインする。
+    ///
+    /// 文字列にして空になる値（`NULL` など）はエラーにします。
     pub fn login_using_id(&self, id: impl std::fmt::Display) -> Result<()> {
+        let id = id.to_string();
+        if id.is_empty() {
+            return Err(Error::msg("主キーが空なのでログインできません"));
+        }
         let session = self.session()?;
         // 他人のセッション ID を押し付ける攻撃（セッション固定化）を防ぐ。
         session.regenerate();
-        session.put(AUTH_ID_KEY, id.to_string());
+        session.put(AUTH_ID_KEY, id);
         session.put(AUTH_AT_KEY, crate::support::time::now_millis().to_string());
         Ok(())
     }
@@ -568,6 +582,35 @@ mod tests {
     #[test]
     fn パスワードの列の名前は既定でpassword() {
         assert_eq!(Member::auth_password_name(), "password");
+    }
+
+    #[test]
+    fn 保存していないモデルではログインできない() {
+        let session = Session::empty();
+        let auth = Auth::new(Some(&session));
+        let unsaved = Member {
+            id: 0,
+            password: String::new(),
+        };
+        let error = auth.login(&unsaved).unwrap_err();
+        assert!(error.to_string().contains("save()"), "{error}");
+        assert!(!auth.check());
+
+        auth.login(&Member {
+            id: 7,
+            password: String::new(),
+        })
+        .unwrap();
+        assert_eq!(auth.id().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn 空の主キーではログインできない() {
+        let session = Session::empty();
+        let auth = Auth::new(Some(&session));
+        assert!(auth.login_using_id("").is_err());
+        assert!(auth.login_using_id(crate::database::Value::Null).is_err());
+        assert!(!auth.check());
     }
 
     /// ログインのついでの作り直しを、メモリ上の SQLite で確かめる。

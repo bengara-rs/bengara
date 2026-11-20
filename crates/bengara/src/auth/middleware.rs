@@ -61,6 +61,7 @@ fn remembers_intended(method: &str) -> bool {
 /// | JSON を期待している | 401 |
 /// | 転送先を指定していない | 401 |
 /// | 転送先を指定している | 302 |
+/// | セッションが無い（`StartSession` の登録し忘れ） | 500（直し方を添えたエラー） |
 ///
 /// # ログイン後に元の画面へ返す
 ///
@@ -107,6 +108,15 @@ impl Default for Authenticate {
 
 impl Middleware for Authenticate {
     fn handle(&self, req: Request, next: Next) -> BoxFuture {
+        // セッションが無いと、ログインしていても理由なく 401 になる。登録し忘れを知らせる。
+        if req.try_session().is_none() {
+            return Box::pin(async {
+                Err(Error::msg(
+                    "ログインの確認にはセッションが要ります。bootstrap/app.rs で \
+                     StartSession を Authenticate（auth）より前に登録してください",
+                ))
+            });
+        }
         if req.auth().check() {
             return next.run(req);
         }
@@ -266,6 +276,26 @@ mod tests {
         );
 
         assert!(RedirectIfAuthenticated::default().redirect_to.is_none());
+    }
+
+    #[tokio::test]
+    async fn セッションが無ければ登録し忘れを知らせる() {
+        use crate::http::handler::Erased;
+        use std::sync::Arc;
+
+        // StartSession を付け忘れると、理由の分からない 401 になっていた。
+        let req = Request::new("GET", "/profile");
+        let stack: Arc<[Arc<dyn Middleware>]> = Arc::from(Vec::new());
+        let handler = Arc::new(Erased::<_, ()>::new(|| async {
+            Ok(crate::http::Response::text("ok"))
+        }));
+        let options = crate::http::response::RenderOptions::new(false, false);
+        let error = Authenticate::new()
+            .handle(req, Next::new(stack, handler, options))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("StartSession"), "{error}");
     }
 
     #[test]

@@ -768,7 +768,12 @@ impl ColumnDefinition<'_> {
         self
     }
 
-    /// 既定値を SQL で決める（`current_timestamp` など）。
+    /// 既定値を SQL で決める（例: `t.integer("views").default_raw("0")`）。
+    ///
+    /// **PostgreSQL の日時の列に `current_timestamp` を書かないでください。**
+    /// bengara は PostgreSQL の日時の列を `text` で作ります。そこへ入るのは
+    /// `2026-11-20 03:04:05.123456+00` のような時差付きの別の形で、bengara が書く
+    /// `YYYY-MM-DD HH:MM:SS` とそろいません。日時は `timestamps()` と `save()` で入れます。
     pub fn default_raw(mut self, sql: &str) -> Self {
         self.column().default = Some(DefaultValue::Raw(sql.to_string()));
         self

@@ -200,6 +200,7 @@ impl ValidationErrors {
 /// 実行時の [`RULE_NAMES`] と、コンパイル時の [`check_rules`] の `panic!` の文が
 /// 両方ともこれを使います。`concat!` に渡すため、定数ではなくマクロにしています。
 /// 規則を足したら、ここと [`Rule::parse`] と `check_rule` の 3 か所を直してください。
+/// `Rule` に種類を足すと、テストの `name_of` でコンパイルが止まります（足し忘れの目印）。
 macro_rules! rule_names {
     () => {
         "required, nullable, integer (int), numeric, boolean (bool), email, url, alpha, \
@@ -2184,6 +2185,56 @@ mod tests {
             assert!(runtime_accepts(&spec), "実行時に `{spec}` が通らない");
             assert!(compile_accepts(&spec), "コンパイル時に `{spec}` が止まる");
         }
+    }
+
+    /// 規則の種類から、一覧（`rule_names!`）に書く名前を返す。
+    ///
+    /// **すべての種類を並べた `match` です。** `Rule` に種類を足すと、ここでテストの
+    /// コンパイルが止まります。名前を足したら、`rule_names!` にも同じ名前を書いてください
+    /// （下のテストが、一覧から読んだ規則がここの名前に戻ることを確かめます）。
+    fn name_of(rule: &Rule) -> &'static str {
+        match rule {
+            Rule::Required => "required",
+            Rule::Nullable => "nullable",
+            Rule::Integer => "integer",
+            Rule::Numeric => "numeric",
+            Rule::Boolean => "boolean",
+            Rule::Email => "email",
+            Rule::Url => "url",
+            Rule::Alpha => "alpha",
+            Rule::AlphaNum => "alpha_num",
+            Rule::AlphaDash => "alpha_dash",
+            Rule::Min(_) => "min",
+            Rule::Max(_) => "max",
+            Rule::Between(..) => "between",
+            Rule::Size(_) => "size",
+            Rule::In(_) => "in",
+            Rule::Confirmed => "confirmed",
+            Rule::Same(_) => "same",
+            Rule::Different(_) => "different",
+            Rule::StartsWith(_) => "starts_with",
+            Rule::EndsWith(_) => "ends_with",
+            Rule::Date => "date",
+        }
+    }
+
+    #[test]
+    fn 一覧の名前と規則の種類が1対1で対応する() {
+        // 一覧に書いた名前は、その名前の種類に読める（別名 `int` `bool` は本来の名前に）。
+        let names = listed_names();
+        let mut kinds = std::collections::BTreeSet::new();
+        for name in &names {
+            let rule = Rule::parse(&with_example(name)).expect("一覧の規則は読める");
+            let canonical = match *name {
+                "int" => "integer",
+                "bool" => "boolean",
+                other => other,
+            };
+            assert_eq!(name_of(&rule), canonical, "`{name}` が別の種類に読める");
+            kinds.insert(name_of(&rule));
+        }
+        // 別名（int と bool）を除けば、一覧の名前は種類ごとに 1 つ。
+        assert_eq!(names.len(), kinds.len() + 2, "{kinds:?}");
     }
 
     #[test]

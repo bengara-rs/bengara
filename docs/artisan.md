@@ -39,6 +39,9 @@
 
 - 本体を引数なしで動かすと `serve` です（`./myapp`）。`--host` か `--port` から始めたときも同じです。
 - `key:generate` と `storage:init` は `bootstrap/app.rs` を呼びません。ルートの組み立てで落ちるアプリでも動きます。
+- `key:generate` は、本物の環境変数に `APP_KEY` があると警告します。そちらが優先され、`.env` に書いた鍵は使われないためです。
+- `about` は鍵そのものを出しません。`APP_KEY` は「あり／なし／短すぎる」で出します。
+- `about` のセッションとキャッシュは、実際に使う方式を出します（知らない名前なら `file`）。
 
 ### データベース
 
@@ -70,8 +73,7 @@
 | `schedule:list` | 定期処理の一覧                 | [scheduling.md](scheduling.md)     |
 | `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
--
-データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
+- データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
 - `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます（[console-commands.md](console-commands.md)）。
 - 無い名前を打つと、エラーと一覧を出して終了コード 1 で終わります。
 - ファイルを生成する `make:*` コマンドはありません。ファイルは手で作ります。
@@ -142,8 +144,7 @@ $ cargo artisan cache:clear --tries=9
 
 `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
-**表を変えるコマンドは同時に流せません。** 2
-つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
+**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
 
 ## serve の動き
 
@@ -168,7 +169,7 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 **見張るのは、ビルドに影響するファイルだけです。**
 
 - `app/` `bootstrap/` `config/` `database/` `routes/` `resources/` の下の `.rs`
-- `resources/lang/` の言語ファイル（`.toml`）
+- `resources/lang/` の言語ファイル（`ja.toml` と `ja/*.toml` の `.toml`）
 - `.env` `Cargo.toml` `Cargo.lock` `build.rs` `main.rs` `artisan.rs` `.cargo/config.toml` `rust-toolchain.toml`
 
 | 見張らないもの                                                       | 理由・代わり                                               |
@@ -178,8 +179,9 @@ cargo artisan serve --host 0.0.0.0 --port 8124
 | `storage/` `target/` `node_modules/` `.git/`、データベースのファイル | ビルドに関係ない                                           |
 
 - 0.4 秒ごとに確かめます。保存が続いている間は待って、1 回のビルドにまとめます。
-- 比べるのは**ファイルの数**と**いちばん新しい更新時刻**です。
-  どちらも変わらない書き換えは見落とします。そのときはファイルを 1 つ保存し直してください。
+- 比べるのは**ファイルの数**と**いちばん新しい更新時刻**と**パス**です。
+  名前の変更や別のディレクトリへの移動にも気づきます。
+- 数・時刻・パスのどれも変わらない書き換えは見落とします。そのときはファイルを 1 つ保存し直してください。
 - ビルドの最中に `cargo update` をしたときも、ファイルを 1 つ保存し直してください。
 
 ### 失敗したとき

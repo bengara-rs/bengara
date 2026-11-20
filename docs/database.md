@@ -79,12 +79,13 @@ let body: Option<String> = row.get("body")?;  // NULL を許すとき
 let maybe = row.try_get::<i64>("views");      // 読めなければ None
 ```
 
-- 読める型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>`・`Value`（生の値）です。
+- 読める型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>`・`Carbon`（日時）・`Value`（生の値）です。
 - **NULL がありうる列は `Option<T>` で読みます。** `T` のままだと、NULL の行でエラーです。
 - 小数を整数で読むと、`2.0` は `2` になり、`2.5` はエラーです。
 - 主キーが `id` でない表は、`where_(列, 値).first()` で引きます。
 - 同じ名前の列が 2 つあると、左の列を採ります。`join` したら `select` で列を決めます。
 - `Row` はそのまま `json(&rows)` で返せます。
+- 結果は全件がメモリに載ります。多いときは `limit` / `offset` で分けて読みます。
 
 ### 条件を足す
 
@@ -113,14 +114,6 @@ Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` で�
 - `where_group` の中では、条件だけが使われます。
 - `where_raw` の `?` は値の置き場所です。文字列の中の `?` も数えます。
 - 列には、モデルの型付きの列（`Post::TITLE`）も渡せます。値の型をコンパイルのときに確かめます（[models.md](models.md) の「型付きの列」）。
-
-```rust
-let rows = DB::table("posts")
-    .where_(Post::STATUS, "published")
-    .order_by_desc(Post::VIEWS)
-    .get()
-    .await?;
-```
 
 ### 並べる・件数を決める
 
@@ -157,8 +150,7 @@ DB::table("posts")
     .await?;
 ```
 
-- `group_by` の無い `having` はエラーです。
-- PostgreSQL では、`having_op` に別名（上の `total`）を渡せません。`having_raw` に式を書きます。
+`group_by` の無い `having` はエラーです。
 
 ### 数える
 
@@ -171,7 +163,6 @@ let sum = DB::table("posts").sum::<i64>("views").await?;                // Optio
 ```
 
 - `group_by` を付けた `count()` は、グループの数を返します。
-- `distinct()` を付けて数えるときは、`select` で列を 1 つにします。
 - 行が無いとき、`sum` / `avg` / `min` / `max` は `None` です。
 - `sum` などは `group_by` と一緒に使えません。
 
@@ -196,9 +187,12 @@ DB::table("posts").truncate().await?;   // 全部消す。採番も 1 に戻る
 - 主キーが `id` でない表の採番は、`insert_get_id_as(値, 主キーの名前)` で受け取ります。
 - 自動採番の無い表には `insert()` を使います。`insert_get_id` は MySQL でエラーになりますが、**行は入っています。**
 - **条件の無い `update` / `delete` は全行が対象です。**
-- `update` は `updated_at` を入れません。
+- `update` は `updated_at` を入れません（モデルの `update` は入れます）。
 - `i64` に収まらない `u64` は、文字列として書き込みます。
-- `update` / `delete` に `join` や `limit` は付けられません。先に ID を取り出して `where_in` で絞ります。
+- `update` / `delete` に `join` や `limit` は付けられません。`order_by` は無視します。
+- 絞って消すなら `delete()` です。`where_` を付けた `truncate()` はエラーです。
+
+`join` や `limit` で絞りたいときは、先に ID を取り出します。
 
 ```rust
 let ids: Vec<i64> = DB::table("posts").latest().limit(10).pluck::<i64>("id").await?;
@@ -217,13 +211,14 @@ DB::table("posts").where_("id", id).decrement("stock", 1).await?;
 
 ### 日時
 
-日時は文字列で入れます。`now()` が UTC の `YYYY-MM-DD HH:MM:SS` を返します。
+日時は `YYYY-MM-DD HH:MM:SS`（UTC）の文字列で入れます。
+`now()` がこの形の文字列を返します。`Carbon`（日時の型。[models.md](models.md)）もそのまま渡せます。
 
 ```rust
 DB::table("posts").insert(&[("title", "x".into()), ("created_at", now().into())]).await?;
 ```
 
-モデルの `save()` なら自動で入ります（[models.md](models.md)）。
+モデルの `save()` なら自動で入ります。
 
 ### 一意制約に当たったか
 
@@ -259,7 +254,23 @@ json(&page)   // data / total / per_page / current_page が出る
 | `from()` / `to()`                              | 何件目から何件目か。空なら `None` |
 | `len()` / `is_empty()`                         | このページの件数 / 空か           |
 
-件数と中身で 2 回問い合わせます。`per_page` と `page` の 0 は 1 として扱います。
+- 件数と中身で 2 回問い合わせます。
+- `per_page` と `page` の 0 は 1 として扱います。
+
+### `distinct()` を付けて数えるとき
+
+`paginate` と `count()` は、`select` で選んだ列で数え方が決まります。
+
+| 選んだ列                                               | 数えるもの                                     |
+|--------------------------------------------------------|------------------------------------------------|
+| 列が 1 つ（`select(&["author_id"])`）                  | 重なりを除いた数。`count()` は NULL を数えない |
+| `posts.*` が 1 つだけ                                  | 重なりを除いた行の数                           |
+| 出力の名前が重ならない列（`posts.id` と `users.name`） | 同上                                           |
+| 指定なし・`*`（`join` が無いとき）                     | 同上                                           |
+| それ以外                                               | エラー                                         |
+
+「それ以外」は、`join` した `*`、名前が重なる列（`posts.id` と `comments.id`）、式（`id as key`）、`posts.*` とほかの列の組み合わせです。
+名前の重なりは大文字小文字を区別せずに見ます。
 
 ## トランザクション
 
@@ -276,6 +287,7 @@ tx.commit().await?;
 - `commit()` を呼ばずに `tx` を捨てると、取り消します。明示するなら `tx.rollback().await?` です。
 - **1 本ずつ `await` します。** 同時に 2 本投げると、2 本目がエラーです。
 - **1 本でも失敗したら、そのトランザクションはもう使えません。** `DB::begin()` からやり直します。
+- SQLite では、ほかのトランザクションの途中なら、始めるところで 5 秒まで待ちます。
 - モデルを中で使うときは `save_using(&tx)` などを使います（[models.md](models.md)）。
 
 ## SQL を直接書く
@@ -290,12 +302,10 @@ let affected = DB::statement("update posts set views = views + 1", &[]).await?;
 | `DB::select(sql, &[値])`    | `Vec<Row>`                                                         |
 | `DB::statement(sql, &[値])` | `Affected`（`rows` は変わった行の数、`last_insert_id` は採番の値） |
 
-- 値の置き場所は、どのドライバでも `?` です。
-- `?` の数と値の数が合わないとエラーです。
+- 値の置き場所は、どのドライバでも `?` です。数が合わないとエラーです。
 - トランザクションの中では `tx.select(...)` / `tx.statement(...)` です。
 - PostgreSQL で `?` を 1 つも書かないときは、`$1` を直に書けます。
-
-組み立てた SQL は `DB::table("posts").where_("id", 1).to_sql()` で見られます。接続はしません。
+- 組み立てた SQL は `.to_sql()` で見られます（`DB::table("posts").where_("id", 1).to_sql()`）。接続はしません。
 
 ## 接続を選ぶ
 
@@ -342,16 +352,15 @@ pub fn config() -> DatabaseConfig {
 | `foreign_keys(b)`    | 真                  | SQLite で外部キーを効かせるか              |
 | `url(s)`             | 空                  | 接続文字列。書くと、ほかの値より優先       |
 
-接続文字列は `mysql://利用者名:パスワード@127.0.0.1:3306/データベース名` の形です（`sqlite://` / `postgres://` も同じ）。
-パスワードの `@` `#` `/` `?` は、`%40` のような形に直します。
+- 接続文字列は `mysql://利用者名:パスワード@127.0.0.1:3306/データベース名` の形です（`sqlite://` / `postgres://` も同じ）。
+- パスワードの `@` `#` `/` `?` は、`%40` のような形に直します。
 
 ### つなぎ方の決まり
 
 - 接続は、最初に使ったときに張ります。
 - SQLite の相対パスは、プロジェクト直下から見ます。
-- ファイルの SQLite は WAL モード（読みと書きを同時にできる形）で開きます。書き込み待ちは 5 秒までです。
 - 名前か `url` に `:memory:` を含むと、メモリ上のデータベースになります。
-- MySQL と PostgreSQL は、サーバが対応していれば暗号化してつなぎます。
+- **メモリ上の SQLite は接続が 1 本です。** トランザクションの途中で `DB::table(...)` や `save()` を呼ぶと、5 秒待ってエラーになります。中では `tx` を使います。
 - MySQL と PostgreSQL は、つながらないと 30 秒待ってからエラーになります。
 - エラー文には接続の名前とつなぎ先が出ます。パスワードは出しません。
 
@@ -368,35 +377,28 @@ pub fn config() -> DatabaseConfig {
 引用符・値の置き場所・列の型名は bengara が書き分けます。
 それでも残る違いは次のとおりです。
 
-| こと                                | SQLite               | MySQL                          | PostgreSQL                                    |
-|-------------------------------------|----------------------|--------------------------------|-----------------------------------------------|
-| `decimal` に文字列を書き戻す        | 通る                 | 通る                           | **断られる**。`f64` で読んで書く              |
-| 整数の列を文字列と比べる            | 通る                 | 通る                           | **SQL エラー**。整数で渡す                    |
-| 型の決まらない所の `None`           | 通る                 | 通る                           | エラー。`cast(? as text)` と書く              |
-| `truncate()` の取り消し             | できる               | **トランザクションを確定する** | できる                                        |
-| 外部キーで指される表の `truncate()` | 指す側が空ならできる | エラー                         | エラー                                        |
-| 1 つの文に渡せる値の数              | 32,766               | 65,535                         | 65,535                                        |
-| `Affected` の `last_insert_id`      | `insert` で入る      | `insert` で入る                | 常に `None`                                   |
-| 読めない型                          | —                    | —                              | `uuid` / `money` / `inet` / 配列 / `interval` |
+| こと                                | SQLite               | MySQL                       | PostgreSQL                                     |
+|-------------------------------------|----------------------|-----------------------------|------------------------------------------------|
+| `decimal` の列に文字列を書く        | 通る                 | 通る                        | **断られる**。`f64` で読んで書く               |
+| 整数の列を文字列と比べる            | 通る                 | 通る                        | **SQL エラー**。整数で渡す                     |
+| 型の決まらない所の `None`           | 通る                 | 通る                        | エラー。`cast(? as text)` と書く               |
+| `having_op` に別名（`total`）を渡す | 通る                 | 通る                        | エラー。`having_raw` に式を書く                |
+| トランザクションの中の `truncate()` | できる               | **エラー**。`delete()` で   | できる                                         |
+| 外部キーで指される表の `truncate()` | 指す側が空ならできる | エラー                      | エラー                                         |
+| `ilike` / `not ilike`               | エラー               | エラー                      | 使える                                         |
+| `<=>`                               | エラー               | 使える                      | エラー                                         |
+| 1 つの文に渡せる値の数              | 32,766               | 65,535                      | 65,535                                         |
+| `Affected` の `last_insert_id`      | `insert` で入る      | `insert` で入る             | 常に `None`。`returning` を付けて `DB::select` |
+| 読めない型                          | —                    | —                           | `uuid` / `money` / `inet` / 配列 / `interval`  |
+| 生の `Value` の真偽                 | `Int`                | `Bool`                      | `Bool`                                         |
+| 生の `Value` の `decimal`           | `Float`              | `Text`（末尾の 0 を落とす） | `Text`（末尾の 0 を落とす）                    |
 
+- 使えないドライバの演算子は、流す前にエラーにします。`ilike` の代わりは `like` です（SQLite は英字の大文字小文字を区別しない。MySQL は照合順序による）。
 - 値の数の上限を超えると、投げる前にエラーにします。`insert_many` は「行 × 列」で数えます。
 - `truncate()` できない表は、`delete()` で空にします（採番は戻りません）。
 - 読めない型は、`cast(列 as text) as 列` で文字列にすれば読めます。
-- PostgreSQL で自分で `insert` を書くときは、`returning` を付けて `DB::select` で受け取ります。
-
-### 生の値の形
-
-`row.get::<T>()` で読めば、どのドライバでも同じ結果です。
-生の `Value`（`row.value()`）を見るときだけ、次に気をつけます。
-
-| 値                     | 形                                                         |
-|------------------------|------------------------------------------------------------|
-| 真偽                   | SQLite は `Int`、ほかは `Bool`                             |
-| `decimal`              | SQLite は `Float`、ほかは `Text`（末尾の 0 を落とす）      |
-| 日付・時刻・日時       | `YYYY-MM-DD` / `HH:MM:SS` / `YYYY-MM-DD HH:MM:SS` の文字列 |
-| `timestamptz`          | UTC に直す（PostgreSQL）                                   |
-| MariaDB の `json`      | `Bytes`。`row.get::<String>()` なら文字列で読める          |
-| MySQL の大きな符号なし | `i64` に収まらなければ `Text`                              |
+- 生の値の違いは、`row.value()` で `Value` を直接見るときだけ気にします。`row.get::<T>()` ならどのドライバでも同じです。
+- 日付・時刻・日時は、どのドライバでも `YYYY-MM-DD` / `HH:MM:SS` / `YYYY-MM-DD HH:MM:SS` の文字列で返ります。PostgreSQL の `timestamptz` は UTC に直します。
 
 ## 安全のための決まり
 
@@ -421,14 +423,6 @@ pub fn config() -> DatabaseConfig {
 - 渡した値は、bengara からはログに出しません。
 - データベースが返したエラー文には、値が入っていることがあります（MySQL の `Duplicate entry '値'` など）。
 - 利用者に見せる文は、`is_unique_violation` で見分けて自分で書きます。
-
-## 気をつけること
-
-- 結果は全件がメモリに載ります。多いときは `limit` / `offset` で分けて読みます。
-- `update` / `delete` の `order_by` は無視します。
-- `where_` を付けた `truncate()` はエラーです。絞って消すなら `delete()` です。
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
 
 ## 関連
 

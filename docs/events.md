@@ -66,19 +66,13 @@ Event::dispatch("user.registered", &Payload { user_id: user.id }).await?;
 - 聞く側のパニックも失敗として扱います。
 - コントローラ・ジョブ・自作コマンド・定期処理の、どこから呼んでも届きます。
 - `Lang::with` の言語は聞く側に引き継ぎます。
+- 聞いている数は `Event::has_listeners(名前)` と `Event::listener_count(名前)` で分かります。
 
 聞く側が失敗しても本体は成功させたいときは、`try_dispatch` を使います。
 
 ```rust
 // 通知に失敗しても、登録そのものは成功させる
 Event::try_dispatch("user.registered", &payload).await?;
-```
-
-聞いている数は、次の 2 つで分かります。
-
-```rust
-if Event::has_listeners("user.registered") { /* ... */ }
-Event::listener_count("user.registered");   // 何件登録されているか
 ```
 
 ### `dispatch` が返すエラー
@@ -89,13 +83,12 @@ Event::listener_count("user.registered");   // 何件登録されているか
 | 検査のエラー（`validate` の失敗）       | 422                             |
 | それ以外のエラー・パニック              | 500                             |
 
-500 になるエラーには、イベントの名前が付きます。元のエラーは `source()` でたどれます。
+- 500 のエラー文には、イベントの名前が付きます（下の例）。元のエラーは `source()` でたどれます。
+- 聞く側の 404 や 422 を利用者に見せたくないときは、`try_dispatch` を使ってください。
 
 ```
 イベント `user.registered` の処理に失敗しました: 元のエラーの文
 ```
-
-聞く側の 404 や 422 を利用者に見せたくないときは、`try_dispatch` を使ってください。
 
 ## 名前と中身
 
@@ -132,24 +125,22 @@ pub async fn handle(Json(payload): Json<Payload>) -> Result<()> {
 .with_events(|e| e.listen_json("user.registered", crate::app::listeners::notify_admin::handle))
 ```
 
-| 聞く側の引数             | 登録するメソッド | 受け取るもの                    |
-|--------------------------|------------------|---------------------------------|
-| `Json(payload): Json<T>` | `listen_json`    | 中身を `T` に読んだもの         |
+| 聞く側の引数             | 登録するメソッド | 受け取るもの                      |
+|--------------------------|------------------|-----------------------------------|
+| `Json(payload): Json<T>` | `listen_json`    | 中身を `T` に読んだもの           |
 | `payload: String`        | `listen`         | JSON の文字列そのまま。自分で読む |
 
 - 型は聞く側の引数から決まります。`listen_json` に型を書く必要はありません。
-- 中身を `T` に読めないときは、聞く側の失敗です。`dispatch` はそこで止まり、`try_dispatch` はログに出して次を呼びます。
+- 中身を `T` に読めないときは、聞く側の失敗です。
 - `Json` は `bengara::queue::Json` と同じ型です。
-
-**中身の形は、コンパイルでは確かめられません。** 知らせる側と聞く側で、同じ構造体を使ってください。
+- **中身の形は、コンパイルでは確かめられません。** 知らせる側と聞く側で、同じ構造体を使ってください。
 
 ## テスト
 
 登録の表はプロセスに 1 つで、アプリを組み立てるたびに置き換わります。
 テストは並んで走るので、ほかのテストの登録で動くことがあります。
 
-- **`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()`
-  の札を取ってください**（[testing.md](testing.md)）。
+- **`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()` の札を取ってください**（[testing.md](testing.md)）。
 - `bootstrap/app.rs` の登録のまま使うテストには、札は要りません。
 
 ```rust
@@ -163,9 +154,7 @@ async fn 聞く側がいなければ何も起きない() {
 ## 知っておくこと
 
 - イベントはクラスでなく、名前（文字列）と中身（構造体）で書きます。
-- 呼ぶたびに登録の表を読むので、1 リクエストで何千回も知らせる使い方には向きません。
-
-まだ無い機能は [backlog.md](backlog.md) にあります。
+- 1 リクエストで何千回も知らせる使い方には向きません。呼ぶたびに登録の表を読むためです。
 
 ## 関連
 

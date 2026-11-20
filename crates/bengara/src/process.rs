@@ -32,11 +32,17 @@
 //!   終わっていても待ち続け、打ち切りの時間で `Err` になります。孫を残すコマンドは
 //!   `quietly()` を付けるか、孫の出力を別の場所へ向けてください。
 //! - 出力は全部メモリに溜めます。出力が多いコマンドは `quietly()` で捨ててください。
+//! - **時間切れのエラー文に、それまでの出力の末尾を入れます。** どこで止まったかを
+//!   見られるようにするためです（標準出力とエラー出力の末尾、それぞれ 2,000 文字まで）。
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 
@@ -48,6 +54,9 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// エラー出力は長くなりがちで、そのままログに流すと読めません。
 /// 失敗の理由はたいてい最後のほうに出るので、末尾を残します。
 const ERROR_TAIL_CHARS: usize = 2000;
+
+/// 時間切れで止めた後、子プロセスの終わりを待つ上限。
+const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// 外部のコマンドを起動する入口。
 ///
@@ -226,30 +235,134 @@ impl PendingProcess {
             });
         }
 
-        let waiting = child.wait_with_output();
-        let output = match self.timeout {
-            Some(limit) => match tokio::time::timeout(limit, waiting).await {
-                Ok(output) => output,
-                // ここで `waiting`（子プロセスを持っている）が捨てられ、
-                // `kill_on_drop` が子プロセスを止めます。
-                Err(_elapsed) => {
-                    return Err(Error::msg(format!(
-                        "`{label}` が {} 秒で終わらなかったので止めました",
-                        limit.as_secs()
-                    )));
-                }
-            },
-            None => waiting.await,
-        }
-        .map_err(|e| Error::msg(format!("`{label}` の終わりを待てませんでした: {e}")))?;
+        // 出力は別のタスクで読み溜める。`wait_with_output` に任せていたころは、
+        // 時間切れで future ごと捨てるので、それまでの出力も失っていました。
+        // 読んだ分は列で受け取るので、途中で止めても手元に残ります。
+        let mut stdout = Collector::spawn(child.stdout.take());
+        let mut stderr = Collector::spawn(child.stderr.take());
+
+        // 終わりは「子プロセスが終わり、出力が両方閉じたとき」です（今までと同じ）。
+        let waiting = async {
+            let status = child.wait().await?;
+            stdout.finished().await;
+            stderr.finished().await;
+            Ok::<_, std::io::Error>(status)
+        };
+        // 先に結果だけを取り出す（`waiting` が子プロセスを借りたままにならないように）。
+        let finished = match self.timeout {
+            Some(limit) => tokio::time::timeout(limit, waiting).await.ok(),
+            None => Some(waiting.await),
+        };
+        let Some(status) = finished else {
+            // 時間切れ。止めて、終わりを待つ（ゾンビを残さない）。孫が出力を握っていても、
+            // 読み溜めのタスクは待たずに、そこまでに届いた分だけを使う。
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(KILL_WAIT, child.wait()).await;
+            let limit = self.timeout.unwrap_or_default();
+            return Err(Error::msg(timed_out_message(
+                &label,
+                limit,
+                &stdout.take_lossy(),
+                &stderr.take_lossy(),
+            )));
+        };
+        let status =
+            status.map_err(|e| Error::msg(format!("`{label}` の終わりを待てませんでした: {e}")))?;
 
         Ok(ProcessResult {
             program: label,
-            exit_code: output.status.code(),
-            successful: output.status.success(),
-            output: String::from_utf8_lossy(&output.stdout).into_owned(),
-            error_output: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: status.code(),
+            successful: status.success(),
+            output: stdout.take_lossy(),
+            error_output: stderr.take_lossy(),
         })
+    }
+}
+
+/// 時間切れのエラー文。それまでの出力の末尾を入れる。
+fn timed_out_message(label: &str, limit: Duration, output: &str, error_output: &str) -> String {
+    let mut message = format!(
+        "`{label}` が {} 秒で終わらなかったので止めました",
+        limit.as_secs()
+    );
+    for (name, text) in [("エラー出力", error_output), ("出力", output)] {
+        let tail = tail_chars(text.trim(), ERROR_TAIL_CHARS);
+        if !tail.is_empty() {
+            message.push_str(&format!("\n{name}の末尾: {tail}"));
+        }
+    }
+    message
+}
+
+/// 子プロセスの出力 1 本を、別のタスクで読み溜める。
+///
+/// 読んだ分はすぐ列へ送ります。タスクを止めても、送った分は手元に残ります。
+/// 捨てたときはタスクも止めます（呼んだ側が待つのをやめたとき、
+/// 孫のプロセスが出力を握ったままでも残らないように）。
+struct Collector {
+    task: Option<JoinHandle<()>>,
+    chunks: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    collected: Vec<u8>,
+}
+
+impl Collector {
+    /// 読み始める。`quietly()` などで出力が無ければ何もしない。
+    fn spawn<R>(pipe: Option<R>) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        let Some(mut pipe) = pipe else {
+            return Self {
+                task: None,
+                chunks: None,
+                collected: Vec::new(),
+            };
+        };
+        let (sender, chunks) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut buffer = vec![0u8; 8 * 1024];
+            loop {
+                match pipe.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sender.send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            task: Some(task),
+            chunks: Some(chunks),
+            collected: Vec::new(),
+        }
+    }
+
+    /// 出力が閉じるまで待つ。
+    async fn finished(&mut self) {
+        if let Some(task) = &mut self.task {
+            let _ = task.await;
+            self.task = None;
+        }
+    }
+
+    /// ここまでに届いた分を文字にする。UTF-8 として読めないバイトは置換文字にします。
+    fn take_lossy(&mut self) -> String {
+        if let Some(chunks) = &mut self.chunks {
+            while let Ok(chunk) = chunks.try_recv() {
+                self.collected.extend_from_slice(&chunk);
+            }
+        }
+        String::from_utf8_lossy(&std::mem::take(&mut self.collected)).into_owned()
+    }
+}
+
+impl Drop for Collector {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -398,6 +511,55 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "30 秒待たずに返る: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn 時間切れのエラーにそれまでの出力の末尾を入れる() {
+        // 書いてから止まるコマンド。以前は時間切れで出力ごと捨てていた。
+        let command: Vec<&str> = if cfg!(windows) {
+            vec![
+                "cmd",
+                "/C",
+                "echo partial-output & echo partial-error 1>&2 & ping -n 30 127.0.0.1 >nul",
+            ]
+        } else {
+            vec![
+                "sh",
+                "-c",
+                "echo partial-output; echo partial-error >&2; sleep 30",
+            ]
+        };
+        let started = std::time::Instant::now();
+        let error = Process::timeout(2)
+            .run(command)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2 秒で終わらなかった"), "{error}");
+        assert!(error.contains("partial-output"), "{error}");
+        assert!(error.contains("partial-error"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "孫が出力を握っていても待たない: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn 時間切れの文は出力の末尾だけを入れる() {
+        let limit = Duration::from_secs(3);
+        assert_eq!(
+            timed_out_message("x", limit, "", "  "),
+            "`x` が 3 秒で終わらなかったので止めました"
+        );
+        let long = "a".repeat(ERROR_TAIL_CHARS + 10) + "END";
+        let message = timed_out_message("x", limit, &long, "boom\n");
+        assert!(message.contains("エラー出力の末尾: boom"), "{message}");
+        assert!(message.contains("END"), "{message}");
+        assert!(
+            !message.contains(&"a".repeat(ERROR_TAIL_CHARS)),
+            "末尾 {ERROR_TAIL_CHARS} 文字に切る"
         );
     }
 

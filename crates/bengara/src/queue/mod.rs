@@ -207,6 +207,11 @@ impl Queue {
     }
 
     /// そのキューで、いますぐ処理できるジョブの数。
+    ///
+    /// **古い予約は数えません。** ワーカーが落ちて `reserved_at` が残った行は、
+    /// `retry_after` 秒を過ぎるとワーカーが取り直します。ただ `retry_after` は
+    /// ワーカーの起動時の引数（`--retry-after`）で、ここからは見えません。
+    /// そのため、取り直せる行も「処理中」として数から外れます。
     pub async fn ready_size_on(queue: &str) -> Result<i64> {
         let now = crate::support::time::format_timestamp(crate::support::time::now_seconds());
         DB::table(TABLE)
@@ -260,7 +265,13 @@ impl Queue {
             t.date_time("available_at");
             t.date_time("reserved_at").nullable();
             t.date_time("created_at");
-            t.index(&["queue", "available_at"]);
+            // 取り出しは `where queue = ? .. order by id limit 1` です。
+            // `(queue, available_at)` の索引では id の順に並べ直す手間が残り、
+            // 20 万件で 1 回 100ms を超えました。`(queue, id)` なら索引の順に
+            // 読んで、条件に合う最初の 1 行で止まります。
+            // MySQL（InnoDB）は二次索引に主キーを持つので `(queue)` と同じ働き、
+            // PostgreSQL と SQLite は `id` まで書かないと並べ直しが残ります。
+            t.index(&["queue", "id"]);
         });
         schema.create_if_not_exists(FAILED_TABLE, |t| {
             t.id();
@@ -354,7 +365,9 @@ mod tests {
         assert!(sql[0].contains("\"attempts\" integer not null default 0"));
         assert!(sql[0].contains("\"reserved_at\" datetime null"));
         // 索引は別の文。
-        assert!(sql
+        assert!(sql.iter().any(|s| s.contains("jobs_queue_id_index")));
+        // 前の索引は作らない（取り出しの並びと合わず、並べ直しが残った）。
+        assert!(!sql
             .iter()
             .any(|s| s.contains("jobs_queue_available_at_index")));
         assert!(sql.iter().any(|s| s.contains("\"failed_jobs\"")));

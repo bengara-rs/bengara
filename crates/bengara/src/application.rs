@@ -32,7 +32,10 @@ struct Inner {
     /// `public/` の**実体**。シンボリックリンクの確認に使います。
     ///
     /// 起動時に1回だけ解決します。以前はリクエストごとに `canonicalize` を叩いていました。
-    /// まだ無いときは `None` で、そのときだけ配信側が解決します。
+    ///
+    /// 起動時に無かったときは `None` で、**ディスクの `public/` は探しません。**
+    /// 以前は、当たらない GET のたびに裏のスレッドで `public/` を探し直していました。
+    /// 起動後に `public/` を作ったときは、起動し直すと配信します。
     public_canonical: Option<Arc<Path>>,
     /// `/storage/...` で配信する置き場所（`storage/app/public/`）。
     storage_public_dir: Arc<Path>,
@@ -348,12 +351,13 @@ impl Application {
                     return Some(response);
                 }
                 // 3. ディスクの public/。`public/storage/` の中は返さない（`serve_public`）。
+                //    起動時に public/ が無かったなら探さない（裏のスレッドにも回さない）。
                 let dir = self.inner.public_dir.clone();
-                let root = self.inner.public_canonical.clone();
+                let root = self.inner.public_canonical.clone()?;
                 let found = tokio::task::spawn_blocking(move || {
                     crate::http::statics::serve_public(
                         &dir,
-                        root.as_deref(),
+                        Some(&*root),
                         &path,
                         if_none_match.as_deref(),
                         want_body,

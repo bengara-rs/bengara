@@ -241,6 +241,7 @@ bengara {version} — cargo artisan
                           サーバーを起動し、変更があれば再ビルドして再起動する
   init                    Laravel と同じ構成のファイルを作る（最初の1回だけ）
   list                    この一覧を出す
+  version                 bengara の版を出す（--version / -V も同じ）
 
   serve は本体を即座に止めます。停止の猶予を確かめるときは本体を直接動かしてください。
 ",

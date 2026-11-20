@@ -33,7 +33,7 @@ const HARD_MAX_BUCKETS: usize = MAX_BUCKETS * 2;
 
 /// 信頼する前段のプロキシを決める環境変数の名前。
 ///
-/// カンマ区切りの IP アドレスの一覧です。特別な値 `*` は「すべて信頼する」。
+/// カンマ区切りの IP アドレスの一覧です。特別な値 `*` は「接続元を信頼する」。
 /// 未設定（空）なら、`X-Forwarded-For` と `X-Real-IP` を**どちらも見ません**。
 ///
 /// `10.0.0.0/8` のような範囲（CIDR）の書き方は読めません。依存クレートを増やさないため、
@@ -280,7 +280,7 @@ impl Throttle {
 enum Trusted {
     /// 1つも信頼しない（既定）。ヘッダーは見ません。
     None,
-    /// すべて信頼する（`*`）。
+    /// 接続元を信頼する（`*`）。前段として取り除くのは接続元のアドレスだけ。
     All,
     /// この一覧だけ信頼する。
     List(Vec<IpAddr>),
@@ -374,7 +374,7 @@ fn key_for_with(req: &Request, trusted: &Trusted, by_ip: bool) -> Option<String>
     let peer = canonical(req.ip()?);
     // ヘッダーから採るのも `IpAddr` です。`user:5` のような文字列は鍵になりません。
     let who = if trusted.allows(&peer) {
-        forwarded_ip(req, trusted).unwrap_or(peer)
+        forwarded_ip(req, trusted, peer).unwrap_or(peer)
     } else {
         peer
     };
@@ -441,10 +441,14 @@ fn target_of(req: &Request) -> Cow<'_, str> {
 /// | 設定 | 採る場所 |
 /// |---|---|
 /// | `Trusted::List` | **右端から**見て、信頼一覧に無い最初のアドレス |
-/// | `Trusted::All` | 先頭（右端から辿る手がかりが無い） |
+/// | `Trusted::All` | **右端から**見て、接続元と違う最初のアドレス |
 ///
-/// `Trusted::List` で右端から辿るのは Laravel / Symfony と同じ考え方です。
+/// どちらも Laravel / Symfony と同じ考え方です。
 /// 自分の前段を右から順に取り除くと、残った右端が本当の相手になります。
+///
+/// `*` は「接続元だけを信頼する」という意味です（Laravel の `TrustProxies` に
+/// `'*'` を書いたときと同じ）。以前は先頭を採っていましたが、先頭は相手が
+/// 自由に決められるので、値を毎回変えるだけで回数制限を回せました。
 ///
 /// 1つも採れなければ `X-Real-IP` を見て、それも読めなければ `None`
 /// （呼ぶ側が接続元のアドレスに落とします）。
@@ -453,7 +457,7 @@ fn target_of(req: &Request) -> Cow<'_, str> {
 /// 1 本目だけを見ていたころは、HAProxy の `option forwardfor`（既定で新しい
 /// ヘッダー行を足す）の下で、相手が付けた 1 本目＝言い値を鍵にしていました。
 /// 値を毎回変えるだけで、回数の制限を無制限に回せました。
-fn forwarded_ip(req: &Request, trusted: &Trusted) -> Option<IpAddr> {
+fn forwarded_ip(req: &Request, trusted: &Trusted, peer: IpAddr) -> Option<IpAddr> {
     // 読めた値は IPv4 の形にそろえる。そろえないと、`::ffff:10.0.0.1` と書かれた
     // 自分の前段を「信頼一覧に無い相手」と見て、そこで辿るのを止めてしまいます。
     let parse = |part: &str| part.trim().parse::<IpAddr>().ok().map(canonical);
@@ -463,16 +467,18 @@ fn forwarded_ip(req: &Request, trusted: &Trusted) -> Option<IpAddr> {
         .flat_map(|value| value.split(','))
         .collect();
     if !forwarded.is_empty() {
-        let found = match trusted {
-            Trusted::None => None,
-            Trusted::All => forwarded.iter().copied().filter_map(parse).next(),
-            Trusted::List(_) => forwarded
-                .iter()
-                .rev()
-                .copied()
-                .filter_map(parse)
-                .find(|ip| !trusted.allows(ip)),
+        // 前段として取り除くアドレスか。`*` のときは接続元だけです。
+        let is_proxy = |ip: &IpAddr| match trusted {
+            Trusted::None => true,
+            Trusted::All => *ip == peer,
+            Trusted::List(list) => list.contains(ip),
         };
+        let found = forwarded
+            .iter()
+            .rev()
+            .copied()
+            .filter_map(parse)
+            .find(|ip| !is_proxy(ip));
         if found.is_some() {
             return found;
         }
@@ -918,8 +924,8 @@ mod tests {
         );
         assert_eq!(
             key_for_with(&req, &Trusted::All, false),
-            Some("1.2.3.4|/login".to_string()),
-            "すべて信頼するときは右端から辿れないので先頭"
+            Some("5.6.7.8|/login".to_string()),
+            "`*` は接続元だけを信頼するので、右端から（Laravel と同じ）"
         );
 
         // X-Forwarded-For が無ければ X-Real-IP を見る。
@@ -952,6 +958,32 @@ mod tests {
             Some("203.0.113.9|/login".to_string()),
             "つないだ 1 本として、右端から辿る"
         );
+    }
+
+    #[test]
+    fn すべて信頼でも先頭の言い値は採らない() {
+        // `TRUSTED_PROXIES=*` は接続元だけを信頼する（Laravel の `'*'` と同じ）。
+        // 先頭を採っていたころは、先頭を毎回変えるだけで回数の制限を回せた。
+        let key = |sent: &str| {
+            let req = from("10.0.0.1").with_headers(vec![("x-forwarded-for".into(), sent.into())]);
+            key_for_with(&req, &Trusted::All, false)
+        };
+        assert_eq!(
+            key("198.51.100.1, 203.0.113.9"),
+            key("198.51.100.2, 203.0.113.9"),
+            "先頭を変えても同じ枠"
+        );
+        assert_eq!(
+            key("198.51.100.1, 203.0.113.9"),
+            Some("203.0.113.9|/login".to_string())
+        );
+        // 接続元と同じアドレスが右端にあれば、前段として取り除く。
+        assert_eq!(
+            key("203.0.113.9, 10.0.0.1"),
+            Some("203.0.113.9|/login".to_string())
+        );
+        // 接続元しか書かれていなければ、接続元のアドレスに落ちる。
+        assert_eq!(key("10.0.0.1"), Some("10.0.0.1|/login".to_string()));
     }
 
     #[test]
@@ -997,7 +1029,7 @@ mod tests {
         assert_eq!(
             key_for_with(&req, &Trusted::All, false),
             Some("1.2.3.4|/login".to_string()),
-            "先頭が読めなければ次を見る"
+            "右端から見て、読めない要素は飛ばす"
         );
 
         // X-Real-IP も検査を通す。

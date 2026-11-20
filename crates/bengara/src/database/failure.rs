@@ -13,6 +13,8 @@ use crate::error::Error;
 pub(crate) struct SqlFailure {
     sql: String,
     source: sqlx::Error,
+    /// よくある理由。分かるときだけ添えます。
+    hint: Option<&'static str>,
 }
 
 impl SqlFailure {
@@ -30,7 +32,11 @@ impl std::fmt::Display for SqlFailure {
             f,
             "SQL の実行に失敗しました: {}\n  SQL: {}",
             self.source, self.sql
-        )
+        )?;
+        if let Some(hint) = self.hint {
+            write!(f, "\n  {hint}")?;
+        }
+        Ok(())
     }
 }
 
@@ -59,6 +65,16 @@ pub(crate) fn failed(sql: &str, error: sqlx::Error) -> Error {
     Error::other(SqlFailure {
         sql: sql.to_string(),
         source: error,
+        hint: None,
+    })
+}
+
+/// `failed` と同じ。よくある理由の文を 1 行添えます。
+pub(crate) fn failed_with_hint(sql: &str, error: sqlx::Error, hint: &'static str) -> Error {
+    Error::other(SqlFailure {
+        sql: sql.to_string(),
+        source: error,
+        hint: Some(hint),
     })
 }
 
@@ -111,6 +127,18 @@ mod tests {
         assert!(message.contains("commit"), "{message}");
         // 原因の連鎖から `SqlFailure` が見つかること（この原因は一意制約違反ではない）。
         assert!(!is_unique_violation(&error));
+    }
+
+    #[test]
+    fn 理由を添えても原因は残る() {
+        let error = failed_with_hint("select 1", sqlx::Error::PoolTimedOut, "理由の文");
+        let message = error.to_string();
+        assert!(message.contains("select 1"), "{message}");
+        assert!(message.contains("理由の文"), "{message}");
+        assert!(!is_unique_violation(&error));
+        // 添えないときは、理由の行を出さない。
+        let plain = failed("select 1", sqlx::Error::PoolTimedOut).to_string();
+        assert!(!plain.contains("理由の文"), "{plain}");
     }
 
     #[test]

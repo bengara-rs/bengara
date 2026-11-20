@@ -155,6 +155,19 @@ pub(crate) fn quote(driver: Driver, name: &str) -> String {
         .join(".")
 }
 
+/// 名前を**必ず**引用符でくくる。式とみなして素通しする経路はありません。
+///
+/// データベースから読んだ名前（`table_names()` の結果など）に使います。
+/// [`quote`] は空白・`(`・`*` を含む名前を式として素通しし、`.` で分けます。
+/// 表の名前にそれらの文字が入っていると、壊れた SQL や別の文になります。
+/// ここでは名前全体を 1 つの名前としてくくり、引用符は二重にして逃がします。
+pub(crate) fn quote_name(driver: Driver, name: &str) -> String {
+    match driver {
+        Driver::MySql => format!("`{}`", name.replace('`', "``")),
+        _ => format!("\"{}\"", name.replace('"', "\"\"")),
+    }
+}
+
 /// 引用符でくくらずにそのまま置く式か。
 ///
 /// 引用符（`"` と `` ` ``）は見ません。`quote_part` が `""` に逃がすので、
@@ -262,6 +275,20 @@ pub(crate) fn is_allowed_value_operator(operator: &str) -> bool {
     VALUE_OPERATORS.contains(&normalize_operator(operator).as_str())
 }
 
+/// そのドライバだけが持つ演算子なら、そのドライバ。どこでも使えるなら `None`。
+///
+/// | 演算子                 | 使えるドライバ | ほかのドライバでは                         |
+/// |------------------------|----------------|--------------------------------------------|
+/// | `ilike` / `not ilike`  | PostgreSQL     | SQLite と MySQL は構文エラー               |
+/// | `<=>`                  | MySQL          | SQLite は構文エラー、PostgreSQL は演算子が無い |
+pub(crate) fn operator_driver(operator: &str) -> Option<Driver> {
+    match normalize_operator(operator).as_str() {
+        "ilike" | "not ilike" => Some(Driver::Postgres),
+        "<=>" => Some(Driver::MySql),
+        _ => None,
+    }
+}
+
 /// 値を2つ以上とる演算子か。
 pub(crate) fn is_set_operator(operator: &str) -> bool {
     SET_OPERATORS.contains(&normalize_operator(operator).as_str())
@@ -344,7 +371,8 @@ pub(crate) fn drop_all(driver: Driver, tables: &[String]) -> Vec<String> {
     if tables.is_empty() {
         return Vec::new();
     }
-    let quoted: Vec<String> = tables.iter().map(|t| quote(driver, t)).collect();
+    // データベースから読んだ名前なので、式として素通ししない（`quote_name`）。
+    let quoted: Vec<String> = tables.iter().map(|t| quote_name(driver, t)).collect();
     match driver {
         Driver::Postgres => vec![format!(
             "drop table if exists {} cascade",
@@ -570,6 +598,15 @@ mod tests {
     }
 
     #[test]
+    fn ドライバだけの演算子を見分ける() {
+        assert_eq!(operator_driver("ilike"), Some(Driver::Postgres));
+        assert_eq!(operator_driver(" NOT   ILIKE "), Some(Driver::Postgres));
+        assert_eq!(operator_driver("<=>"), Some(Driver::MySql));
+        assert_eq!(operator_driver("like"), None);
+        assert_eq!(operator_driver("="), None);
+    }
+
+    #[test]
     fn 名前から読める() {
         assert_eq!(Driver::parse("sqlite"), Some(Driver::Sqlite));
         assert_eq!(Driver::parse("PgSQL"), Some(Driver::Postgres));
@@ -601,6 +638,41 @@ mod tests {
         );
         // 表が無いときは何も出さない（空の文を投げないため）。
         assert!(drop_all(Driver::Postgres, &[]).is_empty());
+    }
+
+    #[test]
+    fn 表を全部消す文はデータベースから読んだ名前を必ずくくる() {
+        // 以前は `quote` を通していたので、空白や `(` を含む名前を素通しし、
+        // `.` で分けていた。`drop table if exists my table` のような壊れた文になる。
+        let tables = vec![
+            "my table".to_string(),
+            "odd(name".to_string(),
+            "a.b".to_string(),
+            "*".to_string(),
+            "x\"y`z".to_string(),
+        ];
+        assert_eq!(
+            drop_all(Driver::Sqlite, &tables),
+            vec![
+                r#"drop table if exists "my table""#.to_string(),
+                r#"drop table if exists "odd(name""#.to_string(),
+                r#"drop table if exists "a.b""#.to_string(),
+                r#"drop table if exists "*""#.to_string(),
+                r#"drop table if exists "x""y`z""#.to_string(),
+            ]
+        );
+        assert_eq!(
+            drop_all(Driver::MySql, &tables[..1]),
+            vec!["drop table if exists `my table`".to_string()]
+        );
+        assert_eq!(
+            drop_all(Driver::MySql, &tables[4..]),
+            vec!["drop table if exists `x\"y``z`".to_string()]
+        );
+        assert_eq!(
+            drop_all(Driver::Postgres, &tables[..2]),
+            vec![r#"drop table if exists "my table", "odd(name" cascade"#.to_string()]
+        );
     }
 
     #[test]

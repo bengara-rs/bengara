@@ -242,7 +242,7 @@ mod imp {
         env.add_function("url", |path: String| {
             // `url()` は渡したパスを逃がさない。属性の外へ出られないよう、ここで逃がしてから
             // 安全な文字列にする（`&` は `&amp;` になるが、属性の中では同じ意味）。
-            Value::from_safe_string(crate::escape_html(&crate::url(&path)))
+            safe_url(&crate::url(&path))
         });
         env.add_function(
             "__",
@@ -284,10 +284,17 @@ mod imp {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        // 値はパーセントエンコードされ、残りはルートの定義の文字だけなので、逃がさずに出せる。
+        // `url()` と同じく逃がしてから安全な文字列にする。値はパーセントエンコードされるが、
+        // 引数をクエリ文字列に回したときの区切りの `&` はそのまま出てくるため
+        // （`&amp;` になるが、属性の中では同じ意味）。
         crate::route_with(&name, &borrowed)
-            .map(Value::from_safe_string)
+            .map(|url| safe_url(&url))
             .map_err(|e| template_error(e.to_string()))
+    }
+
+    /// URL を逃がしてから、テンプレートにそのまま出せる値にする（`url()` と `route()`）。
+    pub(super) fn safe_url(url: &str) -> Value {
+        Value::from_safe_string(crate::escape_html(url))
     }
 
     /// `{'post': 1}` を `[("post", "1")]` にする。値は文字列か数だけ。
@@ -676,6 +683,16 @@ mod tests {
         // 表に無い鍵は鍵そのもの。
         assert_eq!(parts[2], "posts.empty");
         assert_eq!(parts[3], "posts.empty");
+    }
+
+    #[test]
+    fn routeとurlはアンパサンドも逃がす() {
+        // クエリ文字列に回した引数の区切り。属性の中では `&amp;` で同じ意味になる。
+        assert_eq!(
+            safe_url("/posts?page=2&sort=new").to_string(),
+            "/posts?page=2&amp;sort=new"
+        );
+        assert_eq!(safe_url("/a\"b").to_string(), "/a&quot;b");
     }
 
     #[test]

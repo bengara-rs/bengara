@@ -171,19 +171,30 @@ get("/").await
 ```
 
 - `assert_*` はつなげて書けます。
+- **`assert_see` と `assert_dont_see` は、本文そのままと比べます。** Laravel の `assertSee` と違い、HTML の逃がし（`<` → `&lt;`）をしません。画面に `<b>` と出る値は `assert_see("&lt;b&gt;")` と書きます。
 - 失敗すると、URI と本文の先頭（400 文字まで）を出します。
 - **`json()` は、本文が JSON でないとパニックします。**
 
 ### `#[bengara::test]` が用意するもの
 
-- `.env` と `config/` を読みます（プロセスで 1 回）。
+- 下の表の環境変数を入れてから、`.env` と `config/` を読みます（プロセスで 1 回）。
 - `bootstrap/app.rs` の `app()` でアプリを組み立てます（テスト 1 件ごと）。
 - メールの送り先を `array` にします。**本当には送りません。**
-- パスワードの変換の回数を 1,000 に下げます（本番の既定は 240,000）。
-  変えるときは `HASH_ITERATIONS=20000 cargo test` のように渡します。
-- `APP_KEY` が無ければテスト用の鍵を、`APP_ENV` が無ければ `testing` を入れます。
+- パスワードの計算を軽くします。PBKDF2 は 1,000 回（本番の既定は 240,000）、Argon2id は最小に近い設定です。変えるときは `HASH_ITERATIONS=20000 cargo test` のように渡します。
+- `APP_KEY` が本物の環境変数にも `.env` にも無ければ、テスト用の鍵を入れます。
 - ソケットは開きません。ポートの衝突を気にせず並べて走らせられます。
 - 回数の制限（throttle）は本番と同じく効きます。接続元は `127.0.0.1` として数えます。
+
+テストのときに入れる環境変数です。Laravel の `phpunit.xml` の `<env>` と同じ役目です。
+
+| 環境変数         | 値        | 理由                                                                  |
+|------------------|-----------|-----------------------------------------------------------------------|
+| `APP_ENV`        | `testing` | 本番だけの振る舞い（Cookie の `Secure` など）でテストの結果を変えない |
+| `SESSION_DRIVER` | `memory`  | 開発用の `storage/framework/sessions/` にファイルを溜めない           |
+| `CACHE_DRIVER`   | `memory`  | 開発用の `storage/framework/cache/` を汚さない                        |
+
+- 優先順位は「本物の環境変数 > この表 > `.env`」です。`.env` に `APP_ENV=local` と書いても、テストは `testing` で走ります。
+- 変えたいときは本物の環境変数で渡します（`CACHE_DRIVER=file cargo test`）。
 
 ## テストどうしがぶつからないように
 
@@ -200,7 +211,7 @@ get("/").await
 
 - 札は変数で受け取ります（`let _db = ...`）。受け取らないと、その場で手放されます。
 - 1 つのテストで同じ札を 2 回取ると、パニックします。
-- **両方要るときは `refresh_database()` → `exclusive()` の順です。** 逆だと止まります。
+- **両方要るときは `refresh_database()` → `exclusive()` の順です。** 逆に取ると、`refresh_database()` がパニックして知らせます。
 
 ```rust
 let _db = refresh_database().await;
@@ -218,7 +229,8 @@ assert_eq!(Cache::increment("test.count", 1).await.unwrap(), 1);
 Cache::forget("test.count").await.unwrap();      // 片付ける
 ```
 
-`.env` に `SESSION_DRIVER=memory` と `CACHE_DRIVER=memory` を書くと、ディスクにファイルが残りません。
+セッションとキャッシュはメモリに置くので、ディスクにファイルは残りません。
+ただしメモリの中身もプロセスが終わるまで残ります。鍵を変えるのは同じです。
 
 ## 周辺機能のテスト
 

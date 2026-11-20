@@ -2,8 +2,9 @@
 
 設定ファイルの書き方、`.env` に書ける項目、機能フラグの一覧です。
 
-設定は Rust のコードです。`config/` 直下にファイルを置くと、起動時に自動で登録されます。
-設定は実行ファイルに入るので、本番に設定ファイルを置く必要はありません。
+- 設定は Rust のコードです。`config/` 直下に置くと、起動時に自動で読まれます。
+- 設定は実行ファイルに入ります。本番に設定ファイルは置きません。
+- 値は `.env`（環境変数）から読みます。
 
 ## 設定ファイルを書く
 
@@ -24,8 +25,8 @@ pub fn config() -> AppConfig {
 
 | 決まり                                | 守らないと                |
 |---------------------------------------|---------------------------|
-| `config/` の**直下**に置く            | 設定として登録されない    |
-| ファイル名を**小文字**で始める        | 設定として登録されない    |
+| `config/` の**直下**に置く            | 設定として読まれない      |
+| ファイル名を**小文字**で始める        | 設定として読まれない      |
 | `pub fn config() -> 何かの型` を書く  | ビルドが通らない          |
 | 1 つの型は 1 つのファイルからだけ返す | どちらか 1 つしか残らない |
 
@@ -34,16 +35,16 @@ pub fn config() -> AppConfig {
 型を指定して取り出します。文字列のキー（`config("app.name")`）では読めません。
 
 ```rust
-let app = config::<AppConfig>();          // 登録されていなければパニック
-let app = try_config::<AppConfig>();      // 登録されていなければ None
+let app = config::<AppConfig>();          // 無ければパニック
+let app = try_config::<AppConfig>();      // 無ければ None
 ```
 
 取れるのは `config/` のファイルが返した型だけです。
-`config/cache.rs` が無ければ、`config::<CacheConfig>()` はパニックします。
+`config/cache.rs` が無いのに `config::<CacheConfig>()` を呼ぶと、パニックします。
 
 ### 自分の設定を足す
 
-`config/<名前>.rs` に好きな型を定義して、`pub fn config() -> その型` を書きます。
+`config/<名前>.rs` に好きな型を書き、それを返す `config()` を書きます。
 
 ```rust
 // config/shop.rs
@@ -83,15 +84,25 @@ let shop = config::<crate::config::shop::ShopConfig>();
 | `BroadcastConfig` | 配信の送り方               | [websocket.md](websocket.md)           | 作らない        |
 | `QueueConfig`     | ジョブごとの打ち切りの時間 | [queue.md](queue.md)                   | 作らない        |
 
-- `QueueConfig` は `bengara::queue::QueueConfig`、`BroadcastConfig` は `bengara::broadcast::BroadcastConfig` から取り込みます。
-- `QueueConfig` は環境変数からは読みません。置かなければ、どのジョブも `queue:work --timeout` で打ち切ります。
+- 次の 3 つは `prelude` に入っていません。`use` で取り込みます。
+
+  | 型                | 取り込む場所                          |
+  |-------------------|---------------------------------------|
+  | `ArgonConfig`     | `bengara::ArgonConfig`                |
+  | `QueueConfig`     | `bengara::queue::QueueConfig`         |
+  | `BroadcastConfig` | `bengara::broadcast::BroadcastConfig` |
+
+- `QueueConfig` は環境変数から読みません。置かなければ、どのジョブも `queue:work --timeout` で打ち切ります。
 
 ### いまの環境を調べる
 
-- `config::<AppConfig>().is_local()` のように調べます。
-- `is_production()` / `is_local()` / `is_testing()` は、`APP_ENV` がその名前のときに真です。
-- `staging` などは、`config::<AppConfig>().env` を自分で比べます。
-- `#[bengara::test]` のテストは、`APP_ENV` がどこにも無ければ `testing` で動きます。
+| 書き方                                  | 真になるとき         |
+|-----------------------------------------|----------------------|
+| `config::<AppConfig>().is_production()` | `APP_ENV=production` |
+| `config::<AppConfig>().is_local()`      | `APP_ENV=local`      |
+| `config::<AppConfig>().is_testing()`    | `APP_ENV=testing`    |
+
+`staging` などは、`config::<AppConfig>().env` を自分で比べます。
 
 ## env() の使い方
 
@@ -104,10 +115,9 @@ let name: String = env("APP_NAME", "myapp");
 let dir: std::path::PathBuf = env("CACHE_DIR", "storage/cache");
 ```
 
-**数の既定値には型を付けます**（`8000u16`）。付けないと `i32` と読まれ、コンパイルエラーになります。
-
-- 読める型は `String`・`std::path::PathBuf`・`bool`・整数・小数（`f32` `f64`）です。
-- `bool` は `true` `1` `yes` `on` が真、`false` `0` `no` `off` `null` `none` が偽です。
+- **数の既定値には型を付けます**（`8000u16`）。付けないと `i32` になり、コンパイルが通りません。
+- 読める型は、文字列・パス（`PathBuf`）・`bool`・整数・小数です。
+- `bool` は `true` `1` `yes` `on` が真です。`false` `0` `no` `off` `null` `none` が偽です。
 
 | 環境変数の値                   | `env()` が返すもの  |
 |--------------------------------|---------------------|
@@ -125,23 +135,52 @@ APP_ENV=local
 
 # コメント
 DB_PASSWORD="p#ss"
+MAIL_FROM_NAME="${APP_NAME}"
 ```
 
-| 決まり          | 内容                                                                     |
-|-----------------|--------------------------------------------------------------------------|
-| 優先            | 本物の環境変数が勝つ。`.env` は設定されていないものだけを埋める          |
-| 空の環境変数    | 空と空白だけの環境変数は「設定されていない」扱い。`.env` の値で埋める    |
-| 同じ名前が 2 回 | **先に出てくるほう**が勝つ                                               |
-| コメント        | `#` から行末まで。前に空白は要らない（`APP_PORT=8000#dev` は `8000`）    |
-| `#` を含む値    | **必ず引用符で囲む。** 囲まないと `#` より前までが値になる。警告も出ない |
-| `"..."`         | `\n` `\r` `\t` `\\` `\"` `\'` を解釈する。ほかの `\` はそのまま残る      |
-| `'...'`         | すべてそのままの文字                                                     |
-| 行頭の `export` | 無視する                                                                 |
-| 先頭の BOM      | 外して読む（メモ帳で保存しても読める）                                   |
+| 決まり          | 内容                                                                   |
+|-----------------|------------------------------------------------------------------------|
+| 優先            | 本物の環境変数が勝つ。`.env` は設定されていないものだけを埋める        |
+| 空の環境変数    | 空と空白だけの環境変数は、設定されていない扱い。`.env` の値で埋める    |
+| 同じ名前が 2 回 | **先に出てくるほう**が勝つ                                             |
+| コメント        | `#` から行末まで。前に空白は要らない（`APP_PORT=8000#dev` は `8000`）  |
+| `#` を含む値    | **必ず引用符で囲む。** 囲まないと `#` の前までが値になる。警告は出ない |
+| `"..."`         | `\n` `\r` `\t` `\\` `\"` `\'` を解釈する。ほかの `\` はそのまま        |
+| `'...'`         | すべてそのままの文字                                                   |
+| 行頭の `export` | 無視する                                                               |
+| 先頭の BOM      | 外して読む（メモ帳で保存しても読める）                                 |
 
 - Windows のパスは `"..."` の中にそのまま書けます（`DB_DATABASE="C:\data\app.sqlite"`）。
-- 読めない行は、起動時のログに行番号つきの警告が出ます。`=` が無い行や、名前に英数字と `_` 以外が入った行（`APP-PORT=8000`
-  ）です。
+- 読めない行は、起動時のログに行番号つきで警告が出ます。
+  `=` が無い行と、名前に英数字と `_` 以外が入った行（`APP-PORT=8000`）です。
+
+### `${VAR}` で他の値を使う
+
+値の中の `${名前}` は、その変数の値に置き換わります（Laravel と同じ）。
+
+| 決まり            | 内容                                                               |
+|-------------------|--------------------------------------------------------------------|
+| 置き換える所      | 引用符なしの値と `"..."` の中。`'...'` の中は置き換えない          |
+| 探す順            | 本物の環境変数 → `.env` の**前の行**。後の行に書いた変数は使えない |
+| 見つからないとき  | 空になる（警告は出ない）                                           |
+| `$VAR`            | 波かっこが無いものは置き換えない                                   |
+| 閉じていない `${` | そのまま残る                                                       |
+
+既定値つきの `${VAR:-default}` と、`\$` での逃がしは使えません。
+
+### テストのときの値
+
+`#[bengara::test]` のテストは、次の値で動きます。
+
+| 名前             | 値        |
+|------------------|-----------|
+| `APP_ENV`        | `testing` |
+| `SESSION_DRIVER` | `memory`  |
+| `CACHE_DRIVER`   | `memory`  |
+
+- 強さは「本物の環境変数 > この表 > `.env`」です（Laravel の `phpunit.xml` と同じ）。
+- `.env` に `APP_ENV=local` と書いても、テストは `testing` で走ります。
+- くわしくは [testing.md](testing.md) にあります。
 
 ## 環境変数の一覧
 
@@ -159,22 +198,24 @@ DB_PASSWORD="p#ss"
 | `APP_KEY`   | （空）                  | 署名と暗号化の鍵（[APP_KEY](#app_key)） | `AppConfig`  |
 | `RUST_LOG`  | （なし）                | ログの細かさ（[ログ](#ログ)）           | —            |
 
-- `APP_NAME` と `APP_URL` の既定は、`init` が作る `config/app.rs` のものです。
-- `APP_ENV=production` にすると、中身が消えるコマンド（`migrate:fresh` など）が `--force`
-  を求めます（[artisan.md](artisan.md)）。
-- 同じく、セッションの Cookie に `Secure` が付きます。HTTPS でないと Cookie が送られません。
+`APP_ENV=production` にすると、次の 2 つが変わります。
+
+- 中身が消えるコマンド（`migrate:fresh` など）が `--force` を求めます（[artisan.md](artisan.md)）。
+- セッションの Cookie に `Secure` が付きます。HTTPS でないと Cookie が送られません。
 
 ### 待ち受けと停止
 
-| 名前                   | 既定        | 何に効くか                                                                                                                   |
-|------------------------|-------------|------------------------------------------------------------------------------------------------------------------------------|
-| `APP_HOST`             | `127.0.0.1` | 待ち受けるホスト                                                                                                             |
-| `APP_PORT`             | `8000`      | 待ち受けるポート                                                                                                             |
-| `APP_SHUTDOWN_TIMEOUT` | `30`        | 止めるときに待つ上限の秒数。**`0` は無制限**（[deployment.md](deployment.md#止める)）                                        |
-| `APP_MAX_BODY_BYTES`   | `2097152`   | 受け取る本文の上限のバイト数（2 MiB）。ルートの `.max_body` が優先（[requests-and-responses.md](requests-and-responses.md)） |
-| `TRUSTED_PROXIES`      | （空）      | 信頼する前段のアドレス（[TRUSTED_PROXIES](#trusted_proxies)）                                                                |
+| 名前                   | 既定        | 何に効くか                                                     |
+|------------------------|-------------|----------------------------------------------------------------|
+| `APP_HOST`             | `127.0.0.1` | 待ち受けるホスト                                               |
+| `APP_PORT`             | `8000`      | 待ち受けるポート                                               |
+| `APP_SHUTDOWN_TIMEOUT` | `30`        | 止めるときに待つ上限の秒数。**`0` は無制限**                   |
+| `APP_MAX_BODY_BYTES`   | `2097152`   | 受け取る本文の上限（2 MiB）。ルートの `.max_body` のほうが優先 |
+| `TRUSTED_PROXIES`      | （空）      | 信頼する前段のアドレス（[TRUSTED_PROXIES](#trusted_proxies)）  |
 
-`APP_MAX_BODY_BYTES` は起動時に 1 回だけ読みます。`0` や数でない値なら、警告を出して既定にします。
+- 止め方は [deployment.md](deployment.md#止める) にあります。
+- 本文の上限は [requests-and-responses.md](requests-and-responses.md) にあります。
+  `0` や数でない値なら、警告を出して既定にします。
 
 ### 置き場所
 
@@ -189,24 +230,26 @@ DB_PASSWORD="p#ss"
 - どちらも、相対パスなら起動しません。`APP_BASE_PATH` は、指した場所が無いときも起動しません。
 - 基準ディレクトリの決め方は [deployment.md](deployment.md#基準ディレクトリの決め方) にあります。
 
-### セッションと認証
+### セッションとパスワード
 
 | 名前                   | 既定     | 何に効くか                                | 設定ファイル  |
 |------------------------|----------|-------------------------------------------|---------------|
 | `SESSION_DRIVER`       | `file`   | セッションの置き場所（`file` / `memory`） | —             |
 | `SESSION_LIFETIME`     | `120`    | 最後に使ってから消えるまでの分            | —             |
-| `HASH_ITERATIONS`      | `240000` | パスワードの変換の繰り返し回数（PBKDF2）  | `HashConfig`  |
 | `HASH_DRIVER`          | `pbkdf2` | パスワードの方式（`pbkdf2` / `argon2id`） | —             |
+| `HASH_ITERATIONS`      | `240000` | PBKDF2 の繰り返し回数                     | `HashConfig`  |
 | `ARGON_MEMORY`         | `65536`  | Argon2id のメモリ（KiB）                  | `ArgonConfig` |
 | `ARGON_TIME`           | `4`      | Argon2id の繰り返し                       | `ArgonConfig` |
 | `ARGON_THREADS`        | `1`      | Argon2id の並列の数                       | `ArgonConfig` |
 | `HASH_MAX_CONCURRENCY` | CPU の数 | パスワードの計算を同時に走らせる数の上限  | —             |
 
-- `SESSION_DRIVER` の `array` は `memory` と同じです。知らない名前は、警告を出して `file` にします。
+- `SESSION_DRIVER` は大文字小文字を見ません。`array` は `memory` と同じです。
+- 知らない名前は、警告を出して `file` にします。
+- 本番で `memory` にすると、起動時に警告が出ます。起動し直すと全員がログアウトするためです。
 - `SESSION_LIFETIME` は 1 分より短くなりません。最大 60 秒早く切れることがあります（[session.md](session.md)）。
-- `HASH_ITERATIONS`・`HASH_DRIVER`・`ARGON_*`・`HASH_MAX_CONCURRENCY` は [authentication.md](authentication.md) で説明しています。
-- `HASH_DRIVER=argon2id` には機能フラグ `argon2` が要ります。無いときと知らない名前のときは、ログに出して `pbkdf2` にします。
-- 名前と既定値は Laravel 12 の `config/hashing.php` と同じです。
+- `HASH_DRIVER=argon2id` には機能フラグ `argon2` が要ります。
+  フラグが無いときと知らない名前のときは、ログに出して `pbkdf2` にします。
+- パスワードの項目は [authentication.md](authentication.md) にくわしくあります。
 
 ### データベース
 
@@ -219,10 +262,9 @@ DB_PASSWORD="p#ss"
 | `DB_USERNAME`        | `root`（MySQL）/ `postgres`（PostgreSQL）              | 利用者名。空は左の値                                 |
 | `DB_PASSWORD`        | （空）                                                 | パスワード                                           |
 | `DB_URL`             | （空）                                                 | 接続文字列。上の 4 つより優先                        |
-| `DB_MAX_CONNECTIONS` | `5`                                                    | 同時に張る接続の数の上限（全部の接続に同じ値）       |
+| `DB_MAX_CONNECTIONS` | `5`                                                    | 同時に張る接続の数の上限（どの接続も同じ値）         |
 | `DB_TEST_DATABASE`   | SQLite は `:memory:`                                   | テストで使うデータベース                             |
 
-- `DB_TEST_DATABASE` 以外は、`init` が作る `config/database.rs` が読みます。
 - `DB_HOST` から `DB_PASSWORD` までは、MySQL と PostgreSQL のときだけ使います。
 - **`DB_URL` が効くのは、`DB_CONNECTION` で選んだ接続だけです。**
 - **MySQL と PostgreSQL では `DB_TEST_DATABASE` が必須です。** テストは表を全部消すので、無いとテストが始まりません。
@@ -230,18 +272,20 @@ DB_PASSWORD="p#ss"
 
 ### キャッシュ・メール・言語
 
-| 名前                  | 既定                     | 何に効くか                                      | 設定ファイル  |
-|-----------------------|--------------------------|-------------------------------------------------|---------------|
-| `CACHE_DRIVER`        | `file`                   | キャッシュの置き場所（`file` / `memory`）       | `CacheConfig` |
-| `MAIL_MAILER`         | （空なら `MAIL_DRIVER`） | メールの送り先（`log` / `array` / `smtp`）      | `MailConfig`  |
-| `MAIL_DRIVER`         | `log`                    | 古い名前。`MAIL_MAILER` が空のときだけ見る      | `MailConfig`  |
-| `MAIL_FROM`           | `noreply@example.com`    | 差出人                                          | `MailConfig`  |
-| `MAIL_FROM_NAME`      | `bengara`                | 差出人の名前（`init` の `.env` はパッケージ名） | `MailConfig`  |
-| `APP_LOCALE`          | `ja`                     | 画面の言語                                      | —             |
-| `APP_FALLBACK_LOCALE` | `ja`                     | 鍵が無いときに見る言語                          | —             |
+| 名前                  | 既定                     | 何に効くか                                 | 設定ファイル  |
+|-----------------------|--------------------------|--------------------------------------------|---------------|
+| `CACHE_DRIVER`        | `file`                   | キャッシュの置き場所（`file` / `memory`）  | `CacheConfig` |
+| `MAIL_MAILER`         | （空なら `MAIL_DRIVER`） | メールの送り先（`log` / `array` / `smtp`） | `MailConfig`  |
+| `MAIL_DRIVER`         | `log`                    | 古い名前。`MAIL_MAILER` が空のときだけ見る | `MailConfig`  |
+| `MAIL_FROM_ADDRESS`   | （空なら `MAIL_FROM`）   | 差出人のアドレス                           | `MailConfig`  |
+| `MAIL_FROM`           | `noreply@example.com`    | 古い名前。`MAIL_FROM_ADDRESS` が空のとき   | `MailConfig`  |
+| `MAIL_FROM_NAME`      | `bengara`                | 差出人の名前                               | `MailConfig`  |
+| `APP_LOCALE`          | `ja`                     | 画面の言語                                 | —             |
+| `APP_FALLBACK_LOCALE` | `ja`                     | 鍵が無いときに見る言語                     | —             |
 
-- SMTP の項目（`MAIL_HOST`・`MAIL_PORT` など）は [mail.md](mail.md) にあります。
-- くわしくは [cache.md](cache.md) / [mail.md](mail.md) / [localization.md](localization.md) にあります。
+- `MAIL_FROM_ADDRESS` と `MAIL_FROM` の `null` は、空と同じです。
+- `init` が作る `.env` では、`MAIL_FROM_NAME="${APP_NAME}"` です。
+- SMTP の項目（`MAIL_HOST` など）は [mail.md](mail.md) にあります。
 
 ### WebSocket と配信
 
@@ -263,8 +307,8 @@ cargo artisan key:generate
 
 - **64 文字以上が必須です。** 空や短いと、鍵を使うリクエストがエラーになります。
 - `key:generate` は 64 文字の鍵を作って `.env` に書きます。先に `.env` が要ります。
-- すでに値があるときは書き換えません。作り直すときは `--force` を付けます。
-- **作り直すと、いまのセッション・暗号化した値・配った署名付き URL が無効になります。** 全員がログアウトします。
+- 値があるときは書き換えません。作り直すときは `--force` を付けます。
+- **作り直すと、全員がログアウトします。** 暗号化した値と、配った署名付き URL も無効になります。
 
 ## TRUSTED_PROXIES
 
@@ -275,16 +319,18 @@ cargo artisan key:generate
 TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 ```
 
-| 書き方       | 動き                                                   | 採るアドレス                               |
-|--------------|--------------------------------------------------------|--------------------------------------------|
-| 空（既定）   | 転送元のヘッダーを見ない                               | つないできた相手                           |
-| アドレスの列 | カンマ区切り。載っている相手から来たヘッダーだけを見る | **右端から見て、一覧に無い最初のアドレス** |
-| `*`          | すべての相手を信頼する                                 | 左端                                       |
+| 書き方       | 動き                                           | 採るアドレス                                 |
+|--------------|------------------------------------------------|----------------------------------------------|
+| 空（既定）   | 転送元のヘッダーを見ない                       | つないできた相手                             |
+| アドレスの列 | カンマ区切り。載っている相手のヘッダーだけ見る | **右端から見て、一覧に無い最初のアドレス**   |
+| `*`          | 接続元を信頼する（Laravel の `'*'` と同じ）    | **右端から見て、接続元と違う最初のアドレス** |
 
 - 見るヘッダーは `X-Forwarded-For` と `X-Real-IP` です。
 - アドレスは 1 つずつ並べます。範囲の書き方（`10.0.0.0/8`）は使えません。
 - `Request::ip()` は、この値に関係なく**つないできた相手**を返します。
-- **`*` は、前段がヘッダーを必ず上書きする構成でだけ使ってください。** 左端は送り手が好きに書けるので、回数の制限をすり抜けられます。
+- `*` でも左端は採りません。左端は送り手が好きに書けるためです。
+- `*` で外すのは接続元の 1 段だけです。プロキシが 2 段以上なら、アドレスを全部並べます。
+- **プロキシを置かないのに書くと、** 偽のヘッダーで回数の制限をすり抜けられます。
 
 ## ログ
 
@@ -299,7 +345,8 @@ TRUSTED_PROXIES=10.0.0.1,10.0.0.2
 | `myapp=debug`                         | 自分のアプリだけ細かく出す                  |
 
 - 下の 2 つの書き方には、機能フラグ `log-filter` が要ります（既定で入っています）。
-- ログの細かさは、環境変数の `APP_DEBUG` を直接見ます。`config/app.rs` で `debug` を変えても変わりません。
+- ログの細かさは、**環境変数**の `APP_DEBUG` で決まります。`config/app.rs` の `debug` を変えても変わりません。
+  ログの準備を、`config/` を読む前に済ませるためです。
 
 ## 機能フラグ
 
@@ -319,13 +366,15 @@ bengara = { version = "0.1", features = ["sqlite", "mail"] }
 | `mail`       | 入っていない   | SMTP でのメール送信（[mail.md](mail.md)）                       |
 | `websocket`  | 入っていない   | WebSocket の受け口（[websocket.md](websocket.md)）              |
 | `encryption` | 入っていない   | `encrypt` / `decrypt`（[authentication.md](authentication.md)） |
+| `argon2`     | 入っていない   | パスワードの Argon2id（`HASH_DRIVER=argon2id`）                 |
+| `view`       | 入っていない   | テンプレート（[views.md](views.md)）                            |
 | `log-filter` | **入っている** | `RUST_LOG=myapp=debug` のような絞り込み                         |
 
-- `init` で作ったプロジェクトには `features = ["sqlite"]` が入ります。**別のデータベースなら書き換えてください。**
+- `init` で作ると `features = ["sqlite"]` が入ります。**別のデータベースなら書き換えてください。**
 - **キューとマイグレーションにも、データベースのフラグが要ります。**
-- 認証・キャッシュ・ファイル・多言語・イベント・定期処理は、フラグなしで使えます。
+- 次はフラグなしで使えます: 認証・キャッシュ・ファイル・多言語・イベント・定期処理。
 - メールは、送り先が `log` と `array` ならフラグなしで使えます。
-- `Broadcast::publish` はフラグなしで呼べます。受け口（`req.websocket()`）には `websocket` が要ります。
+- 配信（`Broadcast::publish`）はフラグなしで呼べます。受け口（`req.websocket()`）には `websocket` が要ります。
 - `mysql` / `postgres` / `mail` のビルドには C コンパイラが要ります（通信の暗号化のため）。
 - `Cargo.toml` に見える `database` と `tls` は内部用です。自分では書きません。
 
