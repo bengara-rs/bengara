@@ -180,7 +180,8 @@ if post.save_only(&["title"]).await? == 0 {
 | 更新     | 書き戻さない | 入る         |
 
 - フィールドの型は `String`・`Option<String>`・`Carbon`・`Option<Carbon>` のどれでもかまいません。
-- **`DB::table(...)` で直接入れた行には、時刻が入りません。** `timestamps()` の列は NULL を許すので、`String` のフィールドで読むとエラーです。`now()` を自分で入れるか、フィールドを `Option` にします。
+- **`DB::table(...)` で直接入れた行には、時刻が入りません。** `timestamps()` の列は NULL を許すので、`String`
+  のフィールドで読むとエラーです。`now()` を自分で入れるか、フィールドを `Option` にします。
 
 ### 書きやすくする
 

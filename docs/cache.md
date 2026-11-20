@@ -31,7 +31,8 @@ Cache::flush().await?;                           // 全部捨てる
 | `location()`      | `Option<String>`         | 置き場所の表示。`await` は要らない |
 
 - 壊れたファイルは「無い」として扱います。エラーにはなりません。
-- **鍵は小文字の英数字と `. _ -` で付けてください**（`stats.posts`、`post.1`）。ほかの文字や 150 バイトより長い鍵も動きますが、ファイル名が英数字の列になり、どの鍵か見分けられません。
+- **鍵は小文字の英数字と `. _ -` で付けてください**（`stats.posts`、`post.1`）。ほかの文字や 150
+  バイトより長い鍵も動きますが、ファイル名が英数字の列になり、どの鍵か見分けられません。
 
 ## 無ければ作る
 
@@ -93,7 +94,8 @@ let stats: Stats = Cache::remember_json("stats", 600, || async { Ok(count().awai
 
 - 知らない名前を書くと、警告を出して `file` にします。
 - **プロセスを 2 つ以上動かすときは `file` にします。** 全部が同じ `storage/` を見るようにしてください。
-- `storage/` が無いと、`file` は書き込みでエラーになります。`storage:init` で作ってください（[deployment.md](deployment.md)）。
+- `storage/` が無いと、`file` は書き込みでエラーになります。`storage:init`
+  で作ってください（[deployment.md](deployment.md)）。
 - `storage/framework/cache/` は、無ければ作ります。所有者だけが読める権限にします。
 
 `config/cache.rs` を置くと、そちらを使います。無くても動きます。

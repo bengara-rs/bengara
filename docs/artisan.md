@@ -73,7 +73,10 @@
 | `schedule:list` | 定期処理の一覧                 | [scheduling.md](scheduling.md)     |
 | `lang:list`     | 読み込まれている言語の一覧     | [localization.md](localization.md) |
 
-- データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
+-
+
+データベースとキューのコマンドには、データベースの機能フラグが要ります（[configuration.md](configuration.md#機能フラグ)）。
+
 - `app/Console/Commands/` に置いた自分のコマンドも、同じ一覧に並びます（[console-commands.md](console-commands.md)）。
 - 無い名前を打つと、エラーと一覧を出して終了コード 1 で終わります。
 - ファイルを生成する `make:*` コマンドはありません。ファイルは手で作ります。
@@ -144,7 +147,8 @@ $ cargo artisan cache:clear --tries=9
 
 `migrate:rollback` / `migrate:reset` / `migrate:refresh` / `migrate:fresh` / `db:wipe`
 
-**表を変えるコマンドは同時に流せません。** 2 つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
+**表を変えるコマンドは同時に流せません。** 2
+つ目は「実行中です」で止まります（[deployment.md](deployment.md#migrate-の同時実行)）。
 
 ## serve の動き
 

@@ -140,7 +140,8 @@ pub async fn handle(Json(payload): Json<Payload>) -> Result<()> {
 登録の表はプロセスに 1 つで、アプリを組み立てるたびに置き換わります。
 テストは並んで走るので、ほかのテストの登録で動くことがあります。
 
-- **`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()` の札を取ってください**（[testing.md](testing.md)）。
+- **`with_events` の中身を変えたアプリで `Event::dispatch` を呼ぶテストは、`exclusive()`
+  の札を取ってください**（[testing.md](testing.md)）。
 - `bootstrap/app.rs` の登録のまま使うテストには、札は要りません。
 
 ```rust

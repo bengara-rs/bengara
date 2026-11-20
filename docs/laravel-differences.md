@@ -233,7 +233,8 @@ CSRF は、別のサイトからの なりすまし送信のことです。
 | 言語ファイルは PHP の配列                   | `resources/lang/<言語>.toml`。**ビルド時に読む**                |
 | `$signature` でコマンド名を決める           | **ファイル名**から決まる。名前に `:` は入れられない             |
 
-くわしくは [mail.md](mail.md) / [processes.md](processes.md) / [localization.md](localization.md) / [console-commands.md](console-commands.md) にあります。
+くわしくは [mail.md](mail.md) / [processes.md](processes.md) / [localization.md](localization.md) / [console-commands.md](console-commands.md)
+にあります。
 
 ## WebSocket と配信
 
