@@ -157,7 +157,9 @@ jobs:
           cargo build --release
           # 生成されたコードに include_bytes! が入っていること。
           # init は public/robots.txt を作るので、必ず1件以上ある。
-          if ! grep -rq "include_bytes!" target/release/build/myapp-*/out/bengara_app.rs; then
+          # 置き場所は Cargo の版で違う（myapp-<英数字>/out/ と myapp/<英数字>/out/）ので、
+          # パスは決め打ちせずにファイル名で探す。
+          if ! grep -rq --include=bengara_app.rs "include_bytes!" target/release/build; then
             echo "public/ が埋め込まれていません"
             exit 1
           fi

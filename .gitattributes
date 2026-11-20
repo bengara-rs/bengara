@@ -1,0 +1,4 @@
+# 改行は LF にそろえる。
+# Windows で core.autocrlf=true だと、取り出したときに CRLF になる。
+# 雛形（cli/stubs/）は include_str! でそのまま取り込むので、CRLF だと init の出力も変わる。
+* text=auto eol=lf
