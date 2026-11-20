@@ -337,7 +337,7 @@ async fn insert_row(channel: &str, kind: &Kind<'_>, origin: &str) -> Result<()> 
 
 /// 乱数 4 バイトから、`publish` のついでに掃除するかを決める。
 fn sweep_roll(random: [u8; 4]) -> bool {
-    u32::from_le_bytes(random) % SWEEP_ON_INSERT_ONE_IN == 0
+    u32::from_le_bytes(random).is_multiple_of(SWEEP_ON_INSERT_ONE_IN)
 }
 
 /// 残す長さ（秒）より古い行を消す。返るのは消した件数。
