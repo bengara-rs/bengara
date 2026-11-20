@@ -76,8 +76,9 @@ pub trait Model: Sized + Send + Sync + 'static {
     /// `created_at` / `updated_at` を今の時刻にする。
     ///
     /// その**列名**のフィールドが無いときは、何もしません。
-    /// 入れる値は `now()` の文字列です。`#[derive(Model)]` は `.into()` で入れるので、
-    /// `String` から `Into` で変えられる型のフィールドなら動きます。
+    /// `#[derive(Model)]` は [`Carbon::now()`](crate::Carbon::now) を `.into()` で入れるので、
+    /// `String`・`Option<String>`・`Carbon`・`Option<Carbon>` のフィールドで動きます。
+    /// `String` に入る形は `now()` と同じです。
     fn touch_timestamps(&mut self, creating: bool) {
         let _ = creating;
     }

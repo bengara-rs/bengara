@@ -1,12 +1,15 @@
 //! 小さな下支え。Laravel の `Illuminate\Support` に当たります。
 //!
-//! 利用者に見せるのは [`blocking`] だけです。ほかは枠組みの中で使います。
+//! 利用者に見せるのは [`blocking`] と [`Carbon`] だけです。ほかは枠組みの中で使います。
 
+mod carbon;
 pub(crate) mod crypto;
 pub(crate) mod fs;
 pub(crate) mod lock;
 pub(crate) mod text;
 pub(crate) mod time;
+
+pub use carbon::Carbon;
 
 use crate::error::{Error, Result};
 

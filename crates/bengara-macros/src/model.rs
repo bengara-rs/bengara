@@ -144,7 +144,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         };
         quote! {
             fn touch_timestamps(&mut self, __creating: bool) {
-                let __now = ::bengara::database::now();
+                let __now = ::bengara::Carbon::now();
                 #created
                 #updated
             }

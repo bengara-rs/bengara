@@ -104,6 +104,9 @@
 | SQLite で索引の付いた列を落とす             | 失敗する                            | 先に `drop_index` で索引を落とす             |
 | 複数の DB へまとめて流す                    | 無い                                | `--database=名前` で 1 つずつ流す            |
 | 複数のプロセスからの `migrate` の待ち合わせ | 後から来たほうは待たずに止まる      | 1 か所から流す                               |
+| 日時のタイムゾーン                          | `Carbon` は UTC だけ                | 表示するときに自分で時差を足す               |
+| `Carbon` の `format()`（PHP の書式）        | 無い                                | `to_date_string()` などの決まった形を使う    |
+| `Carbon` の `diff_for_humans`（「3 日前」） | 無い                                | `diff_in_days` などで自分で組み立てる        |
 
 ### 認証
 
@@ -313,7 +316,6 @@
 | リレーションの宣言（`hasMany` など）        | `impl` にただのメソッドを書く                            |
 | まとめ読み（`with()`）と遅延ロード          | `where_in` で 2 回に分けて読む（[models.md](models.md)） |
 | 属性の型の変換（`$casts`）                  | 構造体の型で決める                                       |
-| 日時の専用の型                              | 文字列で扱う                                             |
 | 引数の型からモデルを自動で読む              | `req.model::<Post>("post").await?` と書く                |
 | `#[derive(Model)]` での文字列の主キー       | `Model` を手で実装する                                   |
 | `update` と `delete` への `join` や `limit` | エラーになる。条件で絞る                                 |

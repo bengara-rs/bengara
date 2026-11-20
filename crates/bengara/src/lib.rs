@@ -72,12 +72,13 @@ pub use http::{
     Cookie, Handler, Middleware, Middlewares, Next, Redirect, Registered, Request, Response, Route,
     RouteGroup, SameSite, Throttle,
 };
-pub use lang::{Lang, LangTable, __with, __};
+pub use lang::{__with, Lang, LangTable, __};
 pub use mail::{Mail, MailConfig, Mailer, Message};
 pub use paths::{app_path, base_path, public_path, storage_path};
 pub use queue::{Job, JobFuture, Queue, QueueConfig};
 pub use schedule::{Every, Schedule, Task};
 pub use storage::{DiskConfig, Storage, StorageConfig};
+pub use support::Carbon;
 
 /// `#[bengara::test]`：`tests/` 以下のテスト関数に付ける。
 pub use bengara_macros::test;
@@ -238,7 +239,7 @@ pub mod prelude {
     pub use crate::cache::{Cache, CacheConfig, CacheStore};
     pub use crate::console::Command;
     pub use crate::events::{Event, Events};
-    pub use crate::lang::{Lang, __with, __};
+    pub use crate::lang::{__with, Lang, __};
     pub use crate::mail::{Mail, MailConfig, Message};
     pub use crate::queue::{Job, Queue};
     pub use crate::schedule::{Every, Schedule, Task};

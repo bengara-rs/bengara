@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::support::Carbon;
 
 /// DB に渡す値、DB から来た値。
 ///
@@ -365,6 +366,27 @@ impl FromValue for Vec<u8> {
 impl FromValue for Value {
     fn from_value(value: &Value) -> Result<Self> {
         Ok(value.clone())
+    }
+}
+
+/// `String` の列に入れたときと同じ `YYYY-MM-DD HH:MM:SS` の文字列で渡します。
+impl From<Carbon> for Value {
+    fn from(at: Carbon) -> Self {
+        Value::Text(at.to_date_time_string())
+    }
+}
+
+/// 文字列は [`Carbon::parse`] で、整数は UNIX 秒として読みます。
+impl FromValue for Carbon {
+    fn from_value(value: &Value) -> Result<Self> {
+        match value {
+            Value::Text(v) => Carbon::parse(v),
+            Value::Int(v) => Ok(Carbon::from_timestamp(*v)),
+            other => Err(Error::msg(format!(
+                "{} の値を日時として読めません",
+                other.kind()
+            ))),
+        }
     }
 }
 

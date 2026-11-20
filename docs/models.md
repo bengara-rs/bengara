@@ -33,7 +33,7 @@ pub struct Post {
 | `#[model(column = "名前")]` | フィールド | 列名を変える。無ければフィールド名と同じ            |
 | `#[model(skip)]`            | フィールド | 表に無い項目にする。読むときは `Default` の値が入る |
 
-- 使える型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>` です。ふだんは `i64` と `String` を使います。
+- 使える型は、整数・`f32`・`f64`・`bool`・`String`・`Vec<u8>`・`Carbon`（日時）です。ふだんは `i64` と `String` を使います。
 - **NULL を許す列は `Option<...>` にします。** そうしないと、読むときにエラーです。
 - **主キーは自動採番の整数です。** `Option` にはできません。
 - `r#type` のようなフィールドは、`type` が列名になります。
@@ -180,6 +180,51 @@ if post.save_only(&["title"]).await? == 0 {
 **`DB::table(...)` で直接入れた行には、時刻が入りません。**
 `timestamps()` の列は NULL を許すので、`String` のフィールドで読むとエラーです。
 `now()` を自分で入れるか、フィールドを `Option<String>` にします。
+
+### 日時の列を `Carbon` で持つ
+
+日時の列は `bengara::Carbon` で持てます。`String` のままでもかまいません。
+
+```rust
+use bengara::Carbon;
+
+#[derive(Model, Debug, Clone)]
+#[model(table = "posts")]
+pub struct Post {
+    pub id: i64,
+    pub title: String,
+    pub published_at: Option<Carbon>,
+    pub created_at: Carbon,
+    pub updated_at: Carbon,
+}
+
+// 3 日後に公開する
+post.published_at = Some(Carbon::now().add_days(3));
+```
+
+| 項目              | 中身                                                                        |
+|-------------------|-----------------------------------------------------------------------------|
+| 使える型          | `Carbon`・`Option<Carbon>`                                                  |
+| DB に書く形       | `YYYY-MM-DD HH:MM:SS`（UTC）の文字列。`String` の列と同じ                   |
+| 読める値          | その形の文字列と、UNIX 秒の整数                                             |
+| JSON にしたとき   | `"2026-11-20 09:30:00"`。`String` の列と同じ                                |
+| `created_at` など | `String`・`Option<String>`・`Carbon`・`Option<Carbon>` のどれでも時刻が入る |
+
+主なメソッドです。
+
+| メソッド                                                        | 中身                                          |
+|-----------------------------------------------------------------|-----------------------------------------------|
+| `Carbon::now()` / `Carbon::parse("2026-11-20 09:30:00")?`       | いまの時刻 / 文字列から作る                   |
+| `add_days(3)` / `sub_hours(1)` など                             | 秒・分・時・日・月・年を足す / 引く           |
+| `add_months(1)`                                                 | 月を足す。**日は月末で止まる**（1/31 → 2/28） |
+| `start_of_day()` / `end_of_day()`                               | その日の 00:00:00 / 23:59:59                  |
+| `diff_in_days(&other)` など                                     | `other - self`。符号付きの整数                |
+| `is_past()` / `is_future()`                                     | いまより前 / 後                               |
+| `to_date_string()` / `to_time_string()` / `to_iso8601_string()` | `YYYY-MM-DD` / `HH:MM:SS` / `…T…Z`            |
+
+- `parse` が読むのは `YYYY-MM-DD`・`YYYY-MM-DD HH:MM:SS`（区切りは `T` も可）と、末尾の `Z`・小数の秒だけです。
+- `+09:00` のような時差付きは読みません。タイムゾーンは UTC だけです。
+- 入力から取り出すときは `validated.get_as::<Carbon>("published_at")?` と書けます。
 
 ### 書きやすくする
 

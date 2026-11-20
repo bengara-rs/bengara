@@ -1260,6 +1260,18 @@ mod tests {
     }
 
     #[test]
+    fn 日時の型で取り出せる() {
+        let ok = validate(
+            &input(&[("at", "2026-11-20 09:30:00"), ("bad", "2026-02-30")]),
+            &[("at", "required"), ("bad", "required")],
+        )
+        .unwrap();
+        let at = ok.get_as::<crate::Carbon>("at").unwrap();
+        assert_eq!(at.to_date_time_string(), "2026-11-20 09:30:00");
+        assert!(ok.get_as::<crate::Carbon>("bad").is_err());
+    }
+
+    #[test]
     fn 表示用の文字列() {
         let mut e = ValidationErrors::default();
         e.add("a", "A が駄目です。");

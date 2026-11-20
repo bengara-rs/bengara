@@ -1,7 +1,7 @@
 //! いまの時刻を文字列にする。
 //!
-//! 日時専用の型は持ちません（決定記録 #040）。`created_at` などに入れる
-//! `YYYY-MM-DD HH:MM:SS`（UTC）の文字列だけを作ります。
+//! `created_at` などに入れる `YYYY-MM-DD HH:MM:SS`（UTC）の文字列と、
+//! UNIX 秒との行き来を受け持ちます。日時の型 [`Carbon`](super::Carbon) もこの計算を使います。
 //! `chrono` を入れないために自分で計算します。
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -97,7 +97,7 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
 }
 
 /// その月の日数。
-fn days_in_month(year: i64, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -114,7 +114,7 @@ fn is_leap_year(year: i64) -> bool {
 }
 
 /// 年・月・日を 1970-01-01 からの日数に直す。`civil_from_days` の逆です。
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let year_of_era = y - era * 400;
@@ -138,7 +138,7 @@ pub(crate) fn format_timestamp(seconds: i64) -> String {
 /// 1970-01-01 からの日数を、年・月・日に直す。
 ///
 /// Howard Hinnant の `civil_from_days` と同じ手順です。
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let day_of_era = z - era * 146_097;

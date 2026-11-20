@@ -142,7 +142,10 @@ Laravel の書き方を知っている人が、bengara で書き方や動きが�
 | `->get()` が Collection を返す                     | `.get().await?` が `Vec<Row>` を返す                     |
 | `$row->title`                                      | `row.get::<String>("title")?`                            |
 | `DB::transaction(fn () => ...)`                    | `let tx = DB::begin().await?;` … `tx.commit().await?;`   |
-| 日時は `Carbon`                                    | **文字列**（`YYYY-MM-DD HH:MM:SS`、UTC）。`now()` で作る |
+| 日時は `Carbon`（タイムゾーン付き）                | `bengara::Carbon`。**UTC だけ**。DB には文字列で入る     |
+| `addMonth()` は月末を超えると繰り上がる            | `add_months(1)` は**月末で止まる**（1/31 → 2/28）        |
+| `diffInDays()`                                     | `diff_in_days(&other)`。**符号付きの整数**               |
+| `$date->format('Y/m/d')`                           | **無い。** `to_date_string()` などの決まった形だけ       |
 | PostgreSQL の `timestamp` 列                       | **`text` 列**になる（日時は文字列のため）                |
 
 くわしくは [database.md](database.md) にあります。

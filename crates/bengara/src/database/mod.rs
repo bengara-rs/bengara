@@ -800,7 +800,8 @@ impl ConnectionRef {
 
 /// いまの時刻を `YYYY-MM-DD HH:MM:SS`（UTC）で返す。
 ///
-/// `created_at` / `updated_at` に入れる形です。日時専用の型は作っていません（決定記録 #040）。
+/// `created_at` / `updated_at` に入れる形です。日時の型で扱うときは
+/// [`Carbon::now`](crate::Carbon::now) を使います。
 pub fn now() -> String {
     crate::support::time::now_string()
 }
