@@ -171,6 +171,41 @@ impl Session {
         self.put_internal(key, value.into());
     }
 
+    /// `serde` の型を JSON の文字列にして入れる。`Cache::put_json` と同じ形です。
+    ///
+    /// ```ignore
+    /// req.session().put_json("cart", &cart)?;
+    /// let cart: Option<Cart> = req.session().get_json("cart")?;
+    /// ```
+    ///
+    /// JSON にできなければ `Err` です。鍵の決まりは [`put`](Self::put) と同じです。
+    pub fn put_json<T: serde::Serialize + ?Sized>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> crate::error::Result<()> {
+        let text = serde_json::to_string(value)?;
+        self.put(key, text);
+        Ok(())
+    }
+
+    /// [`put_json`](Self::put_json) で入れた値を型に読む。
+    ///
+    /// 無ければ `Ok(None)`、型に読めなければ `Err` です。
+    /// `Cache::get_json` と違って、読めない値を黙って捨てません。セッションは
+    /// 作り直せる値の置き場所ではないためです。flash の値も読めます（[`get`](Self::get) と同じ）。
+    pub fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> crate::error::Result<Option<T>> {
+        let Some(text) = self.get(key) else {
+            return Ok(None);
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| crate::Error::msg(format!("セッションの `{key}` を読めません: {e}")))
+    }
+
     /// 鍵の名前を確かめずに入れる。フレームワークの中から内部の鍵を入れる口です。
     pub(crate) fn put_internal(&self, key: &str, value: String) {
         let mut inner = self.lock();
@@ -468,6 +503,39 @@ mod tests {
         assert_eq!(s.get_or("b", "既定"), "既定");
         assert!(s.has("a"));
         assert!(s.is_dirty());
+    }
+
+    #[test]
+    fn jsonで入れて型で読める() {
+        #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Cart {
+            items: Vec<i64>,
+        }
+        let s = session();
+        s.put_json("cart", &Cart { items: vec![1, 2] }).unwrap();
+        assert_eq!(s.get("cart").as_deref(), Some(r#"{"items":[1,2]}"#));
+        assert_eq!(
+            s.get_json::<Cart>("cart").unwrap(),
+            Some(Cart { items: vec![1, 2] })
+        );
+        // `?Sized` なので、文字列やスライスもそのまま渡せる。
+        s.put_json("tags", ["a", "b"].as_slice()).unwrap();
+        assert_eq!(
+            s.get_json::<Vec<String>>("tags").unwrap().unwrap(),
+            ["a", "b"]
+        );
+
+        // 無い鍵は `None`。
+        assert_eq!(s.get_json::<Cart>("none").unwrap(), None);
+
+        // 壊れた JSON は `Err`。黙って捨てない。
+        s.put("broken", "{壊れた");
+        let error = s.get_json::<Cart>("broken").unwrap_err().to_string();
+        assert!(
+            error.contains("セッションの `broken` を読めません"),
+            "{error}"
+        );
+        assert!(s.has("broken"), "値は残す");
     }
 
     #[test]

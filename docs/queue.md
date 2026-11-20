@@ -39,6 +39,7 @@ pub fn down(schema: &mut Schema) {
 ```rust
 // app/Jobs/SendWelcome.rs
 use bengara::prelude::*;
+use bengara::queue::Json;
 
 use crate::app::models::User;
 
@@ -48,9 +49,7 @@ pub struct Payload {
     pub user_id: i64,
 }
 
-pub async fn handle(payload: String) -> Result<()> {
-    let payload: Payload = bengara::serde_json::from_str(&payload)?;
-
+pub async fn handle(Json(payload): Json<Payload>) -> Result<()> {
     let Some(user) = User::find(payload.user_id).await? else {
         return Ok(()); // もう消えている。成功で終わる
     };
@@ -63,7 +62,14 @@ pub async fn handle(payload: String) -> Result<()> {
 }
 ```
 
-- `handle` は JSON の文字列を受け取ります。中身は自分で読みます。
+`handle` が受け取る形は 2 つです。どちらで読むかは、引数の型から決まります。
+
+| 引数                      | 受け取るもの                                   |
+|---------------------------|------------------------------------------------|
+| `Json(payload): Json<T>`  | 中身を `T` に読んだもの（`bengara::queue::Json`） |
+| `payload: String`         | 積んだ JSON の文字列そのまま。自分で読む         |
+
+- `Json<T>` で読めない中身は、ジョブの失敗になります（下の再挑戦と `failed_jobs` に乗ります）。
 - `Ok(())` で成功です。行は消えます。
 - `Err` で失敗です。待ってから再挑戦します。パニックも同じで、worker は止まりません。
 - **2 回動いても困らない作りにしてください。** 時間切れなどで、もう一度動くことがあります。
@@ -262,9 +268,14 @@ async fn 登録するとジョブが積まれる() {
 処理の中身は、`handle` を直接呼んで確かめます。
 
 ```rust
-let payload = bengara::serde_json::json!({ "user_id": user.id }).to_string();
-crate::app::jobs::send_welcome::handle(payload).await.unwrap();
+use bengara::queue::Json;
+
+crate::app::jobs::send_welcome::handle(Json(Payload { user_id: user.id }))
+    .await
+    .unwrap();
 ```
+
+`String` で受け取る `handle` には、JSON の文字列を渡します。
 
 メールを送るジョブを確かめる全体の例は [mail.md](mail.md#テスト) にあります。
 

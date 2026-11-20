@@ -319,7 +319,7 @@ let plain = decrypt(&hidden)?;       // 改ざんされていればエラー
 
 ## ハッシュの回数
 
-方式は PBKDF2-HMAC-SHA256 です。
+既定の方式は PBKDF2-HMAC-SHA256 です（Argon2id にもできます。下の「Argon2id を使う」）。
 同じ計算を何回もくり返して、総当たりにかかる時間を延ばします。
 保存されるのは次の形の文字列です。
 
@@ -366,6 +366,93 @@ if ok && Hash::needs_rehash(&user.password) {
     user.password = Hash::make_async(input.get("password")).await?;
     user.save().await?;
 }
+```
+
+## Argon2id を使う
+
+Argon2id は、計算に大量のメモリを使わせる方式です。専用の機械（GPU）での総当たりに、PBKDF2 より強いです。
+機能フラグ `argon2` を足し、`HASH_DRIVER=argon2id` にします。
+
+```toml
+bengara = { version = "0.1", features = ["sqlite", "argon2"] }
+```
+
+```sh
+# .env
+HASH_DRIVER=argon2id
+```
+
+保存されるのは次の形の文字列です（PHP の `password_hash` と同じ形）。
+
+```
+$argon2id$v=19$m=65536,t=4,p=1$<塩>$<ハッシュ>
+```
+
+| 環境変数        | 既定     | 意味                   | 範囲                         |
+|-----------------|----------|------------------------|------------------------------|
+| `HASH_DRIVER`   | `pbkdf2` | `pbkdf2` か `argon2id` | —                            |
+| `ARGON_MEMORY`  | `65536`  | 使うメモリ（KiB）      | `8 × ARGON_THREADS` 〜 1 GiB |
+| `ARGON_TIME`    | `4`      | 繰り返し               | 1〜64                        |
+| `ARGON_THREADS` | `1`      | 並列の数               | 1〜16                        |
+
+- 名前と既定値は Laravel 12 の `config/hashing.php` と同じです。
+- 範囲の外の値は、範囲に寄せて使います。ログに警告が 1 回出ます。
+- 強さは `ArgonConfig` を返す設定ファイルでも変えられます（[configuration.md](configuration.md)）。
+- テストのときは `m=8, t=1, p=1` に下げます。`ARGON_*` を環境変数で渡したときは、その値を使います。
+- フラグが無いのに `HASH_DRIVER=argon2id` にすると、ログにエラーが出て、PBKDF2 で作ります。
+- `HASH_DRIVER` が知らない名前のときは、ログに警告が出て、PBKDF2 で作ります。
+- `cargo artisan about` の「パスワード」の行で、いま使っている方式と強さが分かります。
+
+### 方式ごとの関数の動き
+
+| 関数                 | `pbkdf2` のとき                   | `argon2id` のとき                                     |
+|----------------------|-----------------------------------|-------------------------------------------------------|
+| `Hash::make`         | PBKDF2 で作る                     | Argon2id で作る。失敗したらログに出して PBKDF2 で作る |
+| `Hash::make_with`    | PBKDF2 で作る                     | **PBKDF2 で作る**（回数を決める関数なので）           |
+| `Hash::check`        | 保存値の先頭で方式を見分ける      | 同左                                                  |
+| `Hash::needs_rehash` | Argon2id の値は偽（作り直さない） | PBKDF2 の値と、`m`・`t` が設定より小さい値で真        |
+
+- `check` は、どちらの方式の値でも照合します。方式を替えても、古い値でログインできます。
+- `$argon2id$` 以外の Argon2（`$argon2i$`）と bcrypt（`$2y$`）は照合できません。偽になります。
+- `m`・`t`・`p` が上の範囲の上限を超える保存値は、照合せずに偽とします。
+
+### PBKDF2 から移る
+
+`HASH_DRIVER=argon2id` にすると、`attempt` がログインのついでに Argon2id で作り直します（上の「回数を上げたあと」と同じ仕組み）。
+ログインしない人の値は、PBKDF2 のまま残ります。
+
+- `HASH_DRIVER=pbkdf2` に戻しても、Argon2id の値は作り直しません。強い方式から弱い方式へは移りません。
+- 両方の方式の値が混ざっている間は、照合のたびにもう片方の方式も空回しします。
+  どちらの方式の人でも、登録されていない人でも、同じだけ時間がかかります。
+  そのぶん、照合 1 回は 2 つの方式の時間の合計になります。
+
+### Laravel の値をそのまま照合する
+
+Laravel（PHP の `password_hash`）で作った `$argon2id$` の値は、そのまま照合できます。
+作り直す必要はありません。Laravel の既定の bcrypt（`$2y$`）は照合できません（[backlog.md](backlog.md)）。
+
+### 同時に計算する数
+
+パスワードの計算は、同時に走らせる数を `HASH_MAX_CONCURRENCY` までに抑えます。
+Argon2id は 1 件で既定 64 MiB を使うので、ログインが一度に押し寄せてもメモリを使いすぎないようにします。
+
+- 既定は CPU の数です（取れなければ 4）。1 より小さい値は 1 にします。
+- 上限を超えた分は、空くまで待ちます。
+- 上限を通るのは `Hash::make_async`・`Hash::check_async`・`attempt`・`validate_password` です。
+- **待たない形の `Hash::make` / `Hash::check` は、上限を通りません。**
+- PBKDF2 のときも同じ上限が効きます。
+
+### 開発中に速く計算する
+
+Argon2id は、デバッグビルドだと照合 1 回に約 3 秒かかります。
+アプリの `Cargo.toml` に次を書くと、約 0.2 秒になります。
+
+```toml
+# Argon2id をデバッグビルドでも速く計算する
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 ```
 
 まだ無い機能は [backlog.md](backlog.md) にあります。

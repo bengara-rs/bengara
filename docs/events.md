@@ -114,10 +114,32 @@ pub const USER_REGISTERED: &str = "user.registered";
 pub struct Payload {
     pub user_id: i64,
 }
-
-// 聞く側では自分で読む
-let payload: Payload = bengara::serde_json::from_str(&payload)?;
 ```
+
+聞く側は、中身を型で受け取れます。引数を `Json<T>` にして、`listen_json` で登録します。
+
+```rust
+// app/Listeners/NotifyAdmin.rs
+use bengara::events::Json;
+use bengara::prelude::*;
+
+pub async fn handle(Json(payload): Json<Payload>) -> Result<()> {
+    // payload.user_id を使う
+    Ok(())
+}
+
+// bootstrap/app.rs
+.with_events(|e| e.listen_json("user.registered", crate::app::listeners::notify_admin::handle))
+```
+
+| 聞く側の引数             | 登録するメソッド | 受け取るもの                    |
+|--------------------------|------------------|---------------------------------|
+| `Json(payload): Json<T>` | `listen_json`    | 中身を `T` に読んだもの         |
+| `payload: String`        | `listen`         | JSON の文字列そのまま。自分で読む |
+
+- 型は聞く側の引数から決まります。`listen_json` に型を書く必要はありません。
+- 中身を `T` に読めないときは、聞く側の失敗です。`dispatch` はそこで止まり、`try_dispatch` はログに出して次を呼びます。
+- `Json` は `bengara::queue::Json` と同じ型です。
 
 **中身の形は、コンパイルでは確かめられません。** 知らせる側と聞く側で、同じ構造体を使ってください。
 

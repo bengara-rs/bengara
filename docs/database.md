@@ -25,7 +25,6 @@ bengara = { version = "0.1", features = ["sqlite"] }
 - `cargo run -- init` が作る `Cargo.toml` には `sqlite` が入っています。フラグは 2 つ以上書けます。
 - フラグが無いと、つなぐときに「足すべきフラグ」を書いたエラーが返ります。
 - `mysql` と `postgres` のビルドには C コンパイラが要ります。
-- Rust 1.85 で使うときは、依存を 1 つ固定します（[getting-started.md](getting-started.md)）。
 
 ### `.env` に書くこと
 
@@ -113,6 +112,15 @@ Laravel の `->where('views', '>', 100)` は `where_op("views", ">", 100)` で�
 - `where_in` に空の一覧を渡すと 0 件です。渡せるのは 30,000 件までです。
 - `where_group` の中では、条件だけが使われます。
 - `where_raw` の `?` は値の置き場所です。文字列の中の `?` も数えます。
+- 列には、モデルの型付きの列（`Post::TITLE`）も渡せます。値の型をコンパイルのときに確かめます（[models.md](models.md) の「型付きの列」）。
+
+```rust
+let rows = DB::table("posts")
+    .where_(Post::STATUS, "published")
+    .order_by_desc(Post::VIEWS)
+    .get()
+    .await?;
+```
 
 ### 並べる・件数を決める
 

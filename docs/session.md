@@ -50,6 +50,8 @@ pub async fn store(req: Request) -> Result<Response> {
 | `get(key)`             | 読む。無ければ `None`                                                      |
 | `get_or(key, default)` | 読む。無ければ既定値                                                       |
 | `put(key, value)`      | 入れる。次のリクエストでも読める                                           |
+| `put_json(key, &value)` | `serde` の型を JSON の文字列にして入れる。できなければ `Err`              |
+| `get_json::<T>(key)`   | JSON の文字列を型に読む。無ければ `Ok(None)`、読めなければ `Err`           |
 | `flash(key, value)`    | 入れる。**次のリクエストまで**だけ残る                                     |
 | `has(key)`             | あるか                                                                     |
 | `forget(key)`          | 消す                                                                       |
@@ -62,7 +64,14 @@ pub async fn store(req: Request) -> Result<Response> {
 | `regenerate()`         | ID を作り直す。中身は残し、CSRF トークンは作り直す                         |
 | `invalidate()`         | 中身を消して、ID も作り直す                                                |
 
-- 値は文字列です。
+- 値は文字列です。構造体は `put_json` / `get_json` で JSON にして入れます。
+
+```rust
+req.session().put_json("cart", &cart)?;
+let cart: Option<Cart> = req.session().get_json("cart")?;
+```
+
+- `get_json` は、読めない値を黙って捨てません（`Cache::get_json` は捨てて `None` を返します）。
 - 同じ鍵に `put` と `flash` の両方を書かないでください。`get` と `all()` で読める値が食い違います。
 
 `flash` の値は、入れた回と次の回で読めます。

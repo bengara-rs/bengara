@@ -54,6 +54,11 @@ tls = ["sqlx/tls-rustls-ring-webpki"]
 # 暗号は実績のあるクレートに任せます（判断 30）。
 encryption = ["dep:chacha20poly1305"]
 
+# パスワードを Argon2id で作る。既定では入りません。
+# 方式は HASH_DRIVER=argon2id で選びます。フラグが無いときは PBKDF2 のままです。
+# 暗号なので実績のあるクレートに任せます（判断 30 と同じ考え方）。
+argon2 = ["dep:argon2"]
+
 # SMTP でメールを送る。既定では入りません。
 # フラグが無いときも mail モジュールはコンパイルされ、MAIL_MAILER=smtp に
 # したときだけ「features に "mail" を足してください」というエラーになります。
@@ -65,6 +70,12 @@ mail = ["dep:lettre"]
 # というエラーになります。`Broadcast::publish` はフラグが無くても呼べます。
 # フレームの処理は tokio-tungstenite に任せます（判断 10）。
 websocket = ["dep:tokio-tungstenite", "dep:hyper", "dep:hyper-util", "dep:futures-util"]
+
+# テンプレート（resources/views/*.html）。既定では入りません。
+# 書き方は Jinja 系（minijinja）です。Blade の構文ではありません。
+# フラグが無いときも view などの関数はあり、呼ぶと「features に "view" を足してください」の
+# エラーになります。
+view = ["dep:minijinja"]
 
 [dependencies]
 bengara-macros = { workspace = true }
@@ -91,6 +102,9 @@ sqlx = { version = "0.8", default-features = false, features = [
 chacha20poly1305 = { version = "0.10", default-features = false, features = [
     "alloc",
 ], optional = true }
+# パスワードの Argon2id。既定の機能（alloc・getrandom・password-hash）をそのまま使います。
+# getrandom は bengara が使っているものと同じ 0.4 系です。
+argon2 = { version = "0.6", optional = true }
 # メール。待つ形（同期）の送り口だけを使います。
 # bengara は `Mailer::send` を `spawn_blocking` の中で呼ぶので、
 # tokio 向けの送り口（tokio1-rustls-tls）は要りません。依存も少なくなります。
@@ -119,6 +133,14 @@ futures-util = { version = "0.3.34", default-features = false, features = [
     "sink",
     "std",
 ], optional = true }
+# テンプレート。継承（extends / block）・include・マクロ・serde の値を使います。
+# minijinja の型は公開 API に出しません（view.rs の中だけ）。
+minijinja = { version = "3.1", default-features = false, features = [
+    "builtins",
+    "macros",
+    "multi_template",
+    "serde",
+], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -127,6 +149,6 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "connect",
 ] }
 
-# docs.rs では、つなげるドライバとメールと WebSocket を入れた状態で説明を出す。
+# docs.rs では、つなげるドライバとメールと WebSocket と Argon2id とテンプレートを入れた状態で説明を出す。
 [package.metadata.docs.rs]
-features = ["sqlite", "mysql", "postgres", "encryption", "mail", "websocket"]
+features = ["sqlite", "mysql", "postgres", "encryption", "argon2", "mail", "websocket", "view"]

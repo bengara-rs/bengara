@@ -4,7 +4,7 @@ Laravel と同じディレクトリ構成で、Web アプリを Rust で書け�
 
 - `routes/web.rs` や `app/Http/Controllers/` に置いたファイルが、そのまま動きます。
 - `cargo build --release` で実行ファイルが 1 つできます。PHP のような実行環境は要りません。
-- 必要なものは Rust 1.85 以上だけです。
+- 必要なものは Rust 1.88 以上だけです。
 
 > bengara は Laravel 公式とは無関係の、独立したプロジェクトです。
 
@@ -17,6 +17,7 @@ Laravel と同じディレクトリ構成で、Web アプリを Rust で書け�
 | データ     | SQLite / MySQL / MariaDB / PostgreSQL、マイグレーション、モデル、シーダー        |
 | 裏の処理   | キャッシュ、ファイルの置き場所、キュー、定期処理、イベント、メール、外部コマンド |
 | 双方向     | WebSocket、チャンネルへの配信（機能フラグ `websocket`）                          |
+| 画面       | テンプレート（機能フラグ `view`。Jinja 系の書き方）                              |
 | 道具       | `cargo artisan` のコマンド、自分のコマンド、テスト、本番への配置                 |
 
 ページごとの案内は [docs/README.md](docs/README.md) にあります。
@@ -75,12 +76,12 @@ impl HomeController {
 ## 本番に置くもの
 
 置くのは、実行ファイル・`.env`・書き込める `storage/` の 3 つです。
-`public/` と設定は実行ファイルに入っています。
+`public/`・テンプレート・設定は実行ファイルに入っています。
 手順は [docs/deployment.md](docs/deployment.md) にあります。
 
 ## 知っておくこと
 
-- テンプレート（ビュー）はありません。`html(...)` に文字列を渡すか、JSON を返します。
+- テンプレートは機能フラグ `view` で使えます（Jinja 系。Blade ではありません）。[docs/views.md](docs/views.md) にあります。
 - ファイルを生成する `make:*` コマンドはありません。ファイルは手で作ります。
 - 手で動きを確かめているのは Windows 10 だけです。
 

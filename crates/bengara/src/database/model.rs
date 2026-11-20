@@ -13,6 +13,7 @@
 
 use std::marker::PhantomData;
 
+use super::column::{Bind, ModelColumn};
 use super::grammar::Driver;
 use super::query::{Paginator, QueryBuilder};
 use super::transaction::Transaction;
@@ -599,8 +600,9 @@ impl<T: Model> ModelQuery<T> {
     /// 文字列をここへ渡します。文字列のまま比べると、PostgreSQL だけ
     /// `bigint = text` の SQL エラー（500）になるためです（[`Model::INTEGER_KEY`]）。
     /// 主キー以外の列は、渡した値のまま比べます。
-    pub fn where_(self, column: &str, value: impl IntoValue) -> Self {
-        match self.key_condition(column, value.into_value()) {
+    pub fn where_<C: ModelColumn<T>>(self, column: C, value: impl Bind<C::Accepts>) -> Self {
+        let column = column.column_name();
+        match self.key_condition(column, value.bind()) {
             Some(value) => self.map(|q| q.where_(column, value)),
             None => self.nothing(column, false),
         }
@@ -611,13 +613,19 @@ impl<T: Model> ModelQuery<T> {
     /// 整数の主キーの列を `=` `!=` `<>` `<` `<=` `>` `>=` で比べるときは、
     /// [`where_`](Self::where_) と同じく値を直します。整数として読めない文字列は、
     /// `!=` `<>` なら必ず当たる条件（`1 = 1`）、それ以外なら必ず 0 件（`1 = 0`）です。
-    pub fn where_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.compare(false, column, operator, value.into_value())
+    pub fn where_op<C: ModelColumn<T>>(
+        self,
+        column: C,
+        operator: &str,
+        value: impl Bind<C::Accepts>,
+    ) -> Self {
+        self.compare(false, column.column_name(), operator, value.bind())
     }
 
     /// `or` でつないで、列が値と等しい。整数の主キーの扱いは [`where_`](Self::where_) と同じです。
-    pub fn or_where(self, column: &str, value: impl IntoValue) -> Self {
-        match self.key_condition(column, value.into_value()) {
+    pub fn or_where<C: ModelColumn<T>>(self, column: C, value: impl Bind<C::Accepts>) -> Self {
+        let column = column.column_name();
+        match self.key_condition(column, value.bind()) {
             Some(value) => self.map(|q| q.or_where(column, value)),
             None => self.nothing(column, true),
         }
@@ -625,18 +633,29 @@ impl<T: Model> ModelQuery<T> {
 
     /// `or` でつないで、列と値を演算子で比べる。整数の主キーの扱いは
     /// [`where_op`](Self::where_op) と同じです。
-    pub fn or_where_op(self, column: &str, operator: &str, value: impl IntoValue) -> Self {
-        self.compare(true, column, operator, value.into_value())
+    pub fn or_where_op<C: ModelColumn<T>>(
+        self,
+        column: C,
+        operator: &str,
+        value: impl Bind<C::Accepts>,
+    ) -> Self {
+        self.compare(true, column.column_name(), operator, value.bind())
     }
 
     /// 列が一覧のどれかと等しい。
     ///
     /// 整数の主キーの列では、一覧の値を1つずつ直します。整数として読めない文字列は
     /// 当たる行が無いので外します。全部外れたときは必ず 0 件（`1 = 0`）です。
-    pub fn where_in<V: IntoValue + Clone>(self, column: &str, values: &[V]) -> Self {
-        match self.key_list(column, values) {
+    pub fn where_in<C: ModelColumn<T>, V: Bind<C::Accepts> + Clone>(
+        self,
+        column: C,
+        values: &[V],
+    ) -> Self {
+        let column = column.column_name();
+        let values: Vec<Value> = values.iter().cloned().map(Bind::bind).collect();
+        match self.key_list(column, &values) {
             Some(values) => self.map(|q| q.where_in(column, &values)),
-            None => self.map(|q| q.where_in(column, values)),
+            None => self.map(|q| q.where_in(column, &values)),
         }
     }
 
@@ -644,19 +663,31 @@ impl<T: Model> ModelQuery<T> {
     ///
     /// 整数の主キーの列では、一覧の値を1つずつ直します。整数として読めない文字列は
     /// どの行とも等しくないので外します。全部外れたときは必ず当たる条件（`1 = 1`）です。
-    pub fn where_not_in<V: IntoValue + Clone>(self, column: &str, values: &[V]) -> Self {
-        match self.key_list(column, values) {
+    pub fn where_not_in<C: ModelColumn<T>, V: Bind<C::Accepts> + Clone>(
+        self,
+        column: C,
+        values: &[V],
+    ) -> Self {
+        let column = column.column_name();
+        let values: Vec<Value> = values.iter().cloned().map(Bind::bind).collect();
+        match self.key_list(column, &values) {
             Some(values) => self.map(|q| q.where_not_in(column, &values)),
-            None => self.map(|q| q.where_not_in(column, values)),
+            None => self.map(|q| q.where_not_in(column, &values)),
         }
     }
 
     /// `or` でつないで、列が一覧のどれかと等しい。整数の主キーの扱いは
     /// [`where_in`](Self::where_in) と同じです。
-    pub fn or_where_in<V: IntoValue + Clone>(self, column: &str, values: &[V]) -> Self {
-        match self.key_list(column, values) {
+    pub fn or_where_in<C: ModelColumn<T>, V: Bind<C::Accepts> + Clone>(
+        self,
+        column: C,
+        values: &[V],
+    ) -> Self {
+        let column = column.column_name();
+        let values: Vec<Value> = values.iter().cloned().map(Bind::bind).collect();
+        match self.key_list(column, &values) {
             Some(values) => self.map(|q| q.or_where_in(column, &values)),
-            None => self.map(|q| q.or_where_in(column, values)),
+            None => self.map(|q| q.or_where_in(column, &values)),
         }
     }
 
@@ -681,7 +712,7 @@ impl<T: Model> ModelQuery<T> {
     ///
     /// 直す必要が無い列では `None`（渡された一覧をそのまま使う）。
     /// 主キーの列では、直した値の一覧を返します。当たらない値は外します。
-    fn key_list<V: IntoValue + Clone>(&self, column: &str, values: &[V]) -> Option<Vec<Value>> {
+    fn key_list(&self, column: &str, values: &[Value]) -> Option<Vec<Value>> {
         if !(T::INTEGER_KEY && is_primary_key::<T>(column)) {
             return None;
         }
@@ -689,7 +720,7 @@ impl<T: Model> ModelQuery<T> {
             values
                 .iter()
                 .cloned()
-                .filter_map(|value| self.key_condition(column, value.into_value()))
+                .filter_map(|value| self.key_condition(column, value))
                 .collect(),
         )
     }
@@ -746,38 +777,51 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// 列が `NULL`。
-    pub fn where_null(self, column: &str) -> Self {
-        self.map(|q| q.where_null(column))
+    pub fn where_null<C: ModelColumn<T>>(self, column: C) -> Self {
+        self.map(|q| q.where_null(column.column_name()))
     }
 
     /// 列が `NULL` ではない。
-    pub fn where_not_null(self, column: &str) -> Self {
-        self.map(|q| q.where_not_null(column))
+    pub fn where_not_null<C: ModelColumn<T>>(self, column: C) -> Self {
+        self.map(|q| q.where_not_null(column.column_name()))
     }
 
     /// 列が2つの値の間にある。
-    pub fn where_between(self, column: &str, low: impl IntoValue, high: impl IntoValue) -> Self {
-        self.map(|q| q.where_between(column, low, high))
+    pub fn where_between<C: ModelColumn<T>>(
+        self,
+        column: C,
+        low: impl Bind<C::Accepts>,
+        high: impl Bind<C::Accepts>,
+    ) -> Self {
+        let (low, high) = (low.bind(), high.bind());
+        self.map(|q| q.where_between(column.column_name(), low, high))
     }
 
     /// 列が2つの値の間に無い。
-    pub fn where_not_between(
+    pub fn where_not_between<C: ModelColumn<T>>(
         self,
-        column: &str,
-        low: impl IntoValue,
-        high: impl IntoValue,
+        column: C,
+        low: impl Bind<C::Accepts>,
+        high: impl Bind<C::Accepts>,
     ) -> Self {
-        self.map(|q| q.where_not_between(column, low, high))
+        let (low, high) = (low.bind(), high.bind());
+        self.map(|q| q.where_not_between(column.column_name(), low, high))
     }
 
     /// 列が形に当てはまる（`like`）。
-    pub fn where_like(self, column: &str, pattern: impl IntoValue) -> Self {
-        self.map(|q| q.where_like(column, pattern))
+    pub fn where_like<C: ModelColumn<T>>(self, column: C, pattern: impl Bind<C::Accepts>) -> Self {
+        let pattern = pattern.bind();
+        self.map(|q| q.where_like(column.column_name(), pattern))
     }
 
     /// 列と列を比べる。
-    pub fn where_column(self, left: &str, operator: &str, right: &str) -> Self {
-        self.map(|q| q.where_column(left, operator, right))
+    pub fn where_column<L: ModelColumn<T>, R: ModelColumn<T>>(
+        self,
+        left: L,
+        operator: &str,
+        right: R,
+    ) -> Self {
+        self.map(|q| q.where_column(left.column_name(), operator, right.column_name()))
     }
 
     /// SQL を直接書く。
@@ -819,13 +863,13 @@ impl<T: Model> ModelQuery<T> {
     // ---- 並び・件数 ----
 
     /// 昇順に並べる。
-    pub fn order_by(self, column: &str) -> Self {
-        self.map(|q| q.order_by(column))
+    pub fn order_by<C: ModelColumn<T>>(self, column: C) -> Self {
+        self.map(|q| q.order_by(column.column_name()))
     }
 
     /// 降順に並べる。
-    pub fn order_by_desc(self, column: &str) -> Self {
-        self.map(|q| q.order_by_desc(column))
+    pub fn order_by_desc<C: ModelColumn<T>>(self, column: C) -> Self {
+        self.map(|q| q.order_by_desc(column.column_name()))
     }
 
     /// 並べ方を SQL で直接書く。**外から来た文字列を渡さないでください。**
@@ -844,13 +888,13 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// 指定した列の降順。
-    pub fn latest_by(self, column: &str) -> Self {
-        self.map(|q| q.latest_by(column))
+    pub fn latest_by<C: ModelColumn<T>>(self, column: C) -> Self {
+        self.map(|q| q.latest_by(column.column_name()))
     }
 
     /// 指定した列の昇順。
-    pub fn oldest_by(self, column: &str) -> Self {
-        self.map(|q| q.oldest_by(column))
+    pub fn oldest_by<C: ModelColumn<T>>(self, column: C) -> Self {
+        self.map(|q| q.oldest_by(column.column_name()))
     }
 
     /// 取る件数の上限。
@@ -932,33 +976,33 @@ impl<T: Model> ModelQuery<T> {
     }
 
     /// 合計。
-    pub async fn sum<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
-        self.inner.sum(column).await
+    pub async fn sum<V: FromValue>(&self, column: impl ModelColumn<T>) -> Result<Option<V>> {
+        self.inner.sum(column.column_name()).await
     }
 
     /// 平均。
-    pub async fn avg<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
-        self.inner.avg(column).await
+    pub async fn avg<V: FromValue>(&self, column: impl ModelColumn<T>) -> Result<Option<V>> {
+        self.inner.avg(column.column_name()).await
     }
 
     /// 最小。
-    pub async fn min<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
-        self.inner.min(column).await
+    pub async fn min<V: FromValue>(&self, column: impl ModelColumn<T>) -> Result<Option<V>> {
+        self.inner.min(column.column_name()).await
     }
 
     /// 最大。
-    pub async fn max<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
-        self.inner.max(column).await
+    pub async fn max<V: FromValue>(&self, column: impl ModelColumn<T>) -> Result<Option<V>> {
+        self.inner.max(column.column_name()).await
     }
 
     /// ある列だけを一覧で取る。NULL がありうる列は `Option<V>` で読んでください。
-    pub async fn pluck<V: FromValue>(&self, column: &str) -> Result<Vec<V>> {
-        self.inner.pluck(column).await
+    pub async fn pluck<V: FromValue>(&self, column: impl ModelColumn<T>) -> Result<Vec<V>> {
+        self.inner.pluck(column.column_name()).await
     }
 
     /// 最初の行の、ある列の値。NULL がありうる列は `Option<V>` で読んでください。
-    pub async fn value<V: FromValue>(&self, column: &str) -> Result<Option<V>> {
-        self.inner.value(column).await
+    pub async fn value<V: FromValue>(&self, column: impl ModelColumn<T>) -> Result<Option<V>> {
+        self.inner.value(column.column_name()).await
     }
 
     /// 条件に当てはまる行を更新する。

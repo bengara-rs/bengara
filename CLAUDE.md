@@ -15,10 +15,10 @@
 |-------------------------|------------------------------------------|----------------------------------------------------------------------------------------------|
 | `crates/bengara`        | 利用者が依存に書く本体                   | 公開 API は `prelude` 経由で使える形を保つ。axum / hyper を外に漏らさない                    |
 | `crates/bengara-build`  | `build.rs` の自動検出                    | **依存クレートを持たない**。**パニック禁止**（問題は生成コードの `compile_error!` で伝える） |
-| `crates/bengara-macros` | `#[bengara::test]` と `#[derive(Model)]` | ここに機能を増やさない。マクロのエラーは分かりやすい文で出す                                 |
+| `crates/bengara-macros` | `#[bengara::test]` と `#[derive(Model)]` | ここに機能を増やさない。マクロのエラーは分かりやすい文で出す。例外：`#[derive(Model)]` の `columns` 指定（型付きの列の定数）は足した（判断 240） |
 
-- workspace 共通: version 0.1.0 / edition 2021 / rust-version 1.85 / license `MIT OR Apache-2.0`。
-  bengara 自身は edition 2021 で書くが、依存の hyper-util が edition 2024 を要求するため MSRV は 1.85。
+- workspace 共通: version 0.1.0 / edition 2021 / rust-version 1.88 / license `MIT OR Apache-2.0`。
+  bengara 自身は edition 2021 で書く。MSRV は 1.88（依存の版を固定せずに済む下限。判断 248）。
   依存を増やすときは MSRV を上げないか確かめる。
 - `bengara-build` が生成するモジュールは、クレート直下に平らに並べる。入れ子の `#[path]` は書かない
   （rust-analyzer がパスを解決できなくなる）。
@@ -41,6 +41,7 @@
   | セッション（ID ごとの錠と中身） | `session/middleware.rs`・`session/mod.rs`                       | 利用者ごと。ID の表を引く間だけ共有のロックを取る                                                                                   |
   | テスト・手元用の置き場所        | `cache/store.rs`・`session/store.rs`・`mail.rs`・`broadcast.rs` | `memory` のキャッシュとセッション、`array` のメール、`Broadcast::fake` の記録                                                       |
   | WebSocket の接続の表            | `websocket/registry.rs`                                         | 接続・切断・join・leave で書き、publish・local_count で読む。送るのは放してから（接続とチャンネルはリクエスト処理中に増減するため） |
+  | パスワードの計算の同時数        | `auth/hashing.rs`                                               | `Semaphore` の permit。計算の間だけ持つ。リクエストの処理中はパスワードを計算するときだけ取る                                       |
 - **実装していない機能をドキュメントに書かない。** 将来の話は `docs/backlog.md` だけに書く。
 - 依存クレートを安易に増やさない。入れる前に自前で書けないか考える。
 - `panic = "abort"` にしない。ハンドラのパニックは 1 リクエストに閉じ込めて 500 を返す。

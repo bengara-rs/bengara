@@ -324,6 +324,26 @@ impl Request {
         crate::session::csrf_token(self.session())
     }
 
+    /// テンプレートを描いて、HTML のレスポンスで返す。機能フラグ `view` が要ります。
+    ///
+    /// ```ignore
+    /// req.view("posts.create", json!({ "title": "新しい記事" }))
+    /// ```
+    ///
+    /// [`bengara::view`](crate::view()) と同じです。加えて、テンプレートの中で
+    /// `csrf_field()`・`csrf_token()`・`old(key)` が使えます。
+    /// セッションが無い（`StartSession` を通っていない）ときは、`csrf_field()` と
+    /// `csrf_token()` が描画のエラーになり、`old()` は既定値を返します。
+    ///
+    /// `context` に `csrf_token`・`csrf_field`・`old` の鍵があると 500 です。
+    pub fn view(
+        &self,
+        name: &str,
+        context: impl serde::Serialize,
+    ) -> Result<crate::http::Response> {
+        crate::view::request_view(self.try_session(), name, context)
+    }
+
     /// HTTP メソッド。
     ///
     /// 届いた文字列のままです。**大文字小文字は直しません**（HTTP のメソッドは
@@ -664,6 +684,25 @@ impl Request {
                 Err(e)
             }
         }
+    }
+
+    /// 入力を検査し、通った値を型に読む。Laravel の FormRequest に当たります。
+    ///
+    /// ```ignore
+    /// let input: StorePost = req.validate_as()?;
+    /// ```
+    ///
+    /// 規則は型の [`FormRequest::RULES`](crate::validation::FormRequest::RULES) です。
+    /// 検査に落ちたら [`validate`](Self::validate) と同じく 422（前の入力も覚えます）、
+    /// 通った値を型に読めなければ 500 です
+    /// （[`Validated::to_typed`](crate::validation::Validated::to_typed)）。
+    ///
+    /// `RULES` の書き間違いは、ここを使う所で**コンパイルが止まります**。
+    /// ただし確かめるのは `cargo build`（`serve`・`test` を含む）のときで、
+    /// `cargo check` では確かめません。`RULES` を `rules!` で書けば `cargo check` でも止まります。
+    pub fn validate_as<T: crate::validation::FormRequest>(&self) -> Result<T> {
+        const { crate::validation::check_rules(T::RULES) };
+        self.validate(T::RULES)?.to_typed()
     }
 }
 
@@ -1175,6 +1214,58 @@ mod tests {
         assert!(req.validate(&[("title", "required")]).is_err());
         assert!(session.old("title").is_none(), "覚えない");
         assert!(!session.should_save(), "セッションを保存させない");
+    }
+
+    #[test]
+    fn validate_asは422か型付きの値を返す() {
+        #[derive(Debug, serde::Deserialize)]
+        struct StorePost {
+            title: String,
+            age: Option<i64>,
+        }
+        impl crate::validation::FormRequest for StorePost {
+            const RULES: &'static [(&'static str, &'static str)] = crate::rules! {
+                "title" => "required|max:10",
+                "age"   => "nullable|integer",
+            };
+        }
+
+        let req = Request::new("post", "/posts").with_query("title=題&age=30&extra=x");
+        let input: StorePost = req.validate_as().unwrap();
+        assert_eq!(input.title, "題");
+        assert_eq!(input.age, Some(30));
+
+        // `nullable` で空なら None。
+        let req = Request::new("post", "/posts").with_query("title=題");
+        assert_eq!(req.validate_as::<StorePost>().unwrap().age, None);
+
+        // 検査に落ちたら 422。
+        let req = Request::new("post", "/posts").with_query("title=&age=x");
+        let error = req.validate_as::<StorePost>().unwrap_err();
+        assert_eq!(error.status(), 422);
+        match error {
+            crate::Error::Validation(errors) => {
+                assert!(errors.has("title") && errors.has("age"));
+            }
+            other => panic!("検査のエラーのはずです: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_asは規則と型が食い違えば500() {
+        // 規則に `age` が無いのに、型は `Option` でない `age` を求めている。
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Mismatch {
+            age: i64,
+        }
+        impl crate::validation::FormRequest for Mismatch {
+            const RULES: &'static [(&'static str, &'static str)] = &[("title", "required")];
+        }
+        let req = Request::new("post", "/posts").with_query("title=題&age=3");
+        let error = req.validate_as::<Mismatch>().unwrap_err();
+        assert_eq!(error.status(), 500);
+        assert!(error.to_string().contains("項目 `age`"), "{error}");
     }
 
     #[test]

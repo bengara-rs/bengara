@@ -11,6 +11,9 @@
 //!
 //! 失敗すると `Error::Validation` になり、422 と、どの項目がなぜ駄目かの JSON を返します。
 //!
+//! 規則を [`rules!`](crate::rules) で書くと、書き間違いをコンパイルのときに止めます。
+//! 規則と読み先の型をまとめるときは [`FormRequest`] と `req.validate_as()` を使います。
+//!
 //! # 値の前後の空白は落とします
 //!
 //! 検査する前に、値の前後の空白を落とします（Laravel の `TrimStrings` と同じ）。
@@ -72,6 +75,34 @@ impl Validated {
     /// 全部の組。
     pub fn all(&self) -> &BTreeMap<String, String> {
         &self.values
+    }
+
+    /// 通った値を、まとめて型に読む。[`FormRequest`] の `validate_as` が使います。
+    ///
+    /// ```ignore
+    /// #[derive(bengara::serde::Deserialize)]
+    /// #[serde(crate = "bengara::serde")]
+    /// struct Input { title: String, age: Option<i64> }
+    ///
+    /// let input: Input = req.validate(rules! { "title" => "required", "age" => "nullable|integer" })?
+    ///     .to_typed()?;
+    /// ```
+    ///
+    /// | 項目の型 | 読み方 | 読めないとき |
+    /// |---|---|---|
+    /// | `String` | そのまま | — |
+    /// | 整数（`i8`〜`i64`・`u8`〜`u64`・`isize`・`usize`） | 前後の空白を落として読む | 500 |
+    /// | `f32` / `f64` | 同上 | 500 |
+    /// | `bool` | `1` `true` `on` `yes` は真、`0` `false` `off` `no` は偽。大文字小文字は区別する | 500 |
+    /// | `Option<T>` | 空文字と、表に無い項目は `None`。それ以外は `T` として読む | — |
+    /// | `Carbon` | `Carbon::parse` | 500 |
+    /// | 中身の無い列挙（`enum Role { Admin, User }`） | 値を変種の名前として読む | 500 |
+    /// | それ以外（`Vec`・入れ子の構造体など） | 読まない | 500 |
+    ///
+    /// 読めないときは 500 です（検査を通った値が読めないのは、規則と型の食い違いのため）。
+    /// 規則に無い項目は表に入らないので、`Option` でない項目は「値がありません」で落ちます。
+    pub fn to_typed<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        T::deserialize(typed::Table(&self.values)).map_err(|e| e.into_error())
     }
 
     /// 検査した項目に入っているか。
@@ -164,6 +195,19 @@ impl ValidationErrors {
     }
 }
 
+/// 使える規則の名前の一覧。**ここだけに持ちます。**
+///
+/// 実行時の [`RULE_NAMES`] と、コンパイル時の [`check_rules`] の `panic!` の文が
+/// 両方ともこれを使います。`concat!` に渡すため、定数ではなくマクロにしています。
+/// 規則を足したら、ここと [`Rule::parse`] と `check_rule` の 3 か所を直してください。
+macro_rules! rule_names {
+    () => {
+        "required, nullable, integer (int), numeric, boolean (bool), email, url, alpha, \
+         alpha_num, alpha_dash, min, max, size, between, in, confirmed, same, different, \
+         starts_with, ends_with, date"
+    };
+}
+
 /// 1つの規則。
 ///
 /// `f64` を持つので `Eq` は付けません（`PartialEq` だけで足ります）。
@@ -189,12 +233,14 @@ enum Rule {
     Different(String),
     StartsWith(String),
     EndsWith(String),
+    Date,
 }
 
 /// 使える規則の名前。知らない規則を断るときの案内に出します。
-const RULE_NAMES: &str = "required, nullable, integer (int), numeric, boolean (bool), email, \
-                          url, alpha, alpha_num, alpha_dash, min, max, size, between, in, \
-                          confirmed, same, different, starts_with, ends_with";
+///
+/// 一覧は [`rule_names!`] の 1 か所だけに持ちます。コンパイル時の検査
+/// （[`check_rules`]）も同じものを使います。
+const RULE_NAMES: &str = rule_names!();
 
 impl Rule {
     /// `max:255` のような1語を規則にする。
@@ -294,6 +340,7 @@ impl Rule {
             "different" => Rule::Different(text("different")?),
             "starts_with" => Rule::StartsWith(text("starts_with")?),
             "ends_with" => Rule::EndsWith(text("ends_with")?),
+            "date" => Rule::Date,
             // 知らない規則は**書き間違い**です。利用者に見せる 422 にはしません。
             // `min`（引数忘れ）と同じ扱いで、作った人へ 500 で知らせます。
             // 422 にすると、内部の規則名がそのまま画面に出ます。
@@ -304,6 +351,484 @@ impl Rule {
             }
         })
     }
+}
+
+/// 規則を書き、**コンパイルのときに確かめる。**
+///
+/// ```ignore
+/// let input = req.validate(rules! {
+///     "title" => "required|max:255",
+///     "age"   => "nullable|integer",
+/// })?;
+/// ```
+///
+/// 返すのは `&'static [(&'static str, &'static str)]` です。`req.validate(&[..])` と
+/// 同じ物を渡せます。空の `rules! {}` も書けます。
+///
+/// 規則の書き間違い（知らない名前・`min` の数の忘れなど）は、実行して 500 になる
+/// 前に**コンパイルが止まります**（`evaluation of constant value failed`）。
+/// 判定は実行時と同じで、実行時に通る書き方は止めません。
+///
+/// | 止まるもの | 例 |
+/// |---|---|
+/// | 知らない規則名 | `maxx:10` |
+/// | `min` / `max` に数が無い | `min`・`max:nan`・`min:inf` |
+/// | `size` が 0 以上の整数でない | `size:-3`・`size:1.5` |
+/// | `between` の形が違う | `between:5`・`between:a,10` |
+/// | `in` に値が 1 つも無い | `in:`・`in:,,` |
+/// | `same` などに値が無い | `same:` |
+///
+/// 次のものは**実行時に任せます**（500 になります）。`between:10,1`（下限が上限より大きい）、
+/// `max:1e400`（桁あふれ）、`size:1e30`（大きすぎる）。
+#[macro_export]
+macro_rules! rules {
+    ($($field:literal => $spec:literal),* $(,)?) => {{
+        const __BENGARA_RULES: &[(&str, &str)] = &[$(($field, $spec)),*];
+        const _: () = $crate::validation::check_rules(__BENGARA_RULES);
+        __BENGARA_RULES
+    }};
+}
+
+/// 型付きの検査。Laravel の FormRequest に当たります。
+///
+/// `app/Http/Requests/` に、規則と読み先の型を 1 つにまとめて置きます。
+///
+/// ```ignore
+/// // app/Http/Requests/StorePost.rs
+/// use bengara::validation::FormRequest;
+///
+/// #[derive(bengara::serde::Deserialize)]
+/// #[serde(crate = "bengara::serde")]
+/// pub struct StorePost {
+///     pub title: String,
+///     pub age: Option<i64>,
+/// }
+///
+/// impl FormRequest for StorePost {
+///     const RULES: &'static [(&'static str, &'static str)] = bengara::rules! {
+///         "title" => "required|max:255",
+///         "age"   => "nullable|integer",
+///     };
+/// }
+///
+/// // ハンドラ
+/// let input: StorePost = req.validate_as()?;
+/// ```
+///
+/// 検査に落ちたら 422、通った値を型に読めなければ 500 です
+/// （[`Validated::to_typed`]）。
+///
+/// `RULES` の書き間違いは `validate_as` を呼ぶ所で確かめます。この確かめは
+/// `cargo build`（`serve`・`test` を含む）で効き、`cargo check` では効きません。
+/// `rules!` で書けば `cargo check` でも止まります。
+pub trait FormRequest: serde::de::DeserializeOwned {
+    /// 項目と規則の組。`rules!` で書くと、コンパイルのときに確かめます。
+    const RULES: &'static [(&'static str, &'static str)];
+}
+
+/// 規則の書き間違いを、コンパイルのときに止める。`rules!` と `validate_as` が使います。
+///
+/// **判定は実行時（`Rule::parse`）と同じです。** 実行時に通る書き方は止めず、
+/// 実行時に 500 になるもののうち、文字列だけで決まるものを止めます。
+/// 引数を取らない規則（`required` など）に付いた引数は、実行時と同じく無視します。
+///
+/// 止めるときは `panic!` です。`const` の中で呼ぶので、コンパイルのエラー（E0080）になります。
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "title" => "maxx:10" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "n" => "min" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "n" => "max:nan" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "n" => "min:inf" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "s" => "size:-3" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "s" => "size:1.5" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "role" => "in:" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "role" => "in:,," };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "n" => "between:5" };
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = bengara::rules! { "a" => "same:" };
+/// ```
+///
+/// `FormRequest::RULES` を `rules!` で書くと、`validate_as` を呼ばなくても止まります。
+///
+/// ```compile_fail,E0080
+/// #[derive(bengara::serde::Deserialize)]
+/// #[serde(crate = "bengara::serde")]
+/// struct Input {
+///     n: i64,
+/// }
+/// impl bengara::FormRequest for Input {
+///     const RULES: &'static [(&'static str, &'static str)] = bengara::rules! { "n" => "min" };
+/// }
+/// ```
+///
+/// `rules!` を使わなくても、`validate_as` を使う所で止まります（`cargo build` のとき）。
+///
+/// ```compile_fail,E0080
+/// #[derive(bengara::serde::Deserialize)]
+/// #[serde(crate = "bengara::serde")]
+/// struct Input {
+///     n: i64,
+/// }
+/// impl bengara::FormRequest for Input {
+///     const RULES: &'static [(&'static str, &'static str)] = &[("n", "maxx:10")];
+/// }
+/// fn store(req: &bengara::Request) -> bengara::Result<i64> {
+///     Ok(req.validate_as::<Input>()?.n)
+/// }
+/// // ルートに登録したハンドラと同じく、使われる関数にする。
+/// let handler: fn(&bengara::Request) -> bengara::Result<i64> = store;
+/// let _ = handler;
+/// ```
+///
+/// 正しい書き方は通ります。
+///
+/// ```
+/// let rules = bengara::rules! {
+///     "title" => "required|max:255",
+///     "age"   => "nullable|integer|between:0,150",
+///     "at"    => "date",
+/// };
+/// assert_eq!(rules.len(), 3);
+/// let none: &[(&str, &str)] = bengara::rules! {};
+/// assert!(none.is_empty());
+/// ```
+#[doc(hidden)]
+pub const fn check_rules(rules: &[(&str, &str)]) {
+    let mut i = 0;
+    while i < rules.len() {
+        let spec = rules[i].1.as_bytes();
+        // 縦棒で分け、空白だけの区切りは飛ばす（実行時と同じ）。
+        let mut start = 0;
+        while start <= spec.len() {
+            let end = find_byte(spec, start, spec.len(), b'|');
+            let (s, e) = trim_range(spec, start, end);
+            if s < e {
+                check_rule(spec, start, end);
+            }
+            start = end + 1;
+        }
+        i += 1;
+    }
+}
+
+/// 規則 1 つ（`spec[start..end]`）を確かめる。`Rule::parse` と同じ判定です。
+const fn check_rule(spec: &[u8], start: usize, end: usize) {
+    // 最初の `:` の前が名前、後ろが引数。どちらも前後の空白を落とす。
+    // 引数が無いときは空として扱います。空の引数で通る規則は無いので、結果は同じです。
+    let colon = find_byte(spec, start, end, b':');
+    let (ns, ne) = trim_range(spec, start, colon);
+    let (a, b) = if colon < end {
+        trim_range(spec, colon + 1, end)
+    } else {
+        (end, end)
+    };
+    // const fn の中ではクロージャを呼べないので、小さなマクロで書く。
+    macro_rules! is {
+        ($name:literal) => {
+            bytes_eq(spec, ns, ne, $name)
+        };
+    }
+
+    // 引数を取らない規則。付いた引数は実行時も無視しているので、ここでも見ない。
+    if is!("required")
+        || is!("nullable")
+        || is!("integer")
+        || is!("int")
+        || is!("numeric")
+        || is!("boolean")
+        || is!("bool")
+        || is!("email")
+        || is!("url")
+        || is!("alpha")
+        || is!("alpha_num")
+        || is!("alpha_dash")
+        || is!("confirmed")
+        || is!("date")
+    {
+        return;
+    }
+    if is!("min") {
+        if !is_number(spec, a, b) {
+            panic!("検査の規則: `min` には数値が要ります（例: min:10）");
+        }
+        return;
+    }
+    if is!("max") {
+        if !is_number(spec, a, b) {
+            panic!("検査の規則: `max` には数値が要ります（例: max:10）");
+        }
+        return;
+    }
+    if is!("size") {
+        if !is_number(spec, a, b) || is_negative(spec, a, b) || has_fraction(spec, a, b) {
+            panic!("検査の規則: `size` には 0 以上の整数が要ります（例: size:10）");
+        }
+        return;
+    }
+    if is!("between") {
+        let comma = find_byte(spec, a, b, b',');
+        if comma == b {
+            panic!("検査の規則: `between` は between:1,10 の形で書いてください");
+        }
+        let (ls, le) = trim_range(spec, a, comma);
+        if !is_number(spec, ls, le) {
+            panic!("検査の規則: `between` の下限が数値ではありません（例: between:1,10）");
+        }
+        let (hs, he) = trim_range(spec, comma + 1, b);
+        if !is_number(spec, hs, he) {
+            panic!("検査の規則: `between` の上限が数値ではありません（例: between:1,10）");
+        }
+        return;
+    }
+    if is!("in") {
+        // `,` で分けて空白を落とし、空でない値が 1 つでもあれば通す。
+        let mut s = a;
+        while s <= b {
+            let e = find_byte(spec, s, b, b',');
+            let (vs, ve) = trim_range(spec, s, e);
+            if vs < ve {
+                return;
+            }
+            s = e + 1;
+        }
+        panic!("検査の規則: `in` には 1 つ以上の値が要ります（例: in:admin,user）");
+    }
+    if is!("same") {
+        if a == b {
+            panic!("検査の規則: `same` には項目名が要ります（例: same:password）");
+        }
+        return;
+    }
+    if is!("different") {
+        if a == b {
+            panic!("検査の規則: `different` には項目名が要ります（例: different:old_password）");
+        }
+        return;
+    }
+    if is!("starts_with") {
+        if a == b {
+            panic!("検査の規則: `starts_with` には値が要ります（例: starts_with:abc）");
+        }
+        return;
+    }
+    if is!("ends_with") {
+        if a == b {
+            panic!("検査の規則: `ends_with` には値が要ります（例: ends_with:abc）");
+        }
+        return;
+    }
+    panic!(concat!(
+        "検査の規則: 知らない規則名です。使えるのは ",
+        rule_names!(),
+        " です"
+    ));
+}
+
+/// `bytes[start..end]` の中で最初の `needle` の位置。無ければ `end`。
+const fn find_byte(bytes: &[u8], start: usize, end: usize, needle: u8) -> usize {
+    let mut i = start;
+    while i < end {
+        if bytes[i] == needle {
+            return i;
+        }
+        i += 1;
+    }
+    end
+}
+
+/// `bytes[start..end]` が `text` と同じか。
+const fn bytes_eq(bytes: &[u8], start: usize, end: usize, text: &str) -> bool {
+    let text = text.as_bytes();
+    if end - start != text.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < text.len() {
+        if bytes[start + i] != text[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `bytes[start..end]` の前後の空白を落とした範囲。
+///
+/// 実行時の `str::trim` と同じく、Unicode の空白（全角の空白など）も落とします。
+/// ASCII だけを落とすと、実行時に通る `"required|\u{3000}max:10"` を止めてしまいます。
+const fn trim_range(bytes: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
+    while start < end {
+        let (c, width) = decode_char(bytes, start);
+        if !is_white_space(c) {
+            break;
+        }
+        start += width;
+    }
+    while start < end {
+        // 末尾の 1 文字の頭まで戻る（UTF-8 の続きのバイトは 10xxxxxx）。
+        let mut head = end - 1;
+        while bytes[head] & 0xC0 == 0x80 {
+            head -= 1;
+        }
+        let (c, _) = decode_char(bytes, head);
+        if !is_white_space(c) {
+            break;
+        }
+        end = head;
+    }
+    (start, end)
+}
+
+/// `bytes[i]` から始まる 1 文字（UTF-8）を読み、文字の番号とバイト数を返す。
+///
+/// 元は `&str` なので、正しい UTF-8 であることは確かです。
+const fn decode_char(bytes: &[u8], i: usize) -> (u32, usize) {
+    let lead = bytes[i] as u32;
+    if lead < 0x80 {
+        (lead, 1)
+    } else if lead < 0xE0 {
+        (((lead & 0x1F) << 6) | tail(bytes, i + 1), 2)
+    } else if lead < 0xF0 {
+        (
+            ((lead & 0x0F) << 12) | (tail(bytes, i + 1) << 6) | tail(bytes, i + 2),
+            3,
+        )
+    } else {
+        (
+            ((lead & 0x07) << 18)
+                | (tail(bytes, i + 1) << 12)
+                | (tail(bytes, i + 2) << 6)
+                | tail(bytes, i + 3),
+            4,
+        )
+    }
+}
+
+/// UTF-8 の続きのバイトから、中身の 6 ビットを取り出す。
+const fn tail(bytes: &[u8], i: usize) -> u32 {
+    (bytes[i] as u32) & 0x3F
+}
+
+/// Unicode の空白か（`char::is_whitespace` と同じ一覧）。
+const fn is_white_space(c: u32) -> bool {
+    matches!(
+        c,
+        0x09..=0x0D
+            | 0x20
+            | 0x85
+            | 0xA0
+            | 0x1680
+            | 0x2000..=0x200A
+            | 0x2028
+            | 0x2029
+            | 0x202F
+            | 0x205F
+            | 0x3000
+    )
+}
+
+/// 数の形か。`parse::<f64>()` が有限の数として読む形と同じです。
+///
+/// `[+-]?` に続いて「数字 1 個以上（`.` と数字 0 個以上が続いてよい）」か
+/// 「`.` と数字 1 個以上」。その後に `e` か `E`、`[+-]?`、数字 1 個以上が続いてよい。
+/// `inf`・`nan`・`1_000` は数の形ではありません。`1e400` のような桁あふれは
+/// 形としては通し、実行時に任せます。
+const fn is_number(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut i = start;
+    if i < end && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let int_start = i;
+    while i < end && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut digits = i - int_start;
+    if i < end && bytes[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        while i < end && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        digits += i - frac_start;
+    }
+    if digits == 0 {
+        return false;
+    }
+    if i < end && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < end && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < end && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return false;
+        }
+    }
+    i == end
+}
+
+/// 負の数か。`-` で始まり、指数より前に 0 以外の数字があるもの。
+///
+/// `-0` と `-0.0` は実行時に 0 として通るので、負とみなしません。
+const fn is_negative(bytes: &[u8], start: usize, end: usize) -> bool {
+    if start >= end || bytes[start] != b'-' {
+        return false;
+    }
+    let mut i = start + 1;
+    while i < end && bytes[i] != b'e' && bytes[i] != b'E' {
+        if bytes[i] >= b'1' && bytes[i] <= b'9' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// 指数（`e` / `E`）が無く、`.` の後ろに 0 以外の数字があるか（`1.5` など）。
+///
+/// 指数がある値（`1.5e1` は 15）の整数判定は実行時に任せます。
+const fn has_fraction(bytes: &[u8], start: usize, end: usize) -> bool {
+    if find_byte(bytes, start, end, b'e') < end || find_byte(bytes, start, end, b'E') < end {
+        return false;
+    }
+    let dot = find_byte(bytes, start, end, b'.');
+    let mut i = dot;
+    while i < end {
+        if bytes[i] >= b'1' && bytes[i] <= b'9' {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// 入力をひとまとめにしたもの（クエリ・フォーム・JSON のどれか）。
@@ -601,6 +1126,18 @@ fn check(
                 errors.add(field, format!("{field} は {suffix} で終えてください。"));
             }
         }
+        // 受け付ける形は `Carbon::parse` と同じです（Laravel の `date` より狭い）。
+        // 通った値は `get_as::<Carbon>` や `to_typed` でそのまま読めます。
+        Rule::Date => {
+            if crate::Carbon::parse(value).is_err() {
+                errors.add(
+                    field,
+                    format!(
+                        "{field} は日付（YYYY-MM-DD か YYYY-MM-DD HH:MM:SS）で入力してください。"
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -715,6 +1252,309 @@ fn looks_like_email(value: &str) -> bool {
         return false;
     };
     !host.is_empty() && tld.len() >= 2 && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+/// [`Validated::to_typed`] の読み手。検査を通った値（文字列の表）を serde で型に読みます。
+///
+/// 依存を足さないため、自前で書いています。読めるのは 1 段の構造体だけです。
+/// 項目ごとの読み方は `to_typed` の表を見てください。
+mod typed {
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, Visitor};
+
+    use crate::error::Error;
+
+    /// 読めなかった理由。**どの項目かを一緒に持ちます。**
+    #[derive(Debug)]
+    pub(super) struct ReadError {
+        field: Option<String>,
+        reason: String,
+    }
+
+    impl ReadError {
+        /// 項目名がまだ無ければ付ける。値の読み手の外（serde の derive の中）で
+        /// 作られたエラーにも、項目名を付けるために使います。
+        fn in_field(mut self, field: &str) -> Self {
+            if self.field.is_none() {
+                self.field = Some(field.to_string());
+            }
+            self
+        }
+
+        /// 500 になるエラーにする。
+        pub(super) fn into_error(self) -> Error {
+            match self.field {
+                Some(field) => Error::msg(format!(
+                    "検査を通った値を型に読めません（項目 `{field}`）: {}",
+                    self.reason
+                )),
+                None => Error::msg(format!("検査を通った値を型に読めません: {}", self.reason)),
+            }
+        }
+    }
+
+    impl fmt::Display for ReadError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.reason)
+        }
+    }
+
+    impl std::error::Error for ReadError {}
+
+    impl de::Error for ReadError {
+        fn custom<T: fmt::Display>(msg: T) -> Self {
+            Self {
+                field: None,
+                reason: msg.to_string(),
+            }
+        }
+
+        // 規則に無い項目と、送られてこなかった項目は表に入りません。
+        // `Option` でない項目がそうなると、serde がここを呼びます。
+        fn missing_field(field: &'static str) -> Self {
+            Self {
+                field: Some(field.to_string()),
+                reason: "値がありません。規則に `required` を付けるか、`Option` にしてください"
+                    .to_string(),
+            }
+        }
+
+        fn unknown_variant(variant: &str, expected: &'static [&'static str]) -> Self {
+            let names: Vec<String> = expected.iter().map(|name| format!("`{name}`")).collect();
+            Self::custom(format!(
+                "`{variant}` は選べる値にありません（{}）",
+                names.join("・")
+            ))
+        }
+    }
+
+    /// 表全体。構造体として読みます。
+    pub(super) struct Table<'a>(pub(super) &'a BTreeMap<String, String>);
+
+    impl<'de> de::Deserializer<'de> for Table<'_> {
+        type Error = ReadError;
+
+        fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, ReadError> {
+            visitor.visit_map(Entries {
+                iter: self.0.iter(),
+                current: None,
+            })
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map struct enum identifier ignored_any
+        }
+    }
+
+    /// 表の組を 1 つずつ渡す。
+    struct Entries<'a> {
+        iter: std::collections::btree_map::Iter<'a, String, String>,
+        current: Option<(&'a str, &'a str)>,
+    }
+
+    impl<'de> MapAccess<'de> for Entries<'_> {
+        type Error = ReadError;
+
+        fn next_key_seed<K: DeserializeSeed<'de>>(
+            &mut self,
+            seed: K,
+        ) -> Result<Option<K::Value>, ReadError> {
+            let Some((field, value)) = self.iter.next() else {
+                return Ok(None);
+            };
+            self.current = Some((field, value));
+            seed.deserialize(field.as_str().into_deserializer())
+                .map(Some)
+        }
+
+        fn next_value_seed<V: DeserializeSeed<'de>>(
+            &mut self,
+            seed: V,
+        ) -> Result<V::Value, ReadError> {
+            let (field, value) = self.current.take().ok_or_else(|| {
+                <ReadError as de::Error>::custom("項目名より先に値を読もうとしました")
+            })?;
+            seed.deserialize(Field { value })
+                .map_err(|e| e.in_field(field))
+        }
+
+        fn size_hint(&self) -> Option<usize> {
+            Some(self.iter.len())
+        }
+    }
+
+    /// 項目 1 つの値。
+    struct Field<'a> {
+        value: &'a str,
+    }
+
+    impl Field<'_> {
+        /// 前後の空白を落として、数として読む。
+        fn number<T: std::str::FromStr>(&self, what: &str) -> Result<T, ReadError> {
+            self.value.trim().parse().map_err(|_| {
+                <ReadError as de::Error>::custom(format!(
+                    "`{}` を {what} として読めません",
+                    self.value
+                ))
+            })
+        }
+
+        fn unsupported(what: &str) -> ReadError {
+            <ReadError as de::Error>::custom(format!(
+                "{what}には読めません（読めるのは文字列・整数・小数・真偽値・`Option`・\
+                 `Carbon`・中身の無い列挙です）"
+            ))
+        }
+    }
+
+    /// 数の型の読み方をまとめて書く。
+    macro_rules! numbers {
+        ($($method:ident => $visit:ident($ty:ty)),* $(,)?) => {$(
+            fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, ReadError> {
+                visitor.$visit(self.number::<$ty>(stringify!($ty))?)
+            }
+        )*};
+    }
+
+    /// 読まない型をまとめて書く。
+    macro_rules! unsupported {
+        ($($method:ident => $what:literal),* $(,)?) => {$(
+            fn $method<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, ReadError> {
+                Err(Self::unsupported($what))
+            }
+        )*};
+    }
+
+    impl<'de> de::Deserializer<'de> for Field<'_> {
+        type Error = ReadError;
+
+        fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, ReadError> {
+            visitor.visit_str(self.value)
+        }
+
+        fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, ReadError> {
+            visitor.visit_str(self.value)
+        }
+
+        fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, ReadError> {
+            visitor.visit_str(self.value)
+        }
+
+        fn deserialize_identifier<V: Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            visitor.visit_str(self.value)
+        }
+
+        // `boolean` 規則と同じ 8 つ。大文字小文字も同じく区別します。
+        fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, ReadError> {
+            match self.value {
+                "1" | "true" | "on" | "yes" => visitor.visit_bool(true),
+                "0" | "false" | "off" | "no" => visitor.visit_bool(false),
+                other => Err(<ReadError as de::Error>::custom(format!(
+                    "`{other}` を真偽値として読めません（1 true on yes 0 false off no のどれか）"
+                ))),
+            }
+        }
+
+        numbers! {
+            deserialize_i8 => visit_i8(i8),
+            deserialize_i16 => visit_i16(i16),
+            deserialize_i32 => visit_i32(i32),
+            deserialize_i64 => visit_i64(i64),
+            deserialize_u8 => visit_u8(u8),
+            deserialize_u16 => visit_u16(u16),
+            deserialize_u32 => visit_u32(u32),
+            deserialize_u64 => visit_u64(u64),
+            deserialize_f32 => visit_f32(f32),
+            deserialize_f64 => visit_f64(f64),
+        }
+
+        // 空文字は `None`。`nullable` で飛ばした項目は空文字で入るためです。
+        // 表に無い項目は、serde の derive が `None` にします。
+        fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, ReadError> {
+            if self.value.is_empty() {
+                visitor.visit_none()
+            } else {
+                visitor.visit_some(self)
+            }
+        }
+
+        // 中身の無い列挙だけ。値を変種の名前として読みます
+        // （`#[serde(rename_all = "lowercase")]` などが効きます）。
+        fn deserialize_enum<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _variants: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            visitor.visit_enum(self.value.into_deserializer())
+        }
+
+        // 構造体に無い項目は読み飛ばす。
+        fn deserialize_ignored_any<V: Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            visitor.visit_unit()
+        }
+
+        unsupported! {
+            deserialize_char => "1 文字の型（char）",
+            deserialize_bytes => "バイト列",
+            deserialize_byte_buf => "バイト列",
+            deserialize_unit => "`()`",
+            deserialize_seq => "並び（Vec など）",
+            deserialize_map => "表（HashMap など）",
+        }
+
+        fn deserialize_unit_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            Err(Self::unsupported("中身の無い構造体"))
+        }
+
+        fn deserialize_newtype_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            Err(Self::unsupported("包んだ型（struct Id(i64) など）"))
+        }
+
+        fn deserialize_tuple<V: Visitor<'de>>(
+            self,
+            _len: usize,
+            _visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            Err(Self::unsupported("組（タプル）"))
+        }
+
+        fn deserialize_tuple_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _len: usize,
+            _visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            Err(Self::unsupported("組の構造体"))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            _fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, ReadError> {
+            Err(Self::unsupported("入れ子の構造体"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1269,6 +2109,431 @@ mod tests {
         let at = ok.get_as::<crate::Carbon>("at").unwrap();
         assert_eq!(at.to_date_time_string(), "2026-11-20 09:30:00");
         assert!(ok.get_as::<crate::Carbon>("bad").is_err());
+    }
+
+    #[test]
+    fn date規則() {
+        for ok in [
+            "2026-11-20",
+            "2026-11-20 09:30:00",
+            "2026-11-20T09:30:00Z",
+            " 2026-11-20 ",
+        ] {
+            assert!(
+                errors_of(&input(&[("at", ok)]), &[("at", "date")]).is_empty(),
+                "{ok:?} は通る"
+            );
+        }
+        for ng in [
+            "2026-02-30",
+            "2026/11/20",
+            "2026-11-20T09:30:00+09:00",
+            "あした",
+            "",
+        ] {
+            let e = errors_of(&input(&[("at", ng)]), &[("at", "date")]);
+            assert_eq!(
+                e.get("at"),
+                ["at は日付（YYYY-MM-DD か YYYY-MM-DD HH:MM:SS）で入力してください。"],
+                "{ng:?} は落ちる"
+            );
+        }
+        // `nullable` なら空は飛ばす。
+        assert!(errors_of(&input(&[("at", "")]), &[("at", "nullable|date")]).is_empty());
+    }
+
+    /// 一覧（`rule_names!`）から規則名を取り出す。`integer (int)` は 2 つに分ける。
+    fn listed_names() -> Vec<&'static str> {
+        RULE_NAMES
+            .split(',')
+            .flat_map(|item| item.split([' ', '(', ')']))
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// 規則名に、その規則が通る例の引数を付ける。
+    fn with_example(name: &str) -> String {
+        match name {
+            "min" | "max" | "size" => format!("{name}:3"),
+            "between" => format!("{name}:1,3"),
+            "in" | "same" | "different" | "starts_with" | "ends_with" => format!("{name}:a"),
+            _ => name.to_string(),
+        }
+    }
+
+    /// 実行時の判定。規則が読めれば `true`（検査に落ちた 422 も読めたうち）。
+    fn runtime_accepts(spec: &str) -> bool {
+        !matches!(
+            validate(&input(&[]), &[("f", spec)]),
+            Err(error) if !matches!(error, Error::Validation(_))
+        )
+    }
+
+    /// コンパイル時の判定（`check_rules`）を実行時に呼ぶ。止まれば `false`。
+    fn compile_accepts(spec: &str) -> bool {
+        std::panic::catch_unwind(|| check_rules(&[("f", spec)])).is_ok()
+    }
+
+    #[test]
+    fn 一覧のすべての規則名が実行時もコンパイル時も通る() {
+        let names = listed_names();
+        assert_eq!(names.len(), 23, "{names:?}");
+        assert!(names.contains(&"int") && names.contains(&"date"));
+        for name in names {
+            let spec = with_example(name);
+            assert!(runtime_accepts(&spec), "実行時に `{spec}` が通らない");
+            assert!(compile_accepts(&spec), "コンパイル時に `{spec}` が止まる");
+        }
+    }
+
+    #[test]
+    fn コンパイル時の判定は実行時と同じ() {
+        // 文字列だけで決まるものは、両方で同じ結果になる。
+        for spec in [
+            // 通るもの
+            "",
+            "|",
+            " | ",
+            "required",
+            " required | max:10 ",
+            "required:引数は無視",
+            "nullable|date",
+            "max:+1.5e3",
+            "min:.5",
+            "min:5.",
+            "min:-3",
+            "max: 10 ",
+            "size:0",
+            "size:-0",
+            "size:-0.0",
+            "size:1.0",
+            "size:1.5e1",
+            "between:1,10",
+            "between: 1 , 10 ",
+            "in:a",
+            "in:,a,",
+            "same:other",
+            "starts_with: x ",
+            // 全角の空白も `str::trim` と同じく落とす。
+            "required|\u{3000}max:10\u{3000}",
+            "\u{a0}in:\u{2003}a",
+            // 止めるもの
+            "maxx:10",
+            "Required",
+            "min",
+            "min:",
+            "max:nan",
+            "max:NaN",
+            "min:inf",
+            "min:-infinity",
+            "max:1_000",
+            "max:1e",
+            "max:.",
+            "max:0x10",
+            "size:-3",
+            "size:1.5",
+            "size:abc",
+            "size",
+            "between:5",
+            "between:,10",
+            "between:a,10",
+            "between:1,b",
+            "between:1,2,3",
+            "in",
+            "in:",
+            "in:,,",
+            "in: , ",
+            "same",
+            "same:",
+            "different: ",
+            "starts_with:",
+            "ends_with",
+            "required|\u{3000}maxx:10",
+        ] {
+            assert_eq!(
+                compile_accepts(spec),
+                runtime_accepts(spec),
+                "`{spec}` の判定が実行時と違う"
+            );
+        }
+    }
+
+    #[test]
+    fn 実行時に任せるもの() {
+        // 文字列の形だけでは決めないもの。コンパイル時は通し、実行時に 500。
+        for spec in ["between:10,1", "max:1e400", "size:1e30"] {
+            assert!(compile_accepts(spec), "`{spec}` は止めない");
+            assert!(!runtime_accepts(spec), "`{spec}` は実行時に 500");
+        }
+    }
+
+    #[test]
+    fn 数の形はf64として読める形と同じ() {
+        for text in [
+            "0", "10", "-3", "+3", "1.5", ".5", "5.", "1e3", "1E-3", "+.5e+2", "nan", "inf",
+            "-inf", "infinity", "NaN", "1_000", "1e", ".", "", "+", "-", "e3", "1.2.3", " 1",
+            "0x1", "1f", "١",
+        ] {
+            let bytes = text.as_bytes();
+            assert_eq!(
+                is_number(bytes, 0, bytes.len()),
+                text.parse::<f64>().is_ok_and(f64::is_finite),
+                "`{text}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rulesで書いた規則をvalidateに渡せる() {
+        let rules = crate::rules! {
+            "title" => "required|max:5",
+            "at"    => "nullable|date",
+        };
+        let ok = validate(&input(&[("title", "題"), ("at", "2026-11-20")]), rules).unwrap();
+        assert_eq!(ok.get("title"), "題");
+        assert!(errors_of(&input(&[("title", "長すぎる題名")]), rules).has("title"));
+        let empty: &[(&str, &str)] = crate::rules! {};
+        assert!(validate(&input(&[]), empty).unwrap().all().is_empty());
+    }
+
+    #[test]
+    fn コンパイル時に止める文() {
+        let message = |spec: &'static str| {
+            let panic = std::panic::catch_unwind(|| check_rules(&[("f", spec)])).unwrap_err();
+            panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap()
+        };
+        let text = message("maxx:10");
+        assert!(
+            text.starts_with("検査の規則: 知らない規則名です。"),
+            "{text}"
+        );
+        assert!(text.contains("starts_with, ends_with, date"), "{text}");
+        assert!(message("min").contains("`min` には数値が要ります"));
+        assert!(message("size:1.5").contains("`size` には 0 以上の整数が要ります"));
+        assert!(message("in:,").contains("`in` には 1 つ以上の値が要ります"));
+    }
+
+    mod typed_values {
+        use super::*;
+        use serde::Deserialize;
+
+        fn validated(pairs: &[(&str, &str)]) -> Validated {
+            Validated {
+                values: pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+
+        fn error_of<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+            pairs: &[(&str, &str)],
+        ) -> String {
+            let error = validated(pairs).to_typed::<T>().unwrap_err();
+            assert_eq!(error.status(), 500, "{error}");
+            error.to_string()
+        }
+
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Role {
+            Admin,
+            User,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct All {
+            title: String,
+            i8_: i8,
+            i64_: i64,
+            u16_: u16,
+            usize_: usize,
+            isize_: isize,
+            f32_: f32,
+            f64_: f64,
+            yes: bool,
+            no: bool,
+            note: Option<String>,
+            age: Option<i64>,
+            missing: Option<i64>,
+            at: crate::Carbon,
+            role: Role,
+        }
+
+        #[test]
+        fn 表の各型に読める() {
+            let all: All = validated(&[
+                ("title", "題"),
+                ("i8_", "-8"),
+                ("i64_", " 64 "),
+                ("u16_", "16"),
+                ("usize_", "7"),
+                ("isize_", "-7"),
+                ("f32_", "1.5"),
+                ("f64_", "2.25"),
+                ("yes", "on"),
+                ("no", "0"),
+                ("note", ""),
+                ("age", "30"),
+                ("at", "2026-11-20 09:30:00"),
+                ("role", "admin"),
+                ("extra", "規則にない項目は読み飛ばす"),
+            ])
+            .to_typed()
+            .unwrap();
+            assert_eq!(all.title, "題");
+            assert_eq!((all.i8_, all.i64_, all.u16_), (-8, 64, 16));
+            assert_eq!((all.usize_, all.isize_), (7, -7));
+            assert_eq!((all.f32_, all.f64_), (1.5, 2.25));
+            assert!(all.yes && !all.no);
+            assert_eq!(all.note, None, "空文字は None");
+            assert_eq!(all.age, Some(30));
+            assert_eq!(all.missing, None, "表に無い項目は None");
+            assert_eq!(all.at.to_date_time_string(), "2026-11-20 09:30:00");
+            assert_eq!(all.role, Role::Admin);
+        }
+
+        #[test]
+        fn 真偽値の読み方はboolean規則と同じ() {
+            #[derive(Debug, Deserialize)]
+            struct B {
+                #[allow(dead_code)]
+                b: bool,
+            }
+            for (text, expected) in [
+                ("1", true),
+                ("true", true),
+                ("on", true),
+                ("yes", true),
+                ("0", false),
+                ("false", false),
+                ("off", false),
+                ("no", false),
+            ] {
+                #[derive(Deserialize)]
+                struct V {
+                    b: bool,
+                }
+                let v: V = validated(&[("b", text)]).to_typed().unwrap();
+                assert_eq!(v.b, expected, "{text}");
+            }
+            // 大文字小文字は区別する。
+            for text in ["TRUE", "Yes", "On", "2", ""] {
+                let error = error_of::<B>(&[("b", text)]);
+                assert!(error.contains("項目 `b`"), "{error}");
+            }
+        }
+
+        #[test]
+        fn 読めないときは項目名を添えて500() {
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct N {
+                n: i32,
+            }
+            let error = error_of::<N>(&[("n", "abc")]);
+            assert!(
+                error.starts_with("検査を通った値を型に読めません（項目 `n`）: "),
+                "{error}"
+            );
+            assert!(error.contains("`abc` を i32 として読めません"), "{error}");
+            // 型の範囲を超える値も読めない。
+            assert!(error_of::<N>(&[("n", "99999999999")]).contains("項目 `n`"));
+            // `nullable` で空になった値は、`Option` でなければ読めない。
+            assert!(error_of::<N>(&[("n", "")]).contains("項目 `n`"));
+
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct F {
+                f: f64,
+            }
+            assert!(error_of::<F>(&[("f", "x")]).contains("項目 `f`"));
+
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct D {
+                at: crate::Carbon,
+            }
+            let error = error_of::<D>(&[("at", "2026-02-30")]);
+            assert!(error.contains("項目 `at`"), "{error}");
+            assert!(error.contains("日時として読めません"), "{error}");
+
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct R {
+                role: Role,
+            }
+            let error = error_of::<R>(&[("role", "Admin")]);
+            assert!(error.contains("項目 `role`"), "{error}");
+            assert!(error.contains("`Admin` は選べる値にありません"), "{error}");
+
+            // Option の中身も同じ決まりで読む。
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct O {
+                age: Option<u8>,
+            }
+            assert!(error_of::<O>(&[("age", "-1")]).contains("項目 `age`"));
+        }
+
+        #[test]
+        fn 規則に無い必須の項目は500() {
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct T {
+                title: String,
+            }
+            let error = error_of::<T>(&[]);
+            assert!(error.contains("項目 `title`"), "{error}");
+            assert!(error.contains("値がありません"), "{error}");
+        }
+
+        #[test]
+        fn 読まない型は500() {
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct Tags {
+                tags: Vec<String>,
+            }
+            let error = error_of::<Tags>(&[("tags", "a,b")]);
+            assert!(error.contains("項目 `tags`"), "{error}");
+            assert!(error.contains("並び（Vec など）には読めません"), "{error}");
+
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct Inner {
+                a: String,
+            }
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct Outer {
+                inner: Inner,
+            }
+            assert!(error_of::<Outer>(&[("inner", "x")]).contains("入れ子の構造体"));
+
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            enum WithData {
+                A(i64),
+            }
+            #[derive(Debug, Deserialize)]
+            #[allow(dead_code)]
+            struct E {
+                e: WithData,
+            }
+            assert!(error_of::<E>(&[("e", "A")]).contains("項目 `e`"));
+
+            // 構造体でない型は、表全体を読めない。
+            let error = validated(&[]).to_typed::<i64>().unwrap_err().to_string();
+            assert!(
+                error.starts_with("検査を通った値を型に読めません: "),
+                "{error}"
+            );
+        }
     }
 
     #[test]

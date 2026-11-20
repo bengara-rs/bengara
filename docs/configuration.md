@@ -79,6 +79,7 @@ let shop = config::<crate::config::shop::ShopConfig>();
 | `MailConfig`      | メールの送り先             | [mail.md](mail.md)                     | 作らない        |
 | `StorageConfig`   | ファイルの置き場所         | [storage.md](storage.md)               | 作らない        |
 | `HashConfig`      | パスワードの変換の回数     | [authentication.md](authentication.md) | 作らない        |
+| `ArgonConfig`     | Argon2id の強さ            | [authentication.md](authentication.md) | 作らない        |
 | `BroadcastConfig` | 配信の送り方               | [websocket.md](websocket.md)           | 作らない        |
 | `QueueConfig`     | ジョブごとの打ち切りの時間 | [queue.md](queue.md)                   | 作らない        |
 
@@ -190,15 +191,22 @@ DB_PASSWORD="p#ss"
 
 ### セッションと認証
 
-| 名前               | 既定     | 何に効くか                                | 設定ファイル |
-|--------------------|----------|-------------------------------------------|--------------|
-| `SESSION_DRIVER`   | `file`   | セッションの置き場所（`file` / `memory`） | —            |
-| `SESSION_LIFETIME` | `120`    | 最後に使ってから消えるまでの分            | —            |
-| `HASH_ITERATIONS`  | `240000` | パスワードの変換の繰り返し回数            | `HashConfig` |
+| 名前                   | 既定     | 何に効くか                                | 設定ファイル  |
+|------------------------|----------|-------------------------------------------|---------------|
+| `SESSION_DRIVER`       | `file`   | セッションの置き場所（`file` / `memory`） | —             |
+| `SESSION_LIFETIME`     | `120`    | 最後に使ってから消えるまでの分            | —             |
+| `HASH_ITERATIONS`      | `240000` | パスワードの変換の繰り返し回数（PBKDF2）  | `HashConfig`  |
+| `HASH_DRIVER`          | `pbkdf2` | パスワードの方式（`pbkdf2` / `argon2id`） | —             |
+| `ARGON_MEMORY`         | `65536`  | Argon2id のメモリ（KiB）                  | `ArgonConfig` |
+| `ARGON_TIME`           | `4`      | Argon2id の繰り返し                       | `ArgonConfig` |
+| `ARGON_THREADS`        | `1`      | Argon2id の並列の数                       | `ArgonConfig` |
+| `HASH_MAX_CONCURRENCY` | CPU の数 | パスワードの計算を同時に走らせる数の上限  | —             |
 
 - `SESSION_DRIVER` の `array` は `memory` と同じです。知らない名前は、警告を出して `file` にします。
 - `SESSION_LIFETIME` は 1 分より短くなりません。最大 60 秒早く切れることがあります（[session.md](session.md)）。
-- `HASH_ITERATIONS` は [authentication.md](authentication.md) で説明しています。
+- `HASH_ITERATIONS`・`HASH_DRIVER`・`ARGON_*`・`HASH_MAX_CONCURRENCY` は [authentication.md](authentication.md) で説明しています。
+- `HASH_DRIVER=argon2id` には機能フラグ `argon2` が要ります。無いときと知らない名前のときは、ログに出して `pbkdf2` にします。
+- 名前と既定値は Laravel 12 の `config/hashing.php` と同じです。
 
 ### データベース
 

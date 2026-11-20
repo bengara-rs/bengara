@@ -71,7 +71,7 @@ Laravel の書き方を知っている人が、bengara で書き方や動きが�
 |-------------------------------------|------------------------------------------------------------------------------|
 | `$request->route('post')`           | `req.param("post")`。型を変えるなら `req.param_as::<i64>("post")?`           |
 | パス引数の型が合わない              | `param_as` は **404**。ルートに無い名前なら **500**                          |
-| `view("welcome")`                   | **テンプレートは無い。** `html(...)` か JSON を返す                          |
+| `view("welcome")`                   | `view("welcome", ())`。機能フラグ `view` が要る（次の節）                    |
 | `response()->json($data)`           | `json(&data)`                                                                |
 | `redirect('/login')`                | `redirect().to("/login")`                                                    |
 | `abort(403)`                        | `return abort(403);`                                                         |
@@ -81,6 +81,24 @@ Laravel の書き方を知っている人が、bengara で書き方や動きが�
 
 くわしくは [requests-and-responses.md](requests-and-responses.md) にあります。
 
+## テンプレート
+
+テンプレートは機能フラグ `view` で使えます。置き場所は Laravel と同じ `resources/views/` です。
+書き方は **Jinja 系**（minijinja）です。**Blade の構文は使えません。**
+
+| Laravel                                | bengara                                                  |
+|----------------------------------------|----------------------------------------------------------|
+| `welcome.blade.php`                    | `welcome.html`                                           |
+| `{{ $title }}`                         | `{{ title }}`（`$` は付けない）                          |
+| `{!! $html !!}`                        | `{{ html\|safe }}`                                       |
+| `@extends` / `@section` / `@yield`     | `{% extends %}` / `{% block %}`                          |
+| `@csrf`                                | `{{ csrf_field() }}`。`req.view(..)` の中だけ            |
+| `$errors`（検査に落ちた理由）          | **無い。** 検査に落ちると前の画面に戻さず 422 を返すため |
+| `@method('PUT')`                       | **無い。** `_method` による読み替えが無いため            |
+| `resources/views/errors/404.blade.php` | **使わない。** エラーページはテンプレートにならない      |
+
+くわしくは [views.md](views.md) にあります。
+
 ## 入力とバリデーション
 
 | Laravel                                  | bengara                                                             |
@@ -88,6 +106,9 @@ Laravel の書き方を知っている人が、bengara で書き方や動きが�
 | `$request->input('title')`               | `req.input("title")`（`Option<String>`）                            |
 | `$request->validate([...])`              | `req.validate(&[("title", "required\|max:255")])?`                  |
 | 規則は配列でも文字列でも書ける           | **文字列だけ**                                                      |
+| 規則の書き間違いは実行して分かる         | `rules!` で書けば**コンパイルが止まる**                             |
+| FormRequest のクラス（`rules()` と `authorize()`） | トレイト `FormRequest` と `const RULES`。`req.validate_as()?` で型付きの値を受け取る。`authorize()` は無い |
+| `date` は `strtotime` が読める形を全部通す | **`YYYY-MM-DD` と `YYYY-MM-DD HH:MM:SS` だけ**（`T` 区切り・末尾の `Z`・小数の秒も可。時差付きは落とす） |
 | `TrimStrings` で全部の入力の空白を落とす | **検査する値だけ**落とす。`req.input()` は落とさない                |
 | `nullable` で飛ばした値はそのまま残る    | **空文字が入る**                                                    |
 | `alpha` 系は空文字を通す                 | **落とす**（`alpha` / `alpha_num` / `alpha_dash`）                  |
@@ -155,6 +176,7 @@ Laravel の書き方を知っている人が、bengara で書き方や動きが�
 | Laravel                                   | bengara                                                   |
 |-------------------------------------------|-----------------------------------------------------------|
 | `class Post extends Model`                | `#[derive(Model)]` ＋ `#[model(table = "posts")]`         |
+| `Post::CREATED_AT` のような列名の定数      | `#[model(table = "posts", columns)]` で列ごとに `Post::TITLE` を作る。型付きで、条件に渡すと値の型を確かめる |
 | 表の名前はクラス名から推測                | **書く。** 推測しない                                     |
 | 文字列の主キー（`$keyType = 'string'`）   | `derive` では作れない。`Model` を手で実装する             |
 | `$post->comments` で自動的に読む          | `comments()` メソッドを自分で書き、`.get().await?` で読む |
@@ -175,7 +197,9 @@ Laravel の書き方を知っている人が、bengara で書き方や動きが�
 
 | Laravel                               | bengara                                                                    |
 |---------------------------------------|----------------------------------------------------------------------------|
-| `Hash::make($password)`（bcrypt）     | `Hash::make(password)`（PBKDF2-HMAC-SHA256）                               |
+| `Hash::make($password)`（bcrypt）     | `Hash::make(password)`（既定は PBKDF2-HMAC-SHA256）                        |
+| `HASH_DRIVER=argon2id`                | 同じ。機能フラグ `argon2` が要る。`$argon2id$` をそのまま照合できる        |
+| `HASH_DRIVER=argon` / `bcrypt`        | 無い。Argon2i と bcrypt（`$2y$`）の値は照合できない                        |
 | 非同期の中でも `Hash::make`           | `Hash::make_async` / `Hash::check_async` を使う                            |
 | `Auth::attempt([...])`                | `req.auth().attempt::<User>("email", email, password).await?`              |
 | `Auth::user()`                        | `req.auth().user::<User>().await?`。`req` から読む                         |
@@ -219,6 +243,7 @@ Laravel の書き方を知っている人が、bengara で書き方や動きが�
 |--------------------------------------------|----------------------------------------------------------------------------------------------|
 | `SendWelcome::dispatch()`                  | `app/Jobs/SendWelcome.rs` の関数 ＋ `Queue::push("SendWelcome", &payload)`                   |
 | `->onQueue()` / `->delay()`                | `Queue::push_on` / `Queue::later` / `Queue::later_on`                                        |
+| ジョブのプロパティで型付きの値を受け取る   | `handle(Json(payload): Json<Payload>)`。文字列のままの `handle(payload: String)` も書ける      |
 | `retry_after` を設定ファイルに書く         | `queue:work --retry-after=`（既定 90 秒）                                                    |
 | ジョブの `public $timeout = 120;`          | `config/queue.rs` の `QueueConfig::default().timeout("ジョブ名", 120)`。無ければ `--timeout` |
 | `retry_after` を一番長いジョブより長くする | **要らない。** 打ち切りの時間が長いジョブは、予約を延ばす                                    |
@@ -280,7 +305,7 @@ PHP の言語や実行の形に結びついた機能は作りません。代わ�
 
 | PHP 固有のもの                         | bengara での書き方                            |
 |----------------------------------------|-----------------------------------------------|
-| Blade のテンプレート文法               | `html()` に文字列を渡す                       |
+| Blade のテンプレート文法               | 機能フラグ `view` の Jinja 系テンプレート     |
 | サービスコンテナ・プロバイダ           | ハンドラの引数は 2 つの形だけ。設定は型で引く |
 | マジックメソッド（`__get` / `__call`） | 読み込みはいつも明示する                      |
 | 緩い型比較（`==` の暗黙の変換）        | Rust の型を使う                               |

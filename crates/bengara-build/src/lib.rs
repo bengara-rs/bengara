@@ -211,6 +211,10 @@ struct Generator {
     ///
     /// リリースビルドのときだけ中身が入ります。
     public: Vec<(String, PathBuf)>,
+    /// `resources/views/` の中のテンプレート（`resources/views/` からの鍵と、実ファイルのパス）。
+    ///
+    /// リリースビルドのときだけ中身が入ります。`.html` で、中身が UTF-8 のものだけです。
+    views: Vec<(String, PathBuf)>,
     /// 生成コードに埋め込むエラー（`compile_error!` にする）。
     errors: Vec<String>,
 }
@@ -232,6 +236,7 @@ impl Generator {
         }
         self.read_lang(root);
         self.read_public(root);
+        self.read_views(root);
     }
 
     /// `dir` の変化を見張る。無いときは見張らず、警告だけ出す。
@@ -385,6 +390,118 @@ impl Generator {
         format!(
             "#[doc(hidden)]\n\
              static __BENGARA_PUBLIC: &[(&str, &[u8])] = &[{list}];\n"
+        )
+    }
+
+    /// `resources/views/` のテンプレートを、バイナリに埋め込む一覧にする。
+    ///
+    /// 作りは `read_public` と同じです。**リリースビルドのときだけ**集め、
+    /// デバッグビルドでは本体がディスクから読みます。
+    fn read_views(&mut self, root: &Path) {
+        let dir = root.join("resources/views");
+        // 見張りはデバッグビルドでも出す。release に切り替えたときに集め直せるようにする。
+        if !self.watch(&dir) {
+            return;
+        }
+        if env::var("PROFILE").as_deref() != Ok("release") {
+            return;
+        }
+        self.collect_views(&dir, "", 0);
+    }
+
+    /// `resources/views/` を下までたどる。たどり方は `collect_public` と同じです。
+    ///
+    /// 集めるのは `.html` だけです。中身が UTF-8 でないものは `include_str!` が
+    /// 分かりにくいエラーを出すので、ここで読んで確かめ、`compile_error!` で知らせます。
+    fn collect_views(&mut self, dir: &Path, prefix: &str, depth: usize) {
+        // 深すぎるところは見ない。上限が無いとスタックを使い切ってパニックする。
+        if depth >= MAX_DEPTH {
+            warn(&format!(
+                "{} は {MAX_DEPTH} 段より深いので埋め込みません。ディレクトリを浅くしてください",
+                dir.display()
+            ));
+            return;
+        }
+        let Some(entries) = self.read_dir_sorted(dir) else {
+            return;
+        };
+        for entry in entries {
+            let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) else {
+                self.errors.push(format!(
+                    "{} の名前が UTF-8 ではありません",
+                    entry.path.display()
+                ));
+                continue;
+            };
+            // 隠しファイルは埋め込まない。
+            if name.starts_with('.') {
+                continue;
+            }
+            // 鍵の区切りは常に `/`。Windows で作っても Linux と同じ鍵になる。
+            let key = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.is_dir {
+                // 見張りは要らない。`resources/views/` を `read_views` が見張っている。
+                self.collect_views(&entry.path, &key, depth + 1);
+                continue;
+            }
+            // ディレクトリへのリンクは埋め込まない（`collect_public` と同じ）。
+            // 警告は一覧を作る所（`read_dir_sorted`）がリンクごとに出している。
+            if entry.path.is_dir() {
+                continue;
+            }
+            if !name.ends_with(".html") {
+                warn(&format!(
+                    "{} は .html ではないので、テンプレートとして埋め込みません",
+                    entry.path.display()
+                ));
+                continue;
+            }
+            match fs::read(&entry.path) {
+                Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => {}
+                Ok(_) => {
+                    self.errors.push(format!(
+                        "resources/views/{key} の中身が UTF-8 ではありません"
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    self.errors
+                        .push(format!("{} を読めませんでした: {e}", entry.path.display()));
+                    continue;
+                }
+            }
+            self.views.push((key, entry.path));
+        }
+    }
+
+    /// 埋め込んだ `resources/views/` を Rust の定数として書き出す。
+    ///
+    /// ```ignore
+    /// static __BENGARA_VIEWS: &[(&str, &str)] = &[("posts/index.html", include_str!("..."))];
+    /// ```
+    ///
+    /// 親のディレクトリのパスが UTF-8 でないときの扱いは `public_code` と同じです。
+    fn views_code(&mut self) -> String {
+        let mut list = String::new();
+        let mut broken = Vec::new();
+        for (key, path) in &self.views {
+            let Some(text) = path.to_str() else {
+                broken.push(format!(
+                    "{} を埋め込めません。プロジェクトのパスに UTF-8 で表せない文字が含まれています",
+                    path.display()
+                ));
+                continue;
+            };
+            let _ = write!(list, "({key:?}, include_str!({text:?})),");
+        }
+        self.errors.extend(broken);
+        format!(
+            "#[doc(hidden)]\n\
+             static __BENGARA_VIEWS: &[(&str, &str)] = &[{list}];\n"
         )
     }
 
@@ -887,12 +1004,13 @@ impl Generator {
         }
         if is_exactly(&self.stack, JOBS_DIR) {
             let items = std::mem::take(&mut self.jobs);
+            // 中身の型（`String` か `Json<T>`）は、`__call_job` が `handle` の引数から推論します。
             let list = self.join_items(items, "ジョブ", |item| {
                 let (name, flat) = (&item.name, &item.flat);
                 format!(
                     "::bengara::Job {{ name: {name:?}, \
-                     handle: |__payload| ::std::boxed::Box::pin(\
-                     crate::{flat}::handle(__payload)) }}"
+                     handle: |__payload| ::bengara::queue::__call_job(\
+                     crate::{flat}::handle, __payload) }}"
                 )
             });
             let _ = writeln!(self.tree, "pub const JOBS: &[::bengara::Job] = &[{list}];");
@@ -1147,13 +1265,14 @@ impl Generator {
         } else {
             "|_| {}"
         };
-        // 言語の表と、埋め込んだ public/。どちらもビルド時に読んだ中身をそのまま入れる。
+        // 言語の表と、埋め込んだ public/ と resources/views/。どれもビルド時に読んだ中身をそのまま入れる。
         let lang = self.lang_code();
         let public = self.public_code();
+        let views = self.views_code();
 
         let _ = write!(
             code,
-            "{lang}{public}\
+            "{lang}{public}{views}\
              #[doc(hidden)]\n\
              pub fn __bengara_hooks() -> ::bengara::Hooks {{\n\
              \x20   ::bengara::Hooks {{\n\
@@ -1166,6 +1285,7 @@ impl Generator {
              \x20       commands: {commands},\n\
              \x20       lang: || __BENGARA_LANG,\n\
              \x20       public: || __BENGARA_PUBLIC,\n\
+             \x20       views: || __BENGARA_VIEWS,\n\
              \x20       schedule: {schedule},\n\
              \x20   }}\n\
              }}\n"
@@ -1492,6 +1612,76 @@ mod tests {
     }
 
     #[test]
+    fn viewsはhtmlだけを鍵の昇順で埋め込む() {
+        let root = temp_root("views_plain");
+        let views = root.join("resources/views");
+        touch(&views.join("welcome.html"), "<p>hi</p>");
+        touch(&views.join("posts/index.html"), "{{ title }}");
+        touch(&views.join("posts/notes.txt"), "x");
+        touch(&views.join(".hidden.html"), "x");
+
+        let mut generator = Generator::default();
+        generator.collect_views(&views, "", 0);
+
+        let keys: Vec<&str> = generator.views.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["posts/index.html", "welcome.html"]);
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+
+        let code = generator.views_code();
+        assert!(code.starts_with(
+            "#[doc(hidden)]\nstatic __BENGARA_VIEWS: &[(&str, &str)] = &[(\"posts/index.html\", include_str!("
+        ));
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn viewsの中身がutf8でなければ知らせる() {
+        let root = temp_root("views_utf8");
+        let views = root.join("resources/views");
+        touch(&views.join("ok.html"), "ok");
+        fs::write(views.join("bad.html"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let mut generator = Generator::default();
+        generator.collect_views(&views, "", 0);
+
+        let keys: Vec<&str> = generator.views.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["ok.html"]);
+        assert_eq!(
+            generator.errors,
+            ["resources/views/bad.html の中身が UTF-8 ではありません"]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn viewsの中のディレクトリへのリンクは埋め込まない() {
+        let root = temp_root("views_link");
+        let views = root.join("resources/views");
+        touch(&views.join("a.html"), "a");
+        touch(&root.join("other/b.html"), "b");
+        if !link_dir(&root.join("other"), &views.join("other")) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let mut generator = Generator::default();
+        generator.collect_views(&views, "", 0);
+
+        let keys: Vec<&str> = generator.views.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a.html"]);
+        assert!(generator.errors.is_empty(), "{:?}", generator.errors);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 埋め込むviewsが無くても空の一覧をhooksに渡す() {
+        let code = Generator::default().finish();
+        assert!(code.contains("static __BENGARA_VIEWS: &[(&str, &str)] = &[];"));
+        assert!(code.contains("views: || __BENGARA_VIEWS,"));
+    }
+
+    #[test]
     fn 大文字始まりはスネークケースになる() {
         assert_eq!(to_module_name("HomeController").unwrap(), "home_controller");
         assert_eq!(to_module_name("Http").unwrap(), "http");
@@ -1667,6 +1857,27 @@ mod tests {
         // 空の一覧ではなく、生成した定数を参照している。
         assert!(code.contains("seeders: || crate::database::seeders::SEEDERS"));
         assert!(code.contains("migrations: || crate::database::migrations::MIGRATIONS"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ジョブは引数の型を推論する口から呼ぶ() {
+        let root = temp_root("jobs");
+        touch(&root.join("app/Jobs/SendWelcome.rs"), "");
+
+        let mut generator = Generator::default();
+        generator.run(&root);
+        let code = generator.finish();
+
+        let jobs = code.lines().find(|l| l.contains("pub const JOBS")).unwrap();
+        assert_eq!(
+            jobs.trim(),
+            "pub const JOBS: &[::bengara::Job] = &[::bengara::Job { name: \"SendWelcome\", \
+             handle: |__payload| ::bengara::queue::__call_job(\
+             crate::__bengara_app_jobs_send_welcome::handle, __payload) }];"
+        );
+        assert!(code.contains("jobs: || crate::app::jobs::JOBS"));
 
         let _ = fs::remove_dir_all(&root);
     }

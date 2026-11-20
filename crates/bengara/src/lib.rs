@@ -47,20 +47,21 @@ pub mod session;
 mod storage;
 pub mod support;
 pub mod validation;
+pub mod view;
 pub mod websocket;
 
 pub mod testing;
 
 pub use application::{Application, ApplicationBuilder, Exceptions, Routing};
 pub use auth::{
-    authorize, authorize_with, decrypt, encrypt, Auth, Authenticatable, Authenticate, Hash,
-    HashConfig, PasswordReset,
+    authorize, authorize_with, decrypt, encrypt, ArgonConfig, Auth, Authenticatable, Authenticate,
+    Hash, HashConfig, PasswordReset,
 };
 pub use cache::{Cache, CacheConfig, CacheStore, FileCache, MemoryCache};
 pub use config_registry::{config, try_config, AppConfig, Registry};
 pub use console::{Command, CommandFuture};
 pub use database::{
-    now, Affected, Blueprint, ConnectionConfig, DatabaseConfig, Driver, Migration, Model,
+    now, Affected, Blueprint, Column, ConnectionConfig, DatabaseConfig, Driver, Migration, Model,
     ModelQuery, Paginator, QueryBuilder, Row, Schema, Seeder, SeederFuture, Transaction, Value, DB,
 };
 pub use env_vars::{env, FromEnv};
@@ -79,6 +80,8 @@ pub use queue::{Job, JobFuture, Queue, QueueConfig};
 pub use schedule::{Every, Schedule, Task};
 pub use storage::{DiskConfig, Storage, StorageConfig};
 pub use support::Carbon;
+pub use validation::FormRequest;
+pub use view::view;
 
 /// `#[bengara::test]`：`tests/` 以下のテスト関数に付ける。
 pub use bengara_macros::test;
@@ -119,6 +122,11 @@ pub struct Hooks {
     /// 鍵は `public/` からの相対パスで、区切りは常に `/` です。
     /// デバッグビルドでは空になり、ディスクの `public/` を読みます。
     pub public: fn() -> &'static [(&'static str, &'static [u8])],
+    /// リリースビルドでバイナリに埋め込んだ `resources/views/` の中身（`.html` だけ）。
+    ///
+    /// 鍵は `resources/views/` からの相対パスで、区切りは常に `/` です。
+    /// デバッグビルドでは空になり、ディスクの `resources/views/` を読みます。
+    pub views: fn() -> &'static [(&'static str, &'static str)],
     /// `routes/console.rs` の `schedule()` を呼んで登録する。
     pub schedule: fn(&mut Schedule),
 }
@@ -133,6 +141,7 @@ impl Default for Hooks {
             commands: || &[],
             lang: || &[],
             public: || &[],
+            views: || &[],
             schedule: |_| {},
         }
     }

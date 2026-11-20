@@ -9,9 +9,12 @@
 //! ```
 //!
 //! ジョブは `app/Jobs/` に `pub async fn handle(payload: String) -> Result<()>` として
-//! 書きます。一覧は `bengara-build` が作ります。
+//! 書きます。`pub async fn handle(Json(payload): Json<Payload>) -> Result<()>` と書けば、
+//! 中身を型に読んで受け取れます（[`Json`]）。一覧は `bengara-build` が作ります。
 
 mod worker;
+
+pub use crate::support::payload::{FromPayload, Json};
 
 pub(crate) use worker::{
     failed_count, failed_list, retry_failed, run as work, Options as WorkerOptions,
@@ -41,7 +44,7 @@ pub type JobFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 /// ```ignore
 /// pub const JOBS: &[Job] = &[Job {
 ///     name: "SendWelcome",
-///     handle: |payload| Box::pin(crate::app::jobs::send_welcome::handle(payload)),
+///     handle: |payload| bengara::queue::__call_job(crate::app::jobs::send_welcome::handle, payload),
 /// }];
 /// ```
 #[derive(Clone, Copy)]
@@ -50,6 +53,24 @@ pub struct Job {
     pub name: &'static str,
     /// 中身。
     pub handle: fn(String) -> JobFuture,
+}
+
+/// 生成コードがジョブを呼ぶ口。中身を `handle` の引数の型に読んでから呼びます。
+///
+/// 引数の型（`String` か [`Json<T>`]）は `handle` から推論します。
+/// 読めなければ、その `Err` をすぐ返します（ジョブの失敗として、再挑戦と
+/// `failed_jobs` に乗ります）。
+#[doc(hidden)]
+pub fn __call_job<P, F, Fut>(handle: F, payload: String) -> JobFuture
+where
+    P: FromPayload,
+    F: FnOnce(P) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    match P::from_payload(payload) {
+        Ok(payload) => Box::pin(handle(payload)),
+        Err(e) => Box::pin(std::future::ready(Err(e))),
+    }
 }
 
 /// キューの設定。`config/queue.rs` が返します。Laravel の `config/queue.php` に当たります。
@@ -425,5 +446,55 @@ mod tests {
             handle: |_| Box::pin(async { Ok(()) }),
         };
         assert!(format!("{job:?}").contains("SendWelcome"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Welcome {
+        id: i64,
+    }
+
+    async fn handle_string(payload: String) -> Result<()> {
+        assert_eq!(payload, "{壊れていてもよい");
+        Ok(())
+    }
+
+    async fn handle_json(Json(payload): Json<Welcome>) -> Result<()> {
+        if payload.id == 7 {
+            Ok(())
+        } else {
+            Err(Error::msg("id が違う"))
+        }
+    }
+
+    #[tokio::test]
+    async fn ジョブは文字列でも型でも受け取れる() {
+        // 生成コードと同じ形。型は `handle` の引数から推論される。
+        let jobs = [
+            Job {
+                name: "A",
+                handle: |payload| __call_job(handle_string, payload),
+            },
+            Job {
+                name: "B",
+                handle: |payload| __call_job(handle_json, payload),
+            },
+        ];
+        (jobs[0].handle)("{壊れていてもよい".into()).await.unwrap();
+        (jobs[1].handle)(r#"{"id":7}"#.into()).await.unwrap();
+        assert!((jobs[1].handle)(r#"{"id":8}"#.into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn 型に読めない中身はジョブの失敗になる() {
+        let job = Job {
+            name: "B",
+            handle: |payload| __call_job(handle_json, payload),
+        };
+        let error = (job.handle)("{壊れた".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ジョブ・聞く側の中身を"), "{error}");
+        assert!(error.contains("Welcome"), "{error}");
     }
 }

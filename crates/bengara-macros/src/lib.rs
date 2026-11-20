@@ -23,6 +23,7 @@ use syn::{parse_macro_input, ItemFn};
 /// | 指定 | 置き場所 | 既定 |
 /// |---|---|---|
 /// | `#[model(table = "posts")]` | 構造体 | 必須 |
+/// | `#[model(table = "posts", columns)]` | 構造体 | 定数を作らない（書くと列ごとに `Post::TITLE` のような型付きの列の定数を作る） |
 /// | `#[model(primary)]` | フィールド | 列名が `id` の項目 |
 /// | `#[model(column = "名前")]` | フィールド | フィールド名と同じ（`r#type` は `type`） |
 /// | `#[model(skip)]` | フィールド | 表にない項目として扱う |

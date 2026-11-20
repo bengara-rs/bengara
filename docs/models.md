@@ -29,6 +29,7 @@ pub struct Post {
 | 指定                        | 付ける所   | 意味                                                |
 |-----------------------------|------------|-----------------------------------------------------|
 | `#[model(table = "posts")]` | 構造体     | 表の名前。**必須**です                              |
+| `#[model(columns)]`         | 構造体     | 型付きの列の定数を作る（下の「型付きの列」）。`table` と並べて書く |
 | `#[model(primary)]`         | フィールド | 主キーにする。無ければ `id` の項目が主キー          |
 | `#[model(column = "名前")]` | フィールド | 列名を変える。無ければフィールド名と同じ            |
 | `#[model(skip)]`            | フィールド | 表に無い項目にする。読むときは `Default` の値が入る |
@@ -52,6 +53,9 @@ pub struct Post {
 | 同じ列名が 2 回出る                                      | `insert` が失敗する                  |
 | 主キー以外の列が無い                                     | `save()` で入れるものが無い          |
 | タプル構造体・型引数・ライフタイムがある                 | 名前付きフィールドの構造体だけ使える |
+| `columns` 付きで、定数の名前が `TABLE`・`PRIMARY_KEY`・`COLUMNS`・`INTEGER_KEY` になる | `Model` の定数と同じ名前になる |
+| `columns` 付きで、2 つの列の定数の名前が同じになる（`title` と `TITLE`） | 定数が 2 つ作れない |
+| `columns` 付きで、列名が Rust の名前にならない（`2fa` など） | 定数が作れない |
 
 名前に使えるのは英数字（日本語も可）と `_` です。表名には `.`（`スキーマ.表`）も使えます。
 
@@ -107,6 +111,95 @@ let rows = Post::query()
     .select(&["posts.title", "users.name"])
     .get()
     .await?;        // Vec<Row>
+```
+
+## 型付きの列
+
+`#[model(table = "...", columns)]` と書くと、列ごとに定数ができます。
+条件に文字列の列名の代わりに渡すと、値の型をコンパイルのときに確かめます。
+
+```rust
+use bengara::Carbon;
+
+#[derive(Model, Debug, Clone)]
+#[model(table = "posts", columns)]
+pub struct Post {
+    pub id: i64,
+    pub title: String,
+    pub views: i64,
+    pub published_at: Option<Carbon>,
+}
+
+let posts = Post::query()
+    .where_(Post::TITLE, "はじめての投稿")
+    .where_op(Post::VIEWS, ">", 100)
+    .where_op(Post::PUBLISHED_AT, "<", Carbon::now())
+    .order_by_desc(Post::PUBLISHED_AT)
+    .get()
+    .await?;
+
+let titles = Post::query().pluck::<String>(Post::TITLE).await?;
+```
+
+- 定数の名前は**列名を大文字にしたもの**です（`title` → `Post::TITLE`）。`#[model(column = "...")]` で変えた後の名前を使います。
+- 定数の型は `bengara::Column<Post, 型>` です。型はフィールドの型そのまま（`Option<...>` も含む）。
+- `skip` の項目には作りません。
+- `columns` を書かないときは、定数を作りません。自分で書いた同じ名前の定数とぶつからないためです。
+- 文字列の列名も今までどおり使えます。同じクエリに混ぜても動きます。
+- `DB::table("posts")` のクエリビルダにも渡せます。
+
+### 型付きの列を渡せるメソッド
+
+| 種類 | メソッド |
+|------|----------|
+| 条件 | `where_` / `or_where` / `where_op` / `or_where_op` / `where_in` / `where_not_in` / `or_where_in` / `where_null` / `where_not_null` / `where_between` / `where_not_between` / `where_like` / `where_column` |
+| 並び | `order_by` / `order_by_desc` / `latest_by` / `oldest_by` |
+| 値を読む | `value` / `pluck` / `sum` / `avg` / `min` / `max` |
+| 増やす・減らす | `increment` / `decrement`（クエリビルダだけ） |
+
+### 渡せる値
+
+| 列の型 | 渡せる値 |
+|--------|----------|
+| `T` | `T` と、`T` に欠けなく広げられる型 |
+| `Option<T>` | 上に加えて、その `Option`（`None` は `is null` になる） |
+
+欠けなく広げられる組は次のとおりです。
+
+| 列の型 | 渡せる型 |
+|--------|----------|
+| `i16` | `i8` `u8` |
+| `i32` | `i8` `i16` `u8` `u16` |
+| `i64` | `i8` `i16` `i32` `u8` `u16` `u32` |
+| `u16` | `u8` |
+| `u32` | `u8` `u16` |
+| `u64` | `u8` `u16` `u32` |
+| `f64` | `f32` |
+| `String` | `&str` `&String` |
+| `Vec<u8>` | `&[u8]` |
+
+### コンパイルで止まる書き方
+
+| 書き方 | 理由 |
+|--------|------|
+| `where_(Post::VIEWS, "abc")` | `i64` の列に文字列 |
+| `where_(User::EMAIL, "a@example.com")`（`Post::query()` で） | 別のモデルの列 |
+| `where_(Post::VIEWS, n)`（`n` は `u64`） | `i64` に収まらない値がある |
+| `where_(Post::PUBLISHED_AT, 5)` | `Option<Carbon>` の列に整数 |
+| `where_(f64 の列, 2)` | 整数は小数に広げない。`2.0` と書く |
+| `where_(Post::VIEWS, Value::Int(1))` | 型付きの列に `Value` は渡せない。文字列の列名を使う |
+
+### 一覧で列を渡すところ
+
+`select` / `add_select` / `group_by` / `having_op` / `join` / `insert` / `update` などは、文字列で受けます。
+型の違う列を 1 つの配列に並べられないためです。`.name()` で列名を渡します。
+
+```rust
+let rows = Post::query()
+    .select(&[Post::ID.name(), Post::TITLE.name()])
+    .query_builder()
+    .get()
+    .await?;
 ```
 
 ## 保存する

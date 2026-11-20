@@ -16,6 +16,8 @@
 //! 直し方を書いたエラーになります。
 
 mod backend;
+/// 型付きの列（`Column<M, T>`）と、列・値として渡せるもの。
+mod column;
 /// 小数の文字列をそろえる。SQLite には小数の型が無いので要りません。
 #[cfg(any(feature = "mysql", feature = "postgres"))]
 mod decimal;
@@ -46,6 +48,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 pub(crate) use backend::Backend;
 
+pub use column::{AnyValue, Bind, Column, ColumnRef, ModelColumn};
 pub use grammar::Driver;
 pub use migrator::{Migration, Seeder, SeederFuture};
 #[doc(hidden)]

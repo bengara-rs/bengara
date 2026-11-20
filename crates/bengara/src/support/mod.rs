@@ -6,6 +6,7 @@ mod carbon;
 pub(crate) mod crypto;
 pub(crate) mod fs;
 pub(crate) mod lock;
+pub(crate) mod payload;
 pub(crate) mod text;
 pub(crate) mod time;
 

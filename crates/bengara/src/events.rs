@@ -10,6 +10,7 @@
 //!
 //! **起動時に登録します。** 実行中に増えません。
 //! 聞く側の形はジョブと同じ `async fn handle(payload: String) -> Result<()>` です。
+//! 中身を型に読んで受け取るときは [`Events::listen_json`] と [`Json`] を使います。
 //!
 //! ## 組み立て直すと置き換わる
 //!
@@ -26,8 +27,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
+
+pub use crate::support::payload::{FromPayload, Json};
 
 use crate::error::{Error, Result};
 
@@ -54,6 +58,29 @@ where
     }
 }
 
+/// [`Events::listen_json`] が登録する聞く側。中身を `Json<T>` に読んでから呼びます。
+///
+/// `PhantomData<fn() -> T>` にしているのは、`T` を持たないので `T` が
+/// `Sync` でなくても `Listener`（`Send + Sync`）になれるようにするためです。
+struct JsonListener<T, F> {
+    listener: F,
+    payload: PhantomData<fn() -> T>,
+}
+
+impl<T, F, Fut> Listener for JsonListener<T, F>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Json<T>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    fn call(&self, payload: String) -> ListenerFuture {
+        match Json::<T>::from_payload(payload) {
+            Ok(payload) => Box::pin((self.listener)(payload)),
+            Err(e) => Box::pin(std::future::ready(Err(e))),
+        }
+    }
+}
+
 /// 登録の入れ物。`with_events` のクロージャが受け取ります。
 #[derive(Default)]
 pub struct Events {
@@ -75,6 +102,34 @@ impl Events {
             .or_default()
             .push(Arc::new(listener));
         self
+    }
+
+    /// 出来事の名前に、**中身を型に読んで受け取る**聞く側を足す。
+    ///
+    /// ```ignore
+    /// // app/Listeners/SendWelcome.rs
+    /// pub async fn handle(Json(payload): Json<Registered>) -> Result<()> { .. }
+    ///
+    /// // bootstrap/app.rs
+    /// .with_events(|e| e.listen_json("user.registered", SendWelcome::handle))
+    /// ```
+    ///
+    /// 型は聞く側の引数から推論します。中身を読めなければ、聞く側の失敗になります
+    /// （`dispatch` はそこで止まり、`try_dispatch` はログに出して次を呼びます）。
+    /// 呼ばれる順番は [`listen`](Self::listen) と同じく登録した順です。
+    pub fn listen_json<T, F, Fut>(self, event: &str, listener: F) -> Self
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+        F: Fn(Json<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.listen(
+            event,
+            JsonListener {
+                listener,
+                payload: PhantomData,
+            },
+        )
     }
 
     /// 登録されている出来事の名前（並び順は不定）。
@@ -621,6 +676,48 @@ mod tests {
         assert!(!Event::has_listeners(FIRST), "前の登録は消える");
         assert_eq!(Event::listener_count(SECOND), 2);
         Event::dispatch_raw(SECOND, "{}").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 聞く側は型でも受け取れる() {
+        // プロセス共通の表を書くので札を取る（`install` の説明を見てください）。
+        let _lock = crate::testing::exclusive().await;
+        const KEY: &str = "events.listen_json";
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Registered {
+            id: i64,
+        }
+
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        async fn handle(Json(payload): Json<Registered>) -> Result<()> {
+            SEEN.fetch_add(payload.id as usize, Ordering::SeqCst);
+            Ok(())
+        }
+
+        let log = Log::new();
+        install(
+            Events::new()
+                .listen_json(KEY, handle)
+                .listen(KEY, log.recorder("next")),
+        );
+
+        Event::dispatch(KEY, &Registered { id: 5 }).await.unwrap();
+        assert_eq!(SEEN.load(Ordering::SeqCst), 5, "型に読んで届く");
+        assert_eq!(log.taken(), vec![r#"next:{"id":5}"#.to_string()]);
+
+        // 形の違う中身は聞く側の失敗。`dispatch` はそこで止まる。
+        let error = Event::dispatch(KEY, &"文字列")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ジョブ・聞く側の中身を"), "{error}");
+        assert!(log.taken().is_empty(), "失敗した所で止まる");
+
+        // `try_dispatch` はログに出して、次の聞く側を呼ぶ。
+        Event::try_dispatch(KEY, &"文字列").await.unwrap();
+        assert_eq!(log.taken(), vec![r#"next:"文字列""#.to_string()]);
+        assert_eq!(SEEN.load(Ordering::SeqCst), 5, "壊れた中身では呼ばれない");
     }
 
     #[tokio::test]

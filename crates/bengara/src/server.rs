@@ -22,6 +22,9 @@ const CUT_OFF_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// サーバーを起動して、止まるまで待つ。
 pub(crate) fn serve(app: Application, host: &str, port: u16) -> Result<()> {
+    // 埋め込んだテンプレートの構文を、待ち受ける前に確かめる。誤りがあれば起動しない。
+    crate::view::check_embedded()?;
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

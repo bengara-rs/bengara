@@ -27,6 +27,7 @@ myapp/
 ├── app/Console/Commands/        自分のコマンド
 ├── app/Http/Controllers/        コントローラ
 ├── app/Http/Middleware/         ミドルウェア
+├── app/Http/Requests/           型付きの検査（FormRequest）
 ├── app/Jobs/                    キューのジョブ
 ├── app/Listeners/               イベントを聞く側
 ├── app/Models/                  モデル
@@ -39,6 +40,7 @@ myapp/
 ├── database/factories/          テスト用のデータを作る関数
 ├── public/                      静的ファイル
 ├── resources/lang/              言語ごとの文字（*.toml）
+├── resources/views/             テンプレート（*.html。機能フラグ view）
 ├── routes/web.rs                ルート定義
 ├── routes/console.rs            定期処理
 ├── storage/                     実行時の書き込み先
@@ -46,7 +48,8 @@ myapp/
 ```
 
 - `src/` はありません。入口はプロジェクト直下です。
-- `init` は `resources/views/` も作りますが、使いません（テンプレートの機能はありません）。
+- `resources/views/` のテンプレートは、機能フラグ `view` を入れたときに使えます（[views.md](views.md)）。
+  リリースビルドでは実行ファイルに入ります。
 - `config/` に足せるファイルは [configuration.md](configuration.md) にあります。
 
 ## 3 つの約束
@@ -83,9 +86,9 @@ use crate::app::http::controllers::HomeController;
 |-------------------------|---------------------------------------------------------------------------------------|----------------|
 | `database/migrations/`  | `pub fn up(schema: &mut Schema)` と `pub fn down(schema: &mut Schema)`                | 動く           |
 | `database/seeders/`     | `pub async fn run() -> Result<()>`                                                    | 動く           |
-| `app/Jobs/`             | `pub async fn handle(payload: String) -> Result<()>`                                  | 動く           |
+| `app/Jobs/`             | `pub async fn handle(payload: String) -> Result<()>`（`Json<T>` でも受け取れる）      | 動く           |
 | `app/Console/Commands/` | `pub const DESCRIPTION: &str` と `pub async fn handle(args: &[String]) -> Result<()>` | 動く           |
-| `app/Listeners/`        | `pub async fn handle(payload: String) -> Result<()>`                                  | **登録が要る** |
+| `app/Listeners/`        | `pub async fn handle(payload: String) -> Result<()>`（`Json<T>` でも受け取れる）      | **登録が要る** |
 | `database/factories/`   | ただの関数（決まりはない）                                                            | —              |
 | `routes/console.rs`     | `pub fn schedule(s: &mut Schedule)`                                                   | —              |
 

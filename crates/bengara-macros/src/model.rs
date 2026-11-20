@@ -48,7 +48,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
-    let table = table_name(&input)?;
+    let StructOptions {
+        table,
+        columns: with_columns,
+    } = struct_options(&input)?;
     let fields = collect_fields(&input)?;
 
     let used: Vec<&Field> = fields.iter().filter(|f| !f.skip).collect();
@@ -60,6 +63,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     }
 
     check_duplicate_columns(&used)?;
+
+    // `#[model(columns)]` を書いたときだけ、型付きの列の定数を作る。
+    // 書かないときは何も足さない（生成コードは今までと同じ）。
+    let column_consts = if with_columns {
+        column_constants(name, &used)?
+    } else {
+        quote! {}
+    };
 
     let primary = pick_primary(&used, &input)?;
     check_primary_type(primary)?;
@@ -193,12 +204,86 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
             #touch
         }
+
+        #column_consts
     })
 }
 
-/// `#[model(table = "...")]` を読む。
-fn table_name(input: &DeriveInput) -> syn::Result<String> {
+/// `Model` トレイトが持つ定数の名前。型付きの列の定数と同じ名前にはできません。
+///
+/// 固有の定数（`impl Post { const TABLE }`）はトレイトの定数より先に選ばれるので、
+/// 同じ名前にすると `Post::TABLE` の意味が変わってしまいます。
+const RESERVED_CONSTANTS: &[&str] = &["TABLE", "PRIMARY_KEY", "COLUMNS", "INTEGER_KEY"];
+
+/// 型付きの列の定数（`impl Post { pub const TITLE: Column<Post, String> = .. }`）を作る。
+///
+/// 名前は列名を大文字にしたもの、型はフィールドの型そのまま（`Option<..>` も含む）。
+fn column_constants(name: &syn::Ident, fields: &[&Field]) -> syn::Result<proc_macro2::TokenStream> {
+    let mut seen: Vec<(String, &Field)> = Vec::new();
+    let mut consts = Vec::new();
+    for field in fields {
+        let constant = field.column.to_uppercase();
+        if RESERVED_CONSTANTS.contains(&constant.as_str()) {
+            return Err(syn::Error::new(
+                field.ident.span(),
+                format!(
+                    "列 `{}` の定数 `{constant}` は Model の定数と同じ名前になります。\
+                     `#[model(columns)]` を外すか、列名を変えてください",
+                    field.column
+                ),
+            ));
+        }
+        if let Some((_, found)) = seen.iter().find(|(seen, _)| *seen == constant) {
+            return Err(syn::Error::new(
+                field.ident.span(),
+                format!(
+                    "列 `{}` と `{}` の定数名が同じ `{constant}` になります",
+                    found.column, field.column
+                ),
+            ));
+        }
+        // 列名は英数字と `_` だけ（`check_name`）。それでも `2fa` や `_` のように、
+        // Rust の名前にならないものは残るので、ここで断る（`Ident::new` はパニックする）。
+        let ident: syn::Ident = syn::parse_str(&constant).map_err(|_| {
+            syn::Error::new(
+                field.ident.span(),
+                format!(
+                    "列 `{}` からは定数の名前 `{constant}` を作れません。\
+                     `#[model(columns)]` を外すか、列名を変えてください",
+                    field.column
+                ),
+            )
+        })?;
+        let ident = syn::Ident::new(&ident.to_string(), field.ident.span());
+        let ty = &field.ty;
+        let column = LitStr::new(&field.column, field.ident.span());
+        let doc = LitStr::new(&format!("列 `{}`", field.column), field.ident.span());
+        consts.push(quote! {
+            #[doc = #doc]
+            pub const #ident: ::bengara::database::Column<#name, #ty> =
+                ::bengara::database::Column::new(#column);
+        });
+        seen.push((constant, field));
+    }
+    Ok(quote! {
+        impl #name {
+            #(#consts)*
+        }
+    })
+}
+
+/// 構造体の `#[model(..)]` の指定。
+struct StructOptions {
+    /// 表の名前。
+    table: String,
+    /// `columns` を書いたか（型付きの列の定数を作るか）。
+    columns: bool,
+}
+
+/// `#[model(table = "...", columns)]` を読む。
+fn struct_options(input: &DeriveInput) -> syn::Result<StructOptions> {
     let mut table = None;
+    let mut columns = false;
     for attr in &input.attrs {
         if !attr.path().is_ident("model") {
             continue;
@@ -210,15 +295,20 @@ fn table_name(input: &DeriveInput) -> syn::Result<String> {
                 table = Some(value.value());
                 return Ok(());
             }
-            Err(meta.error("構造体に付けられるのは `table = \"表の名前\"` だけです"))
+            if meta.path.is_ident("columns") {
+                columns = true;
+                return Ok(());
+            }
+            Err(meta.error("構造体に付けられるのは `table = \"表の名前\"` と `columns` だけです"))
         })?;
     }
-    table.ok_or_else(|| {
+    let table = table.ok_or_else(|| {
         syn::Error::new(
             input.ident.span(),
             "表の名前が決まっていません。`#[model(table = \"posts\")]` を付けてください",
         )
-    })
+    })?;
+    Ok(StructOptions { table, columns })
 }
 
 /// フィールドの指定を読む。
@@ -601,5 +691,96 @@ mod tests {
         let error =
             run("#[model(table = \"posts\")] struct Post<T> { id: i64, title: T }").unwrap_err();
         assert!(error.contains("型引数"), "{error}");
+    }
+
+    #[test]
+    fn columns_を書くと列ごとに型付きの定数を作る() {
+        let code = squeeze(
+            &run(
+                "#[model(table = \"posts\", columns)] struct Post { id: i64, title: String, \
+                  #[model(column = \"body_text\")] body: Option<String>, #[model(skip)] cache: u8 }",
+            )
+            .unwrap(),
+        );
+        assert!(
+            code.contains(
+                "pubconstTITLE:::bengara::database::Column<Post,String>=\
+                 ::bengara::database::Column::new(\"title\");"
+            ),
+            "{code}"
+        );
+        // 名前は列名から作り、型はフィールドの型そのまま。
+        assert!(
+            code.contains("pubconstBODY_TEXT:::bengara::database::Column<Post,Option<String>>"),
+            "{code}"
+        );
+        assert!(code.contains("#[doc=\"列`title`\"]"), "{code}");
+        assert!(code.contains("pubconstID:"), "{code}");
+        // `skip` の項目は列ではないので作らない。
+        assert!(!code.contains("CACHE"), "{code}");
+    }
+
+    #[test]
+    fn columns_を書かないときは定数を作らない() {
+        let source = "struct Post { id: i64, title: String }";
+        let plain = run(&format!("#[model(table = \"posts\")] {source}")).unwrap();
+        assert!(!plain.contains("Column"), "{plain}");
+        // 書いたときは、書かないときの生成コードの後ろに定数を足すだけ。
+        let with = run(&format!("#[model(table = \"posts\", columns)] {source}")).unwrap();
+        assert!(with.starts_with(&plain), "{with}");
+    }
+
+    #[test]
+    fn 定数が_model_の定数と同じ名前ならビルドで止める() {
+        for column in ["table", "primary_key", "columns", "integer_key"] {
+            let error = run(&format!(
+                "#[model(table = \"posts\", columns)] struct Post {{ id: i64, \
+                 #[model(column = \"{column}\")] other: String }}"
+            ))
+            .unwrap_err();
+            assert!(
+                error.contains(&format!(
+                    "列 `{column}` の定数 `{}` は Model の定数と同じ名前になります",
+                    column.to_uppercase()
+                )),
+                "{error}"
+            );
+        }
+        // `columns` を書かなければ、同じ列名でも通る。
+        assert!(run("#[model(table = \"posts\")] struct Post { id: i64, table: String }").is_ok());
+    }
+
+    #[test]
+    fn 定数名が重なる列はビルドで止める() {
+        let error = run(
+            "#[model(table = \"posts\", columns)] struct Post { id: i64, title: String, \
+             #[model(column = \"TITLE\")] other: String }",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("列 `title` と `TITLE` の定数名が同じ `TITLE` になります"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn 名前にならない列名は定数を作らずに止める() {
+        let error = run(
+            "#[model(table = \"posts\", columns)] struct Post { id: i64, \
+             #[model(column = \"2fa\")] two_factor: String }",
+        )
+        .unwrap_err();
+        assert!(error.contains("定数の名前 `2FA` を作れません"), "{error}");
+    }
+
+    #[test]
+    fn 構造体の知らない指定は使える指定を言う() {
+        let error =
+            run("#[model(table = \"posts\", colums)] struct Post { id: i64, title: String }")
+                .unwrap_err();
+        assert!(
+            error.contains("`table = \"表の名前\"` と `columns` だけです"),
+            "{error}"
+        );
     }
 }

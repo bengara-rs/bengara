@@ -11,6 +11,7 @@
 //!
 //! 値は必ずプレースホルダで渡します。SQL の文字列に埋め込みません。
 
+use super::column::{Bind, ColumnRef};
 use super::grammar::{self, Driver};
 use super::transaction::Transaction;
 use super::value::{Affected, FromValue, IntoValue, Row, Value};
@@ -380,53 +381,94 @@ impl QueryBuilder {
     // ---- 条件 ----
 
     /// 列が値と等しい。列名は英数字と `_` `.` だけが使えます。
-    pub fn where_(self, column: &str, value: impl IntoValue) -> Self {
-        self.push_basic("where_", Glue::And, column, "=", value.into_value())
+    pub fn where_<C: ColumnRef>(self, column: C, value: impl Bind<C::Accepts>) -> Self {
+        self.push_basic("where_", Glue::And, column.column_name(), "=", value.bind())
     }
 
     /// 列と値を演算子で比べる。
     ///
     /// 演算子は許可一覧（`=` `!=` `<` `<=` `>` `>=` `like` `is` など）で照合します。
     /// 外れているときは終端メソッドでエラーになります。
-    pub fn where_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+    pub fn where_op<C: ColumnRef>(
+        mut self,
+        column: C,
+        operator: &str,
+        value: impl Bind<C::Accepts>,
+    ) -> Self {
         self.check_value_operator("where_op", operator);
-        self.push_basic("where_op", Glue::And, column, operator, value.into_value())
+        self.push_basic(
+            "where_op",
+            Glue::And,
+            column.column_name(),
+            operator,
+            value.bind(),
+        )
     }
 
     /// `or` でつないで、列が値と等しい。
-    pub fn or_where(self, column: &str, value: impl IntoValue) -> Self {
-        self.push_basic("or_where", Glue::Or, column, "=", value.into_value())
+    pub fn or_where<C: ColumnRef>(self, column: C, value: impl Bind<C::Accepts>) -> Self {
+        self.push_basic(
+            "or_where",
+            Glue::Or,
+            column.column_name(),
+            "=",
+            value.bind(),
+        )
     }
 
     /// `or` でつないで、列と値を演算子で比べる。演算子は許可一覧で照合します。
-    pub fn or_where_op(mut self, column: &str, operator: &str, value: impl IntoValue) -> Self {
+    pub fn or_where_op<C: ColumnRef>(
+        mut self,
+        column: C,
+        operator: &str,
+        value: impl Bind<C::Accepts>,
+    ) -> Self {
         self.check_value_operator("or_where_op", operator);
         self.push_basic(
             "or_where_op",
             Glue::Or,
-            column,
+            column.column_name(),
             operator,
-            value.into_value(),
+            value.bind(),
         )
     }
 
     /// 列が一覧のどれかと等しい。**空の一覧を渡すと必ず0件になります。**
-    pub fn where_in<T: IntoValue + Clone>(self, column: &str, values: &[T]) -> Self {
-        self.push_in("where_in", Glue::And, column, values, false)
+    pub fn where_in<C: ColumnRef, V: Bind<C::Accepts> + Clone>(
+        self,
+        column: C,
+        values: &[V],
+    ) -> Self {
+        self.push_in("where_in", Glue::And, column.column_name(), values, false)
     }
 
     /// 列が一覧のどれとも等しくない。
-    pub fn where_not_in<T: IntoValue + Clone>(self, column: &str, values: &[T]) -> Self {
-        self.push_in("where_not_in", Glue::And, column, values, true)
+    pub fn where_not_in<C: ColumnRef, V: Bind<C::Accepts> + Clone>(
+        self,
+        column: C,
+        values: &[V],
+    ) -> Self {
+        self.push_in(
+            "where_not_in",
+            Glue::And,
+            column.column_name(),
+            values,
+            true,
+        )
     }
 
     /// `or` でつないで、列が一覧のどれかと等しい。
-    pub fn or_where_in<T: IntoValue + Clone>(self, column: &str, values: &[T]) -> Self {
-        self.push_in("or_where_in", Glue::Or, column, values, false)
+    pub fn or_where_in<C: ColumnRef, V: Bind<C::Accepts> + Clone>(
+        self,
+        column: C,
+        values: &[V],
+    ) -> Self {
+        self.push_in("or_where_in", Glue::Or, column.column_name(), values, false)
     }
 
     /// 列が `NULL`。
-    pub fn where_null(mut self, column: &str) -> Self {
+    pub fn where_null<C: ColumnRef>(mut self, column: C) -> Self {
+        let column = column.column_name();
         self.check_column("where_null", column);
         self.wheres.push(Where::Null {
             boolean: Glue::And,
@@ -437,7 +479,8 @@ impl QueryBuilder {
     }
 
     /// 列が `NULL` ではない。
-    pub fn where_not_null(mut self, column: &str) -> Self {
+    pub fn where_not_null<C: ColumnRef>(mut self, column: C) -> Self {
+        let column = column.column_name();
         self.check_column("where_not_null", column);
         self.wheres.push(Where::Null {
             boolean: Glue::And,
@@ -448,54 +491,62 @@ impl QueryBuilder {
     }
 
     /// 列が2つの値の間にある（両端を含む）。
-    pub fn where_between(
+    pub fn where_between<C: ColumnRef>(
         mut self,
-        column: &str,
-        low: impl IntoValue,
-        high: impl IntoValue,
+        column: C,
+        low: impl Bind<C::Accepts>,
+        high: impl Bind<C::Accepts>,
     ) -> Self {
+        let column = column.column_name();
         self.check_column("where_between", column);
         self.wheres.push(Where::Between {
             boolean: Glue::And,
             column: column.to_string(),
-            low: low.into_value(),
-            high: high.into_value(),
+            low: low.bind(),
+            high: high.bind(),
             not: false,
         });
         self
     }
 
     /// 列が2つの値の間に無い。
-    pub fn where_not_between(
+    pub fn where_not_between<C: ColumnRef>(
         mut self,
-        column: &str,
-        low: impl IntoValue,
-        high: impl IntoValue,
+        column: C,
+        low: impl Bind<C::Accepts>,
+        high: impl Bind<C::Accepts>,
     ) -> Self {
+        let column = column.column_name();
         self.check_column("where_not_between", column);
         self.wheres.push(Where::Between {
             boolean: Glue::And,
             column: column.to_string(),
-            low: low.into_value(),
-            high: high.into_value(),
+            low: low.bind(),
+            high: high.bind(),
             not: true,
         });
         self
     }
 
     /// 列が形に当てはまる（`like`）。`%` は自分で書きます。
-    pub fn where_like(self, column: &str, pattern: impl IntoValue) -> Self {
+    pub fn where_like<C: ColumnRef>(self, column: C, pattern: impl Bind<C::Accepts>) -> Self {
         self.push_basic(
             "where_like",
             Glue::And,
-            column,
+            column.column_name(),
             "like",
-            pattern.into_value(),
+            pattern.bind(),
         )
     }
 
     /// 列と列を比べる。演算子は許可一覧で照合します。
-    pub fn where_column(mut self, left: &str, operator: &str, right: &str) -> Self {
+    pub fn where_column<L: ColumnRef, R: ColumnRef>(
+        mut self,
+        left: L,
+        operator: &str,
+        right: R,
+    ) -> Self {
+        let (left, right) = (left.column_name(), right.column_name());
         self.check_operator("where_column", operator);
         self.check_column("where_column", left);
         self.check_column("where_column", right);
@@ -638,12 +689,12 @@ impl QueryBuilder {
         }
     }
 
-    fn push_in<T: IntoValue + Clone>(
+    fn push_in<A, V: Bind<A> + Clone>(
         mut self,
         place: &str,
         boolean: Glue,
         column: &str,
-        values: &[T],
+        values: &[V],
         not: bool,
     ) -> Self {
         self.check_column(place, column);
@@ -657,7 +708,7 @@ impl QueryBuilder {
         self.wheres.push(Where::In {
             boolean,
             column: column.to_string(),
-            values: values.iter().cloned().map(IntoValue::into_value).collect(),
+            values: values.iter().cloned().map(Bind::bind).collect(),
             not,
         });
         self
@@ -753,7 +804,8 @@ impl QueryBuilder {
     ///
     /// 列名は英数字と `_` `.` だけが使えます。外れているときは終端メソッドで
     /// エラーになります。式で並べたいときは `order_by_raw` を使ってください。
-    pub fn order_by(mut self, column: &str) -> Self {
+    pub fn order_by<C: ColumnRef>(mut self, column: C) -> Self {
+        let column = column.column_name();
         self.check_column("order_by", column);
         self.orders.push(Order::Column {
             column: column.to_string(),
@@ -763,7 +815,8 @@ impl QueryBuilder {
     }
 
     /// 降順に並べる。列名は英数字と `_` `.` だけが使えます。
-    pub fn order_by_desc(mut self, column: &str) -> Self {
+    pub fn order_by_desc<C: ColumnRef>(mut self, column: C) -> Self {
+        let column = column.column_name();
         self.check_column("order_by_desc", column);
         self.orders.push(Order::Column {
             column: column.to_string(),
@@ -799,12 +852,12 @@ impl QueryBuilder {
     }
 
     /// 指定した列の降順。
-    pub fn latest_by(self, column: &str) -> Self {
+    pub fn latest_by<C: ColumnRef>(self, column: C) -> Self {
         self.order_by_desc(column)
     }
 
     /// 指定した列の昇順。
-    pub fn oldest_by(self, column: &str) -> Self {
+    pub fn oldest_by<C: ColumnRef>(self, column: C) -> Self {
         self.order_by(column)
     }
 
@@ -1229,7 +1282,8 @@ impl QueryBuilder {
     /// **NULL がありうる列は `Option<T>` で読んでください**
     /// （`value::<Option<i64>>("views")`）。`T` のままだと、NULL の行で
     /// 読み出しのエラーになります。`row.get::<T>()` と同じ決まりです。
-    pub async fn value<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
+    pub async fn value<T: FromValue>(&self, column: impl ColumnRef) -> Result<Option<T>> {
+        let column = column.column_name();
         ensure_value_column("value", column)?;
         self.check()?;
         let columns = vec![column.to_string()];
@@ -1259,7 +1313,8 @@ impl QueryBuilder {
     /// **NULL がありうる列は `Option<T>` で読んでください**
     /// （`pluck::<Option<String>>("body")`）。`T` のままだと、NULL の行が
     /// 1つでもあると読み出しのエラーになります。
-    pub async fn pluck<T: FromValue>(&self, column: &str) -> Result<Vec<T>> {
+    pub async fn pluck<T: FromValue>(&self, column: impl ColumnRef) -> Result<Vec<T>> {
+        let column = column.column_name();
         ensure_value_column("pluck", column)?;
         self.check()?;
         let columns = vec![column.to_string()];
@@ -1391,23 +1446,23 @@ impl QueryBuilder {
     }
 
     /// 合計。
-    pub async fn sum<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
-        self.aggregate("sum", column).await
+    pub async fn sum<T: FromValue>(&self, column: impl ColumnRef) -> Result<Option<T>> {
+        self.aggregate("sum", column.column_name()).await
     }
 
     /// 平均。
-    pub async fn avg<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
-        self.aggregate("avg", column).await
+    pub async fn avg<T: FromValue>(&self, column: impl ColumnRef) -> Result<Option<T>> {
+        self.aggregate("avg", column.column_name()).await
     }
 
     /// 最小。
-    pub async fn min<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
-        self.aggregate("min", column).await
+    pub async fn min<T: FromValue>(&self, column: impl ColumnRef) -> Result<Option<T>> {
+        self.aggregate("min", column.column_name()).await
     }
 
     /// 最大。
-    pub async fn max<T: FromValue>(&self, column: &str) -> Result<Option<T>> {
-        self.aggregate("max", column).await
+    pub async fn max<T: FromValue>(&self, column: impl ColumnRef) -> Result<Option<T>> {
+        self.aggregate("max", column.column_name()).await
     }
 
     async fn aggregate<T: FromValue>(&self, function: &str, column: &str) -> Result<Option<T>> {
@@ -1684,8 +1739,9 @@ impl QueryBuilder {
     /// 列名は英数字と `_` だけが使えます（表名は付けられません）。
     /// `update` と同じく、**`updated_at` は自動で入れません。**
     /// 使えない指定（`join` / `limit` など）は `update` と同じです。
-    pub async fn increment(&self, column: &str, amount: i64) -> Result<u64> {
-        self.step("increment", column, '+', amount).await
+    pub async fn increment<C: ColumnRef>(&self, column: C, amount: i64) -> Result<u64> {
+        self.step("increment", column.column_name(), '+', amount)
+            .await
     }
 
     /// 列の値を引く。中身は `increment` と同じで、符号だけが違います。
@@ -1693,8 +1749,9 @@ impl QueryBuilder {
     /// ```ignore
     /// DB::table("posts").where_("id", id).decrement("stock", 1).await?;
     /// ```
-    pub async fn decrement(&self, column: &str, amount: i64) -> Result<u64> {
-        self.step("decrement", column, '-', amount).await
+    pub async fn decrement<C: ColumnRef>(&self, column: C, amount: i64) -> Result<u64> {
+        self.step("decrement", column.column_name(), '-', amount)
+            .await
     }
 
     /// `increment` と `decrement` の中身。

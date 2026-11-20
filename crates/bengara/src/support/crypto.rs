@@ -72,8 +72,9 @@ fn compress(state: &mut [u32; 8], block: &[u32; 16]) {
 /// バイト列を語（ビッグエンディアン）に読む。`N` 語ぶん読みます。
 fn to_words<const N: usize>(bytes: &[u8]) -> [u32; N] {
     let mut words = [0u32; N];
-    for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
-        *word = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    let (chunks, _) = bytes.as_chunks::<4>();
+    for (word, chunk) in words.iter_mut().zip(chunks) {
+        *word = u32::from_be_bytes(*chunk);
     }
     words
 }
@@ -93,21 +94,20 @@ fn to_digest(state: &[u32; 8]) -> Digest {
 /// 詰め物の最後に書く長さは、`done` と `input` を足した全体の長さです。
 /// `sha256` は `INIT` と 0 から始めます。
 fn sha256_from(mut state: [u32; 8], done: u64, input: &[u8]) -> Digest {
-    let mut chunks = input.chunks_exact(64);
-    for block in &mut chunks {
+    let (blocks, rest) = input.as_chunks::<64>();
+    for block in blocks {
         compress(&mut state, &to_words(block));
     }
 
     // 詰め物: 0x80 を1バイト、長さが 64 の倍数 - 8 になるまで 0、最後に全体の長さ（ビット数）。
     // 残りは 63 バイト以下なので、詰め物を足しても 2 ブロックに収まります。
-    let rest = chunks.remainder();
     let mut tail = [0u8; 128];
     tail[..rest.len()].copy_from_slice(rest);
     tail[rest.len()] = 0x80;
     let tail_len = if rest.len() < 56 { 64 } else { 128 };
     let bit_len = done.wrapping_add(input.len() as u64).wrapping_mul(8);
     tail[tail_len - 8..tail_len].copy_from_slice(&bit_len.to_be_bytes());
-    for block in tail[..tail_len].chunks_exact(64) {
+    for block in tail[..tail_len].as_chunks::<64>().0 {
         compress(&mut state, &to_words(block));
     }
     to_digest(&state)
@@ -286,12 +286,12 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 
 /// 16進の文字列をバイト列に戻す。形が違えば `None`。
 pub(crate) fn from_hex(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(input.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = (pair[0] as char).to_digit(16)?;
         let lo = (pair[1] as char).to_digit(16)?;
         out.push((hi * 16 + lo) as u8);

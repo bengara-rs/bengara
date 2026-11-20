@@ -34,6 +34,94 @@ pub async fn store(req: Request) -> Result<Response> {
 
 落ちたら `?` で返すだけで **422** になります。
 
+### `rules!` で書くとコンパイルのときに確かめる
+
+```rust
+let input = req.validate(bengara::rules! {
+    "title" => "required|max:255",
+    "age"   => "nullable|integer|between:0,150",
+})?;
+```
+
+- 中身は `&[("title", "required|max:255"), ..]` と同じです。空の `rules! {}` も書けます。
+- 規則の書き間違い（下の「規則の書き間違いは 500 になる」）を、**実行する前にコンパイルで止めます**。
+- 判定は実行時と同じです。実行時に通る書き方は止めません。
+- 止まるとき、エラーの文は `検査の規則: ` で始まります（`evaluation of constant value failed`）。
+- 項目名と規則は、文字列をそのまま書きます（変数は渡せません）。
+
+## 型に読む（FormRequest）
+
+規則と読み先の型を 1 つにまとめます。Laravel の FormRequest に当たります。
+置き場所は `app/Http/Requests/` です。ほかと同じく、大文字始まりのファイルに同じ名前の型を書きます。
+
+```rust
+// app/Http/Requests/StorePost.rs
+use bengara::FormRequest;
+
+#[derive(bengara::serde::Deserialize)]
+#[serde(crate = "bengara::serde")]
+pub struct StorePost {
+    pub title: String,
+    pub age: Option<i64>,
+    pub published_at: Option<bengara::Carbon>,
+}
+
+impl FormRequest for StorePost {
+    const RULES: &'static [(&'static str, &'static str)] = bengara::rules! {
+        "title"        => "required|max:255",
+        "age"          => "nullable|integer",
+        "published_at" => "nullable|date",
+    };
+}
+```
+
+```rust
+// コントローラ
+use crate::app::http::requests::StorePost;
+
+pub async fn store(req: Request) -> Result<Response> {
+    let input: StorePost = req.validate_as()?;
+    // input.title, input.age ...
+}
+```
+
+| 起きたこと                     | 結果                                       |
+|--------------------------------|--------------------------------------------|
+| 検査に落ちた                   | 422（`validate` と同じ。前の入力も覚える） |
+| 通った値を型に読めない         | 500（規則と型が食い違っている）            |
+
+- `authorize()` はありません。誰に許すかは [authorization.md](authorization.md) の書き方で確かめます。
+- 通った値だけを読みます。規則に書いていない項目は、送られてきても読みません。
+
+### 読める型
+
+| 項目の型                                           | 読み方                                                                      | 読めないとき |
+|----------------------------------------------------|-----------------------------------------------------------------------------|--------------|
+| `String`                                           | そのまま                                                                    | —            |
+| 整数（`i8`〜`i64`、`u8`〜`u64`、`isize`、`usize`） | 前後の空白を落として読む                                                    | 500          |
+| `f32` / `f64`                                      | 同上                                                                        | 500          |
+| `bool`                                             | `1` `true` `on` `yes` は真、`0` `false` `off` `no` は偽。大文字小文字は区別 | 500          |
+| `Option<T>`                                        | 空文字と、無い項目は `None`。それ以外は `T` として読む                      | —            |
+| `bengara::Carbon`                                  | `Carbon::parse` で読む                                                      | 500          |
+| 中身の無い列挙（`enum Role { Admin, User }`）      | 値を変種の名前として読む。`#[serde(rename_all = "lowercase")]` などが効く   | 500          |
+| それ以外（`Vec`・入れ子の構造体など）              | 読まない                                                                    | 500          |
+
+- `nullable` の項目は `Option` にします。空のとき空文字が入り、`Option` でなければ読めません。
+- `Option` でない項目が規則に無いと、500 になります（「値がありません」）。
+- 500 の文には項目名が出ます（`検査を通った値を型に読めません（項目 `age`）: ...`）。
+- `validate` の結果からも読めます。`req.validate(..)?.to_typed::<T>()?` です。
+
+### `RULES` の書き間違いを確かめる時
+
+| 書き方                           | `cargo build`（`serve`・`test` を含む） | `cargo check` |
+|----------------------------------|-----------------------------------------|---------------|
+| `RULES` を `rules!` で書く       | 止まる                                  | **止まる**    |
+| `RULES` を `&[(.., ..)]` で書く  | 使われる関数の `validate_as` で止まる   | 止まらない    |
+
+`cargo check` は型を確かめるだけで、`validate_as` の中の確かめまでは進みません。
+どこからも呼ばれない関数（ルートに登録していないハンドラなど）の中の `validate_as` も確かめません。
+`rules!` で書いておけば、どちらでも止まります。
+
 ## 通った値
 
 | メソッド             | 返すもの                             |
@@ -75,6 +163,7 @@ pub async fn store(req: Request) -> Result<Response> {
 | 形         | `email`、`url`、`alpha`、`alpha_num`、`alpha_dash` |
 | 大きさ     | `min:n`、`max:n`、`between:a,b`、`size:n`          |
 | 値         | `in:a,b,c`、`starts_with:x`、`ends_with:x`         |
+| 日付       | `date`                                             |
 | 項目どうし | `confirmed`、`same:other`、`different:other`       |
 
 | 規則         | 通るもの                                                                  |
@@ -85,6 +174,10 @@ pub async fn store(req: Request) -> Result<Response> {
 | `url`        | `http://` か `https://` で始まり、直後にホストがある。空白を含まない      |
 | `alpha` など | 「文字」かどうかを見る。**ひらがな・漢字も通る**（Laravel と同じ）        |
 | `confirmed`  | `項目名_confirmation` と同じか（`password` なら `password_confirmation`） |
+| `date`       | `YYYY-MM-DD` か `YYYY-MM-DD HH:MM:SS`（`Carbon::parse` が読める形）       |
+
+`date` は Laravel より狭く、`2026/11/20` や `+09:00` などの時差付きは落とします。
+区切りの `T`・末尾の `Z`・小数の秒は通ります。
 
 英数字だけに限りたいときは、自分で確かめます。
 
@@ -187,6 +280,9 @@ if !errors.is_empty() {
 | `in:` `in:,,`        | 許す値が 1 つも無い    |
 
 `in:` の空の値は捨てます。`in:admin,user,` でも、`role=`（空）は通りません。
+
+規則を `rules!` で書くと、`between:10,1` 以外は**コンパイルのときに止まります**（上の「`rules!` で書くと
+コンパイルのときに確かめる」）。`between:10,1` と、`max:1e400` のような桁あふれは、実行時に 500 です。
 
 ## 覚えない項目
 

@@ -18,17 +18,17 @@ mod reset;
 #[cfg(feature = "encryption")]
 mod encryption;
 
-pub use hashing::{Hash, HashConfig};
+pub use hashing::{ArgonConfig, Hash, HashConfig};
 pub use middleware::{Authenticate, RedirectIfAuthenticated};
 pub use reset::PasswordReset;
 
-pub(crate) use hashing::install_test_iterations;
+pub(crate) use hashing::{driver_label as hash_driver_label, install_test_iterations};
 pub(crate) use middleware::{is_internal_path, INTENDED_KEY};
 
 use crate::database::Model;
 use crate::error::{Error, Result};
 use crate::session::Session;
-use crate::support::blocking;
+use hashing::run_hashing;
 
 /// セッションに入れる鍵の名前。
 ///
@@ -312,6 +312,7 @@ impl<'a> Auth<'a> {
     /// - 合わなければ `false` を返します。**エラーにはしません**（理由を外に出さないため）。
     /// - 利用者がいない場合も、**照合と同じだけ時間をかけます**（登録の有無が漏れないため）。
     /// - 照合は裏のスレッドで行うので、ほかのリクエストを待たせません。
+    ///   同時に計算する数は `HASH_MAX_CONCURRENCY` までです（超えた分は空くまで待ちます）。
     /// - 合ったとき、保存されている値の回数が設定より少なければ
     ///   （[`Hash::needs_rehash`]）、**その場で作り直して保存します**
     ///   （Laravel の `rehashOnLogin`）。書く列は
@@ -331,7 +332,7 @@ impl<'a> Auth<'a> {
             // 見つからないときも時間を合わせる。
             // **送られてきたパスワードをそのまま渡します。** 固定のダミーだと、
             // 長い入力のときに登録済みの側だけが重くなり、登録の有無が漏れます。
-            blocking(move || {
+            run_hashing(move || {
                 Hash::waste_time(&password);
                 false
             })
@@ -340,7 +341,7 @@ impl<'a> Auth<'a> {
         };
 
         let stored = user.password_hash().to_string();
-        let ok = blocking(move || Hash::check(&password, &stored)).await?;
+        let ok = run_hashing(move || Hash::check(&password, &stored)).await?;
         if ok {
             if Hash::needs_rehash(user.password_hash()) {
                 if let Err(e) = rehash_password(&user, plain).await {
@@ -362,7 +363,7 @@ impl<'a> Auth<'a> {
     ) -> Result<bool> {
         let stored = user.password_hash().to_string();
         let password = password.to_string();
-        blocking(move || Hash::check(&password, &stored)).await
+        run_hashing(move || Hash::check(&password, &stored)).await
     }
 }
 

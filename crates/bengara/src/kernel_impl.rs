@@ -260,6 +260,8 @@ pub fn main(hooks: Hooks, factory: fn() -> Application) {
     crate::lang::install((hooks.lang)());
     // 埋め込んだ public/ を固定する。以後は読むだけ。
     crate::http::statics::install_embedded((hooks.public)());
+    // 埋め込んだ resources/views/ も固定する。
+    crate::view::install_embedded((hooks.views)());
 
     if let Err(error) = dispatch(&args, hooks, factory) {
         eprintln!("エラー: {error}");
@@ -761,6 +763,8 @@ fn print_about(hooks: &Hooks) {
         ),
         ("セッション", env("SESSION_DRIVER", "file".to_string())),
         ("キャッシュ", env("CACHE_DRIVER", "file".to_string())),
+        // いま実際に使う方式と強さ（`HASH_DRIVER`）。
+        ("パスワード", crate::auth::hash_driver_label()),
         // `MAIL_MAILER` → `MAIL_DRIVER` の順に見る（`config/mail.rs` があればそちら）。
         ("メール", crate::mail::driver_label()),
         ("停止の上限", crate::server::shutdown_timeout_label()),
@@ -949,6 +953,8 @@ pub(crate) fn boot_for_tests(hooks: Hooks) {
         crate::lang::install((hooks.lang)());
         // 埋め込んだ public/ を固定する。以後は読むだけ。
         crate::http::statics::install_embedded((hooks.public)());
+        // 埋め込んだ resources/views/ も固定する。
+        crate::view::install_embedded((hooks.views)());
         // マイグレーションの一覧を、あとで `refresh_database()` から使えるようにしておく。
         let _ = TEST_HOOKS.set(hooks);
     });
